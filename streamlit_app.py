@@ -1528,6 +1528,7 @@ def render_product_card(row, flags_mapping, country: str = 'Kenya', advisor_warn
                     st.image(img_url, use_container_width=True)
                     st.caption(raw_name)
 
+            is_checked = st.session_state.get(f"grid_chk_{sid}", False)
             warnings_html = ""
             if advisor_warnings:
                 badges = "".join([
@@ -1536,10 +1537,59 @@ def render_product_card(row, flags_mapping, country: str = 'Kenya', advisor_warn
                     for w in advisor_warnings
                 ])
                 warnings_html = f'<div style="position:absolute;top:8px;right:8px;display:flex;flex-direction:column;z-index:10;">{badges}</div>'
+
+            # Selection state visuals
+            border_style = "3px solid #4CAF50" if is_checked else "1px solid #eee"
+            box_shadow = "0 0 0 3px rgba(76,175,80,0.2), 0 4px 16px rgba(76,175,80,0.15)" if is_checked else "none"
+            green_overlay = (
+                "<div style='position:absolute;inset:0;background:rgba(76,175,80,0.07);border-radius:8px;pointer-events:none;z-index:2;'></div>"
+                if is_checked else ""
+            )
+            tick_html = (
+                "<div style='position:absolute;bottom:10px;right:10px;width:26px;height:26px;"
+                "background:#4CAF50;border-radius:50%;display:flex;align-items:center;"
+                "justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,0.25);z-index:10;'>"
+                "<span class='material-symbols-outlined' style='color:#fff;font-size:17px;line-height:1;'>check</span>"
+                "</div>"
+                if is_checked else ""
+            )
+
+            # Unique key for this card's image click area
+            img_div_id = f"imgclick-{sid}"
+
             st.markdown(
-                f'<div style="position:relative;">{warnings_html}' +
-                f'<img src="{img_url}" loading="lazy" style="width:100%;height:220px;object-fit:contain;background-color:#FFFFFF;border-radius:8px;border:1px solid #eee;margin-bottom:8px;">' +
-                f'{price_overlay_html}</div>',
+                f'<div id="{img_div_id}" style="position:relative;cursor:pointer;border-radius:10px;'
+                f'border:{border_style};box-shadow:{box_shadow};'
+                f'transition:border 0.15s ease,box-shadow 0.15s ease;overflow:hidden;margin-bottom:8px;">'
+                f'{warnings_html}'
+                f'{green_overlay}'
+                f'<img src="{img_url}" loading="lazy" style="width:100%;height:220px;object-fit:contain;'
+                f'background-color:#FFFFFF;border-radius:8px;display:block;">'
+                f'{price_overlay_html}'
+                f'{tick_html}'
+                f'</div>'
+                f'<script>'
+                f'(function(){{'
+                f'  var el=document.getElementById("{img_div_id}");'
+                f'  if(el&&!el._bound){{'
+                f'    el._bound=true;'
+                f'    el.addEventListener("click",function(e){{'
+                f'      e.stopPropagation();'
+                f'      // Walk up to find Streamlit iframe root and locate our checkbox'
+                f'      var root=window.parent?window.parent.document:document;'
+                f'      var allCbs=root.querySelectorAll(\'input[type="checkbox"]\');'
+                f'      allCbs.forEach(function(cb){{'
+                f'        var lbl=cb.closest("label");'
+                f'        if(!lbl)return;'
+                f'        // Find checkbox whose nearby container has our SID'
+                f'        var section=cb.closest(\'[data-testid="stVerticalBlockBorderWrapper"]\');'
+                f'        if(!section)section=cb.closest(\'[data-testid="column"]\');'
+                f'        if(section&&section.textContent.indexOf("{sid}")>-1){{cb.click();}}'
+                f'      }});'
+                f'    }});'
+                f'  }}'
+                f'}})();'
+                f'</script>',
                 unsafe_allow_html=True
             )
 
