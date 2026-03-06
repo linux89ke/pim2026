@@ -16,10 +16,9 @@ from dataclasses import dataclass
 import base64
 import time
 
-# --- IMPORTS FOR IMAGE ADVISOR & GOOGLE SHEETS ---
+# --- IMPORTS FOR IMAGE ADVISOR ---
 import requests
 from PIL import Image
-from streamlit_gsheets import GSheetsConnection
 
 # -------------------------------------------------
 # JUMIA THEME COLORS & GLOBAL CSS
@@ -344,7 +343,7 @@ def extract_product_attributes(name: str, explicit_color: Optional[str] = None, 
     return attrs
 
 # -------------------------------------------------
-# DATA LOADING HELPERS & GSHEETS
+# LOCAL CSV DATA LOADING HELPERS
 # -------------------------------------------------
 def load_txt_file(filename: str) -> List[str]:
     try:
@@ -362,34 +361,34 @@ def load_excel_file(filename: str, column: Optional[str] = None):
         return df
     except Exception: return [] if column else pd.DataFrame()
 
-def safe_gsheets_read(url: str, worksheet, ttl: int = 3600, retries: int = 3, **kwargs) -> pd.DataFrame:
-    """Helper to read Google Sheets with automatic retry logic for 429 Quota errors."""
-    for attempt in range(retries + 1):
+def safe_local_read(filename: str, usecols=None) -> pd.DataFrame:
+    """Helper to safely read local fallback CSVs replacing Google Sheets"""
+    if not os.path.exists(filename):
+        logger.warning(f"Local file not found: {filename}")
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(filename, usecols=usecols, dtype=str)
+        return df.dropna(how='all')
+    except Exception as e:
         try:
-            conn = st.connection("gsheets", type=GSheetsConnection)
-            df = conn.read(spreadsheet=url, worksheet=worksheet, ttl=ttl, **kwargs)
-            return df
-        except Exception as e:
-            err_msg = str(e)
-            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "RATE_LIMIT_EXCEEDED" in err_msg:
-                if attempt < retries:
-                    logger.warning(f"Quota exceeded reading '{worksheet}'. Retrying in 3s (Attempt {attempt+1}/{retries})...")
-                    time.sleep(3)
-                    continue
-            logger.error(f"Failed to read sheet '{worksheet}' after {attempt} attempts: {e}")
-            raise e
-    return pd.DataFrame()
+            # Fallback for weird encoding or separators often seen in Excel CSV exports
+            df = pd.read_csv(filename, sep=';', encoding='ISO-8859-1', usecols=usecols, dtype=str)
+            return df.dropna(how='all')
+        except Exception as e2:
+            logger.error(f"Error reading local file {filename}: {e2}")
+            return pd.DataFrame()
 
-# --- GSHEET: PROHIBITED PRODUCTS ---
+# --- LOCAL: PROHIBITED PRODUCTS ---
 @st.cache_data(ttl=3600)
-def load_prohibited_from_sheet() -> Dict[str, List[Dict]]:
-    SHEET_URL = "https://docs.google.com/spreadsheets/d/1XkWkSKre4hp-h98GA17e76lVXhS01Re03EL242nHrpg/edit"
+def load_prohibited_from_local() -> Dict[str, List[Dict]]:
     COUNTRY_TABS = ["KE", "UG", "NG", "GH", "MA"]
     prohibited_by_country = {}
     for tab in COUNTRY_TABS:
         try:
-            df = safe_gsheets_read(url=SHEET_URL, worksheet=tab, ttl=3600)
-            if df.empty: continue
+            df = safe_local_read(f"Prohibbited.xlsx - {tab}.csv")
+            if df.empty: 
+                prohibited_by_country[tab] = []
+                continue
             df.columns = [str(c).strip().lower() for c in df.columns]
             keyword_col = next((c for c in df.columns if 'keyword' in c or 'prohibited' in c or 'name' in c), df.columns[0])
             category_col = next((c for c in df.columns if 'cat' in c), None)
@@ -406,22 +405,23 @@ def load_prohibited_from_sheet() -> Dict[str, List[Dict]]:
                 country_rules.append({'keyword': keyword, 'categories': categories})
             prohibited_by_country[tab] = country_rules
         except Exception as e:
-            msg = f"⚠️ **Google Sheets Error:** Failed to load Prohibited Products for **{tab}**. (Error: {e})"
+            msg = f"⚠️ **File Error:** Failed to load local Prohibited Products for **{tab}**. (Error: {e})"
             logger.error(msg)
             st.error(msg)
             prohibited_by_country[tab] = []
     return prohibited_by_country
 
-# --- GSHEET: RESTRICTED BRANDS ---
+# --- LOCAL: RESTRICTED BRANDS ---
 @st.cache_data(ttl=3600)
-def load_restricted_brands_from_sheet() -> Dict[str, List[Dict]]:
-    SHEET_URL = "https://docs.google.com/spreadsheets/d/1jXRkKRul6VhdnTaItyYR4IZOM9qBe4B217UD7WsYWFA/edit"
+def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
     COUNTRY_TABS = {"Kenya": "KE", "Uganda": "UG", "Nigeria": "NG", "Ghana": "GH", "Morocco": "MA"}
     config_by_country = {}
     for country_name, tab_name in COUNTRY_TABS.items():
         try:
-            df = safe_gsheets_read(url=SHEET_URL, worksheet=tab_name, ttl=3600)
-            if df.empty: continue
+            df = safe_local_read(f"Restricted_Brands.xlsx - {tab_name}.csv")
+            if df.empty: 
+                config_by_country[country_name] = []
+                continue
             df.columns = [str(c).strip().lower() for c in df.columns]
             brand_dict = {}
             for _, row in df.iterrows():
@@ -448,66 +448,61 @@ def load_restricted_brands_from_sheet() -> Dict[str, List[Dict]]:
                 country_rules.append({'brand': b_lower, 'brand_raw': data['brand_raw'], 'sellers': data['sellers'], 'categories': data['categories'], 'variations': list(data['variations'])})
             config_by_country[country_name] = country_rules
         except Exception as e:
-            msg = f"⚠️ **Google Sheets Error:** Failed to load Restricted Brands for **{tab_name}**. (Error: {e})"
+            msg = f"⚠️ **File Error:** Failed to load local Restricted Brands for **{tab_name}**. (Error: {e})"
             logger.error(msg)
             st.error(msg)
             config_by_country[country_name] = []
     return config_by_country
 
-# --- GSHEET: REFURBISHED DATA ---
+# --- LOCAL: REFURBISHED DATA ---
 @st.cache_data(ttl=3600)
-def load_refurb_data_from_sheet() -> dict:
-    SHEET_URL = "https://docs.google.com/spreadsheets/d/1mGmXEvNZsKUta82X82-lISSf3rzDU7yBRh5F4R6mYwE/edit"
+def load_refurb_data_from_local() -> dict:
     COUNTRY_TABS = ["KE", "UG", "NG", "GH", "MA"]
-    CATEGORY_TAB = "Categries"
-    NAME_TAB = "Name"
     result = {"sellers": {}, "categories": {"Phones": set(), "Laptops": set()}, "keywords": set()}
     for tab in COUNTRY_TABS:
         try:
-            df = safe_gsheets_read(url=SHEET_URL, worksheet=tab, usecols=[0, 1], ttl=3600)
+            df = safe_local_read(f"Refurb.xlsx - {tab}.csv", usecols=[0, 1])
             if not df.empty:
                 df.columns = [str(c).strip() for c in df.columns]
                 phones_set = set(df.iloc[:, 0].dropna().astype(str).str.strip().str.lower()) - {"", "nan", "phones"}
                 laptops_set = set(df.iloc[:, 1].dropna().astype(str).str.strip().str.lower()) - {"", "nan", "laptops"}
                 result["sellers"][tab] = {"Phones": phones_set, "Laptops": laptops_set}
         except Exception as e:
-            msg = f"⚠️ **Google Sheets Error:** Failed to load Refurb Sellers for **{tab}**. (Error: {e})"
+            msg = f"⚠️ **File Error:** Failed to load local Refurb Sellers for **{tab}**. (Error: {e})"
             logger.error(msg)
             st.warning(msg)
             result["sellers"][tab] = {"Phones": set(), "Laptops": set()}
     try:
-        df_cats = safe_gsheets_read(url=SHEET_URL, worksheet=CATEGORY_TAB, usecols=[0, 1], ttl=3600)
+        df_cats = safe_local_read("Refurb.xlsx - Categories.csv", usecols=[0, 1])
         if not df_cats.empty:
             df_cats.columns = [str(c).strip() for c in df_cats.columns]
             result["categories"]["Phones"] = {clean_category_code(c) for c in df_cats.iloc[:, 0].dropna().astype(str) if c.strip() and c.strip().lower() not in ("phones", "phone", "nan")}
             result["categories"]["Laptops"] = {clean_category_code(c) for c in df_cats.iloc[:, 1].dropna().astype(str) if c.strip() and c.strip().lower() not in ("laptops", "laptop", "nan")}
     except Exception as e:
-        msg = f"⚠️ **Google Sheets Error:** Failed to load Refurb Categories. (Error: {e})"
+        msg = f"⚠️ **File Error:** Failed to load local Refurb Categories. (Error: {e})"
         logger.error(msg)
         st.warning(msg)
     try:
-        df_names = safe_gsheets_read(url=SHEET_URL, worksheet=NAME_TAB, usecols=[0], ttl=3600)
+        df_names = safe_local_read("Refurb.xlsx - Name.csv", usecols=[0])
         if not df_names.empty:
             first_col = df_names.columns[0]
             result["keywords"] = {k for k in df_names[first_col].dropna().astype(str).str.strip().str.lower() if k and k not in ("name", "keyword", "keywords", "words", "nan")}
     except Exception as e:
-        msg = f"⚠️ **Google Sheets Error:** Failed to load Refurb Keywords. (Error: {e})"
+        msg = f"⚠️ **File Error:** Failed to load local Refurb Keywords. (Error: {e})"
         logger.error(msg)
         st.warning(msg)
         result["keywords"] = {"refurb", "refurbished", "renewed"}
     return result
 
-# --- GSHEET: PERFUME DATA ---
+# --- LOCAL: PERFUME DATA ---
 @st.cache_data(ttl=3600)
-def load_perfume_data_from_sheet() -> Dict:
-    SHEET_URL = "https://docs.google.com/spreadsheets/d/1BvS13LAtPd1tE0O12ZnJPIGdhXf_KJm7jix4nVqOC60/edit"
+def load_perfume_data_from_local() -> Dict:
     COUNTRY_TABS = ["KE", "UG", "NG", "GH", "MA"]
-    KEYWORDS_TAB = "Keywords"
     result = {"sellers": {}, "keywords": set(), "category_codes": set()}
 
     for tab in COUNTRY_TABS:
         try:
-            df = safe_gsheets_read(url=SHEET_URL, worksheet=tab, ttl=3600)
+            df = safe_local_read(f"Perfume.xlsx - {tab}.csv")
             if not df.empty:
                 df.columns = [str(c).strip() for c in df.columns]
                 seller_col = next((c for c in df.columns if 'seller' in c.lower()), df.columns[0])
@@ -517,13 +512,13 @@ def load_perfume_data_from_sheet() -> Dict:
                 )
                 result["sellers"][tab] = sellers
         except Exception as e:
-            msg = f"⚠️ **Google Sheets Error:** Perfume Sellers tab '{tab}' failed. (Error: {e})"
+            msg = f"⚠️ **File Error:** Local Perfume Sellers tab '{tab}' failed. (Error: {e})"
             logger.error(msg)
             st.warning(msg)
             result["sellers"][tab] = set() 
 
     try:
-        df_kw = safe_gsheets_read(url=SHEET_URL, worksheet=KEYWORDS_TAB, ttl=3600)
+        df_kw = safe_local_read("Perfume.xlsx - Keywords.csv")
         if not df_kw.empty:
             df_kw.columns = [str(c).strip() for c in df_kw.columns]
             kw_col = next((c for c in df_kw.columns if 'brand' in c.lower() or 'keyword' in c.lower()), df_kw.columns[0])
@@ -533,13 +528,13 @@ def load_perfume_data_from_sheet() -> Dict:
             )
             result["keywords"] = keywords
     except Exception as e:
-        msg = f"⚠️ **Google Sheets Error:** Perfume Keywords tab failed. (Error: {e})"
+        msg = f"⚠️ **File Error:** Local Perfume Keywords tab failed. (Error: {e})"
         logger.error(msg)
         st.warning(msg)
         result["keywords"] = set()
 
     try:
-        df_cats = safe_gsheets_read(url=SHEET_URL, worksheet="Categories", ttl=3600)
+        df_cats = safe_local_read("Perfume.xlsx - Categories.csv")
         if not df_cats.empty:
             df_cats.columns = [str(c).strip() for c in df_cats.columns]
             cat_col = next((c for c in df_cats.columns if 'cat' in c.lower()), df_cats.columns[0])
@@ -549,22 +544,21 @@ def load_perfume_data_from_sheet() -> Dict:
             )
             result["category_codes"] = cat_codes
     except Exception as e:
-        msg = f"⚠️ **Google Sheets Error:** Perfume Categories tab failed. (Error: {e})"
+        msg = f"⚠️ **File Error:** Local Perfume Categories tab failed. (Error: {e})"
         logger.error(msg)
         st.warning(msg)
         result["category_codes"] = set()
     return result
 
-# --- GSHEET: BOOKS DATA ---
+# --- LOCAL: BOOKS DATA ---
 @st.cache_data(ttl=3600)
-def load_books_data_from_sheet() -> Dict:
-    SHEET_URL = "https://docs.google.com/spreadsheets/d/17ZGqh3ycH4iW1V_p75L8wEIobpM2ZgGxGRfvCaBioF8/edit"
+def load_books_data_from_local() -> Dict:
     COUNTRY_TABS = ["KE", "UG", "NG", "GH", "MA"]
     result = {"sellers": {}, "category_codes": set()}
 
     for tab in COUNTRY_TABS:
         try:
-            df = safe_gsheets_read(url=SHEET_URL, worksheet=tab, ttl=3600)
+            df = safe_local_read(f"Books_sellers.xlsx - {tab}.csv")
             if not df.empty:
                 df.columns = [str(c).strip() for c in df.columns]
                 seller_col = next((c for c in df.columns if 'seller' in c.lower()), df.columns[0])
@@ -574,13 +568,13 @@ def load_books_data_from_sheet() -> Dict:
                 )
                 result["sellers"][tab] = sellers
         except Exception as e:
-            msg = f"⚠️ **Google Sheets Error:** Books Sellers tab '{tab}' failed. (Error: {e})"
+            msg = f"⚠️ **File Error:** Local Books Sellers tab '{tab}' failed. (Error: {e})"
             logger.error(msg)
             st.warning(msg)
             result["sellers"][tab] = set()
 
     try:
-        df_cats = safe_gsheets_read(url=SHEET_URL, worksheet="Categories", ttl=3600)
+        df_cats = safe_local_read("Books_sellers.xlsx - Categories.csv")
         if not df_cats.empty:
             df_cats.columns = [str(c).strip() for c in df_cats.columns]
             cat_col = next((c for c in df_cats.columns if 'cat' in c.lower()), df_cats.columns[0])
@@ -590,23 +584,21 @@ def load_books_data_from_sheet() -> Dict:
             )
             result["category_codes"] = cat_codes
     except Exception as e:
-        msg = f"⚠️ **Google Sheets Error:** Books Categories tab failed. (Error: {e})"
+        msg = f"⚠️ **File Error:** Local Books Categories tab failed. (Error: {e})"
         logger.error(msg)
         st.warning(msg)
         result["category_codes"] = set()
     return result
 
-# --- GSHEET: JERSEYS DATA ---
+# --- LOCAL: JERSEYS DATA ---
 @st.cache_data(ttl=3600)
-def load_jerseys_from_sheet() -> Dict:
-    SHEET_URL = "https://docs.google.com/spreadsheets/d/1W5yW6lDEW1CAqm9--ultMrNL_CWabab3Fr9fnKJ6xXY/edit"
+def load_jerseys_from_local() -> Dict:
     COUNTRY_TABS = ["KE", "UG", "NG", "GH", "MA"]
-    CATEGORIES_TAB = "categories"
     result: Dict = {"keywords": {tab: set() for tab in COUNTRY_TABS}, "exempted": {tab: set() for tab in COUNTRY_TABS}, "categories": set()}
 
     for tab in COUNTRY_TABS:
         try:
-            df = safe_gsheets_read(url=SHEET_URL, worksheet=tab, ttl=3600)
+            df = safe_local_read(f"Jersey_validation.xlsx - {tab}.csv")
             if not df.empty:
                 df.columns = [str(c).strip() for c in df.columns]
                 kw_col = next((c for c in df.columns if "keyword" in c.lower()), df.columns[0])
@@ -617,39 +609,36 @@ def load_jerseys_from_sheet() -> Dict:
                     exempted = set(df[ex_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "exempted sellers", "seller"])]))
                     result["exempted"][tab] = exempted
         except Exception as e:
-            msg = f"⚠️ **Google Sheets Error:** Jerseys tab '{tab}' failed. (Error: {e})"
+            msg = f"⚠️ **File Error:** Local Jerseys tab '{tab}' failed. (Error: {e})"
             logger.error(msg)
             st.warning(msg)
 
     try:
-        df_cats = safe_gsheets_read(url=SHEET_URL, worksheet=CATEGORIES_TAB, ttl=3600)
+        df_cats = safe_local_read("Jersey_validation.xlsx - categories.csv")
         if not df_cats.empty:
             df_cats.columns = [str(c).strip().lower() for c in df_cats.columns]
             cat_col = next((c for c in df_cats.columns if "cat" in c), df_cats.columns[0])
             result["categories"] = set(df_cats[cat_col].dropna().astype(str).apply(clean_category_code).pipe(lambda s: s[~s.isin(["", "nan", "categories", "category"])]))
     except Exception as e:
-        msg = f"⚠️ **Google Sheets Error:** Jerseys Categories tab failed. (Error: {e})"
+        msg = f"⚠️ **File Error:** Local Jerseys Categories tab failed. (Error: {e})"
         logger.error(msg)
         st.warning(msg)
     return result
 
-# --- GSHEET: SUSPECTED FAKE DATA ---
+# --- LOCAL: SUSPECTED FAKE DATA ---
 @st.cache_data(ttl=3600)
-def load_suspected_fake_from_sheet() -> pd.DataFrame:
-    SHEET_URL = "https://docs.google.com/spreadsheets/d/1OdunXvEi1zNvAdWznvo2QLGFufUlN00V03ZWnd8pBCo/edit"
+def load_suspected_fake_from_local() -> pd.DataFrame:
     try:
-        df = safe_gsheets_read(url=SHEET_URL, worksheet=0, ttl=3600)
-        if not df.empty: return df
-    except Exception as e:
-        msg = f"⚠️ **Google Sheets Error:** Failed to load Suspected Fake from Google Sheet, falling back to local. (Error: {e})"
-        logger.warning(msg)
-        st.warning(msg)
-    
-    # Fallback to local file if Sheet is unavailable
-    try:
+        # Check standard suspected_fake file if present
         if os.path.exists('suspected_fake.xlsx'):
             return pd.read_excel('suspected_fake.xlsx', engine='openpyxl', dtype=str)
-    except: pass
+        # Fallback to the country-specific CSV exports
+        df = safe_local_read("suspected_fake.xlsx - KE.csv")
+        if not df.empty: return df
+    except Exception as e:
+        msg = f"⚠️ **File Error:** Failed to load local Suspected Fake data. (Error: {e})"
+        logger.warning(msg)
+        st.warning(msg)
     return pd.DataFrame()
 
 
@@ -702,9 +691,9 @@ def load_all_support_files() -> Dict:
     return {
         'blacklisted_words': safe_load_txt('blacklisted.txt'),
         'book_category_codes': safe_load_txt('Books_cat.txt'),
-        'books_data': load_books_data_from_sheet(),
+        'books_data': load_books_data_from_local(),
         'perfume_category_codes': safe_load_txt('Perfume_cat.txt'),
-        'perfume_data': load_perfume_data_from_sheet(),
+        'perfume_data': load_perfume_data_from_local(),
         'sneaker_category_codes': safe_load_txt('Sneakers_Cat.txt'),
         'sneaker_sensitive_brands': [b.lower() for b in safe_load_txt('Sneakers_Sensitive.txt')],
         'sensitive_words': [w.lower() for w in safe_load_txt('sensitive_words.txt')],
@@ -714,17 +703,17 @@ def load_all_support_files() -> Dict:
         'category_fas': safe_load_txt('Fashion_cat.txt'),
         'reasons': load_excel_file('reasons.xlsx'),
         'flags_mapping': load_flags_mapping(),
-        'jerseys_data': load_jerseys_from_sheet(),
+        'jerseys_data': load_jerseys_from_local(),
         'warranty_category_codes': safe_load_txt('warranty.txt'),
-        'suspected_fake': load_suspected_fake_from_sheet(),
+        'suspected_fake': load_suspected_fake_from_local(),
         'duplicate_exempt_codes': safe_load_txt('duplicate_exempt.txt'),
-        'restricted_brands_all': load_restricted_brands_from_sheet(),
-        'prohibited_words_all': load_prohibited_from_sheet(),
+        'restricted_brands_all': load_restricted_brands_from_local(),
+        'prohibited_words_all': load_prohibited_from_local(),
         'known_brands': safe_load_txt('brands.txt'),
         'variation_allowed_codes': safe_load_txt('variation.txt'),
         'weight_category_codes': safe_load_txt('weight.txt'),
         'smartphone_category_codes': safe_load_txt('smartphones.txt'),
-        'refurb_data': load_refurb_data_from_sheet(),
+        'refurb_data': load_refurb_data_from_local(),
     }
 
 @st.cache_data(ttl=3600)
@@ -1717,7 +1706,7 @@ st.markdown(f"""
 
 with st.sidebar:
     st.header("System Status")
-    if st.button("🔄 Clear Cache & Reload Data", use_container_width=True, type="secondary", help="Use this if Google Sheets fail to load due to rate limits."):
+    if st.button("🔄 Clear Cache & Reload Data", use_container_width=True, type="secondary", help="Forces a reload of all support rules from local files."):
         st.cache_data.clear()
         st.rerun()
         
