@@ -1582,7 +1582,7 @@ def render_product_card(row, flags_mapping, country: str = 'Kenya', advisor_warn
 
             col_img, col_more = st.columns([1.2, 0.8], gap="small")
             with col_img:
-                st.button("🖼 Poor Image", key=f"btn_img_{sid}", use_container_width=True, on_click=quick_reject_item, args=(sid, img_code, img_cmt, 'Poor images', toast_name), type="primary", help="Reject: Poor Image Quality")
+                st.button("Poor Image", key=f"btn_img_{sid}", use_container_width=True, on_click=quick_reject_item, args=(sid, img_code, img_cmt, 'Poor images', toast_name), type="primary", help="Reject: Poor Image Quality")
             with col_more:
                 with st.popover("✕ More", use_container_width=True):
                     st.markdown("<p style='font-size:12px;font-weight:700;margin:0 0 8px 0;'>Select rejection reason:</p>", unsafe_allow_html=True)
