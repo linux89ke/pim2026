@@ -970,31 +970,6 @@ def check_seller_approved_for_books(
         flagged['Comment_Detail'] = "Seller not approved to sell books: " + flagged['SELLER_NAME'].astype(str)
     return flagged.drop_duplicates(subset=['PRODUCT_SET_SID'])
 
-def check_perfume_wrong_category(
-    data: pd.DataFrame,
-    perfume_data: Dict,
-) -> pd.DataFrame:
-    if not {'NAME', 'CATEGORY_CODE'}.issubset(data.columns):
-        return pd.DataFrame(columns=data.columns)
-    category_codes = perfume_data.get('category_codes', set())
-    if not category_codes:
-        return pd.DataFrame(columns=data.columns)
-    PERFUME_NAME_KEYWORDS = re.compile(
-        r'\b(perfume|parfum|eau\s+de\s+toilette|toilette|cologne|oud|attar|edp|edt)\b',
-        re.IGNORECASE
-    )
-    d = data.copy()
-    d['_cat_clean'] = d['CATEGORY_CODE'].apply(clean_category_code)
-    name_is_perfume = d['NAME'].astype(str).apply(lambda x: bool(PERFUME_NAME_KEYWORDS.search(x)))
-    wrong_cat = ~d['_cat_clean'].isin(category_codes)
-    flagged = d[name_is_perfume & wrong_cat].copy()
-    if not flagged.empty:
-        flagged['Comment_Detail'] = (
-            "Name suggests perfume but category is not a perfume category: "
-            + flagged['_cat_clean']
-        )
-    return flagged.drop(columns=['_cat_clean'], errors='ignore').drop_duplicates(subset=['PRODUCT_SET_SID'])
-
 def check_seller_approved_for_perfume(
     data: pd.DataFrame,
     perfume_category_codes: List[str],
@@ -1251,7 +1226,6 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
         ("Seller Not approved to sell Refurb", check_refurb_seller_approval, {'refurb_data': support_files.get('refurb_data', {}), 'country_code': country_validator.code}),
         ("Product Warranty", check_product_warranty, {'warranty_category_codes': support_files['warranty_category_codes']}),
         ("Seller Approve to sell books", check_seller_approved_for_books, {'books_data': support_files.get('books_data', {}), 'country_code': country_validator.code, 'book_category_codes': support_files['book_category_codes']}),
-        ("Wrong Category", check_perfume_wrong_category, {'perfume_data': support_files.get('perfume_data', {})}),
         ("Seller Approved to Sell Perfume", check_seller_approved_for_perfume, {'perfume_category_codes': support_files['perfume_category_codes'], 'perfume_data': support_files.get('perfume_data', {}), 'country_code': country_validator.code}),
         ("Counterfeit Sneakers", check_counterfeit_sneakers, {'sneaker_category_codes': support_files['sneaker_category_codes'], 'sneaker_sensitive_brands': support_files['sneaker_sensitive_brands']}),
         ("Suspected counterfeit Jerseys", check_counterfeit_jerseys, {'jerseys_data': support_files.get('jerseys_data', {}), 'country_code': country_validator.code}),
