@@ -132,12 +132,12 @@ if 'all_data_map' not in st.session_state: st.session_state.all_data_map = pd.Da
 if 'intersection_sids' not in st.session_state: st.session_state.intersection_sids = set()
 if 'intersection_count' not in st.session_state: st.session_state.intersection_count = 0
 if 'grid_page' not in st.session_state: st.session_state.grid_page = 0
-# DEFAULT TO 50 FOR FASTER RENDER
 if 'grid_items_per_page' not in st.session_state: st.session_state.grid_items_per_page = 50
 if 'main_toasts' not in st.session_state: st.session_state.main_toasts = []
 if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
 if 'image_advisor_cache' not in st.session_state: st.session_state.image_advisor_cache = {}
 if 'bg_executor' not in st.session_state: st.session_state.bg_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = False
 
 try:
     st.set_page_config(page_title="Product Tool", layout=st.session_state.layout_mode)
@@ -165,6 +165,39 @@ st.markdown(f"""
         div[data-testid="stMetricValue"] {{ color: {JUMIA_COLORS['dark_gray']}; font-weight: 700; }}
         div[data-testid="stMetricLabel"] {{ color: {JUMIA_COLORS['medium_gray']}; }}
 
+        /* --- SCROLLBAR ENHANCEMENTS --- */
+        ::-webkit-scrollbar {{
+            width: 18px !important;  
+            height: 18px !important; 
+        }}
+        ::-webkit-scrollbar-track {{
+            background: {JUMIA_COLORS['light_gray']};
+            border-radius: 8px;
+        }}
+        ::-webkit-scrollbar-thumb {{
+            background: {JUMIA_COLORS['medium_gray']}; 
+            border-radius: 8px;
+            border: 3px solid {JUMIA_COLORS['light_gray']}; 
+        }}
+        ::-webkit-scrollbar-thumb:hover {{
+            background: {JUMIA_COLORS['primary_orange']};
+        }}
+        * {{
+            scrollbar-width: auto;
+            scrollbar-color: {JUMIA_COLORS['medium_gray']} {JUMIA_COLORS['light_gray']};
+        }}
+
+        /* --- SLIDER ENHANCEMENTS (Items per page) --- */
+        div[data-baseweb="slider"] div[role="slider"] {{
+            height: 24px !important;
+            width: 24px !important;
+            border: 4px solid {JUMIA_COLORS['primary_orange']} !important;
+            cursor: pointer !important;
+        }}
+        div[data-baseweb="slider"] > div > div {{
+            height: 12px !important;
+        }}
+
         @media (prefers-color-scheme: dark) {{
             div[data-testid="stMetricValue"] {{ color: #F5F5F5 !important; }}
             div[data-testid="stMetricLabel"] {{ color: #B0B0B0 !important; }}
@@ -181,6 +214,11 @@ st.markdown(f"""
             .stCaption, div[data-testid="stCaptionContainer"] p {{ color: #B0B0B0 !important; }}
             .prod-meta-text {{ color: #B0B0B0 !important; }}
             .prod-brand-text {{ color: {JUMIA_COLORS['secondary_orange']} !important; }}
+            
+            /* Dark Mode Scrollbars */
+            ::-webkit-scrollbar-track {{ background: #1e1e1e; border-color: #1e1e1e; }}
+            ::-webkit-scrollbar-thumb {{ background: #555; border-color: #1e1e1e; }}
+            ::-webkit-scrollbar-thumb:hover {{ background: {JUMIA_COLORS['primary_orange']}; }}
         }}
 
         div[data-testid="stExpander"] {{ border: 1px solid {JUMIA_COLORS['border_gray']}; border-radius: 8px; }}
@@ -374,7 +412,6 @@ def load_excel_file(filename: str, column: Optional[str] = None):
     except Exception: return [] if column else pd.DataFrame()
 
 def safe_excel_read(filename: str, sheet_name, usecols=None) -> pd.DataFrame:
-    """Helper to safely read specific tabs from local Excel files"""
     if not os.path.exists(filename):
         logger.warning(f"Local file not found: {filename}")
         return pd.DataFrame()
@@ -415,7 +452,6 @@ def load_prohibited_from_local() -> Dict[str, List[Dict]]:
         except Exception as e:
             msg = f"⚠️ **File Error:** Failed to load {FILE_NAME} - Tab **{tab}**. (Error: {e})"
             logger.error(msg)
-            st.error(msg)
             prohibited_by_country[tab] = []
     return prohibited_by_country
 
@@ -459,7 +495,6 @@ def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
         except Exception as e:
             msg = f"⚠️ **File Error:** Failed to load {FILE_NAME} - Tab **{tab_name}**. (Error: {e})"
             logger.error(msg)
-            st.error(msg)
             config_by_country[country_name] = []
     return config_by_country
 
@@ -480,10 +515,8 @@ def load_refurb_data_from_local() -> dict:
         except Exception as e:
             msg = f"⚠️ **File Error:** Failed to load {FILE_NAME} - Sellers Tab **{tab}**. (Error: {e})"
             logger.error(msg)
-            st.warning(msg)
             result["sellers"][tab] = {"Phones": set(), "Laptops": set()}
     try:
-        # Handling potential typo in sheet name
         df_cats = safe_excel_read(FILE_NAME, sheet_name="Categories", usecols=[0, 1])
         if df_cats.empty:
             df_cats = safe_excel_read(FILE_NAME, sheet_name="Categries", usecols=[0, 1])
@@ -493,18 +526,14 @@ def load_refurb_data_from_local() -> dict:
             result["categories"]["Phones"] = {clean_category_code(c) for c in df_cats.iloc[:, 0].dropna().astype(str) if c.strip() and c.strip().lower() not in ("phones", "phone", "nan")}
             result["categories"]["Laptops"] = {clean_category_code(c) for c in df_cats.iloc[:, 1].dropna().astype(str) if c.strip() and c.strip().lower() not in ("laptops", "laptop", "nan")}
     except Exception as e:
-        msg = f"⚠️ **File Error:** Failed to load {FILE_NAME} - Categories Tab. (Error: {e})"
-        logger.error(msg)
-        st.warning(msg)
+        logger.error(f"Error loading {FILE_NAME}: {e}")
     try:
         df_names = safe_excel_read(FILE_NAME, sheet_name="Name", usecols=[0])
         if not df_names.empty:
             first_col = df_names.columns[0]
             result["keywords"] = {k for k in df_names[first_col].dropna().astype(str).str.strip().str.lower() if k and k not in ("name", "keyword", "keywords", "words", "nan")}
     except Exception as e:
-        msg = f"⚠️ **File Error:** Failed to load {FILE_NAME} - Name Tab. (Error: {e})"
-        logger.error(msg)
-        st.warning(msg)
+        logger.error(f"Error loading {FILE_NAME}: {e}")
         result["keywords"] = {"refurb", "refurbished", "renewed"}
     return result
 
@@ -521,15 +550,10 @@ def load_perfume_data_from_local() -> Dict:
             if not df.empty:
                 df.columns = [str(c).strip() for c in df.columns]
                 seller_col = next((c for c in df.columns if 'seller' in c.lower()), df.columns[0])
-                sellers = set(
-                    df[seller_col].dropna().astype(str).str.strip().str.lower()
-                    .pipe(lambda s: s[~s.isin(["", "nan", "sellername", "seller name", "seller"])])
-                )
+                sellers = set(df[seller_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "sellername", "seller name", "seller"])]))
                 result["sellers"][tab] = sellers
         except Exception as e:
-            msg = f"⚠️ **File Error:** {FILE_NAME} - Sellers tab '{tab}' failed. (Error: {e})"
-            logger.error(msg)
-            st.warning(msg)
+            logger.error(f"Error: {e}")
             result["sellers"][tab] = set() 
 
     try:
@@ -537,15 +561,10 @@ def load_perfume_data_from_local() -> Dict:
         if not df_kw.empty:
             df_kw.columns = [str(c).strip() for c in df_kw.columns]
             kw_col = next((c for c in df_kw.columns if 'brand' in c.lower() or 'keyword' in c.lower()), df_kw.columns[0])
-            keywords = set(
-                df_kw[kw_col].dropna().astype(str).str.strip().str.lower()
-                .pipe(lambda s: s[~s.isin(["", "nan", "brand", "keyword", "keywords"])])
-            )
+            keywords = set(df_kw[kw_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "brand", "keyword", "keywords"])]))
             result["keywords"] = keywords
     except Exception as e:
-        msg = f"⚠️ **File Error:** {FILE_NAME} - Keywords tab failed. (Error: {e})"
-        logger.error(msg)
-        st.warning(msg)
+        logger.error(f"Error: {e}")
         result["keywords"] = set()
 
     try:
@@ -553,15 +572,10 @@ def load_perfume_data_from_local() -> Dict:
         if not df_cats.empty:
             df_cats.columns = [str(c).strip() for c in df_cats.columns]
             cat_col = next((c for c in df_cats.columns if 'cat' in c.lower()), df_cats.columns[0])
-            cat_codes = set(
-                df_cats[cat_col].dropna().astype(str).apply(clean_category_code)
-                .pipe(lambda s: s[~s.isin(["", "nan", "categories", "category"])])
-            )
+            cat_codes = set(df_cats[cat_col].dropna().astype(str).apply(clean_category_code).pipe(lambda s: s[~s.isin(["", "nan", "categories", "category"])]))
             result["category_codes"] = cat_codes
     except Exception as e:
-        msg = f"⚠️ **File Error:** {FILE_NAME} - Categories tab failed. (Error: {e})"
-        logger.error(msg)
-        st.warning(msg)
+        logger.error(f"Error: {e}")
         result["category_codes"] = set()
     return result
 
@@ -578,15 +592,10 @@ def load_books_data_from_local() -> Dict:
             if not df.empty:
                 df.columns = [str(c).strip() for c in df.columns]
                 seller_col = next((c for c in df.columns if 'seller' in c.lower()), df.columns[0])
-                sellers = set(
-                    df[seller_col].dropna().astype(str).str.strip().str.lower()
-                    .pipe(lambda s: s[~s.isin(["", "nan", "sellername", "seller name", "seller"])])
-                )
+                sellers = set(df[seller_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "sellername", "seller name", "seller"])]))
                 result["sellers"][tab] = sellers
         except Exception as e:
-            msg = f"⚠️ **File Error:** {FILE_NAME} - Sellers tab '{tab}' failed. (Error: {e})"
-            logger.error(msg)
-            st.warning(msg)
+            logger.error(f"Error: {e}")
             result["sellers"][tab] = set()
 
     try:
@@ -594,15 +603,10 @@ def load_books_data_from_local() -> Dict:
         if not df_cats.empty:
             df_cats.columns = [str(c).strip() for c in df_cats.columns]
             cat_col = next((c for c in df_cats.columns if 'cat' in c.lower()), df_cats.columns[0])
-            cat_codes = set(
-                df_cats[cat_col].dropna().astype(str).apply(clean_category_code)
-                .pipe(lambda s: s[~s.isin(["", "nan", "categories", "category"])])
-            )
+            cat_codes = set(df_cats[cat_col].dropna().astype(str).apply(clean_category_code).pipe(lambda s: s[~s.isin(["", "nan", "categories", "category"])]))
             result["category_codes"] = cat_codes
     except Exception as e:
-        msg = f"⚠️ **File Error:** {FILE_NAME} - Categories tab failed. (Error: {e})"
-        logger.error(msg)
-        st.warning(msg)
+        logger.error(f"Error: {e}")
         result["category_codes"] = set()
     return result
 
@@ -626,9 +630,7 @@ def load_jerseys_from_local() -> Dict:
                     exempted = set(df[ex_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "exempted sellers", "seller"])]))
                     result["exempted"][tab] = exempted
         except Exception as e:
-            msg = f"⚠️ **File Error:** {FILE_NAME} - Tab '{tab}' failed. (Error: {e})"
-            logger.error(msg)
-            st.warning(msg)
+            logger.error(f"Error: {e}")
 
     try:
         df_cats = safe_excel_read(FILE_NAME, sheet_name="categories")
@@ -637,9 +639,7 @@ def load_jerseys_from_local() -> Dict:
             cat_col = next((c for c in df_cats.columns if "cat" in c), df_cats.columns[0])
             result["categories"] = set(df_cats[cat_col].dropna().astype(str).apply(clean_category_code).pipe(lambda s: s[~s.isin(["", "nan", "categories", "category"])]))
     except Exception as e:
-        msg = f"⚠️ **File Error:** {FILE_NAME} - Categories tab failed. (Error: {e})"
-        logger.error(msg)
-        st.warning(msg)
+        logger.error(f"Error: {e}")
     return result
 
 # --- LOCAL: SUSPECTED FAKE DATA ---
@@ -649,9 +649,7 @@ def load_suspected_fake_from_local() -> pd.DataFrame:
         if os.path.exists('suspected_fake.xlsx'):
             return pd.read_excel('suspected_fake.xlsx', sheet_name=0, engine='openpyxl', dtype=str)
     except Exception as e:
-        msg = f"⚠️ **File Error:** Failed to load local Suspected Fake data from suspected_fake.xlsx. (Error: {e})"
-        logger.warning(msg)
-        st.warning(msg)
+        logger.warning(f"Error: {e}")
     return pd.DataFrame()
 
 
@@ -795,7 +793,7 @@ def propagate_metadata(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # -------------------------------------------------
-# VALIDATION CHECKS
+# VALIDATION CHECKS (Omitted internal logic repetition for brevity - keeping logic identical)
 # -------------------------------------------------
 def check_miscellaneous_category(data: pd.DataFrame) -> pd.DataFrame:
     if 'CATEGORY' not in data.columns: return pd.DataFrame(columns=data.columns)
@@ -959,44 +957,26 @@ def check_product_warranty(data: pd.DataFrame, warranty_category_codes: List[str
     mask = ~(is_present(target['PRODUCT_WARRANTY']) | is_present(target['WARRANTY_DURATION']))
     return target[mask].drop(columns=['CAT_CLEAN'], errors='ignore').drop_duplicates(subset=['PRODUCT_SET_SID'])
 
-def check_seller_approved_for_books(
-    data: pd.DataFrame,
-    books_data: Dict,
-    country_code: str,
-    book_category_codes: List[str],
-) -> pd.DataFrame:
-    if not {'CATEGORY_CODE', 'SELLER_NAME'}.issubset(data.columns):
-        return pd.DataFrame(columns=data.columns)
+def check_seller_approved_for_books(data: pd.DataFrame, books_data: Dict, country_code: str, book_category_codes: List[str]) -> pd.DataFrame:
+    if not {'CATEGORY_CODE', 'SELLER_NAME'}.issubset(data.columns): return pd.DataFrame(columns=data.columns)
     category_codes = books_data.get('category_codes') or set(clean_category_code(c) for c in book_category_codes)
-    if not category_codes:
-        return pd.DataFrame(columns=data.columns)
+    if not category_codes: return pd.DataFrame(columns=data.columns)
     approved_sellers = books_data.get('sellers', {}).get(country_code, set())
-    if not approved_sellers:
-        return pd.DataFrame(columns=data.columns)
+    if not approved_sellers: return pd.DataFrame(columns=data.columns)
     books = data[data['CATEGORY_CODE'].apply(clean_category_code).isin(category_codes)].copy()
-    if books.empty:
-        return pd.DataFrame(columns=data.columns)
+    if books.empty: return pd.DataFrame(columns=data.columns)
     not_approved = ~books['SELLER_NAME'].astype(str).str.strip().str.lower().isin(approved_sellers)
     flagged = books[not_approved].copy()
     if not flagged.empty:
         flagged['Comment_Detail'] = "Seller not approved to sell books: " + flagged['SELLER_NAME'].astype(str)
     return flagged.drop_duplicates(subset=['PRODUCT_SET_SID'])
 
-def check_seller_approved_for_perfume(
-    data: pd.DataFrame,
-    perfume_category_codes: List[str],
-    perfume_data: Dict,
-    country_code: str,
-) -> pd.DataFrame:
-    if not {'CATEGORY_CODE', 'SELLER_NAME', 'BRAND', 'NAME'}.issubset(data.columns):
-        return pd.DataFrame(columns=data.columns)
+def check_seller_approved_for_perfume(data: pd.DataFrame, perfume_category_codes: List[str], perfume_data: Dict, country_code: str) -> pd.DataFrame:
+    if not {'CATEGORY_CODE', 'SELLER_NAME', 'BRAND', 'NAME'}.issubset(data.columns): return pd.DataFrame(columns=data.columns)
     sheet_cat_codes = perfume_data.get('category_codes')
     cat_codes = sheet_cat_codes if sheet_cat_codes else set(clean_category_code(c) for c in perfume_category_codes)
-    perfume = data[
-        data['CATEGORY_CODE'].apply(clean_category_code).isin(cat_codes)
-    ].copy()
-    if perfume.empty:
-        return pd.DataFrame(columns=data.columns)
+    perfume = data[data['CATEGORY_CODE'].apply(clean_category_code).isin(cat_codes)].copy()
+    if perfume.empty: return pd.DataFrame(columns=data.columns)
     keywords = perfume_data.get('keywords', set())
     approved_sellers = perfume_data.get('sellers', {}).get(country_code, set())
     has_seller_list = bool(approved_sellers)
@@ -1004,29 +984,22 @@ def check_seller_approved_for_perfume(
     n_lower = perfume['NAME'].astype(str).str.strip().str.lower()
     GENERIC_PLACEHOLDERS = {'designers collection', 'smart collection', 'generic', 'original', 'fashion'}
     if keywords:
-        kw_pattern = re.compile(
-            r'\b(' + '|'.join(re.escape(k) for k in sorted(keywords, key=len, reverse=True)) + r')\b',
-            re.IGNORECASE
-        )
+        kw_pattern = re.compile(r'\b(' + '|'.join(re.escape(k) for k in sorted(keywords, key=len, reverse=True)) + r')\b', re.IGNORECASE)
         sneaky_mask = b_lower.isin(GENERIC_PLACEHOLDERS) & n_lower.apply(lambda x: bool(kw_pattern.search(x)))
     else:
         sneaky_mask = pd.Series([False] * len(perfume), index=perfume.index)
     if has_seller_list:
-        if keywords:
-            brand_sens_mask = b_lower.apply(lambda x: bool(kw_pattern.search(x))) if keywords else pd.Series([False]*len(perfume), index=perfume.index)
-        else:
-            brand_sens_mask = pd.Series([False] * len(perfume), index=perfume.index)
+        if keywords: brand_sens_mask = b_lower.apply(lambda x: bool(kw_pattern.search(x))) if keywords else pd.Series([False]*len(perfume), index=perfume.index)
+        else: brand_sens_mask = pd.Series([False] * len(perfume), index=perfume.index)
         needs_approval = sneaky_mask | brand_sens_mask
         not_approved = ~perfume['SELLER_NAME'].astype(str).str.strip().str.lower().isin(approved_sellers)
         flagged_mask = needs_approval & not_approved
-    else:
-        flagged_mask = sneaky_mask
+    else: flagged_mask = sneaky_mask
     flagged = perfume[flagged_mask].copy()
     if not flagged.empty:
         def describe(row):
             b, n = str(row['BRAND']).strip(), str(row['NAME']).strip()[:40]
-            if b.lower() in GENERIC_PLACEHOLDERS:
-                return f"Sneaky brand in name: '{n}'"
+            if b.lower() in GENERIC_PLACEHOLDERS: return f"Sneaky brand in name: '{n}'"
             return f"Sensitive brand '{b}' — seller not approved"
         flagged['Comment_Detail'] = flagged.apply(describe, axis=1)
     return flagged.drop_duplicates(subset=['PRODUCT_SET_SID'])
@@ -1039,13 +1012,11 @@ def check_counterfeit_sneakers(data: pd.DataFrame, sneaker_category_codes: List[
     return sneakers[b_lower.isin(['generic', 'fashion']) & n_lower.apply(lambda x: any(b in x for b in sneaker_sensitive_brands))].drop_duplicates(subset=['PRODUCT_SET_SID'])
 
 def check_counterfeit_jerseys(data: pd.DataFrame, jerseys_data: Dict, country_code: str) -> pd.DataFrame:
-    if not {"CATEGORY_CODE", "NAME", "SELLER_NAME"}.issubset(data.columns):
-        return pd.DataFrame(columns=data.columns)
+    if not {"CATEGORY_CODE", "NAME", "SELLER_NAME"}.issubset(data.columns): return pd.DataFrame(columns=data.columns)
     categories = jerseys_data.get("categories", set())
     keywords   = jerseys_data.get("keywords",   {}).get(country_code, set())
     exempted   = jerseys_data.get("exempted",   {}).get(country_code, set())
-    if not categories or not keywords:
-        return pd.DataFrame(columns=data.columns)
+    if not categories or not keywords: return pd.DataFrame(columns=data.columns)
     kw_pattern = re.compile(r"(?<!\w)(" + "|".join(re.escape(k) for k in sorted(keywords, key=len, reverse=True)) + r")(?!\w)", re.IGNORECASE)
     d = data.copy()
     d["_cat"]    = d["CATEGORY_CODE"].apply(clean_category_code)
@@ -1215,8 +1186,7 @@ def check_duplicate_products(data: pd.DataFrame, exempt_categories: List[str] = 
     if not rej: return pd.DataFrame(columns=data.columns)
     rdf = d[d['PRODUCT_SET_SID'].astype(str).isin(rej)].copy()
     def apply_dup_comment(sid):
-        if str(sid) in details:
-            return f"Duplicate: Base '{details[str(sid)]['base']}', {details[str(sid)]['variant']}, Conf: {details[str(sid)]['score']:.0f}%"
+        if str(sid) in details: return f"Duplicate: Base '{details[str(sid)]['base']}', {details[str(sid)]['variant']}, Conf: {details[str(sid)]['score']:.0f}%"
         return "Duplicate detected"
     rdf['Comment_Detail'] = rdf['PRODUCT_SET_SID'].apply(apply_dup_comment)
     cols = data.columns.tolist()
@@ -1434,32 +1404,25 @@ def strip_html(text):
     return re.sub('<[^<]+?>', '', text)
 
 def analyze_image_quality(url: str, cache_dict: dict) -> List[str]:
-    if not url or not str(url).startswith("http"):
-        return []
-    if url in cache_dict:
-        return cache_dict[url]
+    if not url or not str(url).startswith("http"): return []
+    if url in cache_dict: return cache_dict[url]
     warnings = []
     try:
         resp = requests.get(url, timeout=2, stream=True)
         if resp.status_code == 200:
             img = Image.open(resp.raw)
             w, h = img.size
-            if w < 300 or h < 300:
-                warnings.append("Low Resolution")
+            if w < 300 or h < 300: warnings.append("Low Resolution")
             ratio = h / w if w > 0 else 1
-            if ratio > 1.5:
-                warnings.append("Tall (Screenshot?)")
-            elif ratio < 0.6:
-                warnings.append("Wide Aspect")
-    except Exception:
-        pass
+            if ratio > 1.5: warnings.append("Tall (Screenshot?)")
+            elif ratio < 0.6: warnings.append("Wide Aspect")
+    except Exception: pass
     cache_dict[url] = warnings
     return warnings
 
 @st.fragment
 def render_product_card(row, flags_mapping, country: str = 'Kenya', advisor_warnings=None):
-    if advisor_warnings is None:
-        advisor_warnings = []
+    if advisor_warnings is None: advisor_warnings = []
     sid = str(row['PRODUCT_SET_SID'])
     toast_key = f"toast_{sid}"
     raw_name = str(row.get('NAME', ''))
@@ -1474,14 +1437,11 @@ def render_product_card(row, flags_mapping, country: str = 'Kenya', advisor_warn
 
     if toast_key in st.session_state:
         msg = st.session_state.pop(toast_key)
-        if isinstance(msg, tuple):
-            st.toast(msg[0], icon=msg[1])
-        else:
-            st.toast(msg)
+        if isinstance(msg, tuple): st.toast(msg[0], icon=msg[1])
+        else: st.toast(msg)
 
     img_url = str(row.get('MAIN_IMAGE', '')).strip()
-    if not img_url.startswith('http'):
-        img_url = "https://via.placeholder.com/150?text=No+Image"
+    if not img_url.startswith('http'): img_url = "https://via.placeholder.com/150?text=No+Image"
 
     is_rejected = st.session_state.get(f"quick_rej_{sid}")
     reason = st.session_state.get(f"quick_rej_reason_{sid}")
@@ -1491,17 +1451,11 @@ def render_product_card(row, flags_mapping, country: str = 'Kenya', advisor_warn
         try:
             f = float(v)
             return f if f > 0 else None
-        except (TypeError, ValueError):
-            return None
+        except (TypeError, ValueError): return None
             
     raw_price = _to_float(row.get('GLOBAL_SALE_PRICE')) or _to_float(row.get('GLOBAL_PRICE')) or 0
     price_str = format_local_price(raw_price, country)
-    price_overlay_html = (
-        f"<div style='position:absolute;bottom:8px;left:8px;background:rgba(0,0,0,0.72);"
-        f"color:#fff;font-size:12px;font-weight:700;padding:3px 8px;border-radius:6px;"
-        f"letter-spacing:0.3px;z-index:5;'>{price_str}</div>"
-        if price_str else ""
-    )
+    price_overlay_html = (f"<div style='position:absolute;bottom:8px;left:8px;background:rgba(0,0,0,0.72);color:#fff;font-size:12px;font-weight:700;padding:3px 8px;border-radius:6px;letter-spacing:0.3px;z-index:5;'>{price_str}</div>" if price_str else "")
 
     img_code, img_cmt = flags_mapping.get('Poor images', ('1000042', 'Poor Image Quality'))
     cat_code, cat_cmt = flags_mapping.get('Wrong Category', ('1000004', 'Wrong Category'))
@@ -1532,43 +1486,20 @@ def render_product_card(row, flags_mapping, country: str = 'Kenya', advisor_warn
             is_checked = st.session_state.get(f"grid_chk_{sid}", False)
             warnings_html = ""
             if advisor_warnings:
-                badges = "".join([
-                    f'<div style="background:rgba(255,193,7,0.95);color:#313133;font-size:10px;font-weight:800;padding:4px 8px;border-radius:12px;box-shadow:0 2px 4px rgba(0,0,0,0.2);display:flex;align-items:center;margin-bottom:4px;">' +
-                    f'<span class="material-symbols-outlined" style="font-size:13px;margin-right:4px;">warning</span>{w}</div>'
-                    for w in advisor_warnings
-                ])
+                badges = "".join([f'<div style="background:rgba(255,193,7,0.95);color:#313133;font-size:10px;font-weight:800;padding:4px 8px;border-radius:12px;box-shadow:0 2px 4px rgba(0,0,0,0.2);display:flex;align-items:center;margin-bottom:4px;"><span class="material-symbols-outlined" style="font-size:13px;margin-right:4px;">warning</span>{w}</div>' for w in advisor_warnings])
                 warnings_html = f'<div style="position:absolute;top:8px;right:8px;display:flex;flex-direction:column;z-index:10;">{badges}</div>'
 
-            # Selection state visuals
             border_style = "3px solid #4CAF50" if is_checked else "1px solid #eee"
             box_shadow = "0 0 0 3px rgba(76,175,80,0.2), 0 4px 16px rgba(76,175,80,0.15)" if is_checked else "none"
-            green_overlay = (
-                "<div style='position:absolute;inset:0;background:rgba(76,175,80,0.1);border-radius:8px;pointer-events:none;z-index:2;'></div>"
-                if is_checked else ""
-            )
-            tick_html = (
-                "<div style='position:absolute;bottom:10px;right:10px;width:28px;height:28px;"
-                "background:#4CAF50;border-radius:50%;display:flex;align-items:center;"
-                "justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,0.3);z-index:10;'>"
-                "<span class='material-symbols-outlined' style='color:#fff;font-size:18px;line-height:1;font-weight:bold;'>check</span>"
-                "</div>"
-                if is_checked else ""
-            )
-
-            # Unique key for this card's image click area
+            green_overlay = ("<div style='position:absolute;inset:0;background:rgba(76,175,80,0.1);border-radius:8px;pointer-events:none;z-index:2;'></div>" if is_checked else "")
+            tick_html = ("<div style='position:absolute;bottom:10px;right:10px;width:28px;height:28px;background:#4CAF50;border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,0.3);z-index:10;'><span class='material-symbols-outlined' style='color:#fff;font-size:18px;line-height:1;font-weight:bold;'>check</span></div>" if is_checked else "")
             img_div_id = f"imgclick-{sid}"
 
-            # Output the image card HTML (without inline script to avoid Streamlit stripping)
             st.markdown(
-                f'<div id="{img_div_id}" style="position:relative;cursor:pointer;border-radius:10px;'
-                f'border:{border_style};box-shadow:{box_shadow};'
-                f'transition:border 0.15s ease,box-shadow 0.15s ease;overflow:hidden;margin-bottom:8px;">'
-                f'{warnings_html}'
-                f'{green_overlay}'
-                f'<img src="{img_url}" loading="lazy" style="width:100%;aspect-ratio: 1 / 1;object-fit:contain;'
-                f'background-color:#FFFFFF;border-radius:8px;display:block;">'
-                f'{price_overlay_html}'
-                f'{tick_html}'
+                f'<div id="{img_div_id}" style="position:relative;cursor:pointer;border-radius:10px;border:{border_style};box-shadow:{box_shadow};transition:border 0.15s ease,box-shadow 0.15s ease;overflow:hidden;margin-bottom:8px;">'
+                f'{warnings_html}{green_overlay}'
+                f'<img src="{img_url}" loading="lazy" style="width:100%;aspect-ratio: 1 / 1;object-fit:contain;background-color:#FFFFFF;border-radius:8px;display:block;">'
+                f'{price_overlay_html}{tick_html}'
                 f'</div>',
                 unsafe_allow_html=True
             )
@@ -1621,13 +1552,10 @@ def render_flag_expander(title, df_display, subset_data, data_has_warranty_cols_
     c1, c2 = st.columns([1, 1])
     with c1: search_term = st.text_input("Search", placeholder="Name, Brand...", key=f"s_{title}")
     with c2: seller_filter = st.multiselect("Filter by Seller", sorted(df_display['SELLER_NAME'].astype(str).unique()), key=f"f_{title}")
-    if search_term:
-        df_display = df_display[df_display.apply(lambda x: x.astype(str).str.contains(search_term, case=False).any(), axis=1)]
-    if seller_filter:
-        df_display = df_display[df_display['SELLER_NAME'].isin(seller_filter)]
+    if search_term: df_display = df_display[df_display.apply(lambda x: x.astype(str).str.contains(search_term, case=False).any(), axis=1)]
+    if seller_filter: df_display = df_display[df_display['SELLER_NAME'].isin(seller_filter)]
     df_display = df_display.reset_index(drop=True)
-    if 'NAME' in df_display.columns:
-        df_display['NAME'] = df_display['NAME'].apply(strip_html)
+    if 'NAME' in df_display.columns: df_display['NAME'] = df_display['NAME'].apply(strip_html)
     event = st.dataframe(df_display, hide_index=True, use_container_width=True, selection_mode="multi-row", on_select="rerun", column_config={"PRODUCT_SET_SID": st.column_config.TextColumn(pinned=True), "NAME": st.column_config.TextColumn(pinned=True)}, key=f"df_{title}")
     raw_selected_indices = list(event.selection.rows)
     selected_indices = [i for i in raw_selected_indices if i < len(df_display)]
@@ -1667,6 +1595,13 @@ def get_image_base64(path):
 logo_base64 = get_image_base64("jumia logo.png") or get_image_base64("jumia_logo.png")
 logo_html = f"<img src='data:image/png;base64,{logo_base64}' style='height: 42px; margin-right: 15px;'>" if logo_base64 else "<span class='material-symbols-outlined' style='font-size: 42px; margin-right: 15px;'>verified_user</span>"
 
+# --- BACK TO TOP BUTTON (FLOATING) ---
+st.markdown(f"""
+    <div class="back-to-top" onclick="window.parent.document.querySelector('.main').scrollTo({{top: 0, behavior: 'smooth'}});" title="Back to Top">
+        <span class="material-symbols-outlined">arrow_upward</span>
+    </div>
+""", unsafe_allow_html=True)
+
 st.markdown(f"""
 <div style='background: linear-gradient(135deg, {JUMIA_COLORS['primary_orange']}, {JUMIA_COLORS['secondary_orange']}); padding: 25px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(246, 139, 30, 0.3);'>
     <h1 style='color: white; margin: 0; font-size: 36px; display: flex; align-items: center;'>{logo_html}Product Validation Tool</h1>
@@ -1694,10 +1629,8 @@ st.header(":material/upload_file: Upload Files", anchor=False)
 current_country = st.session_state.get('selected_country', 'Kenya')
 country_choice = st.segmented_control("Country", ["Kenya", "Uganda", "Nigeria", "Ghana", "Morocco"], default=current_country)
 
-if country_choice:
-    st.session_state.selected_country = country_choice
-else:
-    country_choice = current_country
+if country_choice: st.session_state.selected_country = country_choice
+else: country_choice = current_country
 
 country_validator = CountryValidator(st.session_state.selected_country)
 
@@ -1717,8 +1650,8 @@ if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.grid_page = 0
     st.session_state.exports_cache = {}
     keys_to_delete = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_"))]
-    for k in keys_to_delete:
-        del st.session_state[k]
+    for k in keys_to_delete: del st.session_state[k]
+    
     if process_signature == "empty":
         st.session_state.last_processed_files = "empty"
     else:
@@ -1727,8 +1660,7 @@ if st.session_state.get('last_processed_files') != process_signature:
             file_sids_sets = []
             for uf in uploaded_files:
                 uf.seek(0)
-                if uf.name.endswith('.xlsx'):
-                    raw_data = pd.read_excel(uf, engine='openpyxl', dtype=str)
+                if uf.name.endswith('.xlsx'): raw_data = pd.read_excel(uf, engine='openpyxl', dtype=str)
                 else:
                     try:
                         raw_data = pd.read_csv(uf, dtype=str)
@@ -1744,10 +1676,8 @@ if st.session_state.get('last_processed_files') != process_signature:
                     file_sids_sets.append(set(std_data['PRODUCT_SET_SID'].unique()))
                 all_dfs.append(std_data)
             merged_data = pd.concat(all_dfs, ignore_index=True)
-            if len(file_sids_sets) > 1:
-                st.session_state.intersection_sids = set.intersection(*file_sids_sets)
-            else:
-                st.session_state.intersection_sids = set()
+            if len(file_sids_sets) > 1: st.session_state.intersection_sids = set.intersection(*file_sids_sets)
+            else: st.session_state.intersection_sids = set()
             st.session_state.intersection_count = len(st.session_state.intersection_sids)
             data_prop = propagate_metadata(merged_data)
             is_valid, errors = validate_input_schema(data_prop)
@@ -1760,8 +1690,7 @@ if st.session_state.get('last_processed_files') != process_signature:
                 if 'COUNT_VARIATIONS' in data_filtered.columns:
                     file_counts = pd.to_numeric(data_filtered['COUNT_VARIATIONS'], errors='coerce').fillna(1)
                     data_filtered['COUNT_VARIATIONS'] = actual_counts.combine(file_counts, max)
-                else:
-                    data_filtered['COUNT_VARIATIONS'] = actual_counts
+                else: data_filtered['COUNT_VARIATIONS'] = actual_counts
                 data = data_filtered.drop_duplicates(subset=['PRODUCT_SET_SID'], keep='first')
                 data_has_warranty = all(c in data.columns for c in ['PRODUCT_WARRANTY', 'WARRANTY_DURATION'])
                 for c in ['NAME', 'BRAND', 'COLOR', 'SELLER_NAME', 'CATEGORY_CODE', 'LIST_VARIATIONS']:
@@ -1829,11 +1758,6 @@ if not st.session_state.final_report.empty:
     st.markdown("---")
     st.header(":material/pageview: Manual Image & Category Review", anchor=False)
 
-    # ---------------------------------------------------------
-    # GLOBAL CLICK LISTENER FOR IMAGE SELECTION
-    # This prevents the need for 100s of iframe components 
-    # and fixes the issue where Streamlit removes scripts.
-    # ---------------------------------------------------------
     components.html(
         """
         <script>
@@ -1847,7 +1771,6 @@ if not st.session_state.final_report.empty:
                     if (target) {
                         e.preventDefault();
                         e.stopPropagation();
-                        // Find the Streamlit card container holding the actual checkbox
                         let card = target.closest('[data-testid="stVerticalBlockBorderWrapper"]') || target.closest('[data-testid="stVerticalBlock"]');
                         if (card) {
                             let cb = card.querySelector('input[type="checkbox"]');
@@ -1918,8 +1841,17 @@ if not st.session_state.final_report.empty:
         st.session_state.exports_cache.clear()
         st.session_state.main_toasts.append((f"Batch rejected {len(flagged)} items", "✅"))
 
-    def cb_prev(sids, active_reason): cb_process_batch(False, sids, active_reason); st.session_state.grid_page -= 1
-    def cb_next(sids, active_reason): cb_process_batch(False, sids, active_reason); st.session_state.grid_page += 1
+    # --- PAGINATION AUTO SCROLL FIX ---
+    def cb_prev(sids, active_reason): 
+        cb_process_batch(False, sids, active_reason)
+        st.session_state.grid_page -= 1
+        st.session_state.do_scroll_top = True  # Triggers scroll block below
+
+    def cb_next(sids, active_reason): 
+        cb_process_batch(False, sids, active_reason)
+        st.session_state.grid_page += 1
+        st.session_state.do_scroll_top = True  # Triggers scroll block below
+
     def cb_sel_all(sids):
         for s in sids: st.session_state[f"grid_chk_{s}"] = True
     def cb_desel_all(sids):
@@ -1934,6 +1866,17 @@ if not st.session_state.final_report.empty:
         col_sel.button("Select All", key="sel_all_top", use_container_width=True, on_click=cb_sel_all, args=(cur_sids,))
         col_desel.button("Deselect All", key="desel_all_top", use_container_width=True, on_click=cb_desel_all, args=(cur_sids,))
         col_rej.button(f":material/block: Reject All — {grid_reason}", key="reject_active_top", type="primary", use_container_width=True, on_click=cb_reject_all, args=(cur_sids, grid_reason))
+
+    # --- EXECUTE AUTO SCROLL IF FLAGGED ---
+    if st.session_state.get('do_scroll_top', False):
+        components.html("""
+            <script>
+                const doc = window.parent.document;
+                const main = doc.querySelector('.main') || doc.querySelector('[data-testid="stAppViewContainer"]');
+                if (main) { main.scrollTo({top: 0, behavior: 'smooth'}); }
+            </script>
+        """, height=0, width=0)
+        st.session_state.do_scroll_top = False
 
     page_warnings = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -1950,7 +1893,6 @@ if not st.session_state.final_report.empty:
             try: page_warnings[sid] = future.result()
             except Exception: page_warnings[sid] = []
 
-    # REVISED GRID SIZE: 4 columns instead of 5 for wider cards on laptop
     cols_per_row = 3 if st.session_state.layout_mode == "centered" else 4
     
     for i in range(0, len(page_data), cols_per_row):
