@@ -1602,20 +1602,81 @@ def render_flag_expander(title, df_display, subset_data, data_has_warranty_cols_
     raw_selected_indices = list(event.selection.rows)
     selected_indices = [i for i in raw_selected_indices if i < len(df_display)]
     st.caption(f"{len(selected_indices)} of {len(df_display)} rows selected")
-    cat_code, cat_cmt = support_files['flags_mapping'].get('Wrong Category', ('1000004', 'Wrong Category'))
     has_selection = len(selected_indices) > 0
-    btn_col1, btn_col2 = st.columns([1, 1])
+
+    # Build ordered rejection reason options from flags_mapping
+    _fm = support_files['flags_mapping']
+    _reason_options = [
+        "Wrong Category",
+        "Restricted brands",
+        "Suspected Fake product",
+        "Seller Not approved to sell Refurb",
+        "Product Warranty",
+        "Seller Approve to sell books",
+        "Seller Approved to Sell Perfume",
+        "Counterfeit Sneakers",
+        "Suspected counterfeit Jerseys",
+        "Prohibited products",
+        "Unnecessary words in NAME",
+        "Single-word NAME",
+        "Generic BRAND Issues",
+        "Fashion brand issues",
+        "BRAND name repeated in NAME",
+        "Wrong Variation",
+        "Generic branded products with genuine brands",
+        "Missing COLOR",
+        "Missing Weight/Volume",
+        "Incomplete Smartphone Name",
+        "Duplicate product",
+        "Poor images",
+        "Other Reason (Custom)",
+    ]
+
+    btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
     with btn_col1:
-        if st.button("Approve Selected", key=f"approve_sel_{title}", type="primary", use_container_width=True, disabled=not has_selection):
+        if st.button("✓ Approve Selected", key=f"approve_sel_{title}", type="primary", use_container_width=True, disabled=not has_selection):
             sids_to_process = df_display.iloc[selected_indices]['PRODUCT_SET_SID'].tolist()
             bulk_approve_dialog(sids_to_process, title, subset_data[subset_data['PRODUCT_SET_SID'].isin(sids_to_process)], data_has_warranty_cols_check, support_files, country_validator)
     with btn_col2:
-        if st.button("Reject as Wrong Category", key=f"wrong_cat_sel_{title}", type="secondary", use_container_width=True, disabled=not has_selection):
-            to_reject = df_display.iloc[selected_indices]['PRODUCT_SET_SID'].tolist()
-            st.session_state.final_report.loc[st.session_state.final_report['ProductSetSid'].isin(to_reject), ['Status', 'Reason', 'Comment', 'FLAG']] = ['Rejected', cat_code, cat_cmt, 'Wrong Category']
-            st.session_state.main_toasts.append(f"{len(to_reject)} items re-classified as Wrong Category.")
-            st.session_state.exports_cache.clear()
-            st.rerun()
+        if st.button("✕ Reject Selected", key=f"reject_sel_{title}", type="secondary", use_container_width=True, disabled=not has_selection):
+            st.session_state[f"show_reject_dd_{title}"] = not st.session_state.get(f"show_reject_dd_{title}", False)
+    with btn_col3:
+        with st.popover("↓ Reject As...", use_container_width=True, disabled=not has_selection):
+            st.markdown("<p style='font-size:12px;font-weight:700;margin:0 0 8px 0;'>Select rejection reason:</p>", unsafe_allow_html=True)
+            chosen_reason = st.selectbox(
+                "Reason", _reason_options,
+                key=f"rej_reason_dd_{title}",
+                label_visibility="collapsed"
+            )
+            if chosen_reason == "Other Reason (Custom)":
+                custom_comment = st.text_area(
+                    "Custom comment", placeholder="Type your rejection reason here...",
+                    key=f"custom_comment_{title}", height=80
+                )
+                if st.button("Apply Custom Rejection", key=f"apply_custom_{title}", type="primary",
+                             use_container_width=True, disabled=not has_selection):
+                    to_reject = df_display.iloc[selected_indices]['PRODUCT_SET_SID'].tolist()
+                    final_comment = custom_comment.strip() if custom_comment.strip() else "Other Reason"
+                    st.session_state.final_report.loc[
+                        st.session_state.final_report['ProductSetSid'].isin(to_reject),
+                        ['Status', 'Reason', 'Comment', 'FLAG']
+                    ] = ['Rejected', '1000007 - Other Reason', final_comment, 'Other Reason (Custom)']
+                    st.session_state.main_toasts.append(f"{len(to_reject)} items rejected with custom reason.")
+                    st.session_state.exports_cache.clear()
+                    st.rerun()
+            else:
+                _rcode, _rcmt = _fm.get(chosen_reason, ('1000007 - Other Reason', chosen_reason))
+                st.caption(f"Code: {_rcode[:40]}...")
+                if st.button("Apply Rejection", key=f"apply_dd_{title}", type="primary",
+                             use_container_width=True, disabled=not has_selection):
+                    to_reject = df_display.iloc[selected_indices]['PRODUCT_SET_SID'].tolist()
+                    st.session_state.final_report.loc[
+                        st.session_state.final_report['ProductSetSid'].isin(to_reject),
+                        ['Status', 'Reason', 'Comment', 'FLAG']
+                    ] = ['Rejected', _rcode, _rcmt, chosen_reason]
+                    st.session_state.main_toasts.append(f"{len(to_reject)} items rejected as '{chosen_reason}'.")
+                    st.session_state.exports_cache.clear()
+                    st.rerun()
 
 # -------------------------------------------------
 # APP INITIALIZATION
