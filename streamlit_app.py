@@ -1632,15 +1632,12 @@ def render_flag_expander(title, df_display, subset_data, data_has_warranty_cols_
         "Other Reason (Custom)",
     ]
 
-    btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
+    btn_col1, btn_col2 = st.columns([1, 1])
     with btn_col1:
         if st.button("✓ Approve Selected", key=f"approve_sel_{title}", type="primary", use_container_width=True, disabled=not has_selection):
             sids_to_process = df_display.iloc[selected_indices]['PRODUCT_SET_SID'].tolist()
             bulk_approve_dialog(sids_to_process, title, subset_data[subset_data['PRODUCT_SET_SID'].isin(sids_to_process)], data_has_warranty_cols_check, support_files, country_validator)
     with btn_col2:
-        if st.button("✕ Reject Selected", key=f"reject_sel_{title}", type="secondary", use_container_width=True, disabled=not has_selection):
-            st.session_state[f"show_reject_dd_{title}"] = not st.session_state.get(f"show_reject_dd_{title}", False)
-    with btn_col3:
         with st.popover("↓ Reject As...", use_container_width=True, disabled=not has_selection):
             st.markdown("<p style='font-size:12px;font-weight:700;margin:0 0 8px 0;'>Select rejection reason:</p>", unsafe_allow_html=True)
             chosen_reason = st.selectbox(
