@@ -1120,7 +1120,7 @@ def check_wrong_variation(data: pd.DataFrame, allowed_variation_codes: List[str]
     if 'CATEGORY_CODE' not in d.columns: return pd.DataFrame(columns=data.columns)
     d['cat_clean'] = d['CATEGORY_CODE'].apply(clean_category_code)
     d['qty_var'] = pd.to_numeric(d['COUNT_VARIATIONS'], errors='coerce').fillna(1).astype(int)
-    flagged = d[(d['qty_var'] > 1) & (~d['cat_clean'].isin(set(clean_category_code(c) for c in allowed_variation_codes)))].copy()
+    flagged = d[(d['qty_var'] >= 3) & (~d['cat_clean'].isin(set(clean_category_code(c) for c in allowed_variation_codes)))].copy()
     if not flagged.empty:
         flagged['Comment_Detail'] = "Variations: " + flagged['qty_var'].astype(str) + ", Category: " + flagged['cat_clean']
     return flagged.drop_duplicates(subset=['PRODUCT_SET_SID'])
