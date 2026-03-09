@@ -1791,14 +1791,6 @@ if uploaded_files and not st.session_state.final_report.empty:
 </div>
 """, unsafe_allow_html=True)
 
-    # ── Nigeria: info banner about multi-country inclusions ──────────────────
-    if is_nigeria and multi_count > 0:
-        st.info(
-            f"ℹ️ **{multi_count} multi-country SKU(s)** (where `ACTIVE_STATUS_COUNTRY` is `MULTIPLE` or `MULTI`) "
-            f"have been included in this Nigeria report and are subject to the same validation rules.",
-            icon=None,
-        )
-
     st.subheader(":material/flag: Flags Breakdown", anchor=False)
     if not rej_df.empty:
         base_display_cols = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'CATEGORY', 'COLOR', 'PARENTSKU', 'SELLER_NAME']
