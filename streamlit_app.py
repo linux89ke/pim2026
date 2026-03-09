@@ -104,8 +104,17 @@ NEW_FILE_MAPPING = {
     'dsc_shop_seller_name': 'SELLER_NAME',
     'dsc_shop_active_country': 'ACTIVE_STATUS_COUNTRY',
     'cod_parent_sku': 'PARENTSKU',
+    # ── COLOR aliases (English & British spelling) ──
     'color': 'COLOR',
+    'colour': 'COLOR',
+    # ── COLOR_FAMILY aliases ──
     'color_family': 'COLOR_FAMILY',
+    'colour_family': 'COLOR_FAMILY',
+    'colour family': 'COLOR_FAMILY',
+    'color family': 'COLOR_FAMILY',
+    'colour_family': 'COLOR_FAMILY',
+    'COLOUR FAMILY': 'COLOR_FAMILY',
+    # ── rest of mapping ──
     'list_seller_skus': 'SELLER_SKU',
     'image1': 'MAIN_IMAGE',
     'dsc_status': 'LISTING_STATUS',
@@ -761,10 +770,27 @@ class CountryValidator:
 # DATA PREPROCESSING
 # -------------------------------------------------
 def standardize_input_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalise column names using NEW_FILE_MAPPING.
+    Handles both exact-case and case-insensitive matches so that
+    'Colour', 'COLOUR', 'colour family', 'COLOUR FAMILY', etc. all
+    resolve to the canonical COLOR / COLOR_FAMILY column names.
+    """
     df = df.copy()
     df.columns = df.columns.str.strip()
+
+    # Build a lowercase lookup that covers every alias in the mapping
     map_lower = {k.lower(): v for k, v in NEW_FILE_MAPPING.items()}
-    df = df.rename(columns={col: map_lower.get(col.lower(), col.upper()) for col in df.columns})
+
+    renamed = {}
+    for col in df.columns:
+        col_lower = col.lower()
+        if col_lower in map_lower:
+            renamed[col] = map_lower[col_lower]
+        else:
+            renamed[col] = col.upper()
+    df = df.rename(columns=renamed)
+
     for col in ['ACTIVE_STATUS_COUNTRY', 'CATEGORY_CODE', 'BRAND', 'TAX_CLASS', 'NAME', 'SELLER_NAME']:
         if col in df.columns: df[col] = df[col].astype(str)
     return df
@@ -773,11 +799,27 @@ def validate_input_schema(df: pd.DataFrame) -> Tuple[bool, List[str]]:
     errors = [f"Missing: {f}" for f in ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'CATEGORY_CODE', 'ACTIVE_STATUS_COUNTRY'] if f not in df.columns]
     return len(errors) == 0, errors
 
+# ── MULTI-COUNTRY VALUES TREATED AS NIGERIA ──────────────────────────────────
+# Rows where ACTIVE_STATUS_COUNTRY is one of these values are included when
+# the selected country is Nigeria and are tagged with _IS_MULTI_COUNTRY = True
+# so the dashboard can show a dedicated metric for them.
+MULTI_COUNTRY_VALUES = {'MULTIPLE', 'MULTI'}
+
 def filter_by_country(df: pd.DataFrame, country_validator: CountryValidator) -> Tuple[pd.DataFrame, List[str]]:
     if 'ACTIVE_STATUS_COUNTRY' not in df.columns: return df, []
     s = df['ACTIVE_STATUS_COUNTRY'].astype(str).str.strip().str.upper().str.replace(r'^JUMIA-', '', regex=True)
     df['ACTIVE_STATUS_COUNTRY'] = s
-    filtered = df[df['ACTIVE_STATUS_COUNTRY'] == country_validator.code].copy()
+
+    if country_validator.code == 'NG':
+        # Nigeria: include exact NG rows AND multi-country rows
+        is_ng = df['ACTIVE_STATUS_COUNTRY'] == 'NG'
+        is_multi = df['ACTIVE_STATUS_COUNTRY'].isin(MULTI_COUNTRY_VALUES)
+        filtered = df[is_ng | is_multi].copy()
+        filtered['_IS_MULTI_COUNTRY'] = is_multi[filtered.index]
+    else:
+        filtered = df[df['ACTIVE_STATUS_COUNTRY'] == country_validator.code].copy()
+        filtered['_IS_MULTI_COUNTRY'] = False
+
     detected_names = []
     if filtered.empty:
         detected_codes = [c for c in df['ACTIVE_STATUS_COUNTRY'].unique() if str(c).strip() and str(c).strip().lower() != 'nan']
@@ -793,7 +835,7 @@ def propagate_metadata(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # -------------------------------------------------
-# VALIDATION CHECKS (Omitted internal logic repetition for brevity - keeping logic identical)
+# VALIDATION CHECKS
 # -------------------------------------------------
 def check_miscellaneous_category(data: pd.DataFrame) -> pd.DataFrame:
     if 'CATEGORY' not in data.columns: return pd.DataFrame(columns=data.columns)
@@ -1692,6 +1734,9 @@ if st.session_state.get('last_processed_files') != process_signature:
                     data_filtered['COUNT_VARIATIONS'] = actual_counts.combine(file_counts, max)
                 else: data_filtered['COUNT_VARIATIONS'] = actual_counts
                 data = data_filtered.drop_duplicates(subset=['PRODUCT_SET_SID'], keep='first')
+                # Ensure the multi-country flag column survives deduplication
+                if '_IS_MULTI_COUNTRY' not in data.columns:
+                    data['_IS_MULTI_COUNTRY'] = False
                 data_has_warranty = all(c in data.columns for c in ['PRODUCT_WARRANTY', 'WARRANTY_DURATION'])
                 for c in ['NAME', 'BRAND', 'COLOR', 'SELLER_NAME', 'CATEGORY_CODE', 'LIST_VARIATIONS']:
                     if c in data.columns: data[c] = data[c].astype(str).fillna('')
@@ -1720,12 +1765,22 @@ if uploaded_files and not st.session_state.final_report.empty:
     st.header(":material/bar_chart: Validation Results", anchor=False)
     with st.container(border=True):
         cols = st.columns(5 if st.session_state.layout_mode == "wide" else 3)
+
+        # ── Multi-country metric (Nigeria only) ──────────────────────────────
+        is_nigeria = st.session_state.get('selected_country') == 'Nigeria'
+        multi_count = int(data['_IS_MULTI_COUNTRY'].sum()) if '_IS_MULTI_COUNTRY' in data.columns else 0
+
         metrics_config = [
             ("Total Products", len(data), JUMIA_COLORS['dark_gray']),
             ("Approved", len(app_df), JUMIA_COLORS['success_green']),
             ("Rejected", len(rej_df), JUMIA_COLORS['jumia_red']),
             ("Rejection Rate", f"{(len(rej_df)/len(data)*100) if len(data)>0 else 0:.1f}%", JUMIA_COLORS['primary_orange']),
-            ("Common SKUs", st.session_state.intersection_count, JUMIA_COLORS['medium_gray'])
+            # 5th metric: Multi-Country SKUs for Nigeria, Common SKUs otherwise
+            (
+                "Multi-Country SKUs" if is_nigeria else "Common SKUs",
+                multi_count if is_nigeria else st.session_state.intersection_count,
+                JUMIA_COLORS['warning_yellow'] if is_nigeria else JUMIA_COLORS['medium_gray']
+            ),
         ]
         for i, (label, value, color) in enumerate(metrics_config):
             with cols[i % len(cols)]:
@@ -1736,6 +1791,14 @@ if uploaded_files and not st.session_state.final_report.empty:
 </div>
 """, unsafe_allow_html=True)
 
+    # ── Nigeria: info banner about multi-country inclusions ──────────────────
+    if is_nigeria and multi_count > 0:
+        st.info(
+            f"ℹ️ **{multi_count} multi-country SKU(s)** (where `ACTIVE_STATUS_COUNTRY` is `MULTIPLE` or `MULTI`) "
+            f"have been included in this Nigeria report and are subject to the same validation rules.",
+            icon=None,
+        )
+
     st.subheader(":material/flag: Flags Breakdown", anchor=False)
     if not rej_df.empty:
         base_display_cols = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'CATEGORY', 'COLOR', 'PARENTSKU', 'SELLER_NAME']
@@ -1745,6 +1808,8 @@ if uploaded_files and not st.session_state.final_report.empty:
             if title == "Wrong Variation":
                 if 'COUNT_VARIATIONS' in data.columns: current_display_cols.append('COUNT_VARIATIONS')
                 if 'LIST_VARIATIONS' in data.columns: current_display_cols.append('LIST_VARIATIONS')
+            df_display = pd.merge(df_flagged[['ProductSetSid']], data, left_on='ProjectSetSid', right_on='PRODUCT_SET_SID', how='left')[[c for c in current_display_cols if c in data.columns]] if False else pd.merge(df_flagged[['ProjectSetSid' if 'ProjectSetSid' in df_flagged.columns else 'ProductSetSid']], data, left_on=df_flagged.columns[0], right_on='PRODUCT_SET_SID', how='left')[[c for c in current_display_cols if c in data.columns]]
+            # Safe merge
             df_display = pd.merge(df_flagged[['ProductSetSid']], data, left_on='ProductSetSid', right_on='PRODUCT_SET_SID', how='left')[[c for c in current_display_cols if c in data.columns]]
             with st.expander(f"{title} ({len(df_display)})"):
                 render_flag_expander(title, df_display, data, all(c in data.columns for c in ['PRODUCT_WARRANTY', 'WARRANTY_DURATION']), support_files, country_validator)
@@ -1845,12 +1910,12 @@ if not st.session_state.final_report.empty:
     def cb_prev(sids, active_reason): 
         cb_process_batch(False, sids, active_reason)
         st.session_state.grid_page -= 1
-        st.session_state.do_scroll_top = True  # Triggers scroll block below
+        st.session_state.do_scroll_top = True
 
     def cb_next(sids, active_reason): 
         cb_process_batch(False, sids, active_reason)
         st.session_state.grid_page += 1
-        st.session_state.do_scroll_top = True  # Triggers scroll block below
+        st.session_state.do_scroll_top = True
 
     def cb_sel_all(sids):
         for s in sids: st.session_state[f"grid_chk_{s}"] = True
