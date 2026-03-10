@@ -104,7 +104,9 @@ def normalize_post_qc(df: pd.DataFrame) -> pd.DataFrame:
 
     # Synthetic columns so the rest of the app doesn't break if it
     # ever inspects these on a post-QC DataFrame
-    df.setdefault('ACTIVE_STATUS_COUNTRY', 'UNKNOWN')
+    if 'ACTIVE_STATUS_COUNTRY' not in df.columns:
+        df['ACTIVE_STATUS_COUNTRY'] = 'UNKNOWN'
+        
     df['_IS_MULTI_COUNTRY'] = False
     df['PARENTSKU']         = df.get('PRODUCT_SET_SID', pd.Series(dtype=str))
     df['COLOR']             = ''
