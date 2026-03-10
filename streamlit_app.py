@@ -132,12 +132,19 @@ NEW_FILE_MAPPING = {
 
 logger = logging.getLogger(__name__)
 
+# Post-QC logic lives in postqc.py — import detection, normalisation and UI from there
+from postqc import detect_file_type, normalize_post_qc, run_checks as run_post_qc_checks, render_post_qc_section
+
 # -------------------------------------------------
 # INITIALIZATION & CONTEXT
 # -------------------------------------------------
 if 'layout_mode' not in st.session_state: st.session_state.layout_mode = "wide"
 if 'final_report' not in st.session_state: st.session_state.final_report = pd.DataFrame()
 if 'all_data_map' not in st.session_state: st.session_state.all_data_map = pd.DataFrame()
+if 'post_qc_summary' not in st.session_state: st.session_state.post_qc_summary = pd.DataFrame()
+if 'post_qc_results' not in st.session_state: st.session_state.post_qc_results = {}
+if 'post_qc_data' not in st.session_state: st.session_state.post_qc_data = pd.DataFrame()
+if 'file_mode' not in st.session_state: st.session_state.file_mode = None
 if 'intersection_sids' not in st.session_state: st.session_state.intersection_sids = set()
 if 'intersection_count' not in st.session_state: st.session_state.intersection_count = 0
 if 'grid_page' not in st.session_state: st.session_state.grid_page = 0
@@ -1760,19 +1767,24 @@ else:
 if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.final_report = pd.DataFrame()
     st.session_state.all_data_map = pd.DataFrame()
+    st.session_state.post_qc_summary = pd.DataFrame()
+    st.session_state.post_qc_results = {}
+    st.session_state.post_qc_data = pd.DataFrame()
+    st.session_state.file_mode = None
     st.session_state.intersection_sids = set()
     st.session_state.intersection_count = 0
     st.session_state.grid_page = 0
     st.session_state.exports_cache = {}
     keys_to_delete = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_"))]
     for k in keys_to_delete: del st.session_state[k]
-    
+
     if process_signature == "empty":
         st.session_state.last_processed_files = "empty"
     else:
         try:
             all_dfs = []
             file_sids_sets = []
+            detected_modes = []
             for uf in uploaded_files:
                 uf.seek(0)
                 if uf.name.endswith('.xlsx'): raw_data = pd.read_excel(uf, engine='openpyxl', dtype=str)
@@ -1785,51 +1797,81 @@ if st.session_state.get('last_processed_files') != process_signature:
                     except:
                         uf.seek(0)
                         raw_data = pd.read_csv(uf, sep=';', encoding='ISO-8859-1', dtype=str)
-                std_data = standardize_input_data(raw_data)
-                if 'PRODUCT_SET_SID' in std_data.columns:
-                    std_data['PRODUCT_SET_SID'] = std_data['PRODUCT_SET_SID'].astype(str).str.strip()
-                    file_sids_sets.append(set(std_data['PRODUCT_SET_SID'].unique()))
-                all_dfs.append(std_data)
-            merged_data = pd.concat(all_dfs, ignore_index=True)
-            if len(file_sids_sets) > 1: st.session_state.intersection_sids = set.intersection(*file_sids_sets)
-            else: st.session_state.intersection_sids = set()
-            st.session_state.intersection_count = len(st.session_state.intersection_sids)
-            data_prop = propagate_metadata(merged_data)
-            is_valid, errors = validate_input_schema(data_prop)
-            if is_valid:
-                data_filtered, det_names = filter_by_country(data_prop, country_validator)
-                if data_filtered.empty:
-                    st.error(f"No {country_validator.country} products found. Detected countries: {', '.join(det_names) if det_names else 'None'}", icon=":material/error:")
-                    st.stop()
-                actual_counts = data_filtered.groupby('PRODUCT_SET_SID')['PRODUCT_SET_SID'].transform('count')
-                if 'COUNT_VARIATIONS' in data_filtered.columns:
-                    file_counts = pd.to_numeric(data_filtered['COUNT_VARIATIONS'], errors='coerce').fillna(1)
-                    data_filtered['COUNT_VARIATIONS'] = actual_counts.combine(file_counts, max)
-                else: data_filtered['COUNT_VARIATIONS'] = actual_counts
-                data = data_filtered.drop_duplicates(subset=['PRODUCT_SET_SID'], keep='first')
-                # Ensure the multi-country flag column survives deduplication
-                if '_IS_MULTI_COUNTRY' not in data.columns:
-                    data['_IS_MULTI_COUNTRY'] = False
-                data_has_warranty = all(c in data.columns for c in ['PRODUCT_WARRANTY', 'WARRANTY_DURATION'])
-                for c in ['NAME', 'BRAND', 'COLOR', 'SELLER_NAME', 'CATEGORY_CODE', 'LIST_VARIATIONS']:
-                    if c in data.columns: data[c] = data[c].astype(str).fillna('')
-                if 'COLOR_FAMILY' not in data.columns: data['COLOR_FAMILY'] = ""
-                final_report, _ = validate_products(data, support_files, country_validator, data_has_warranty, None)
-                st.session_state.final_report = final_report
-                st.session_state.all_data_map = data
+                detected_modes.append(detect_file_type(raw_data))
+                all_dfs.append(raw_data)
+
+            # Use the mode of the first file (all files should be same type)
+            file_mode = detected_modes[0] if detected_modes else 'pre_qc'
+            st.session_state.file_mode = file_mode
+
+            # ── POST-QC PATH ─────────────────────────────────────────────
+            if file_mode == 'post_qc':
+                norm_dfs = [normalize_post_qc(df) for df in all_dfs]
+                merged = pd.concat(norm_dfs, ignore_index=True)
+                # Deduplicate keeping first occurrence of each SKU
+                merged_dedup = merged.drop_duplicates(subset=['PRODUCT_SET_SID'], keep='first')
+                with st.status("Running Post-QC checks...", expanded=True) as status:
+                    summary_df, results = run_post_qc_checks(merged_dedup, support_files)
+                    status.update(label="Post-QC checks complete!", state="complete", expanded=False)
+                st.session_state.post_qc_summary = summary_df
+                st.session_state.post_qc_results = results
+                st.session_state.post_qc_data = merged_dedup
                 st.session_state.last_processed_files = process_signature
+
+            # ── PRE-QC PATH (existing logic) ─────────────────────────────
             else:
-                for e in errors: st.error(e)
-                st.session_state.last_processed_files = "error"
+                std_dfs = []
+                for raw_data in all_dfs:
+                    std_data = standardize_input_data(raw_data)
+                    if 'PRODUCT_SET_SID' in std_data.columns:
+                        std_data['PRODUCT_SET_SID'] = std_data['PRODUCT_SET_SID'].astype(str).str.strip()
+                        file_sids_sets.append(set(std_data['PRODUCT_SET_SID'].unique()))
+                    std_dfs.append(std_data)
+                merged_data = pd.concat(std_dfs, ignore_index=True)
+                if len(file_sids_sets) > 1: st.session_state.intersection_sids = set.intersection(*file_sids_sets)
+                else: st.session_state.intersection_sids = set()
+                st.session_state.intersection_count = len(st.session_state.intersection_sids)
+                data_prop = propagate_metadata(merged_data)
+                is_valid, errors = validate_input_schema(data_prop)
+                if is_valid:
+                    data_filtered, det_names = filter_by_country(data_prop, country_validator)
+                    if data_filtered.empty:
+                        st.error(f"No {country_validator.country} products found. Detected countries: {', '.join(det_names) if det_names else 'None'}", icon=":material/error:")
+                        st.stop()
+                    actual_counts = data_filtered.groupby('PRODUCT_SET_SID')['PRODUCT_SET_SID'].transform('count')
+                    if 'COUNT_VARIATIONS' in data_filtered.columns:
+                        file_counts = pd.to_numeric(data_filtered['COUNT_VARIATIONS'], errors='coerce').fillna(1)
+                        data_filtered['COUNT_VARIATIONS'] = actual_counts.combine(file_counts, max)
+                    else: data_filtered['COUNT_VARIATIONS'] = actual_counts
+                    data = data_filtered.drop_duplicates(subset=['PRODUCT_SET_SID'], keep='first')
+                    if '_IS_MULTI_COUNTRY' not in data.columns:
+                        data['_IS_MULTI_COUNTRY'] = False
+                    data_has_warranty = all(c in data.columns for c in ['PRODUCT_WARRANTY', 'WARRANTY_DURATION'])
+                    for c in ['NAME', 'BRAND', 'COLOR', 'SELLER_NAME', 'CATEGORY_CODE', 'LIST_VARIATIONS']:
+                        if c in data.columns: data[c] = data[c].astype(str).fillna('')
+                    if 'COLOR_FAMILY' not in data.columns: data['COLOR_FAMILY'] = ""
+                    final_report, _ = validate_products(data, support_files, country_validator, data_has_warranty, None)
+                    st.session_state.final_report = final_report
+                    st.session_state.all_data_map = data
+                    st.session_state.last_processed_files = process_signature
+                else:
+                    for e in errors: st.error(e)
+                    st.session_state.last_processed_files = "error"
         except Exception as e:
             st.error(f"Processing error: {e}")
             st.code(traceback.format_exc())
             st.session_state.last_processed_files = "error"
 
 # ==========================================
+# POST-QC RESULTS SECTION
+# ==========================================
+if uploaded_files and st.session_state.file_mode == 'post_qc' and not st.session_state.post_qc_summary.empty:
+    render_post_qc_section(support_files)
+
+# ==========================================
 # RESULTS SECTION
 # ==========================================
-if uploaded_files and not st.session_state.final_report.empty:
+if uploaded_files and not st.session_state.final_report.empty and st.session_state.file_mode != 'post_qc':
     fr = st.session_state.final_report
     data = st.session_state.all_data_map
     app_df = fr[fr['Status'] == 'Approved']
@@ -1892,7 +1934,7 @@ if uploaded_files and not st.session_state.final_report.empty:
 # ==========================================
 # SECTION 2: MANUAL IMAGE REVIEW
 # ==========================================
-if not st.session_state.final_report.empty:
+if not st.session_state.final_report.empty and st.session_state.file_mode != 'post_qc':
     st.markdown("---")
     st.header(":material/pageview: Manual Image & Category Review", anchor=False)
 
@@ -2082,7 +2124,7 @@ if not st.session_state.final_report.empty:
 # ==========================================
 # SECTION 3: EXPORTS
 # ==========================================
-if not st.session_state.final_report.empty:
+if not st.session_state.final_report.empty and st.session_state.file_mode != 'post_qc':
     st.markdown("---")
     st.markdown(f"""
 <div style='background: linear-gradient(135deg, {JUMIA_COLORS['primary_orange']}, {JUMIA_COLORS['secondary_orange']}); padding: 20px 24px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(246, 139, 30, 0.25);'>
