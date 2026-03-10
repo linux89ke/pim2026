@@ -1915,14 +1915,29 @@ if not st.session_state.final_report.empty:
             "Wrong Category": "Wrong Category",
             "Suspected Fake": "Suspected Fake product",
             "Restricted Brand": "Restricted brands",
-            "Wrong Brand": "Generic branded products with genuine brands"
+            "Wrong Brand": "Generic branded products with genuine brands",
+            "Other Reason (Custom)": "Other Reason (Custom)",
         }
 
     with st.container(border=True):
         st.markdown(f"<p style='font-weight: 700; margin: 0 0 10px 0;'>Batch Rejection Mode</p>", unsafe_allow_html=True)
         grid_reason = st.segmented_control("Select rejection reason for batch actions:", list(get_batch_labels().keys()), default="Poor Image Quality", label_visibility="collapsed")
         if not grid_reason: grid_reason = "Poor Image Quality"
-        st.markdown(f"""<div class='batch-info-box' style='background: var(--background-color, {JUMIA_COLORS['light_gray']});'><span style='font-size: 12px; font-weight: 600;'>Active Reason:</span><span style='font-size: 13px; font-weight: 700; margin-left: 8px;'>{grid_reason}</span></div>""", unsafe_allow_html=True)
+
+        # Custom comment input — only shown when Other Reason selected
+        grid_custom_comment = ""
+        if grid_reason == "Other Reason (Custom)":
+            grid_custom_comment = st.text_area(
+                "Custom rejection comment",
+                placeholder="Type your rejection reason here...",
+                key="grid_custom_comment",
+                height=80,
+            )
+            if not grid_custom_comment.strip():
+                st.warning("Please enter a custom comment before rejecting.", icon="⚠️")
+
+        active_label = grid_reason if grid_reason != "Other Reason (Custom)" else f"Other: {grid_custom_comment[:40]}..." if grid_custom_comment.strip() else "Other Reason (Custom) — enter comment above"
+        st.markdown(f"""<div class='batch-info-box' style='background: var(--background-color, {JUMIA_COLORS['light_gray']});'><span style='font-size: 12px; font-weight: 600;'>Active Reason:</span><span style='font-size: 13px; font-weight: 700; margin-left: 8px;'>{active_label}</span></div>""", unsafe_allow_html=True)
 
     review_data = pd.merge(valid_grid_df[['ProductSetSid']], st.session_state.all_data_map, left_on='ProductSetSid', right_on='PRODUCT_SET_SID', how='left')
 
@@ -1944,8 +1959,15 @@ if not st.session_state.final_report.empty:
         if not flagged:
             if show_warning: st.session_state.main_toasts.append(("No items selected.", "⚠️"))
             return
-        flag_key = get_batch_labels()[active_reason]
-        code, cmt = support_files['flags_mapping'].get(flag_key, ("1000007 - Other Reason", "Manual rejection"))
+        if active_reason == "Other Reason (Custom)":
+            custom_cmt = st.session_state.get("grid_custom_comment", "").strip()
+            if not custom_cmt:
+                st.session_state.main_toasts.append(("Please enter a custom comment first.", "⚠️"))
+                return
+            code, cmt, flag_key = "1000007 - Other Reason", custom_cmt, "Other Reason (Custom)"
+        else:
+            flag_key = get_batch_labels()[active_reason]
+            code, cmt = support_files['flags_mapping'].get(flag_key, ("1000007 - Other Reason", "Manual rejection"))
         st.session_state.final_report.loc[st.session_state.final_report['ProductSetSid'].isin(flagged), ['Status', 'Reason', 'Comment', 'FLAG']] = ['Rejected', code, cmt, flag_key]
         for s in flagged:
             st.session_state[f"quick_rej_{s}"] = True
