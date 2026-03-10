@@ -638,24 +638,23 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, Tuple[str, str]]:
 def load_all_support_files() -> Dict:
     def safe_load_txt(f): return load_txt_file(f) if os.path.exists(f) else []
     
-    # --- NEW: Load the Fashion Categories from the specific XLS structure ---
+    # --- NEW: Clean reader for proper XLSX format ---
     fashion_paths = []
     try:
-        fash_file = 'fashion brands.xls'
+        fash_file = 'fashion brands.xlsx'  # <--- Now looking for the .xlsx file
         if os.path.exists(fash_file):
-            try: df_fash = pd.read_excel(fash_file, dtype=str)
-            except: 
-                try: df_fash = pd.read_csv(fash_file, sep='\t', dtype=str)
-                except: df_fash = pd.read_csv(fash_file, dtype=str)
+            df_fash = pd.read_excel(fash_file, dtype=str)
             
-            if 'Category Path' not in df_fash.columns:
-                try: df_fash = pd.read_csv(fash_file, dtype=str)
-                except: pass
-
-            if 'Category Path' in df_fash.columns:
-                fashion_paths = df_fash['Category Path'].dropna().astype(str).tolist()
+            # Force headers to lowercase and strip hidden spaces just to be safe
+            df_fash.columns = df_fash.columns.astype(str).str.strip().str.lower()
+            
+            # Hunt for the 'category path' column automatically
+            path_col = next((col for col in df_fash.columns if 'path' in col), None)
+            
+            if path_col:
+                fashion_paths = df_fash[path_col].dropna().astype(str).tolist()
     except Exception as e:
-        logger.error(f"Error loading fashion brands.xls: {e}")
+        logger.error(f"Error loading {fash_file}: {e}")
 
     return {
         'postqc_fashion_cats': fashion_paths,
