@@ -149,12 +149,12 @@ if 'main_toasts' not in st.session_state: st.session_state.main_toasts = []
 if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
 if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = False
 if 'display_df_cache' not in st.session_state: st.session_state.display_df_cache = {}
-
 # Session state counters for dynamic st_javascript keys
 if 'desel_counter' not in st.session_state: st.session_state.desel_counter = 0
-if 'batch_counter' not in st.session_state: st.session_state.batch_counter = 0  
+if 'batch_counter' not in st.session_state: st.session_state.batch_counter = 0
 if 'clear_counter' not in st.session_state: st.session_state.clear_counter = 0
 if 'ls_processed_flag' not in st.session_state: st.session_state.ls_processed_flag = False
+if 'ls_read_trigger' not in st.session_state: st.session_state.ls_read_trigger = 0
 
 try: st.set_page_config(page_title="Product Tool", layout=st.session_state.layout_mode)
 except: pass
@@ -1249,6 +1249,36 @@ REASON_MAP = {
 }
 
 # -------------------------------------------------
+# PROCESS GRID ACTIONS
+# -------------------------------------------------
+def _process_grid_selections(raw_json: str, support_files: dict) -> int:
+    """Parse {sid: reason_key} JSON and apply rejections. Returns count."""
+    if not raw_json or not isinstance(raw_json, str) or raw_json in ("0", "null", ""):
+        return 0
+    try:
+        pending = json.loads(raw_json)
+        if not isinstance(pending, dict) or not pending:
+            return 0
+        reason_groups: dict[str, list] = {}
+        for sid, reason_key in pending.items():
+            reason_groups.setdefault(reason_key, []).append(sid)
+        total = 0
+        for reason_key, sids in reason_groups.items():
+            flag_name = REASON_MAP.get(reason_key, "Other Reason (Custom)")
+            code, cmt = support_files["flags_mapping"].get(
+                flag_name, ("1000007 - Other Reason", "Manual rejection")
+            )
+            apply_rejection(sids, code, cmt, flag_name)
+            for s in sids:
+                st.session_state[f"quick_rej_{s}"] = True
+                st.session_state[f"quick_rej_reason_{s}"] = flag_name
+            total += len(sids)
+        return total
+    except Exception as e:
+        logger.error(f"Grid selections parse error: {e}")
+        return 0
+
+# -------------------------------------------------
 # HTML GRID BUILDER
 # -------------------------------------------------
 def build_fast_grid_html(
@@ -1653,6 +1683,7 @@ if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.batch_counter = 0
     st.session_state.clear_counter = 0
     st.session_state.ls_processed_flag = False
+    st.session_state.ls_read_trigger = 0
     keys_to_delete = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_"))]
     for k in keys_to_delete: del st.session_state[k]
 
@@ -1788,65 +1819,105 @@ def render_image_grid():
     st.header(":material/pageview: Manual Image & Category Review", anchor=False)
 
     # --- Hidden trigger button to allow JavaScript to instantly ping Streamlit ---
-    st.markdown("""<style>button[title="hidden_trigger_btn"] { display: none !important; }</style>""", unsafe_allow_html=True)
-    js_triggered = st.button("Hidden", key="hidden_process", help="hidden_trigger_btn")
+    st.markdown("""<style>
+    button[title="hidden_trigger_btn"] {
+        opacity: 0 !important;
+        position: fixed !important;
+        bottom: -200px !important;
+        width: 1px !important;
+        height: 1px !important;
+        pointer-events: auto !important;
+    }
+    </style>""", unsafe_allow_html=True)
+    js_triggered = st.button("•", key="hidden_process", help="hidden_trigger_btn")
+    if js_triggered:
+        st.session_state.ls_read_trigger += 1
 
-    # Fetch pending button states
-    batch_clicked = st.session_state.pop("_batch_reject_pending", False)
-    deselect_clicked = st.session_state.pop("_deselect_pending", False)
-
-    batch_reason_options = [
-        ("Poor Image Quality",  "REJECT_POOR_IMAGE"),
-        ("Wrong Category",      "REJECT_WRONG_CAT"),
-        ("Suspected Fake",      "REJECT_FAKE"),
-        ("Restricted Brand",    "REJECT_BRAND"),
-        ("Wrong Brand",         "REJECT_WRONG_BRAND"),
-        ("Prohibited Product",  "REJECT_PROHIBITED"),
-    ]
-    batch_labels = [l for l, _ in batch_reason_options]
-    batch_reason_label = st.session_state.pop("_batch_reject_reason", batch_labels[0])
-    batch_reason_key = dict(batch_reason_options).get(batch_reason_label, "REJECT_POOR_IMAGE")
-
-    ls_data = None
-    
-    # Process Deselect OR Read LocalStorage
-    if deselect_clicked:
+    # ── Deselect pending — handle at top before any st_javascript read ──
+    # Uses counter-based key to prevent DuplicateWidgetID on repeated clicks
+    if st.session_state.pop("_deselect_pending", False):
         st.session_state.desel_counter += 1
-        st_javascript("localStorage.removeItem('_grid_pending');", key=f"ls_desel_exec_{st.session_state.desel_counter}")
+        st_javascript(
+            "localStorage.removeItem('_grid_pending');",
+            key=f"ls_desel_exec_{st.session_state.desel_counter}"
+        )
+        st.session_state.ls_processed_flag = False
+        # Don't return — fall through so grid still renders
     else:
-        ls_data = st_javascript("return localStorage.getItem('_grid_pending') || null;", key="ls_read_stable")
+        # Read localStorage with a dynamic key so it forces a re-read when triggered
+        ls_data = st_javascript(
+            "return localStorage.getItem('_grid_pending') || null;",
+            key=f"ls_read_{st.session_state.ls_read_trigger}"
+        )
 
-    # --- Processing Logic (No st.rerun() or return! Let the script naturally redraw the grid) ---
-    if ls_data and ls_data not in ("0", "null", None):
-        try:
-            pending = json.loads(ls_data)
-            count = 0
-            has_specific = any(v != "SELECTED" for v in pending.values())
+        # Normalize: treat 0 (int), "0", "null", None as "nothing pending"
+        ls_is_empty = ls_data in (0, "0", "null", None, "")
 
-            # Trigger processing if Batch Reject was clicked, OR if JS sent a specific inline action
-            if batch_clicked or has_specific or js_triggered:
-                for sid, rkey in pending.items():
-                    # If they just selected it but didn't assign a specific reason, leave it alone until batch reject
-                    if rkey == "SELECTED" and not batch_clicked:
-                        continue 
+        # Reset processed flag when localStorage is empty
+        if ls_is_empty:
+            st.session_state.ls_processed_flag = False
 
-                    actual_rkey = batch_reason_key if rkey == "SELECTED" else rkey
-                    flag_name = REASON_MAP.get(actual_rkey, "Other Reason (Custom)")
-                    code, cmt = support_files["flags_mapping"].get(flag_name, ("1000007 - Other Reason", "Manual rejection"))
+        batch_reason_options = [
+            ("Poor Image Quality",  "REJECT_POOR_IMAGE"),
+            ("Wrong Category",      "REJECT_WRONG_CAT"),
+            ("Suspected Fake",      "REJECT_FAKE"),
+            ("Restricted Brand",    "REJECT_BRAND"),
+            ("Wrong Brand",         "REJECT_WRONG_BRAND"),
+            ("Prohibited Product",  "REJECT_PROHIBITED"),
+        ]
+        batch_labels = [l for l, _ in batch_reason_options]
 
-                    apply_rejection([sid], code, cmt, flag_name)
-                    st.session_state[f"quick_rej_{sid}"] = True
-                    st.session_state[f"quick_rej_reason_{sid}"] = flag_name
-                    count += 1
+        # ── Batch reject — flag was set on previous render, now ls_data is available ──
+        if st.session_state.get("_batch_reject_pending") and not ls_is_empty:
+            st.session_state.pop("_batch_reject_pending")
+            chosen_label_val = st.session_state.pop("_batch_reject_reason", batch_labels[0])
+            chosen_key = dict(batch_reason_options).get(chosen_label_val, "REJECT_POOR_IMAGE")
+            flag_name = REASON_MAP.get(chosen_key, "Other Reason (Custom)")
+            code, cmt = support_files["flags_mapping"].get(flag_name, ("1000007 - Other Reason", "Manual rejection"))
+            try:
+                obj = json.loads(ls_data)
+                sids = list(obj.keys())
+                if sids:
+                    apply_rejection(sids, code, cmt, flag_name)
+                    for s in sids:
+                        st.session_state[f"quick_rej_{s}"] = True
+                        st.session_state[f"quick_rej_reason_{s}"] = flag_name
+                    st.session_state.batch_counter += 1
+                    st_javascript(
+                        "localStorage.removeItem('_grid_pending');",
+                        key=f"ls_clr_batch_{st.session_state.batch_counter}"
+                    )
+                    st.session_state.ls_processed_flag = False
+                    st.session_state.main_toasts.append((f"Batch rejected {len(sids)} product(s)", "✅"))
+                    st.session_state.exports_cache.clear()
+                    st.session_state.display_df_cache.clear()
+                    st.rerun(scope="app")
+            except Exception as e:
+                logger.error(f"Batch reject parse error: {e}")
 
-                if count > 0:
-                    st.session_state.clear_counter += 1
-                    st_javascript("localStorage.removeItem('_grid_pending');", key=f"ls_clear_{st.session_state.clear_counter}")
-                    st.toast(f"Successfully Rejected {count} product(s)!", icon="✅")
-        except Exception as e:
-            logger.error(f"Grid selections parse error: {e}")
+        # ── Auto-process individual card quick-rejects ──────────
+        # Only process if ls_data has content AND we haven't already processed it this render
+        elif not ls_is_empty and not st.session_state.ls_processed_flag:
+            st.session_state.ls_processed_flag = True
+            count = _process_grid_selections(ls_data, support_files)
+            if count > 0:
+                st.session_state.clear_counter += 1
+                st_javascript(
+                    "localStorage.removeItem('_grid_pending');",
+                    key=f"ls_clear_{st.session_state.clear_counter}"
+                )
+                st.session_state.ls_processed_flag = False
+                st.session_state.main_toasts.append((f"Rejected {count} product(s)", "✅"))
+                st.session_state.exports_cache.clear()
+                st.session_state.display_df_cache.clear()
+                st.session_state.final_report = st.session_state.final_report.copy()
+                st.rerun(scope="app")
+            else:
+                # Nothing actionable in localStorage (e.g. only SELECTED entries, no real rejections)
+                st.session_state.ls_processed_flag = False
+            # NOTE: No return here — grid still renders below
 
-    # --- Prepare Data for Grid Rendering ---
+    # ── Render grid UI ────────────────────────────────────────────────────────
     fr   = st.session_state.final_report
     data = st.session_state.all_data_map
 
@@ -1855,12 +1926,10 @@ def render_image_grid():
         for k in st.session_state.keys()
         if k.startswith("quick_rej_") and "reason" not in k
     }
-    
-    # We include recently rejected items so the grid can render the grey "REJECTED" overlay
     mask = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
     valid_grid_df = fr[mask]
 
-    # ── Search & filter ───────────────────────────────────────────────────────
+    # Search & filter
     c1, c2, c3 = st.columns([1.5, 1.5, 2])
     with c1: search_n  = st.text_input("Search by Name", placeholder="Product name…")
     with c2: search_sc = st.text_input("Search by Seller/Category", placeholder="Seller or Category…")
@@ -1888,7 +1957,7 @@ def render_image_grid():
     if st.session_state.grid_page >= total_pages:
         st.session_state.grid_page = 0
 
-    # ── Native Streamlit controls ─────────────────────────────────────────────
+    # ── Controls row ──────────────────────────────────────────────────────────
     ctrl_cols = st.columns([1, 1, 1, 2, 2, 2])
     with ctrl_cols[0]:
         if st.button("◀ Prev", use_container_width=True, disabled=st.session_state.grid_page == 0):
@@ -1896,25 +1965,33 @@ def render_image_grid():
             st.session_state.do_scroll_top = True
             st.rerun(scope="fragment")
     with ctrl_cols[1]:
-        st.markdown(f"<div style='text-align:center;padding:8px 0;font-weight:700;'>"
-                    f"Page {st.session_state.grid_page+1} / {total_pages}</div>",
-                    unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='text-align:center;padding:8px 0;font-weight:700;'>"
+            f"Page {st.session_state.grid_page+1} / {total_pages}</div>",
+            unsafe_allow_html=True
+        )
     with ctrl_cols[2]:
         if st.button("Next ▶", use_container_width=True, disabled=st.session_state.grid_page >= total_pages - 1):
             st.session_state.grid_page += 1
             st.session_state.do_scroll_top = True
             st.rerun(scope="fragment")
     with ctrl_cols[3]:
-        chosen_label = st.selectbox("Batch reason", batch_labels, label_visibility="collapsed",
-                                    key="grid_batch_reason")
+        batch_labels = [l for l, _ in batch_reason_options]
+        chosen_label = st.selectbox(
+            "Batch reason", batch_labels,
+            label_visibility="collapsed",
+            key="grid_batch_reason"
+        )
     with ctrl_cols[4]:
         if st.button("✗ Batch Reject Selected", use_container_width=True, type="primary"):
             st.session_state["_batch_reject_pending"] = True
             st.session_state["_batch_reject_reason"] = chosen_label
+            st.session_state.ls_read_trigger += 1   # ← force fresh localStorage read
             st.rerun(scope="fragment")
     with ctrl_cols[5]:
         if st.button("☐ Deselect All", use_container_width=True):
             st.session_state["_deselect_pending"] = True
+            st.session_state.ls_read_trigger += 1   # ← force fresh localStorage read
             st.rerun(scope="fragment")
 
     # ── Image quality checks ──────────────────────────────────────────────────
