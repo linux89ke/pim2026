@@ -1527,6 +1527,7 @@ let pendingRejections = {{}};
 
 function sendBridge(action) {{
   let input = window.parent.document.querySelector('input[placeholder="__CARD_ACT__"]');
+  
   if (!input) {{
     for (const el of window.parent.document.querySelectorAll('input')) {{
       if (el.placeholder === '__CARD_ACT__') {{ input = el; break; }}
@@ -1541,10 +1542,27 @@ function sendBridge(action) {{
       }} catch(e) {{}}
     }}
   }}
-  if (!input) return;
+  
+  if (!input) {{
+    console.error("Streamlit Bridge Error: Hidden input not found on the page.");
+    return;
+  }}
+  
+  // Set the value using React's native setter bypass
   const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
   setter.call(input, action);
+  
+  // 1. Tell React the input value changed
   input.dispatchEvent(new Event('input', {{bubbles:true}}));
+  
+  // 2. Force Streamlit to submit the box by simulating the "Enter" key
+  input.dispatchEvent(new KeyboardEvent('keydown', {{
+      key: 'Enter',
+      code: 'Enter',
+      keyCode: 13,
+      which: 13,
+      bubbles: true
+  }}));
 }}
 
 function renderCard(card) {{
