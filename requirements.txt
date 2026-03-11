@@ -13,3 +13,4 @@ xlsxwriter
 mediapipe
 scikit-learn
 st-styled
+streamlit-javascript
