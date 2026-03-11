@@ -149,9 +149,10 @@ if 'main_toasts' not in st.session_state: st.session_state.main_toasts = []
 if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
 if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = False
 if 'display_df_cache' not in st.session_state: st.session_state.display_df_cache = {}
+
 # Session state counters for dynamic st_javascript keys
 if 'desel_counter' not in st.session_state: st.session_state.desel_counter = 0
-if 'batch_counter' not in st.session_state: st.session_state.batch_counter = 0
+if 'batch_counter' not in st.session_state: st.session_state.batch_counter = 0  
 if 'clear_counter' not in st.session_state: st.session_state.clear_counter = 0
 if 'ls_processed_flag' not in st.session_state: st.session_state.ls_processed_flag = False
 if 'ls_read_trigger' not in st.session_state: st.session_state.ls_read_trigger = 0
@@ -1833,6 +1834,17 @@ def render_image_grid():
     if js_triggered:
         st.session_state.ls_read_trigger += 1
 
+    # ── Batch reason options — defined here so both branches can access them ──
+    batch_reason_options = [
+        ("Poor Image Quality",  "REJECT_POOR_IMAGE"),
+        ("Wrong Category",      "REJECT_WRONG_CAT"),
+        ("Suspected Fake",      "REJECT_FAKE"),
+        ("Restricted Brand",    "REJECT_BRAND"),
+        ("Wrong Brand",         "REJECT_WRONG_BRAND"),
+        ("Prohibited Product",  "REJECT_PROHIBITED"),
+    ]
+    batch_labels = [l for l, _ in batch_reason_options]
+
     # ── Deselect pending — handle at top before any st_javascript read ──
     # Uses counter-based key to prevent DuplicateWidgetID on repeated clicks
     if st.session_state.pop("_deselect_pending", False):
@@ -1856,16 +1868,6 @@ def render_image_grid():
         # Reset processed flag when localStorage is empty
         if ls_is_empty:
             st.session_state.ls_processed_flag = False
-
-        batch_reason_options = [
-            ("Poor Image Quality",  "REJECT_POOR_IMAGE"),
-            ("Wrong Category",      "REJECT_WRONG_CAT"),
-            ("Suspected Fake",      "REJECT_FAKE"),
-            ("Restricted Brand",    "REJECT_BRAND"),
-            ("Wrong Brand",         "REJECT_WRONG_BRAND"),
-            ("Prohibited Product",  "REJECT_PROHIBITED"),
-        ]
-        batch_labels = [l for l, _ in batch_reason_options]
 
         # ── Batch reject — flag was set on previous render, now ls_data is available ──
         if st.session_state.get("_batch_reject_pending") and not ls_is_empty:
@@ -1976,7 +1978,6 @@ def render_image_grid():
             st.session_state.do_scroll_top = True
             st.rerun(scope="fragment")
     with ctrl_cols[3]:
-        batch_labels = [l for l, _ in batch_reason_options]
         chosen_label = st.selectbox(
             "Batch reason", batch_labels,
             label_visibility="collapsed",
