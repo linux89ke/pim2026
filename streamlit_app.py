@@ -1442,6 +1442,12 @@ def build_fast_grid_html(page_data, flags_mapping, country, page_warnings, rejec
     html_parts.append("</div>")
     return "".join(html_parts)
 
+    try: 
+    support_files = load_support_files_lazy()
+except Exception as e: 
+    st.error(f"Failed to load configs: {e}")
+    st.stop()
+
 # ==========================================
 # APP UI & DATA PIPELINE
 # ==========================================
