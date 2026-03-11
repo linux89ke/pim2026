@@ -144,6 +144,7 @@ if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
 if 'bg_executor' not in st.session_state: st.session_state.bg_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = False
 if 'display_df_cache' not in st.session_state: st.session_state.display_df_cache = {}
+if 'js_bridge_input' not in st.session_state: st.session_state.js_bridge_input = ""
 
 try: st.set_page_config(page_title="Product Tool", layout=st.session_state.layout_mode)
 except: pass
@@ -220,8 +221,22 @@ st.markdown(f"""
         div[data-testid="stVerticalBlockBorderWrapper"] {{ overflow: visible !important; }}
 
         .rejected-card-overlay {{ position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(231, 60, 23, 0.9); color: white; padding: 8px 16px; border-radius: 20px; font-weight: bold; font-size: 12px; white-space: nowrap; display: flex; align-items: center; }}
-        
+
+        /* JS-selectable card base style */
+        .js-img-card {{ transition: border 0.12s ease, box-shadow 0.12s ease; }}
+        .js-img-card:hover {{ border-color: {JUMIA_COLORS['primary_orange']} !important; }}
+
         div[data-testid="stVerticalBlockBorderWrapper"] .stButton > button {{ white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; font-size: 11px !important; padding: 6px 4px !important; min-height: 36px !important; line-height: 1.2 !important; }}
+
+        /* Hide the JS bridge input completely */
+        div[data-testid="stTextInput"]:has(input[aria-label="__js_bridge__"]) {{
+            position: absolute !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
+            height: 0 !important;
+            width: 0 !important;
+            overflow: hidden !important;
+        }}
     </style>
 """, unsafe_allow_html=True)
 
@@ -270,7 +285,6 @@ def create_match_key(row: pd.Series) -> str:
     color = normalize_text(row.get('COLOR', ''))
     return f"{brand}|{name}|{color}"
 
-# --- FIX 1: df_hash utility ---
 def df_hash(df: pd.DataFrame) -> str:
     try:
         return hashlib.md5(pd.util.hash_pandas_object(df, index=True).values).hexdigest()
@@ -396,7 +410,6 @@ def safe_excel_read(filename: str, sheet_name, usecols=None) -> pd.DataFrame:
         logger.error(f"Error reading tab '{sheet_name}' from {filename}: {e}")
         return pd.DataFrame()
 
-# --- LOCAL: PROHIBITED PRODUCTS ---
 @st.cache_data(ttl=3600)
 def load_prohibited_from_local() -> Dict[str, List[Dict]]:
     FILE_NAME = "Prohibbited.xlsx"
@@ -428,7 +441,6 @@ def load_prohibited_from_local() -> Dict[str, List[Dict]]:
             prohibited_by_country[tab] = []
     return prohibited_by_country
 
-# --- LOCAL: RESTRICTED BRANDS ---
 @st.cache_data(ttl=3600)
 def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
     FILE_NAME = "Restricted_Brands.xlsx"
@@ -470,7 +482,6 @@ def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
             config_by_country[country_name] = []
     return config_by_country
 
-# --- LOCAL: REFURBISHED DATA ---
 @st.cache_data(ttl=3600)
 def load_refurb_data_from_local() -> dict:
     FILE_NAME = "Refurb.xlsx"
@@ -505,7 +516,6 @@ def load_refurb_data_from_local() -> dict:
         result["keywords"] = {"refurb", "refurbished", "renewed"}
     return result
 
-# --- LOCAL: PERFUME DATA ---
 @st.cache_data(ttl=3600)
 def load_perfume_data_from_local() -> Dict:
     FILE_NAME = "Perfume.xlsx"
@@ -540,7 +550,6 @@ def load_perfume_data_from_local() -> Dict:
     except Exception as e: result["category_codes"] = set()
     return result
 
-# --- LOCAL: BOOKS DATA ---
 @st.cache_data(ttl=3600)
 def load_books_data_from_local() -> Dict:
     FILE_NAME = "Books_sellers.xlsx"
@@ -565,7 +574,6 @@ def load_books_data_from_local() -> Dict:
     except Exception as e: result["category_codes"] = set()
     return result
 
-# --- LOCAL: JERSEYS DATA ---
 @st.cache_data(ttl=3600)
 def load_jerseys_from_local() -> Dict:
     FILE_NAME = "Jersey_validation.xlsx"
@@ -593,7 +601,6 @@ def load_jerseys_from_local() -> Dict:
     except Exception as e: logger.error(f"Error: {e}")
     return result
 
-# --- LOCAL: SUSPECTED FAKE DATA ---
 @st.cache_data(ttl=3600)
 def load_suspected_fake_from_local() -> pd.DataFrame:
     try:
@@ -1094,28 +1101,21 @@ def check_incomplete_smartphone_name(data: pd.DataFrame, smartphone_category_cod
     if not flagged.empty: flagged['Comment_Detail'] = "Name missing Storage/Memory spec (e.g., 64GB)"
     return flagged.drop_duplicates(subset=['PRODUCT_SET_SID'])
 
-# --- FIX 4: Fast O(n) duplicate check replacing O(n²) TF-IDF ---
 def check_duplicate_products(data: pd.DataFrame, exempt_categories: List[str] = None, similarity_threshold: float = 0.70, known_colors: List[str] = None, **kwargs) -> pd.DataFrame:
     if not {'NAME', 'SELLER_NAME', 'BRAND'}.issubset(data.columns):
         return pd.DataFrame(columns=data.columns)
-
     d = data.copy()
     if exempt_categories and 'CATEGORY_CODE' in d.columns:
-        d = d[~d['CATEGORY_CODE'].apply(clean_category_code).isin(
-            set(clean_category_code(c) for c in exempt_categories))]
+        d = d[~d['CATEGORY_CODE'].apply(clean_category_code).isin(set(clean_category_code(c) for c in exempt_categories))]
     if d.empty:
         return pd.DataFrame(columns=data.columns)
-
-    # Fast exact normalized key — O(n)
     d['_norm_name'] = d['NAME'].astype(str).apply(lambda x: re.sub(r'\s+', '', normalize_text(x)))
     d['_norm_brand'] = d['BRAND'].astype(str).str.lower().str.strip()
     d['_norm_seller'] = d['SELLER_NAME'].astype(str).str.lower().str.strip()
     d['_dedup_key'] = d['_norm_seller'] + '|' + d['_norm_brand'] + '|' + d['_norm_name']
-
     seen_keys: dict = {}
     rej: set = set()
     details: dict = {}
-
     for _, row in d.iterrows():
         key = row['_dedup_key']
         sid = str(row['PRODUCT_SET_SID'])
@@ -1124,10 +1124,8 @@ def check_duplicate_products(data: pd.DataFrame, exempt_categories: List[str] = 
             details[sid] = {'base': str(row['NAME'])[:40]}
         else:
             seen_keys[key] = sid
-
     if not rej:
         return pd.DataFrame(columns=data.columns)
-
     rdf = d[d['PRODUCT_SET_SID'].astype(str).isin(rej)].copy()
     rdf['Comment_Detail'] = rdf['PRODUCT_SET_SID'].apply(
         lambda sid: f"Duplicate: '{details[str(sid)]['base']}'" if str(sid) in details else "Duplicate detected"
@@ -1139,8 +1137,6 @@ def check_duplicate_products(data: pd.DataFrame, exempt_categories: List[str] = 
 
 # -------------------------------------------------
 # MASTER VALIDATION RUNNER
-# --- FIX 2: Removed st.write from ThreadPoolExecutor ---
-# --- FIX 1: Wrapped in cached_validate_products below ---
 # -------------------------------------------------
 def validate_products(data: pd.DataFrame, support_files: Dict, country_validator: CountryValidator, data_has_warranty_cols: bool, common_sids: Optional[set] = None, skip_validators: Optional[List[str]] = None):
     data['PRODUCT_SET_SID'] = data['PRODUCT_SET_SID'].astype(str).str.strip()
@@ -1181,7 +1177,6 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
     restricted_keys = {}
     validation_errors = []
 
-    # FIX 2: Use spinner instead of st.status + st.write to avoid per-check rerenders
     with st.spinner("Validating products... This may take a moment."):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             future_to_name = {}
@@ -1252,11 +1247,8 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
     return country_validator.ensure_status_column(final_df), results
 
 
-# --- FIX 1: Cached wrapper for validate_products ---
 @st.cache_data(show_spinner=False, ttl=3600)
 def cached_validate_products(data_hash: str, _data: pd.DataFrame, _support_files: Dict, country_code: str, data_has_warranty_cols: bool):
-    """Cache validation results keyed by data hash + country. 
-    Prevents re-running 21 checks on every button click or widget interaction."""
     country_name = next(
         (k for k, v in CountryValidator.COUNTRY_CONFIG.items() if v['code'] == country_code),
         "Kenya"
@@ -1349,10 +1341,8 @@ def quick_reject_item(sid, reason_code, comment, flag_name, toast_name):
 
 def strip_html(text): return re.sub('<[^<]+?>', '', text) if isinstance(text, str) else text
 
-# --- FIX 5: Image quality cache persisted via st.cache_data (survives reruns) ---
 @st.cache_data(ttl=86400, show_spinner=False)
 def analyze_image_quality_cached(url: str) -> List[str]:
-    """Cached image quality check — persists across reruns for 24 hours."""
     if not url or not str(url).startswith("http"):
         return []
     warnings = []
@@ -1403,7 +1393,7 @@ def render_product_card(row, flags_mapping, country: str = 'Kenya', advisor_warn
             f = float(v)
             return f if f > 0 else None
         except (TypeError, ValueError): return None
-            
+
     raw_price = _to_float(row.get('GLOBAL_SALE_PRICE')) or _to_float(row.get('GLOBAL_PRICE')) or 0
     price_str = format_local_price(raw_price, country)
     price_overlay_html = (f"<div style='position:absolute;bottom:8px;left:8px;background:rgba(0,0,0,0.72);color:#fff;font-size:12px;font-weight:700;padding:3px 8px;border-radius:6px;letter-spacing:0.3px;z-index:5;'>{price_str}</div>" if price_str else "")
@@ -1424,11 +1414,12 @@ def render_product_card(row, flags_mapping, country: str = 'Kenya', advisor_warn
             with col_msg: st.markdown(f"""<div style="background: linear-gradient(135deg, {JUMIA_COLORS['jumia_red']}, #FF6B6B); color: white; padding: 8px 12px; border-radius: 6px; font-weight: bold; font-size: 11px; text-align: center;">{reason}</div>""", unsafe_allow_html=True)
             with col_btn: st.button(":material/undo:", key=f"res_{sid}", on_click=restore_single_item, args=(sid,), use_container_width=True, help="Undo rejection")
         else:
-            # Zoom popover only — no checkbox, selection is JS-driven
-            with st.popover("🔍", use_container_width=False):
+            # ── ZOOM POPOVER (no checkbox — JS handles selection) ──────────────
+            with st.popover("🔍 Zoom", use_container_width=False):
                 st.image(img_url, use_container_width=True)
                 st.caption(raw_name)
-            
+
+            # ── WARNING BADGES ─────────────────────────────────────────────────
             warnings_html = ""
             if advisor_warnings:
                 badges = "".join([
@@ -1438,32 +1429,41 @@ def render_product_card(row, flags_mapping, country: str = 'Kenya', advisor_warn
                     f'<span class="material-symbols-outlined" style="font-size:13px;margin-right:4px;">warning</span>{w}</div>'
                     for w in advisor_warnings
                 ])
-                warnings_html = f'<div style="position:absolute;top:8px;right:8px;display:flex;flex-direction:column;z-index:10;">{badges}</div>'
-            
+                warnings_html = (
+                    f'<div style="position:absolute;top:8px;right:8px;'
+                    f'display:flex;flex-direction:column;z-index:10;">{badges}</div>'
+                )
+
+            # ── JS-DRIVEN SELECTABLE IMAGE CARD ───────────────────────────────
+            # Clicking the image toggles selection entirely in JS — zero Python rerun.
+            # The green border/overlay/tick are controlled by __jsToggle() in the parent doc.
             st.markdown(f'''
-            <div id="imgclick-{sid}" 
-                 data-sid="{sid}" 
-                 class="js-img-card" 
-                 style="position:relative;cursor:pointer;border-radius:10px;border:2px solid #eee;
-                        box-shadow:none;transition:border 0.12s ease,box-shadow 0.12s ease;
-                        overflow:hidden;margin-bottom:8px;">
-              {warnings_html}
-              <div class="js-green-overlay" 
-                   style="display:none;position:absolute;inset:0;background:rgba(76,175,80,0.12);
-                          border-radius:8px;pointer-events:none;z-index:2;"></div>
-              <img src="{img_url}" loading="lazy" 
-                   style="width:100%;aspect-ratio:1/1;object-fit:contain;
-                          background-color:#FFFFFF;border-radius:8px;display:block;">
-              {price_overlay_html}
-              <div class="js-tick" 
-                   style="display:none;position:absolute;bottom:10px;right:10px;width:28px;height:28px;
-                          background:#4CAF50;border-radius:50%;align-items:center;justify-content:center;
-                          box-shadow:0 2px 8px rgba(0,0,0,0.3);z-index:10;">
-                <span class="material-symbols-outlined" 
-                      style="color:#fff;font-size:18px;line-height:1;font-weight:bold;">check</span>
-              </div>
-            </div>
-            ''', unsafe_allow_html=True)
+<div id="imgclick-{sid}"
+     data-sid="{sid}"
+     class="js-img-card"
+     style="position:relative;cursor:pointer;border-radius:10px;
+            border:2px solid #eee;box-shadow:none;
+            transition:border 0.12s ease,box-shadow 0.12s ease;
+            overflow:hidden;margin-bottom:8px;">
+  {warnings_html}
+  <div class="js-green-overlay"
+       style="display:none;position:absolute;inset:0;
+              background:rgba(76,175,80,0.12);border-radius:8px;
+              pointer-events:none;z-index:2;"></div>
+  <img src="{img_url}" loading="lazy"
+       style="width:100%;aspect-ratio:1/1;object-fit:contain;
+              background-color:#FFFFFF;border-radius:8px;display:block;">
+  {price_overlay_html}
+  <div class="js-tick"
+       style="display:none;position:absolute;bottom:10px;right:10px;
+              width:28px;height:28px;background:#4CAF50;border-radius:50%;
+              align-items:center;justify-content:center;
+              box-shadow:0 2px 8px rgba(0,0,0,0.3);z-index:10;">
+    <span class="material-symbols-outlined"
+          style="color:#fff;font-size:18px;line-height:1;font-weight:bold;">check</span>
+  </div>
+</div>
+''', unsafe_allow_html=True)
 
             st.markdown(f"""<div style="font-size:13px;line-height:1.4;margin:8px 0;"><span class='prod-name-tip' data-full="{raw_name_attr}">{name_text}</span>{color_badge_html}<div class='prod-meta-text' style="font-size:11px;margin-bottom:4px;">{cat_text}</div><div class='prod-brand-text' style="color:{JUMIA_COLORS['primary_orange']};font-weight:600;margin-bottom:8px;">{brand_text}</div><div class='prod-meta-text' style="font-size:10px;padding-top:8px;border-top:1px dashed #E0E0E0;">{seller_text}</div></div>""", unsafe_allow_html=True)
 
@@ -1472,11 +1472,11 @@ def render_product_card(row, flags_mapping, country: str = 'Kenya', advisor_warn
             with col_more:
                 with st.popover("✕ More", use_container_width=True):
                     st.markdown("<p style='font-size:12px;font-weight:700;margin:0 0 8px 0;'>Select rejection reason:</p>", unsafe_allow_html=True)
-                    st.button("Wrong Category",     key=f"cat_{sid}",   use_container_width=True, on_click=quick_reject_item, args=(sid, cat_code,         cat_cmt,         'Wrong Category',                               toast_name))
-                    st.button("Fake Product",       key=f"fake_{sid}",  use_container_width=True, on_click=quick_reject_item, args=(sid, fake_code,        fake_cmt,        'Suspected Fake product',                       toast_name))
-                    st.button("Restricted Brand",   key=f"brnd_{sid}",  use_container_width=True, on_click=quick_reject_item, args=(sid, brnd_code,        brnd_cmt,        'Restricted brands',                            toast_name))
-                    st.button("Prohibited Product", key=f"proh_{sid}",  use_container_width=True, on_click=quick_reject_item, args=(sid, proh_code,        proh_cmt,        'Prohibited products',                          toast_name))
-                    st.button("Wrong Color",        key=f"colr_{sid}",  use_container_width=True, on_click=quick_reject_item, args=(sid, color_code,       color_cmt,       'Missing COLOR',                                toast_name))
+                    st.button("Wrong Category",     key=f"cat_{sid}",   use_container_width=True, on_click=quick_reject_item, args=(sid, cat_code,         cat_cmt,         'Wrong Category',                                toast_name))
+                    st.button("Fake Product",       key=f"fake_{sid}",  use_container_width=True, on_click=quick_reject_item, args=(sid, fake_code,        fake_cmt,        'Suspected Fake product',                        toast_name))
+                    st.button("Restricted Brand",   key=f"brnd_{sid}",  use_container_width=True, on_click=quick_reject_item, args=(sid, brnd_code,        brnd_cmt,        'Restricted brands',                             toast_name))
+                    st.button("Prohibited Product", key=f"proh_{sid}",  use_container_width=True, on_click=quick_reject_item, args=(sid, proh_code,        proh_cmt,        'Prohibited products',                           toast_name))
+                    st.button("Wrong Color",        key=f"colr_{sid}",  use_container_width=True, on_click=quick_reject_item, args=(sid, color_code,       color_cmt,       'Missing COLOR',                                 toast_name))
                     st.button("Wrong Brand",        key=f"wbrnd_{sid}", use_container_width=True, on_click=quick_reject_item, args=(sid, wrong_brand_code, wrong_brand_cmt, 'Generic branded products with genuine brands',  toast_name))
                     st.divider()
                     st.markdown("<p style='font-size:11px;font-weight:700;margin:0 0 4px 0;'>Other Reason (Custom)</p>", unsafe_allow_html=True)
@@ -1510,9 +1510,7 @@ def bulk_approve_dialog(sids_to_process, title, subset_data, data_has_warranty_c
             st.session_state.display_df_cache.clear()
         st.rerun()
 
-# --- FIX 3: Cache merged display DataFrames in render_flag_expander ---
 def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_check, support_files, country_validator):
-    # Build display df once and cache it — avoids repeated pd.merge on every interaction
     cache_key = f"display_df_{title}"
     base_display_cols = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'CATEGORY', 'COLOR', 'GLOBAL_SALE_PRICE', 'GLOBAL_PRICE', 'PARENTSKU', 'SELLER_NAME']
     current_display_cols = base_display_cols.copy()
@@ -1658,6 +1656,7 @@ if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.grid_page = 0
     st.session_state.exports_cache = {}
     st.session_state.display_df_cache = {}
+    st.session_state.js_bridge_input = ""
     keys_to_delete = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_"))]
     for k in keys_to_delete: del st.session_state[k]
 
@@ -1724,7 +1723,6 @@ if st.session_state.get('last_processed_files') != process_signature:
                         if c in data.columns: data[c] = data[c].astype(str).fillna('')
                     if 'COLOR_FAMILY' not in data.columns: data['COLOR_FAMILY'] = ""
 
-                    # FIX 1: Use cached validation — won't re-run on button clicks
                     data_hash = df_hash(data) + country_validator.code
                     final_report, _ = cached_validate_products(data_hash, data, support_files, country_validator.code, data_has_warranty)
 
@@ -1782,7 +1780,6 @@ if uploaded_files and not st.session_state.final_report.empty and st.session_sta
 
 # ==========================================
 # SECTION 2: MANUAL IMAGE REVIEW
-# --- FIX 6: Wrapped in @st.fragment to isolate reruns ---
 # ==========================================
 @st.fragment
 def render_image_grid():
@@ -1792,215 +1789,222 @@ def render_image_grid():
     st.markdown("---")
     st.header(":material/pageview: Manual Image & Category Review", anchor=False)
 
-    # ── JS SELECTION ENGINE ──────────────────────────────────────────────────
-    # One-time injection of the selection engine into the parent document.
-    # Uses postMessage to send selected SIDs back to the Streamlit hidden input.
+    # ── ONE-TIME JS SELECTION ENGINE ─────────────────────────────────────────
+    # Installs the selection system into the parent document once.
+    # All image toggling is pure JS — zero Python reruns on click.
+    # postMessage bridge → hidden text input syncs selection back to Python
+    # only when the user clicks "Reject Selected".
     components.html("""
-    <script>
-    (function() {
-      var doc = window.parent.document;
-      if (doc.__jsSelectionReady) return;   // already installed
-      doc.__jsSelectionReady = true;
-      var SEL = doc.__jsSelected = new Set();
-      
-      // ── Toggle a single card ──────────────────────────────────────────────────
-      doc.__jsToggle = function(el) {
-        var sid = el.dataset.sid;
-        if (!sid) return;
-        var overlay = el.querySelector('.js-green-overlay');
-        var tick    = el.querySelector('.js-tick');
-        
-        if (SEL.has(sid)) {
-          SEL.delete(sid);
-          el.style.border     = '2px solid #eee';
-          el.style.boxShadow  = 'none';
-          if (overlay) overlay.style.display = 'none';
-          if (tick)    tick.style.display    = 'none';
-        } else {
-          SEL.add(sid);
-          el.style.border     = '3px solid #4CAF50';
-          el.style.boxShadow  = '0 0 0 3px rgba(76,175,80,0.2)';
-          if (overlay) overlay.style.display = 'block';
-          if (tick)    tick.style.display    = 'flex';
-        }
-        _updateCount();
-      };
-      
-      // ── Select all SIDs on current page ──────────────────────────────────────
-      doc.__jsSelectAll = function(sids) {
-        sids.forEach(function(sid) {
-          var el = doc.getElementById('imgclick-' + sid);
-          if (!el) return;
-          SEL.add(sid);
-          el.style.border    = '3px solid #4CAF50';
-          el.style.boxShadow = '0 0 0 3px rgba(76,175,80,0.2)';
-          var o = el.querySelector('.js-green-overlay');
-          var t = el.querySelector('.js-tick');
-          if (o) o.style.display = 'block';
-          if (t) t.style.display = 'flex';
-        });
-        _updateCount();
-      };
-      
-      // ── Deselect all SIDs on current page ────────────────────────────────────
-      doc.__jsDeselectAll = function(sids) {
-        sids.forEach(function(sid) {
-          SEL.delete(sid);
-          var el = doc.getElementById('imgclick-' + sid);
-          if (!el) return;
-          el.style.border    = '2px solid #eee';
-          el.style.boxShadow = 'none';
-          var o = el.querySelector('.js-green-overlay');
-          var t = el.querySelector('.js-tick');
-          if (o) o.style.display = 'none';
-          if (t) t.style.display = 'none';
-        });
-        _updateCount();
-      };
-      
-      // ── postMessage bridge → Streamlit hidden input ───────────────────────────
-      // Writes "sid1,sid2,...|ACTION_KEY" into the hidden text input, then fires
-      // React's synthetic input event so Streamlit picks up the change.
-      doc.__jsCommit = function(actionKey) {
-        var sids = Array.from(SEL);
-        if (sids.length === 0) {
-          alert('No images selected. Click an image to select it, then reject.');
-          return;
-        }
-        var payload = sids.join(',') + '|' + actionKey;
-        // Find our hidden bridge input — keyed by aria-label
-        var inp = doc.querySelector('input[aria-label="__js_bridge__"]');
-        if (!inp) { console.warn('JS bridge input not found'); return; }
-        
-        // Use React's internal setter so the onChange fires
-        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        setter.call(inp, payload);
-        inp.dispatchEvent(new Event('input', { bubbles: true }));
-        
-        // Clear visual selection optimistically
-        SEL.clear();
-        doc.querySelectorAll('.js-img-card').forEach(function(el) {
-          el.style.border    = '2px solid #eee';
-          el.style.boxShadow = 'none';
-          var o = el.querySelector('.js-green-overlay');
-          var t = el.querySelector('.js-tick');
-          if (o) o.style.display = 'none';
-          if (t) t.style.display = 'none';
-        });
-        _updateCount();
-      };
-      
-      // ── Selection count badge ─────────────────────────────────────────────────
-      function _updateCount() {
-        var badge = doc.getElementById('js-sel-badge');
-        var badgeBot = doc.getElementById('js-sel-badge-bot');
-        if (badge) {
-          badge.textContent = SEL.size > 0 ? SEL.size + ' selected' : '';
-          badge.style.display = SEL.size > 0 ? 'inline-block' : 'none';
-        }
-        if (badgeBot) {
-          badgeBot.textContent = SEL.size > 0 ? SEL.size + ' selected' : '';
-          badgeBot.style.display = SEL.size > 0 ? 'inline-block' : 'none';
-        }
-      }
-      
-      // ── Global click delegation — catches clicks on image cards ──────────────
-      if (!doc.__jsClickDelegated) {
-        doc.__jsClickDelegated = true;
-        doc.addEventListener('click', function(e) {
-          var card = e.target.closest('.js-img-card');
-          if (card) {
-            e.stopPropagation();
-            doc.__jsToggle(card);
-          }
-        }, true);
-      }
-    })();
-    </script>
-    """, height=0, width=0)
+<script>
+(function() {
+  var doc = window.parent.document;
+  if (doc.__jsSelectionReady) return;  // Guard: install only once
+  doc.__jsSelectionReady = true;
 
-    # ── HIDDEN BRIDGE INPUT ──────────────────────────────────────────────────
-    # Invisible text input; JS writes to it, Python reads it each rerun.
-    # aria-label="__js_bridge__" lets JS find it without relying on a generated id.
+  // ── Persistent selection Set ───────────────────────────────────────────────
+  var SEL = doc.__jsSelected = new Set();
+
+  // ── Toggle a single card ──────────────────────────────────────────────────
+  doc.__jsToggle = function(el) {
+    var sid = el.dataset.sid;
+    if (!sid) return;
+    var overlay = el.querySelector('.js-green-overlay');
+    var tick    = el.querySelector('.js-tick');
+    if (SEL.has(sid)) {
+      SEL.delete(sid);
+      el.style.border    = '2px solid #eee';
+      el.style.boxShadow = 'none';
+      if (overlay) overlay.style.display = 'none';
+      if (tick)    tick.style.display    = 'none';
+    } else {
+      SEL.add(sid);
+      el.style.border    = '3px solid #4CAF50';
+      el.style.boxShadow = '0 0 0 3px rgba(76,175,80,0.2)';
+      if (overlay) overlay.style.display = 'block';
+      if (tick)    tick.style.display    = 'flex';
+    }
+    _updateBadge();
+  };
+
+  // ── Select all SIDs on current page ──────────────────────────────────────
+  doc.__jsSelectAll = function(sids) {
+    sids.forEach(function(sid) {
+      var el = doc.getElementById('imgclick-' + sid);
+      if (!el) return;
+      SEL.add(sid);
+      el.style.border    = '3px solid #4CAF50';
+      el.style.boxShadow = '0 0 0 3px rgba(76,175,80,0.2)';
+      var o = el.querySelector('.js-green-overlay');
+      var t = el.querySelector('.js-tick');
+      if (o) o.style.display = 'block';
+      if (t) t.style.display = 'flex';
+    });
+    _updateBadge();
+  };
+
+  // ── Deselect all SIDs on current page ────────────────────────────────────
+  doc.__jsDeselectAll = function(sids) {
+    sids.forEach(function(sid) {
+      SEL.delete(sid);
+      var el = doc.getElementById('imgclick-' + sid);
+      if (!el) return;
+      el.style.border    = '2px solid #eee';
+      el.style.boxShadow = 'none';
+      var o = el.querySelector('.js-green-overlay');
+      var t = el.querySelector('.js-tick');
+      if (o) o.style.display = 'none';
+      if (t) t.style.display = 'none';
+    });
+    _updateBadge();
+  };
+
+  // ── Commit selection → Streamlit hidden input (postMessage bridge) ────────
+  // Writes "sid1,sid2,...|ACTION_KEY" into the hidden bridge input using
+  // React's internal value setter so Streamlit's onChange fires correctly.
+  doc.__jsCommit = function(actionKey) {
+    var sids = Array.from(SEL);
+    if (sids.length === 0) {
+      alert('No images selected. Click an image to select it first.');
+      return;
+    }
+    var payload = sids.join(',') + '|' + actionKey;
+
+    // Find the bridge input by its aria-label (set by the patcher below)
+    var inp = doc.querySelector('input[aria-label="__js_bridge__"]');
+    if (!inp) {
+      // Fallback: find by data attribute we set
+      inp = doc.querySelector('input[data-bridge="js_bridge"]');
+    }
+    if (!inp) {
+      console.warn('JS bridge input not found — cannot commit selection');
+      return;
+    }
+
+    // Use React's internal setter so onChange fires
+    var nativeSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype, 'value').set;
+    nativeSetter.call(inp, payload);
+    inp.dispatchEvent(new Event('input', { bubbles: true }));
+
+    // Optimistically clear visual selection
+    SEL.clear();
+    doc.querySelectorAll('.js-img-card').forEach(function(card) {
+      card.style.border    = '2px solid #eee';
+      card.style.boxShadow = 'none';
+      var o = card.querySelector('.js-green-overlay');
+      var t = card.querySelector('.js-tick');
+      if (o) o.style.display = 'none';
+      if (t) t.style.display = 'none';
+    });
+    _updateBadge();
+  };
+
+  // ── Live selection count badge ─────────────────────────────────────────────
+  function _updateBadge() {
+    doc.querySelectorAll('.js-sel-badge').forEach(function(b) {
+      if (SEL.size > 0) {
+        b.textContent = SEL.size + ' selected';
+        b.style.display = 'inline-block';
+      } else {
+        b.textContent = '';
+        b.style.display = 'none';
+      }
+    });
+  }
+
+  // ── Global click delegation — catches image card clicks ──────────────────
+  if (!doc.__jsClickDelegated) {
+    doc.__jsClickDelegated = true;
+    doc.addEventListener('click', function(e) {
+      var card = e.target.closest('.js-img-card');
+      if (card) {
+        e.stopPropagation();
+        doc.__jsToggle(card);
+      }
+    }, true);
+  }
+})();
+</script>
+""", height=0, width=0)
+
+    # ── HIDDEN BRIDGE INPUT ───────────────────────────────────────────────────
+    # This text input is invisible to the user (hidden via CSS + JS).
+    # JS writes "sid1,sid2|ACTION_KEY" into it; Python reads it each rerun.
     bridge_val = st.text_input(
         "__js_bridge__",
-        value="",
+        value=st.session_state.get("js_bridge_input", ""),
         key="js_bridge_input",
         label_visibility="collapsed",
     )
 
-    # Inject the aria-label (Streamlit strips it, so we patch via JS)
+    # Patch the input with aria-label and data attribute so JS can find it reliably
     components.html("""
-    <script>
-    (function() {
-      var doc = window.parent.document;
-      function labelBridge() {
-        // Find unlabelled text inputs and label ours by placeholder heuristic.
-        // We set a unique placeholder on our input via CSS injection instead —
-        // simpler: just find the most-recently-added text input in the fragment.
-        var inputs = doc.querySelectorAll('input[data-testid="stTextInput-Input"]');
-        
-        // The bridge input is the one we need; it has no visible label.
-        // Walk backwards — it's rendered last in this fragment.
-        for (var i = inputs.length - 1; i >= 0; i--) {
-          var inp = inputs[i];
-          // If already labelled, skip
-          if (inp.getAttribute('aria-label') === '__js_bridge__') break;
-          inp.setAttribute('aria-label', '__js_bridge__');
-          inp.style.cssText = 'position:absolute!important;opacity:0!important;pointer-events:none!important;height:0!important;width:0!important;';
-          break;
-        }
-      }
-      // Run now and after a short delay (fragment may render async)
-      labelBridge();
-      setTimeout(labelBridge, 600);
-    })();
-    </script>
-    """, height=0, width=0)
+<script>
+(function patch() {
+  var doc = window.parent.document;
+  // Walk all stTextInput inputs from the end — our bridge is rendered last
+  var inputs = doc.querySelectorAll('input[data-testid="stTextInput-Input"]');
+  for (var i = inputs.length - 1; i >= 0; i--) {
+    var inp = inputs[i];
+    if (inp.getAttribute('aria-label') === '__js_bridge__') break; // already done
+    // Only patch inputs that are visually hidden (our CSS hides the wrapper)
+    var wrapper = inp.closest('[data-testid="stTextInput"]');
+    if (wrapper && (wrapper.style.height === '0px' || getComputedStyle(wrapper).opacity === '0')) {
+      inp.setAttribute('aria-label', '__js_bridge__');
+      inp.setAttribute('data-bridge', 'js_bridge');
+      break;
+    }
+    // Fallback: just patch the last one that has no aria-label
+    if (!inp.getAttribute('aria-label') || inp.getAttribute('aria-label') === '') {
+      inp.setAttribute('aria-label', '__js_bridge__');
+      inp.setAttribute('data-bridge', 'js_bridge');
+      break;
+    }
+  }
+})();
+</script>
+""", height=0, width=0)
 
-    # ── PROCESS BRIDGE VALUE ─────────────────────────────────────────────────
+    # ── PROCESS BRIDGE VALUE ──────────────────────────────────────────────────
     def _get_batch_labels():
         return {
-            "Poor Image Quality":  "Poor images",
-            "Wrong Category":      "Wrong Category",
-            "Suspected Fake":      "Suspected Fake product",
-            "Restricted Brand":    "Restricted brands",
-            "Wrong Brand":         "Generic branded products with genuine brands",
-            "Prohibited Product":  "Prohibited products",
-            "OTHER_CUSTOM":        "Other Reason (Custom)",
+            "Poor Image Quality": "Poor images",
+            "Wrong Category":     "Wrong Category",
+            "Suspected Fake":     "Suspected Fake product",
+            "Restricted Brand":   "Restricted brands",
+            "Wrong Brand":        "Generic branded products with genuine brands",
+            "Prohibited Product": "Prohibited products",
+            "OTHER_CUSTOM":       "Other Reason (Custom)",
         }
 
     if bridge_val and "|" in bridge_val:
         raw_sids_str, action_key = bridge_val.rsplit("|", 1)
         js_sids = [s.strip() for s in raw_sids_str.split(",") if s.strip()]
-        if js_sids:
+        if js_sids and action_key:
             if action_key == "OTHER_CUSTOM":
                 custom_cmt = st.session_state.get("grid_custom_comment", "").strip()
-                code  = "1000007 - Other Reason"
-                cmt   = custom_cmt or "Custom rejection"
+                code     = "1000007 - Other Reason"
+                cmt      = custom_cmt or "Custom rejection"
                 flag_key = "Other Reason (Custom)"
             else:
                 flag_key = _get_batch_labels().get(action_key, action_key)
                 code, cmt = support_files['flags_mapping'].get(
                     flag_key, ("1000007 - Other Reason", action_key))
-            
             st.session_state.final_report.loc[
                 st.session_state.final_report['ProductSetSid'].isin(js_sids),
                 ['Status', 'Reason', 'Comment', 'FLAG']
             ] = ['Rejected', code, cmt, flag_key]
-            
             for s in js_sids:
                 st.session_state[f"quick_rej_{s}"] = True
                 st.session_state[f"quick_rej_reason_{s}"] = flag_key
-            
             st.session_state.exports_cache.clear()
             st.session_state.display_df_cache.clear()
             st.session_state.main_toasts.append(
                 (f"Batch rejected {len(js_sids)} items as '{flag_key}'", "✅"))
-            st.session_state.js_bridge_input = ""
+            st.session_state.js_bridge_input = ""  # Clear bridge
             st.rerun()
 
-    # ── DATA PREP ────────────────────────────────────────────────────────────
+    # ── DATA PREP ─────────────────────────────────────────────────────────────
     fr = st.session_state.final_report
     quick_rej_sids = [
         k.replace("quick_rej_", "")
@@ -2011,7 +2015,7 @@ def render_image_grid():
     valid_grid_df = fr[mask]
 
     c_rev_1, c_rev_2, c_rev_3 = st.columns([1.5, 1.5, 2])
-    with c_rev_1: search_n  = st.text_input("Search by Name", placeholder="Product name...")
+    with c_rev_1: search_n  = st.text_input("Search by Name",              placeholder="Product name...")
     with c_rev_2: search_sc = st.text_input("Search by Seller / Category", placeholder="Seller or Category...")
     with c_rev_3:
         st.session_state.grid_items_per_page = st.select_slider(
@@ -2020,7 +2024,9 @@ def render_image_grid():
 
     # ── BATCH REASON SELECTOR ─────────────────────────────────────────────────
     with st.container(border=True):
-        st.markdown("<p style='font-weight:700;margin:0 0 10px 0;'>Batch Rejection Mode</p>", unsafe_allow_html=True)
+        st.markdown(
+            "<p style='font-weight:700;margin:0 0 10px 0;'>Batch Rejection Mode</p>",
+            unsafe_allow_html=True)
         batch_options = list(_get_batch_labels().keys())
         grid_reason = st.segmented_control(
             "Batch reason", batch_options,
@@ -2041,7 +2047,8 @@ def render_image_grid():
             else (f"Other: {grid_custom_comment[:40]}..." if grid_custom_comment.strip()
                   else "Other Reason — enter comment above"))
         st.markdown(
-            f"<div class='batch-info-box' style='background:var(--background-color,{JUMIA_COLORS['light_gray']});'>"
+            f"<div class='batch-info-box' "
+            f"style='background:var(--background-color,{JUMIA_COLORS['light_gray']});'>"
             f"<span style='font-size:12px;font-weight:600;'>Active Reason:</span>"
             f"<span style='font-size:13px;font-weight:700;margin-left:8px;'>{active_label}</span>"
             f"</div>",
@@ -2054,7 +2061,8 @@ def render_image_grid():
         left_on='ProductSetSid', right_on='PRODUCT_SET_SID', how='left')
 
     if search_n:
-        review_data = review_data[review_data['NAME'].astype(str).str.contains(search_n, case=False, na=False)]
+        review_data = review_data[
+            review_data['NAME'].astype(str).str.contains(search_n, case=False, na=False)]
     if search_sc:
         mc = (review_data['CATEGORY'].astype(str).str.contains(search_sc, case=False, na=False)
               if 'CATEGORY' in review_data.columns else False)
@@ -2069,92 +2077,96 @@ def render_image_grid():
     page_data = review_data.iloc[
         st.session_state.grid_page * items_per_page :
         (st.session_state.grid_page + 1) * items_per_page]
-    
-    cur_sids   = page_data['PRODUCT_SET_SID'].tolist()
-    sids_json  = json.dumps(cur_sids)
+    cur_sids  = page_data['PRODUCT_SET_SID'].tolist()
+    sids_json = json.dumps(cur_sids)
 
-    # ── INJECT CURRENT PAGE SIDs + STICKY NAV JS HANDLERS ────────────────────
+    # Inject current page SIDs into parent doc scope for JS access
     components.html(f"""
-    <script>
-    (function() {{
-      var doc = window.parent.document;
-      // Store current page SIDs so nav buttons can call selectAll/deselectAll
-      doc.__curPageSids = {sids_json};
-    }})();
-    </script>
-    """, height=0, width=0)
+<script>
+(function() {{
+  window.parent.document.__curPageSids = {sids_json};
+}})();
+</script>
+""", height=0, width=0)
 
-    # Callbacks that navigate and deselect stale page SIDs
+    # ── NAVIGATION CALLBACKS ──────────────────────────────────────────────────
     def cb_prev():
-        # Clear quick_rej checks before page change
-        for s in cur_sids: st.session_state.pop(f"grid_chk_{s}", None)
         st.session_state.grid_page -= 1
         st.session_state.do_scroll_top = True
 
     def cb_next():
-        for s in cur_sids: st.session_state.pop(f"grid_chk_{s}", None)
         st.session_state.grid_page += 1
         st.session_state.do_scroll_top = True
+
+    action_key = "OTHER_CUSTOM" if grid_reason == "OTHER_CUSTOM" else grid_reason
 
     # ── STICKY HEADER ─────────────────────────────────────────────────────────
     with st_yled.sticky_header(background_color="#FFFFFF", padding="15px 10px", key="sticky-nav-top"):
         col_pg1, col_pg2, col_pg3, col_sel, col_desel, col_rej, col_badge = st.columns(
             [0.8, 1.2, 0.8, 0.7, 0.9, 1.8, 1.2])
-        
+
         col_pg1.button(
             ":material/arrow_back: Prev", key="pt",
             disabled=(st.session_state.grid_page == 0),
             use_container_width=True, on_click=cb_prev)
-            
+
         col_pg2.markdown(
             f"<p style='text-align:center;margin:0;padding:10px 0;font-weight:600;'>"
             f"Page {st.session_state.grid_page + 1} of {total_pages}</p>",
             unsafe_allow_html=True)
-            
+
         col_pg3.button(
             "Next :material/arrow_forward:", key="nt",
             disabled=(st.session_state.grid_page >= total_pages - 1),
             use_container_width=True, on_click=cb_next)
 
-        # These buttons call pure JS — zero Python rerun
+        # Pure JS buttons — no Python rerun on click
         col_sel.markdown(
             f"<button onclick=\"window.parent.document.__jsSelectAll && "
             f"window.parent.document.__jsSelectAll({sids_json})\" "
-            f"style='width:100%;padding:8px 4px;border-radius:4px;border:2px solid {JUMIA_COLORS['primary_orange']};"
-            f"background:white;color:{JUMIA_COLORS['primary_orange']};font-weight:600;cursor:pointer;font-size:13px;'>"
+            f"style='width:100%;padding:8px 4px;border-radius:4px;"
+            f"border:2px solid {JUMIA_COLORS['primary_orange']};"
+            f"background:white;color:{JUMIA_COLORS['primary_orange']};"
+            f"font-weight:600;cursor:pointer;font-size:13px;'>"
             f"Select All</button>",
             unsafe_allow_html=True)
-            
+
         col_desel.markdown(
             f"<button onclick=\"window.parent.document.__jsDeselectAll && "
             f"window.parent.document.__jsDeselectAll({sids_json})\" "
-            f"style='width:100%;padding:8px 4px;border-radius:4px;border:2px solid {JUMIA_COLORS['border_gray']};"
-            f"background:white;color:{JUMIA_COLORS['medium_gray']};font-weight:600;cursor:pointer;font-size:13px;'>"
+            f"style='width:100%;padding:8px 4px;border-radius:4px;"
+            f"border:2px solid {JUMIA_COLORS['border_gray']};"
+            f"background:white;color:{JUMIA_COLORS['medium_gray']};"
+            f"font-weight:600;cursor:pointer;font-size:13px;'>"
             f"Deselect All</button>",
             unsafe_allow_html=True)
 
-        action_key = "OTHER_CUSTOM" if grid_reason == "OTHER_CUSTOM" else grid_reason
         col_rej.markdown(
             f"<button onclick=\"window.parent.document.__jsCommit && "
             f"window.parent.document.__jsCommit('{action_key}')\" "
             f"style='width:100%;padding:8px 4px;border-radius:4px;border:none;"
-            f"background:{JUMIA_COLORS['primary_orange']};color:white;font-weight:700;cursor:pointer;font-size:13px;'>"
+            f"background:{JUMIA_COLORS['primary_orange']};color:white;"
+            f"font-weight:700;cursor:pointer;font-size:13px;'>"
             f"🚫 Reject Selected</button>",
             unsafe_allow_html=True)
 
-        # Live selection count badge (updated by JS)
+        # Live badge — updated by JS, no Python involvement
         col_badge.markdown(
-            "<span id='js-sel-badge' "
-            "style='display:none;background:#4CAF50;color:white;padding:6px 14px;"
-            "border-radius:20px;font-weight:700;font-size:13px;'></span>",
+            "<span class='js-sel-badge' "
+            "style='display:none;background:#4CAF50;color:white;"
+            "padding:6px 14px;border-radius:20px;font-weight:700;font-size:13px;'></span>",
             unsafe_allow_html=True)
 
     # ── SCROLL TO TOP ─────────────────────────────────────────────────────────
     if st.session_state.get('do_scroll_top', False):
-        components.html("""<script>var doc = window.parent.document;var main = doc.querySelector('.main') || doc.querySelector('[data-testid="stAppViewContainer"]');if (main) main.scrollTo({top:0, behavior:'smooth'});</script>""", height=0, width=0)
+        components.html("""<script>
+var doc = window.parent.document;
+var main = doc.querySelector('.main') || doc.querySelector('[data-testid="stAppViewContainer"]');
+if (main) main.scrollTo({top:0, behavior:'smooth'});
+</script>""", height=0, width=0)
         st.session_state.do_scroll_top = False
 
-    # ── IMAGE QUALITY CHECKS (cached) ─────────────────────────────────────────
+    # ── IMAGE QUALITY CHECKS (cached 24h) ────────────────────────────────────
     page_warnings = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_sid = {
@@ -2199,17 +2211,17 @@ def render_image_grid():
     with st.container():
         col_pg1_b, col_pg2_b, col_pg3_b, col_sel_b, col_desel_b, col_rej_b, col_badge_b = st.columns(
             [0.8, 1.2, 0.8, 0.7, 0.9, 1.8, 1.2])
-        
+
         col_pg1_b.button(
             ":material/arrow_back: Prev", key="pb",
             disabled=(st.session_state.grid_page == 0),
             use_container_width=True, on_click=cb_prev)
-            
+
         col_pg2_b.markdown(
             f"<p style='text-align:center;margin:0;padding:10px 0;font-weight:600;'>"
             f"Page {st.session_state.grid_page + 1} of {total_pages}</p>",
             unsafe_allow_html=True)
-            
+
         col_pg3_b.button(
             "Next :material/arrow_forward:", key="nb",
             disabled=(st.session_state.grid_page >= total_pages - 1),
@@ -2218,16 +2230,20 @@ def render_image_grid():
         col_sel_b.markdown(
             f"<button onclick=\"window.parent.document.__jsSelectAll && "
             f"window.parent.document.__jsSelectAll({sids_json})\" "
-            f"style='width:100%;padding:8px 4px;border-radius:4px;border:2px solid {JUMIA_COLORS['primary_orange']};"
-            f"background:white;color:{JUMIA_COLORS['primary_orange']};font-weight:600;cursor:pointer;font-size:13px;'>"
+            f"style='width:100%;padding:8px 4px;border-radius:4px;"
+            f"border:2px solid {JUMIA_COLORS['primary_orange']};"
+            f"background:white;color:{JUMIA_COLORS['primary_orange']};"
+            f"font-weight:600;cursor:pointer;font-size:13px;'>"
             f"Select All</button>",
             unsafe_allow_html=True)
-            
+
         col_desel_b.markdown(
             f"<button onclick=\"window.parent.document.__jsDeselectAll && "
             f"window.parent.document.__jsDeselectAll({sids_json})\" "
-            f"style='width:100%;padding:8px 4px;border-radius:4px;border:2px solid {JUMIA_COLORS['border_gray']};"
-            f"background:white;color:{JUMIA_COLORS['medium_gray']};font-weight:600;cursor:pointer;font-size:13px;'>"
+            f"style='width:100%;padding:8px 4px;border-radius:4px;"
+            f"border:2px solid {JUMIA_COLORS['border_gray']};"
+            f"background:white;color:{JUMIA_COLORS['medium_gray']};"
+            f"font-weight:600;cursor:pointer;font-size:13px;'>"
             f"Deselect All</button>",
             unsafe_allow_html=True)
 
@@ -2235,20 +2251,20 @@ def render_image_grid():
             f"<button onclick=\"window.parent.document.__jsCommit && "
             f"window.parent.document.__jsCommit('{action_key}')\" "
             f"style='width:100%;padding:8px 4px;border-radius:4px;border:none;"
-            f"background:{JUMIA_COLORS['primary_orange']};color:white;font-weight:700;cursor:pointer;font-size:13px;'>"
+            f"background:{JUMIA_COLORS['primary_orange']};color:white;"
+            f"font-weight:700;cursor:pointer;font-size:13px;'>"
             f"🚫 Reject Selected</button>",
             unsafe_allow_html=True)
 
         col_badge_b.markdown(
-            "<span id='js-sel-badge-bot' "
-            "style='display:none;background:#4CAF50;color:white;padding:6px 14px;"
-            "border-radius:20px;font-weight:700;font-size:13px;'></span>",
+            "<span class='js-sel-badge' "
+            "style='display:none;background:#4CAF50;color:white;"
+            "padding:6px 14px;border-radius:20px;font-weight:700;font-size:13px;'></span>",
             unsafe_allow_html=True)
 
 
 # ==========================================
 # SECTION 3: EXPORTS
-# --- FIX 6: Wrapped in @st.fragment to isolate reruns ---
 # ==========================================
 @st.fragment
 def render_exports_section():
