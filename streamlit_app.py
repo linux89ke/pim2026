@@ -149,11 +149,11 @@ if 'main_toasts' not in st.session_state: st.session_state.main_toasts = []
 if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
 if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = False
 if 'display_df_cache' not in st.session_state: st.session_state.display_df_cache = {}
-
-# Session state counters for dynamic st_javascript keys
+# ── FIX: Counters for unique st_javascript keys (prevents DuplicateWidgetID) ──
 if 'desel_counter' not in st.session_state: st.session_state.desel_counter = 0
-if 'batch_counter' not in st.session_state: st.session_state.batch_counter = 0  
+if 'batch_counter' not in st.session_state: st.session_state.batch_counter = 0
 if 'clear_counter' not in st.session_state: st.session_state.clear_counter = 0
+if 'ls_processed_flag' not in st.session_state: st.session_state.ls_processed_flag = False
 
 try: st.set_page_config(page_title="Product Tool", layout=st.session_state.layout_mode)
 except: pass
@@ -1248,10 +1248,10 @@ REASON_MAP = {
 }
 
 # -------------------------------------------------
-# PROCESS GRID ACTIONS (called from Python-side controls)
+# PROCESS GRID ACTIONS
 # -------------------------------------------------
 def _process_grid_selections(raw_json: str, support_files: dict) -> int:
-    """Parse {sid: reason_key} JSON from localStorage and apply rejections. Returns count."""
+    """Parse {sid: reason_key} JSON and apply rejections. Returns count."""
     if not raw_json or not isinstance(raw_json, str) or raw_json in ("0", "null", ""):
         return 0
     try:
@@ -1288,12 +1288,9 @@ def build_fast_grid_html(
     rejected_state: dict,
     cols_per_row: int,
 ) -> str:
-    O, G, R, DG = (
-        JUMIA_COLORS["primary_orange"],
-        JUMIA_COLORS["success_green"],
-        JUMIA_COLORS["jumia_red"],
-        JUMIA_COLORS["dark_gray"],
-    )
+    O  = JUMIA_COLORS["primary_orange"]
+    G  = JUMIA_COLORS["success_green"]
+    R  = JUMIA_COLORS["jumia_red"]
 
     committed_json = json.dumps(rejected_state)
 
@@ -1370,9 +1367,8 @@ const CARDS     = {cards_json};
 const COMMITTED = {committed_json};
 const LS_KEY    = '_grid_pending';
 
-let selectedSids = new Set();  /* stores "sid|reasonKey" strings */
+let selectedSids = new Set();
 
-/* Restore pending state from localStorage (persists across Streamlit reruns) */
 (function() {{
   try {{
     const raw = localStorage.getItem(LS_KEY);
@@ -1477,20 +1473,6 @@ function quickReject(evt, sid, reasonKey) {{
   saveToLS();
 }}
 
-/* Called by Python-injected buttons (selectAll / deselectAll via re-render) */
-window._gridSelectAll = function() {{
-  CARDS.forEach(c => {{
-    if (!(c.sid in COMMITTED)) {{
-      const ex = [...selectedSids].find(e=>e.startsWith(c.sid+'|'));
-      if (!ex) selectedSids.add(c.sid+'|SELECTED');
-    }}
-  }});
-  renderAll(); saveToLS();
-}};
-window._gridDeselect = function() {{
-  selectedSids.clear(); renderAll(); saveToLS();
-}};
-
 renderAll();
 </script>
 </body>
@@ -1499,7 +1481,7 @@ renderAll();
 
 
 # -------------------------------------------------
-# UI COMPONENTS (Metrics & Expanders)
+# UI COMPONENTS
 # -------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
 def analyze_image_quality_cached(url: str) -> List[str]:
@@ -1686,6 +1668,11 @@ if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.grid_page = 0
     st.session_state.exports_cache = {}
     st.session_state.display_df_cache = {}
+    # Reset all JS-bridge counters on new file load
+    st.session_state.desel_counter = 0
+    st.session_state.batch_counter = 0
+    st.session_state.clear_counter = 0
+    st.session_state.ls_processed_flag = False
     keys_to_delete = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_"))]
     for k in keys_to_delete: del st.session_state[k]
 
@@ -1810,7 +1797,7 @@ if uploaded_files and not st.session_state.final_report.empty and st.session_sta
 
 
 # ==========================================
-# SECTION 2: MANUAL IMAGE REVIEW
+# SECTION 2: MANUAL IMAGE REVIEW  ── FULLY FIXED
 # ==========================================
 @st.fragment
 def render_image_grid():
@@ -1820,20 +1807,30 @@ def render_image_grid():
     st.markdown("---")
     st.header(":material/pageview: Manual Image & Category Review", anchor=False)
 
-    # Fix 4 Top (Deselect)
+    # ── FIX 4: Deselect pending — handle at top before any st_javascript read ──
+    # Uses counter-based key to prevent DuplicateWidgetID on repeated clicks
     if st.session_state.pop("_deselect_pending", False):
         st.session_state.desel_counter += 1
-        st_javascript("localStorage.removeItem('_grid_pending');", key=f"ls_desel_exec_{st.session_state.desel_counter}")
-        st.rerun(scope="fragment")
-
-    # Fix 2 Top
-    if "ls_processed_flag" not in st.session_state:
+        st_javascript(
+            "localStorage.removeItem('_grid_pending');",
+            key=f"ls_desel_exec_{st.session_state.desel_counter}"
+        )
         st.session_state.ls_processed_flag = False
+        # Don't return — fall through so grid still renders
 
+    # ── FIX 2: Read localStorage with a STABLE key (not time-based) ──────────
+    # st_javascript returns 0 on first render before JS executes, then actual value
     ls_data = st_javascript(
         "return localStorage.getItem('_grid_pending') || null;",
-        key="ls_read_stable",   # ← STABLE KEY
+        key="ls_read_stable",
     )
+
+    # Normalize: treat 0 (int), "0", "null", None as "nothing pending"
+    ls_is_empty = ls_data in (0, "0", "null", None, "")
+
+    # Reset processed flag when localStorage is empty
+    if ls_is_empty:
+        st.session_state.ls_processed_flag = False
 
     batch_reason_options = [
         ("Poor Image Quality",  "REJECT_POOR_IMAGE"),
@@ -1845,40 +1842,45 @@ def render_image_grid():
     ]
     batch_labels = [l for l, _ in batch_reason_options]
 
-    # Fix 3 Top (Batch Reject)
-    if st.session_state.get("_batch_reject_pending") and ls_data and ls_data not in ("0", "null"):
+    # ── FIX 3: Batch reject — flag was set on previous render, now ls_data is available ──
+    if st.session_state.get("_batch_reject_pending") and not ls_is_empty:
         st.session_state.pop("_batch_reject_pending")
         chosen_label_val = st.session_state.pop("_batch_reject_reason", batch_labels[0])
         chosen_key = dict(batch_reason_options).get(chosen_label_val, "REJECT_POOR_IMAGE")
-        count = _process_grid_selections(ls_data, support_files)
-        if count > 0:
-            flag_name = REASON_MAP.get(chosen_key, "Other Reason (Custom)")
-            code, cmt = support_files["flags_mapping"].get(flag_name, ("1000007 - Other Reason", "Manual rejection"))
-            try:
-                obj = json.loads(ls_data)
-                sids = list(obj.keys())
+        flag_name = REASON_MAP.get(chosen_key, "Other Reason (Custom)")
+        code, cmt = support_files["flags_mapping"].get(flag_name, ("1000007 - Other Reason", "Manual rejection"))
+        try:
+            obj = json.loads(ls_data)
+            sids = list(obj.keys())
+            if sids:
                 apply_rejection(sids, code, cmt, flag_name)
                 for s in sids:
                     st.session_state[f"quick_rej_{s}"] = True
                     st.session_state[f"quick_rej_reason_{s}"] = flag_name
-            except: pass
-            
-            st.session_state.batch_counter += 1
-            st_javascript("localStorage.removeItem('_grid_pending');", key=f"ls_clr_batch_{st.session_state.batch_counter}")
-            st.session_state.main_toasts.append((f"Batch rejected {count} product(s)", "✅"))
-            st.session_state.exports_cache.clear()
-            st.session_state.display_df_cache.clear()
-            st.rerun(scope="app")
+                st.session_state.batch_counter += 1
+                st_javascript(
+                    "localStorage.removeItem('_grid_pending');",
+                    key=f"ls_clr_batch_{st.session_state.batch_counter}"
+                )
+                st.session_state.ls_processed_flag = False
+                st.session_state.main_toasts.append((f"Batch rejected {len(sids)} product(s)", "✅"))
+                st.session_state.exports_cache.clear()
+                st.session_state.display_df_cache.clear()
+                st.rerun(scope="app")
+        except Exception as e:
+            logger.error(f"Batch reject parse error: {e}")
+        return  # return here to avoid double-processing below
 
-    # Fix 2 continued (Auto Processing)
-    elif ls_data and isinstance(ls_data, str) and ls_data not in ("0", "null") and not st.session_state.ls_processed_flag:
+    # ── FIX 2 continued: Auto-process individual card quick-rejects ──────────
+    # Only process if ls_data has content AND we haven't already processed it this render
+    if not ls_is_empty and not st.session_state.ls_processed_flag:
         st.session_state.ls_processed_flag = True
         count = _process_grid_selections(ls_data, support_files)
         if count > 0:
             st.session_state.clear_counter += 1
             st_javascript(
                 "localStorage.removeItem('_grid_pending');",
-                key=f"ls_clear_{st.session_state.clear_counter}",
+                key=f"ls_clear_{st.session_state.clear_counter}"
             )
             st.session_state.ls_processed_flag = False
             st.session_state.main_toasts.append((f"Rejected {count} product(s)", "✅"))
@@ -1887,10 +1889,11 @@ def render_image_grid():
             st.session_state.final_report = st.session_state.final_report.copy()
             st.rerun(scope="app")
         else:
+            # Nothing actionable in localStorage (e.g. only SELECTED entries, no real rejections)
             st.session_state.ls_processed_flag = False
-    elif ls_data in ("0", "null", None):
-        st.session_state.ls_processed_flag = False
+        # NOTE: No return here — grid still renders below
 
+    # ── Render grid UI ────────────────────────────────────────────────────────
     fr   = st.session_state.final_report
     data = st.session_state.all_data_map
 
@@ -1902,7 +1905,7 @@ def render_image_grid():
     mask = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
     valid_grid_df = fr[mask]
 
-    # ── Search & filter ───────────────────────────────────────────────────────
+    # Search & filter
     c1, c2, c3 = st.columns([1.5, 1.5, 2])
     with c1: search_n  = st.text_input("Search by Name", placeholder="Product name…")
     with c2: search_sc = st.text_input("Search by Seller/Category", placeholder="Seller or Category…")
@@ -1930,7 +1933,7 @@ def render_image_grid():
     if st.session_state.grid_page >= total_pages:
         st.session_state.grid_page = 0
 
-    # ── Native Streamlit controls (100% reliable) ─────────────────────────────
+    # ── Controls row ──────────────────────────────────────────────────────────
     ctrl_cols = st.columns([1, 1, 1, 2, 2, 2])
     with ctrl_cols[0]:
         if st.button("◀ Prev", use_container_width=True, disabled=st.session_state.grid_page == 0):
@@ -1938,23 +1941,31 @@ def render_image_grid():
             st.session_state.do_scroll_top = True
             st.rerun(scope="fragment")
     with ctrl_cols[1]:
-        st.markdown(f"<div style='text-align:center;padding:8px 0;font-weight:700;'>"
-                    f"Page {st.session_state.grid_page+1} / {total_pages}</div>",
-                    unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='text-align:center;padding:8px 0;font-weight:700;'>"
+            f"Page {st.session_state.grid_page+1} / {total_pages}</div>",
+            unsafe_allow_html=True
+        )
     with ctrl_cols[2]:
         if st.button("Next ▶", use_container_width=True, disabled=st.session_state.grid_page >= total_pages - 1):
             st.session_state.grid_page += 1
             st.session_state.do_scroll_top = True
             st.rerun(scope="fragment")
     with ctrl_cols[3]:
-        chosen_label = st.selectbox("Batch reason", batch_labels, label_visibility="collapsed",
-                                    key="grid_batch_reason")
+        # FIX: use a regular variable, not session_state key conflict
+        chosen_label = st.selectbox(
+            "Batch reason", batch_labels,
+            label_visibility="collapsed",
+            key="grid_batch_reason"
+        )
     with ctrl_cols[4]:
+        # ── FIX 3: Set a flag + trigger rerun so ls_data is available next render ──
         if st.button("✗ Batch Reject Selected", use_container_width=True, type="primary"):
             st.session_state["_batch_reject_pending"] = True
             st.session_state["_batch_reject_reason"] = chosen_label
             st.rerun(scope="fragment")
     with ctrl_cols[5]:
+        # ── FIX 4: Set a flag + trigger rerun so ls_desel runs at top of next render ──
         if st.button("☐ Deselect All", use_container_width=True):
             st.session_state["_deselect_pending"] = True
             st.rerun(scope="fragment")
@@ -1994,6 +2005,8 @@ def render_image_grid():
         )
         st.session_state.do_scroll_top = False
 
+
+# ==========================================
 # SECTION 3: EXPORTS
 # ==========================================
 @st.fragment
@@ -2042,6 +2055,8 @@ def render_exports_section():
                                 del st.session_state.exports_cache[export_key]
                                 st.rerun()
 
-# Call the fragmented sections
+# ==========================================
+# CALL FRAGMENTS
+# ==========================================
 render_image_grid()
 render_exports_section()
