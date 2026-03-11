@@ -144,7 +144,6 @@ if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
 if 'bg_executor' not in st.session_state: st.session_state.bg_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = False
 if 'display_df_cache' not in st.session_state: st.session_state.display_df_cache = {}
-if 'js_bridge_input' not in st.session_state: st.session_state.js_bridge_input = ""
 
 try: st.set_page_config(page_title="Product Tool", layout=st.session_state.layout_mode)
 except: pass
@@ -221,22 +220,8 @@ st.markdown(f"""
         div[data-testid="stVerticalBlockBorderWrapper"] {{ overflow: visible !important; }}
 
         .rejected-card-overlay {{ position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(231, 60, 23, 0.9); color: white; padding: 8px 16px; border-radius: 20px; font-weight: bold; font-size: 12px; white-space: nowrap; display: flex; align-items: center; }}
-
-        /* JS-selectable card base style */
-        .js-img-card {{ transition: border 0.12s ease, box-shadow 0.12s ease; }}
-        .js-img-card:hover {{ border-color: {JUMIA_COLORS['primary_orange']} !important; }}
-
+        
         div[data-testid="stVerticalBlockBorderWrapper"] .stButton > button {{ white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; font-size: 11px !important; padding: 6px 4px !important; min-height: 36px !important; line-height: 1.2 !important; }}
-
-        /* Hide the JS bridge input completely */
-        div[data-testid="stTextInput"]:has(input[aria-label="__js_bridge__"]) {{
-            position: absolute !important;
-            opacity: 0 !important;
-            pointer-events: none !important;
-            height: 0 !important;
-            width: 0 !important;
-            overflow: hidden !important;
-        }}
     </style>
 """, unsafe_allow_html=True)
 
@@ -285,6 +270,7 @@ def create_match_key(row: pd.Series) -> str:
     color = normalize_text(row.get('COLOR', ''))
     return f"{brand}|{name}|{color}"
 
+# --- FIX 1: df_hash utility ---
 def df_hash(df: pd.DataFrame) -> str:
     try:
         return hashlib.md5(pd.util.hash_pandas_object(df, index=True).values).hexdigest()
@@ -410,6 +396,7 @@ def safe_excel_read(filename: str, sheet_name, usecols=None) -> pd.DataFrame:
         logger.error(f"Error reading tab '{sheet_name}' from {filename}: {e}")
         return pd.DataFrame()
 
+# --- LOCAL: PROHIBITED PRODUCTS ---
 @st.cache_data(ttl=3600)
 def load_prohibited_from_local() -> Dict[str, List[Dict]]:
     FILE_NAME = "Prohibbited.xlsx"
@@ -441,6 +428,7 @@ def load_prohibited_from_local() -> Dict[str, List[Dict]]:
             prohibited_by_country[tab] = []
     return prohibited_by_country
 
+# --- LOCAL: RESTRICTED BRANDS ---
 @st.cache_data(ttl=3600)
 def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
     FILE_NAME = "Restricted_Brands.xlsx"
@@ -482,6 +470,7 @@ def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
             config_by_country[country_name] = []
     return config_by_country
 
+# --- LOCAL: REFURBISHED DATA ---
 @st.cache_data(ttl=3600)
 def load_refurb_data_from_local() -> dict:
     FILE_NAME = "Refurb.xlsx"
@@ -516,6 +505,7 @@ def load_refurb_data_from_local() -> dict:
         result["keywords"] = {"refurb", "refurbished", "renewed"}
     return result
 
+# --- LOCAL: PERFUME DATA ---
 @st.cache_data(ttl=3600)
 def load_perfume_data_from_local() -> Dict:
     FILE_NAME = "Perfume.xlsx"
@@ -550,6 +540,7 @@ def load_perfume_data_from_local() -> Dict:
     except Exception as e: result["category_codes"] = set()
     return result
 
+# --- LOCAL: BOOKS DATA ---
 @st.cache_data(ttl=3600)
 def load_books_data_from_local() -> Dict:
     FILE_NAME = "Books_sellers.xlsx"
@@ -574,6 +565,7 @@ def load_books_data_from_local() -> Dict:
     except Exception as e: result["category_codes"] = set()
     return result
 
+# --- LOCAL: JERSEYS DATA ---
 @st.cache_data(ttl=3600)
 def load_jerseys_from_local() -> Dict:
     FILE_NAME = "Jersey_validation.xlsx"
@@ -601,6 +593,7 @@ def load_jerseys_from_local() -> Dict:
     except Exception as e: logger.error(f"Error: {e}")
     return result
 
+# --- LOCAL: SUSPECTED FAKE DATA ---
 @st.cache_data(ttl=3600)
 def load_suspected_fake_from_local() -> pd.DataFrame:
     try:
@@ -1101,21 +1094,28 @@ def check_incomplete_smartphone_name(data: pd.DataFrame, smartphone_category_cod
     if not flagged.empty: flagged['Comment_Detail'] = "Name missing Storage/Memory spec (e.g., 64GB)"
     return flagged.drop_duplicates(subset=['PRODUCT_SET_SID'])
 
+# --- FIX 4: Fast O(n) duplicate check replacing O(n²) TF-IDF ---
 def check_duplicate_products(data: pd.DataFrame, exempt_categories: List[str] = None, similarity_threshold: float = 0.70, known_colors: List[str] = None, **kwargs) -> pd.DataFrame:
     if not {'NAME', 'SELLER_NAME', 'BRAND'}.issubset(data.columns):
         return pd.DataFrame(columns=data.columns)
+
     d = data.copy()
     if exempt_categories and 'CATEGORY_CODE' in d.columns:
-        d = d[~d['CATEGORY_CODE'].apply(clean_category_code).isin(set(clean_category_code(c) for c in exempt_categories))]
+        d = d[~d['CATEGORY_CODE'].apply(clean_category_code).isin(
+            set(clean_category_code(c) for c in exempt_categories))]
     if d.empty:
         return pd.DataFrame(columns=data.columns)
+
+    # Fast exact normalized key — O(n)
     d['_norm_name'] = d['NAME'].astype(str).apply(lambda x: re.sub(r'\s+', '', normalize_text(x)))
     d['_norm_brand'] = d['BRAND'].astype(str).str.lower().str.strip()
     d['_norm_seller'] = d['SELLER_NAME'].astype(str).str.lower().str.strip()
     d['_dedup_key'] = d['_norm_seller'] + '|' + d['_norm_brand'] + '|' + d['_norm_name']
+
     seen_keys: dict = {}
     rej: set = set()
     details: dict = {}
+
     for _, row in d.iterrows():
         key = row['_dedup_key']
         sid = str(row['PRODUCT_SET_SID'])
@@ -1124,8 +1124,10 @@ def check_duplicate_products(data: pd.DataFrame, exempt_categories: List[str] = 
             details[sid] = {'base': str(row['NAME'])[:40]}
         else:
             seen_keys[key] = sid
+
     if not rej:
         return pd.DataFrame(columns=data.columns)
+
     rdf = d[d['PRODUCT_SET_SID'].astype(str).isin(rej)].copy()
     rdf['Comment_Detail'] = rdf['PRODUCT_SET_SID'].apply(
         lambda sid: f"Duplicate: '{details[str(sid)]['base']}'" if str(sid) in details else "Duplicate detected"
@@ -1137,6 +1139,8 @@ def check_duplicate_products(data: pd.DataFrame, exempt_categories: List[str] = 
 
 # -------------------------------------------------
 # MASTER VALIDATION RUNNER
+# --- FIX 2: Removed st.write from ThreadPoolExecutor ---
+# --- FIX 1: Wrapped in cached_validate_products below ---
 # -------------------------------------------------
 def validate_products(data: pd.DataFrame, support_files: Dict, country_validator: CountryValidator, data_has_warranty_cols: bool, common_sids: Optional[set] = None, skip_validators: Optional[List[str]] = None):
     data['PRODUCT_SET_SID'] = data['PRODUCT_SET_SID'].astype(str).str.strip()
@@ -1177,6 +1181,7 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
     restricted_keys = {}
     validation_errors = []
 
+    # FIX 2: Use spinner instead of st.status + st.write to avoid per-check rerenders
     with st.spinner("Validating products... This may take a moment."):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             future_to_name = {}
@@ -1247,8 +1252,11 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
     return country_validator.ensure_status_column(final_df), results
 
 
+# --- FIX 1: Cached wrapper for validate_products ---
 @st.cache_data(show_spinner=False, ttl=3600)
 def cached_validate_products(data_hash: str, _data: pd.DataFrame, _support_files: Dict, country_code: str, data_has_warranty_cols: bool):
+    """Cache validation results keyed by data hash + country. 
+    Prevents re-running 21 checks on every button click or widget interaction."""
     country_name = next(
         (k for k, v in CountryValidator.COUNTRY_CONFIG.items() if v['code'] == country_code),
         "Kenya"
@@ -1341,8 +1349,10 @@ def quick_reject_item(sid, reason_code, comment, flag_name, toast_name):
 
 def strip_html(text): return re.sub('<[^<]+?>', '', text) if isinstance(text, str) else text
 
+# --- FIX 5: Image quality cache persisted via st.cache_data (survives reruns) ---
 @st.cache_data(ttl=86400, show_spinner=False)
 def analyze_image_quality_cached(url: str) -> List[str]:
+    """Cached image quality check — persists across reruns for 24 hours."""
     if not url or not str(url).startswith("http"):
         return []
     warnings = []
@@ -1393,7 +1403,7 @@ def render_product_card(row, flags_mapping, country: str = 'Kenya', advisor_warn
             f = float(v)
             return f if f > 0 else None
         except (TypeError, ValueError): return None
-
+            
     raw_price = _to_float(row.get('GLOBAL_SALE_PRICE')) or _to_float(row.get('GLOBAL_PRICE')) or 0
     price_str = format_local_price(raw_price, country)
     price_overlay_html = (f"<div style='position:absolute;bottom:8px;left:8px;background:rgba(0,0,0,0.72);color:#fff;font-size:12px;font-weight:700;padding:3px 8px;border-radius:6px;letter-spacing:0.3px;z-index:5;'>{price_str}</div>" if price_str else "")
@@ -1414,56 +1424,26 @@ def render_product_card(row, flags_mapping, country: str = 'Kenya', advisor_warn
             with col_msg: st.markdown(f"""<div style="background: linear-gradient(135deg, {JUMIA_COLORS['jumia_red']}, #FF6B6B); color: white; padding: 8px 12px; border-radius: 6px; font-weight: bold; font-size: 11px; text-align: center;">{reason}</div>""", unsafe_allow_html=True)
             with col_btn: st.button(":material/undo:", key=f"res_{sid}", on_click=restore_single_item, args=(sid,), use_container_width=True, help="Undo rejection")
         else:
-            # ── ZOOM POPOVER (no checkbox — JS handles selection) ──────────────
-            with st.popover("🔍 Zoom", use_container_width=False):
-                st.image(img_url, use_container_width=True)
-                st.caption(raw_name)
+            col_chk, col_zm = st.columns([3, 1.5], vertical_alignment="center")
+            with col_chk: st.checkbox("Select", key=f"grid_chk_{sid}")
+            with col_zm:
+                with st.popover(":material/search:", use_container_width=True):
+                    st.image(img_url, use_container_width=True)
+                    st.caption(raw_name)
 
-            # ── WARNING BADGES ─────────────────────────────────────────────────
+            is_checked = st.session_state.get(f"grid_chk_{sid}", False)
             warnings_html = ""
             if advisor_warnings:
-                badges = "".join([
-                    f'<div style="background:rgba(255,193,7,0.95);color:#313133;font-size:10px;font-weight:800;'
-                    f'padding:4px 8px;border-radius:12px;box-shadow:0 2px 4px rgba(0,0,0,0.2);'
-                    f'display:flex;align-items:center;margin-bottom:4px;">'
-                    f'<span class="material-symbols-outlined" style="font-size:13px;margin-right:4px;">warning</span>{w}</div>'
-                    for w in advisor_warnings
-                ])
-                warnings_html = (
-                    f'<div style="position:absolute;top:8px;right:8px;'
-                    f'display:flex;flex-direction:column;z-index:10;">{badges}</div>'
-                )
+                badges = "".join([f'<div style="background:rgba(255,193,7,0.95);color:#313133;font-size:10px;font-weight:800;padding:4px 8px;border-radius:12px;box-shadow:0 2px 4px rgba(0,0,0,0.2);display:flex;align-items:center;margin-bottom:4px;"><span class="material-symbols-outlined" style="font-size:13px;margin-right:4px;">warning</span>{w}</div>' for w in advisor_warnings])
+                warnings_html = f'<div style="position:absolute;top:8px;right:8px;display:flex;flex-direction:column;z-index:10;">{badges}</div>'
 
-            # ── JS-DRIVEN SELECTABLE IMAGE CARD ───────────────────────────────
-            # Clicking the image toggles selection entirely in JS — zero Python rerun.
-            # The green border/overlay/tick are controlled by __jsToggle() in the parent doc.
-            st.markdown(f'''
-<div id="imgclick-{sid}"
-     data-sid="{sid}"
-     class="js-img-card"
-     style="position:relative;cursor:pointer;border-radius:10px;
-            border:2px solid #eee;box-shadow:none;
-            transition:border 0.12s ease,box-shadow 0.12s ease;
-            overflow:hidden;margin-bottom:8px;">
-  {warnings_html}
-  <div class="js-green-overlay"
-       style="display:none;position:absolute;inset:0;
-              background:rgba(76,175,80,0.12);border-radius:8px;
-              pointer-events:none;z-index:2;"></div>
-  <img src="{img_url}" loading="lazy"
-       style="width:100%;aspect-ratio:1/1;object-fit:contain;
-              background-color:#FFFFFF;border-radius:8px;display:block;">
-  {price_overlay_html}
-  <div class="js-tick"
-       style="display:none;position:absolute;bottom:10px;right:10px;
-              width:28px;height:28px;background:#4CAF50;border-radius:50%;
-              align-items:center;justify-content:center;
-              box-shadow:0 2px 8px rgba(0,0,0,0.3);z-index:10;">
-    <span class="material-symbols-outlined"
-          style="color:#fff;font-size:18px;line-height:1;font-weight:bold;">check</span>
-  </div>
-</div>
-''', unsafe_allow_html=True)
+            border_style = "3px solid #4CAF50" if is_checked else "1px solid #eee"
+            box_shadow = "0 0 0 3px rgba(76,175,80,0.2), 0 4px 16px rgba(76,175,80,0.15)" if is_checked else "none"
+            green_overlay = ("<div style='position:absolute;inset:0;background:rgba(76,175,80,0.1);border-radius:8px;pointer-events:none;z-index:2;'></div>" if is_checked else "")
+            tick_html = ("<div style='position:absolute;bottom:10px;right:10px;width:28px;height:28px;background:#4CAF50;border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,0.3);z-index:10;'><span class='material-symbols-outlined' style='color:#fff;font-size:18px;line-height:1;font-weight:bold;'>check</span></div>" if is_checked else "")
+            img_div_id = f"imgclick-{sid}"
+
+            st.markdown(f'<div id="{img_div_id}" style="position:relative;cursor:pointer;border-radius:10px;border:{border_style};box-shadow:{box_shadow};transition:border 0.15s ease,box-shadow 0.15s ease;overflow:hidden;margin-bottom:8px;">{warnings_html}{green_overlay}<img src="{img_url}" loading="lazy" style="width:100%;aspect-ratio: 1 / 1;object-fit:contain;background-color:#FFFFFF;border-radius:8px;display:block;">{price_overlay_html}{tick_html}</div>', unsafe_allow_html=True)
 
             st.markdown(f"""<div style="font-size:13px;line-height:1.4;margin:8px 0;"><span class='prod-name-tip' data-full="{raw_name_attr}">{name_text}</span>{color_badge_html}<div class='prod-meta-text' style="font-size:11px;margin-bottom:4px;">{cat_text}</div><div class='prod-brand-text' style="color:{JUMIA_COLORS['primary_orange']};font-weight:600;margin-bottom:8px;">{brand_text}</div><div class='prod-meta-text' style="font-size:10px;padding-top:8px;border-top:1px dashed #E0E0E0;">{seller_text}</div></div>""", unsafe_allow_html=True)
 
@@ -1510,7 +1490,9 @@ def bulk_approve_dialog(sids_to_process, title, subset_data, data_has_warranty_c
             st.session_state.display_df_cache.clear()
         st.rerun()
 
+# --- FIX 3: Cache merged display DataFrames in render_flag_expander ---
 def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_check, support_files, country_validator):
+    # Build display df once and cache it — avoids repeated pd.merge on every interaction
     cache_key = f"display_df_{title}"
     base_display_cols = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'CATEGORY', 'COLOR', 'GLOBAL_SALE_PRICE', 'GLOBAL_PRICE', 'PARENTSKU', 'SELLER_NAME']
     current_display_cols = base_display_cols.copy()
@@ -1656,7 +1638,6 @@ if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.grid_page = 0
     st.session_state.exports_cache = {}
     st.session_state.display_df_cache = {}
-    st.session_state.js_bridge_input = ""
     keys_to_delete = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_"))]
     for k in keys_to_delete: del st.session_state[k]
 
@@ -1723,6 +1704,7 @@ if st.session_state.get('last_processed_files') != process_signature:
                         if c in data.columns: data[c] = data[c].astype(str).fillna('')
                     if 'COLOR_FAMILY' not in data.columns: data['COLOR_FAMILY'] = ""
 
+                    # FIX 1: Use cached validation — won't re-run on button clicks
                     data_hash = df_hash(data) + country_validator.code
                     final_report, _ = cached_validate_products(data_hash, data, support_files, country_validator.code, data_has_warranty)
 
@@ -1780,414 +1762,8 @@ if uploaded_files and not st.session_state.final_report.empty and st.session_sta
 
 # ==========================================
 # SECTION 2: MANUAL IMAGE REVIEW
+# --- FIX 6: Wrapped in @st.fragment to isolate reruns ---
 # ==========================================
-
-# ── HELPER: build the self-contained HTML grid ───────────────────────────────
-# All buttons, JS, and cards live inside ONE components.html() iframe so that
-# onclick handlers work natively without crossing the iframe boundary.
-# The bridge crosses the boundary only ONCE when the user commits a rejection.
-def _build_grid_html(page_data, flags_mapping, country, page_warnings,
-                     rejected_sids_set, rejected_reasons_map,
-                     cols_per_row, current_page, total_pages,
-                     batch_options_dict, active_reason_key):
-    O  = JUMIA_COLORS['primary_orange']
-    R  = JUMIA_COLORS['jumia_red']
-    G  = JUMIA_COLORS['success_green']
-    DG = JUMIA_COLORS['dark_gray']
-    MG = JUMIA_COLORS['medium_gray']
-    LG = JUMIA_COLORS['light_gray']
-    BG = JUMIA_COLORS['border_gray']
-
-    sids_json = json.dumps(page_data['PRODUCT_SET_SID'].tolist())
-    batch_opts_html = "".join(
-        f'<option value="{v}" {"selected" if v == active_reason_key else ""}>{k}</option>'
-        for k, v in batch_options_dict.items()
-    )
-
-    parts = []
-
-    # ── CSS ──────────────────────────────────────────────────────────────────
-    parts.append(f"""
-<style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-          background: transparent; color: {DG}; }}
-
-  /* NAV BAR */
-  .nav-bar {{ display:flex; align-items:center; justify-content:space-between;
-              padding:10px 14px; background:#fff; border-radius:10px;
-              border:1px solid {BG}; margin-bottom:14px;
-              box-shadow:0 2px 8px rgba(0,0,0,0.06); flex-wrap:wrap; gap:8px; }}
-  .nav-left, .nav-right {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
-  .nav-page {{ font-weight:700; font-size:13px; white-space:nowrap; }}
-  .sel-badge {{ background:{G}; color:#fff; padding:4px 12px; border-radius:20px;
-                font-weight:700; font-size:12px; display:none; }}
-
-  /* SHARED BUTTON STYLE */
-  .btn {{ border:none; border-radius:5px; padding:7px 14px; font-weight:700;
-          font-size:12px; cursor:pointer; transition:opacity 0.15s; white-space:nowrap; }}
-  .btn:hover {{ opacity:0.85; }}
-  .btn:disabled {{ opacity:0.4; cursor:not-allowed; }}
-  .btn-outline {{ background:#fff; border:2px solid {O}; color:{O}; }}
-  .btn-ghost  {{ background:#fff; border:2px solid {BG}; color:{MG}; }}
-  .btn-primary {{ background:{O}; color:#fff; }}
-  .btn-danger  {{ background:{R}; color:#fff; }}
-
-  /* BATCH SELECT */
-  .batch-select {{ padding:6px 10px; border-radius:5px; border:1px solid {BG};
-                   font-size:12px; font-weight:600; outline:none; cursor:pointer;
-                   background:#fff; color:{DG}; }}
-
-  /* GRID */
-  .grid {{ display:grid; grid-template-columns:repeat({cols_per_row}, 1fr);
-           gap:14px; margin-top:6px; }}
-
-  /* CARD */
-  .card {{ border:2px solid {BG}; border-radius:10px; padding:10px;
-           background:#fff; position:relative; transition:border 0.12s, box-shadow 0.12s; }}
-  .card.selected {{ border-color:{G}; box-shadow:0 0 0 3px rgba(76,175,80,0.2);
-                    background:rgba(76,175,80,0.03); }}
-  .card.rejected {{ background:#fafafa; border-color:#ccc; }}
-
-  /* IMAGE AREA */
-  .img-wrap {{ position:relative; cursor:pointer; border-radius:8px; overflow:hidden;
-               aspect-ratio:1/1; background:#fff; }}
-  .card-img  {{ width:100%; height:100%; object-fit:contain; display:block;
-                transition:filter 0.2s; }}
-  .card.rejected .card-img {{ filter:grayscale(100%); opacity:0.4; }}
-
-  /* GREEN OVERLAY + TICK */
-  .sel-overlay {{ display:none; position:absolute; inset:0;
-                  background:rgba(76,175,80,0.12); pointer-events:none; z-index:2; }}
-  .card.selected .sel-overlay {{ display:block; }}
-  .sel-tick {{ display:none; position:absolute; bottom:8px; right:8px;
-               width:26px; height:26px; background:{G}; border-radius:50%;
-               align-items:center; justify-content:center;
-               box-shadow:0 2px 6px rgba(0,0,0,0.3); z-index:3;
-               font-size:15px; color:#fff; font-weight:bold; }}
-  .card.selected .sel-tick {{ display:flex; }}
-
-  /* PRICE TAG */
-  .price-tag {{ position:absolute; bottom:8px; left:8px;
-                background:rgba(0,0,0,0.72); color:#fff;
-                font-size:11px; font-weight:700; padding:3px 8px;
-                border-radius:5px; z-index:4; }}
-
-  /* WARNING BADGES */
-  .warn-wrap {{ position:absolute; top:8px; right:8px;
-                display:flex; flex-direction:column; gap:4px; z-index:5; }}
-  .warn-badge {{ background:rgba(255,193,7,0.95); color:{DG};
-                 font-size:10px; font-weight:800; padding:3px 8px;
-                 border-radius:10px; white-space:nowrap; }}
-
-  /* REJECTED OVERLAY */
-  .rej-overlay {{ position:absolute; inset:0; background:rgba(255,255,255,0.88);
-                  display:flex; flex-direction:column; align-items:center;
-                  justify-content:center; z-index:10; border-radius:8px; padding:10px; }}
-  .rej-badge {{ background:{R}; color:#fff; padding:4px 12px; border-radius:12px;
-                font-weight:700; font-size:11px; margin-bottom:8px; text-align:center; }}
-  .rej-reason {{ font-size:11px; font-weight:600; color:{R};
-                 text-align:center; margin-bottom:10px; padding:0 6px; }}
-
-  /* CARD META */
-  .card-meta {{ margin-top:8px; font-size:11px; line-height:1.45; }}
-  .card-name {{ font-weight:700; white-space:nowrap; overflow:hidden;
-                text-overflow:ellipsis; margin-bottom:3px; font-size:12px; }}
-  .card-brand {{ color:{O}; font-weight:700; margin-bottom:3px; }}
-  .card-cat   {{ color:{MG}; font-size:10px; margin-bottom:3px; }}
-  .card-seller {{ color:#999; font-size:9px; padding-top:5px;
-                  border-top:1px dashed {BG}; margin-top:5px; }}
-  .color-badge {{ display:inline-block; padding:2px 8px; border-radius:10px;
-                  font-size:9px; font-weight:600; border:1px solid {BG};
-                  background:{LG}; margin-bottom:4px; }}
-
-  /* CARD ACTIONS */
-  .card-actions {{ display:flex; gap:5px; margin-top:8px; }}
-  .act-btn {{ flex:1; padding:6px 4px; font-size:10px; font-weight:700;
-              border:none; border-radius:4px; cursor:pointer;
-              background:{O}; color:#fff; text-align:center; }}
-  .act-btn:hover {{ opacity:0.85; }}
-  .act-select {{ flex:1; font-size:10px; border:1px solid {BG}; border-radius:4px;
-                 padding:5px 4px; outline:none; cursor:pointer;
-                 background:#fff; color:{DG}; font-weight:600; }}
-</style>
-""")
-
-    # ── JS (all inside the iframe — no window.parent needed for interaction) ──
-    parts.append(f"""
-<script>
-  var SEL = new Set();
-
-  function sendBridge(payload) {{
-    // Cross-iframe bridge: write payload into hidden Streamlit text_input.
-    // Uses React's internal setter so onChange fires and Python gets the value.
-    var doc = window.parent.document;
-    // Primary selector: data attribute stamped by patcher snippet
-    var inp = doc.querySelector('input[data-card-bridge="1"]');
-    // Fallback: placeholder (works in some Streamlit versions)
-    if (!inp) inp = doc.querySelector('input[placeholder="__CARD_ACT__"]');
-    // Fallback 2: last stTextInput that is currently empty
-    if (!inp) {{
-      var all = doc.querySelectorAll('input[data-testid="stTextInput-Input"]');
-      for (var i = all.length - 1; i >= 0; i--) {{
-        if (!all[i].value) {{ inp = all[i]; break; }}
-      }}
-    }}
-    if (!inp) {{ console.warn('Card bridge input not found'); return; }}
-    var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-    setter.call(inp, payload);
-    inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
-  }}
-
-  function toggleCard(sid) {{
-    var card = document.getElementById('card-' + sid);
-    if (!card) return;
-    if (SEL.has(sid)) {{
-      SEL.delete(sid);
-      card.classList.remove('selected');
-    }} else {{
-      SEL.add(sid);
-      card.classList.add('selected');
-    }}
-    updateBadge();
-  }}
-
-  function selectAll() {{
-    var sids = {sids_json};
-    sids.forEach(function(sid) {{
-      SEL.add(sid);
-      var c = document.getElementById('card-' + sid);
-      if (c) c.classList.add('selected');
-    }});
-    updateBadge();
-  }}
-
-  function deselectAll() {{
-    SEL.clear();
-    document.querySelectorAll('.card').forEach(function(c) {{ c.classList.remove('selected'); }});
-    updateBadge();
-  }}
-
-  function updateBadge() {{
-    var b = document.getElementById('sel-badge');
-    if (b) {{
-      b.style.display = SEL.size > 0 ? 'inline-block' : 'none';
-      b.textContent   = SEL.size + ' selected';
-    }}
-  }}
-
-  function doBatchReject() {{
-    if (SEL.size === 0) {{ alert('No images selected. Click an image to select it.'); return; }}
-    var reason = document.getElementById('batch-reason').value;
-    sendBridge('BATCH_REJECT_' + reason + ':' + Array.from(SEL).join(','));
-  }}
-
-  function rejectOne(sid, reasonKey) {{
-    sendBridge('REJECT_ONE_' + reasonKey + ':' + sid);
-  }}
-
-  function restoreOne(sid) {{
-    sendBridge('RESTORE:' + sid);
-  }}
-</script>
-""")
-
-    # ── NAV BAR ──────────────────────────────────────────────────────────────
-    prev_disabled = 'disabled' if current_page == 0 else ''
-    next_disabled = 'disabled' if current_page >= total_pages - 1 else ''
-    parts.append(f"""
-<div class="nav-bar">
-  <div class="nav-left">
-    <button class="btn btn-outline" onclick="sendBridge('NAV_PREV:1')" {prev_disabled}>← Prev</button>
-    <span class="nav-page">Page {current_page + 1} of {total_pages}</span>
-    <button class="btn btn-outline" onclick="sendBridge('NAV_NEXT:1')" {next_disabled}>Next →</button>
-  </div>
-  <div class="nav-right">
-    <button class="btn btn-ghost" onclick="selectAll()">Select All</button>
-    <button class="btn btn-ghost" onclick="deselectAll()">Deselect All</button>
-    <span class="sel-badge" id="sel-badge">0 selected</span>
-    <select id="batch-reason" class="batch-select">{batch_opts_html}</select>
-    <button class="btn btn-danger" onclick="doBatchReject()">🚫 Batch Reject</button>
-  </div>
-</div>
-<div class="grid">
-""")
-
-    # ── CARDS ────────────────────────────────────────────────────────────────
-    for _, row in page_data.iterrows():
-        sid       = str(row['PRODUCT_SET_SID'])
-        img_url   = str(row.get('MAIN_IMAGE', '')).strip()
-        if not img_url.startswith('http'): img_url = "https://via.placeholder.com/150?text=No+Image"
-        name      = str(row.get('NAME', '')).replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
-        short     = (name[:38] + '…') if len(name) > 38 else name
-        brand     = str(row.get('BRAND', 'Unknown')).replace('<', '&lt;')
-        cat       = str(row.get('CATEGORY', '')).replace('<', '&lt;')
-        seller    = str(row.get('SELLER_NAME', '')).replace('<', '&lt;')
-        color_v   = str(row.get('COLOR', '')).strip()
-        color_badge = f'<span class="color-badge">{color_v}</span><br>' if color_v and color_v.lower() not in ['nan','','none','null'] else ''
-
-        # Price
-        def _f(v):
-            try: f = float(v); return f if f > 0 else None
-            except: return None
-        raw_price = _f(row.get('GLOBAL_SALE_PRICE')) or _f(row.get('GLOBAL_PRICE')) or 0
-        price_str = format_local_price(raw_price, country)
-        price_html = f'<div class="price-tag">{price_str}</div>' if price_str else ''
-
-        # Warnings
-        warns = page_warnings.get(sid, [])
-        warn_html = ''.join(f'<div class="warn-badge">{w}</div>' for w in warns)
-        warn_wrap = f'<div class="warn-wrap">{warn_html}</div>' if warn_html else ''
-
-        is_rej    = sid in rejected_sids_set
-        rej_rsn   = rejected_reasons_map.get(sid, '')
-
-        if is_rej:
-            parts.append(f"""
-<div class="card rejected" id="card-{sid}">
-  <div class="img-wrap">
-    <img src="{img_url}" class="card-img" loading="lazy">
-    <div class="rej-overlay">
-      <div class="rej-badge">REJECTED</div>
-      <div class="rej-reason">{rej_rsn}</div>
-      <button class="btn btn-ghost" onclick="restoreOne('{sid}')" style="font-size:11px;padding:5px 12px;">↩ Undo</button>
-    </div>
-  </div>
-  <div class="card-meta">
-    <div class="card-name" title="{name}">{short}</div>
-    <div class="card-brand">{brand}</div>
-  </div>
-</div>
-""")
-        else:
-            parts.append(f"""
-<div class="card" id="card-{sid}" onclick="toggleCard('{sid}')">
-  <div class="img-wrap">
-    {warn_wrap}
-    <img src="{img_url}" class="card-img" loading="lazy">
-    <div class="sel-overlay"></div>
-    <div class="sel-tick">✓</div>
-    {price_html}
-  </div>
-  <div class="card-meta">
-    <div class="card-name" title="{name}">{short}</div>
-    {color_badge}
-    <div class="card-brand">{brand}</div>
-    <div class="card-cat">{cat}</div>
-    <div class="card-seller">{seller}</div>
-  </div>
-  <div class="card-actions" onclick="event.stopPropagation()">
-    <button class="act-btn" onclick="rejectOne('{sid}','POOR_IMAGE')">Poor Image</button>
-    <select class="act-select" onchange="if(this.value){{ rejectOne('{sid}',this.value); this.value=''; }}">
-      <option value="">More…</option>
-      <option value="WRONG_CAT">Wrong Category</option>
-      <option value="FAKE">Fake Product</option>
-      <option value="BRAND">Restricted Brand</option>
-      <option value="PROHIBITED">Prohibited</option>
-      <option value="COLOR">Wrong Color</option>
-      <option value="WRONG_BRAND">Wrong Brand</option>
-    </select>
-  </div>
-</div>
-""")
-
-    parts.append("</div>")  # close .grid
-
-    # ── PREFETCH NEXT PAGE ────────────────────────────────────────────────────
-    parts.append("<script>setTimeout(function(){")
-    parts.append(f"var urls={json.dumps([str(r.get('MAIN_IMAGE','')).strip() for _, r in page_data.iterrows() if str(r.get('MAIN_IMAGE','')).startswith('http')])};")
-    parts.append("urls.forEach(function(u){new Image().src=u;});},800);</script>")
-
-    return "".join(parts)
-
-
-def _process_card_bridge_action(action: str, support_files: dict) -> bool:
-    """Parse bridge payload and apply to session state. Returns True if rerun needed."""
-    if not action or ':' not in action:
-        return False
-
-    fm = support_files['flags_mapping']
-
-    # Map short reason keys → (flag_name, reason_code, comment)
-    REASON_MAP = {
-        'POOR_IMAGE':   ('Poor images',                                  *fm.get('Poor images',   ('1000042','Poor Image Quality'))),
-        'WRONG_CAT':    ('Wrong Category',                               *fm.get('Wrong Category', ('1000004','Wrong Category'))),
-        'FAKE':         ('Suspected Fake product',                       *fm.get('Suspected Fake product', ('1000023','Fake Product'))),
-        'BRAND':        ('Restricted brands',                            *fm.get('Restricted brands', ('1000024','Restricted brands'))),
-        'PROHIBITED':   ('Prohibited products',                          *fm.get('Prohibited products', ('1000007','Prohibited product'))),
-        'COLOR':        ('Missing COLOR',                                *fm.get('Missing COLOR', ('1000005','Missing/Wrong Color'))),
-        'WRONG_BRAND':  ('Generic branded products with genuine brands', *fm.get('Generic branded products with genuine brands', ('1000007','Use the displayed brand on the product instead of Generic.'))),
-        # Batch reason keys (same as _get_batch_labels values)
-        'Poor Image Quality': ('Poor images',                                  *fm.get('Poor images',   ('1000042','Poor Image Quality'))),
-        'Wrong Category':     ('Wrong Category',                               *fm.get('Wrong Category', ('1000004','Wrong Category'))),
-        'Suspected Fake':     ('Suspected Fake product',                       *fm.get('Suspected Fake product', ('1000023','Fake Product'))),
-        'Restricted Brand':   ('Restricted brands',                            *fm.get('Restricted brands', ('1000024','Restricted brands'))),
-        'Wrong Brand':        ('Generic branded products with genuine brands', *fm.get('Generic branded products with genuine brands', ('1000007','Use the displayed brand on the product instead of Generic.'))),
-        'Prohibited Product': ('Prohibited products',                          *fm.get('Prohibited products', ('1000007','Prohibited product'))),
-    }
-
-    def _apply_rejection(sids, flag_key, code, cmt):
-        st.session_state.final_report.loc[
-            st.session_state.final_report['ProductSetSid'].isin(sids),
-            ['Status', 'Reason', 'Comment', 'FLAG']
-        ] = ['Rejected', code, cmt, flag_key]
-        for s in sids:
-            st.session_state[f"quick_rej_{s}"] = True
-            st.session_state[f"quick_rej_reason_{s}"] = flag_key
-        st.session_state.exports_cache.clear()
-        st.session_state.display_df_cache.clear()
-
-    # ── BATCH REJECT ─────────────────────────────────────────────────────────
-    if action.startswith('BATCH_REJECT_'):
-        rest = action[len('BATCH_REJECT_'):]
-        reason_key, sids_str = rest.split(':', 1)
-        sids = [s.strip() for s in sids_str.split(',') if s.strip()]
-        if not sids: return False
-        if reason_key == 'OTHER_CUSTOM':
-            custom = st.session_state.get('grid_custom_comment', '').strip()
-            _apply_rejection(sids, 'Other Reason (Custom)', '1000007 - Other Reason', custom or 'Custom rejection')
-        else:
-            entry = REASON_MAP.get(reason_key)
-            if entry: _apply_rejection(sids, entry[0], entry[1], entry[2])
-        st.session_state.main_toasts.append((f"Batch rejected {len(sids)} items", "✅"))
-        return True
-
-    # ── SINGLE REJECT ─────────────────────────────────────────────────────────
-    if action.startswith('REJECT_ONE_'):
-        rest = action[len('REJECT_ONE_'):]
-        reason_key, sid = rest.split(':', 1)
-        entry = REASON_MAP.get(reason_key)
-        if entry: _apply_rejection([sid], entry[0], entry[1], entry[2])
-        return True
-
-    # ── RESTORE ───────────────────────────────────────────────────────────────
-    if action.startswith('RESTORE:'):
-        sid = action[len('RESTORE:'):]
-        st.session_state.final_report.loc[
-            st.session_state.final_report['ProductSetSid'] == sid,
-            ['Status', 'Reason', 'Comment', 'FLAG']
-        ] = ['Approved', '', '', 'Approved by User']
-        st.session_state.pop(f"quick_rej_{sid}", None)
-        st.session_state.pop(f"quick_rej_reason_{sid}", None)
-        st.session_state.exports_cache.clear()
-        st.session_state.display_df_cache.clear()
-        st.session_state.main_toasts.append("Item restored!")
-        return True
-
-    # ── NAVIGATION ────────────────────────────────────────────────────────────
-    if action.startswith('NAV_PREV:'):
-        st.session_state.grid_page = max(0, st.session_state.grid_page - 1)
-        st.session_state.do_scroll_top = True
-        return True
-
-    if action.startswith('NAV_NEXT:'):
-        st.session_state.grid_page += 1
-        st.session_state.do_scroll_top = True
-        return True
-
-    return False
-
-
 @st.fragment
 def render_image_grid():
     if st.session_state.final_report.empty or st.session_state.file_mode == 'post_qc':
@@ -2196,153 +1772,130 @@ def render_image_grid():
     st.markdown("---")
     st.header(":material/pageview: Manual Image & Category Review", anchor=False)
 
-    # ── HIDDEN BRIDGE INPUT ───────────────────────────────────────────────────
-    # JS inside the components.html iframe calls sendBridge(action) which writes
-    # to THIS input via React's native setter. Python reads the value each rerun.
-    # The input is hidden by the patcher snippet below.
-    action_bridge = st.text_input(
-        "bridge", key="card_action_bridge",
-        label_visibility="collapsed",
-        placeholder="__CARD_ACT__"
-    )
+    components.html("""<script>const doc = window.parent.document;if (!doc.getElementById("global-img-click-listener")) {let scriptTag = doc.createElement("script");scriptTag.id = "global-img-click-listener";scriptTag.text = `document.addEventListener("click", function(e) {let target = e.target.closest('div[id^="imgclick-"]');if (target) {e.preventDefault();e.stopPropagation();let card = target.closest('[data-testid="stVerticalBlockBorderWrapper"]') || target.closest('[data-testid="stVerticalBlock"]');if (card) {let cb = card.querySelector('input[type="checkbox"]');if (cb) cb.click();}}});`;doc.body.appendChild(scriptTag);}</script>""", height=0, width=0)
 
-    # ── PATCHER: stamp data-card-bridge="1" onto the real DOM input ───────────
-    # Runs right after the input is rendered. Finds the last stTextInput-Input
-    # that has no value yet (our bridge starts empty) and marks + hides it.
-    # This is more reliable than querying by placeholder (React may not reflect it).
-    components.html("""
-<script>
-(function() {
-  var doc = window.parent.document;
-  if (doc.querySelector('input[data-card-bridge="1"]')) return;
-  var inputs = doc.querySelectorAll('input[data-testid="stTextInput-Input"]');
-  for (var i = inputs.length - 1; i >= 0; i--) {
-    var inp = inputs[i];
-    var ph = inp.placeholder || inp.getAttribute('placeholder') || '';
-    if (ph === '__CARD_ACT__' || inp.value === '') {
-      inp.setAttribute('data-card-bridge', '1');
-      var wrap = inp.closest('[data-testid="stTextInput"]') || inp.parentElement.parentElement;
-      if (wrap) {
-        wrap.style.cssText = 'position:absolute!important;opacity:0!important;'
-          + 'pointer-events:none!important;height:0!important;overflow:hidden!important;'
-          + 'margin:0!important;padding:0!important;';
-      }
-      break;
-    }
-  }
-})();
-</script>
-""", height=0, width=0)
-
-    # ── PROCESS BRIDGE ACTION ─────────────────────────────────────────────────
-    if action_bridge:
-        did_act = _process_card_bridge_action(action_bridge, support_files)
-        st.session_state.card_action_bridge = ""   # clear bridge
-        if did_act:
-            st.rerun()
-
-    # ── SCROLL TO TOP ─────────────────────────────────────────────────────────
-    if st.session_state.get('do_scroll_top', False):
-        components.html("""<script>
-var m = window.parent.document.querySelector('.main') ||
-        window.parent.document.querySelector('[data-testid="stAppViewContainer"]');
-if (m) m.scrollTo({top:0, behavior:'smooth'});
-</script>""", height=0, width=0)
-        st.session_state.do_scroll_top = False
-
-    # ── SEARCH & PAGE SIZE ────────────────────────────────────────────────────
-    c1, c2, c3 = st.columns([1.5, 1.5, 2])
-    with c1: search_n  = st.text_input("Search by Name",              placeholder="Product name...")
-    with c2: search_sc = st.text_input("Search by Seller / Category", placeholder="Seller or Category...")
-    with c3:
-        st.session_state.grid_items_per_page = st.select_slider(
-            "Items per page", options=[20, 50, 100, 200],
-            value=st.session_state.grid_items_per_page)
-
-    # ── CUSTOM COMMENT (shown only when OTHER_CUSTOM selected inside grid) ────
-    grid_custom_comment = st.text_area(
-        "Custom rejection comment (used when 'Other Custom' is selected in the grid)",
-        placeholder="Type custom reason here before clicking Batch Reject with Other Custom…",
-        key="grid_custom_comment", height=68)
-
-    # ── DATA PREP ─────────────────────────────────────────────────────────────
     fr = st.session_state.final_report
-    quick_rej_sids = {
-        k.replace("quick_rej_", "")
-        for k in st.session_state.keys()
-        if k.startswith("quick_rej_") and "reason" not in k
-    }
+    quick_rej_sids = [k.replace("quick_rej_", "") for k in st.session_state.keys() if k.startswith("quick_rej_") and "reason" not in k]
     mask = (fr['Status'] == 'Approved') | (fr['ProductSetSid'].isin(quick_rej_sids))
     valid_grid_df = fr[mask]
 
-    review_data = pd.merge(
-        valid_grid_df[['ProductSetSid']],
-        st.session_state.all_data_map,
-        left_on='ProductSetSid', right_on='PRODUCT_SET_SID', how='left')
+    c_rev_1, c_rev_2, c_rev_3 = st.columns([1.5, 1.5, 2])
+    with c_rev_1: search_n = st.text_input("Search by Name", placeholder="Product name...")
+    with c_rev_2: search_sc = st.text_input("Search by Seller / Category", placeholder="Seller or Category...")
+    with c_rev_3: st.session_state.grid_items_per_page = st.select_slider("Items per page", options=[20, 50, 100, 200], value=st.session_state.grid_items_per_page)
 
-    if search_n:
-        review_data = review_data[
-            review_data['NAME'].astype(str).str.contains(search_n, case=False, na=False)]
+    def get_batch_labels(): return {"Poor Image Quality": "Poor images", "Wrong Category": "Wrong Category", "Suspected Fake": "Suspected Fake product", "Restricted Brand": "Restricted brands", "Wrong Brand": "Generic branded products with genuine brands", "Other Reason (Custom)": "Other Reason (Custom)"}
+
+    with st.container(border=True):
+        st.markdown(f"<p style='font-weight: 700; margin: 0 0 10px 0;'>Batch Rejection Mode</p>", unsafe_allow_html=True)
+        grid_reason = st.segmented_control("Select rejection reason for batch actions:", list(get_batch_labels().keys()), default="Poor Image Quality", label_visibility="collapsed")
+        if not grid_reason: grid_reason = "Poor Image Quality"
+
+        grid_custom_comment = ""
+        if grid_reason == "Other Reason (Custom)":
+            grid_custom_comment = st.text_area("Custom rejection comment", placeholder="Type your rejection reason here...", key="grid_custom_comment", height=80)
+            if not grid_custom_comment.strip(): st.warning("Please enter a custom comment before rejecting.", icon="⚠️")
+
+        active_label = grid_reason if grid_reason != "Other Reason (Custom)" else f"Other: {grid_custom_comment[:40]}..." if grid_custom_comment.strip() else "Other Reason (Custom) — enter comment above"
+        st.markdown(f"""<div class='batch-info-box' style='background: var(--background-color, {JUMIA_COLORS['light_gray']});'><span style='font-size: 12px; font-weight: 600;'>Active Reason:</span><span style='font-size: 13px; font-weight: 700; margin-left: 8px;'>{active_label}</span></div>""", unsafe_allow_html=True)
+
+    review_data = pd.merge(valid_grid_df[['ProductSetSid']], st.session_state.all_data_map, left_on='ProductSetSid', right_on='PRODUCT_SET_SID', how='left')
+
+    if search_n: review_data = review_data[review_data['NAME'].astype(str).str.contains(search_n, case=False, na=False)]
     if search_sc:
-        mc = (review_data['CATEGORY'].astype(str).str.contains(search_sc, case=False, na=False)
-              if 'CATEGORY' in review_data.columns else pd.Series(False, index=review_data.index))
+        mc = review_data['CATEGORY'].astype(str).str.contains(search_sc, case=False, na=False) if 'CATEGORY' in review_data.columns else False
         ms = review_data['SELLER_NAME'].astype(str).str.contains(search_sc, case=False, na=False)
         review_data = review_data[mc | ms]
 
     items_per_page = st.session_state.grid_items_per_page
-    total_pages    = max(1, (len(review_data) + items_per_page - 1) // items_per_page)
+    total_pages = max(1, (len(review_data) + items_per_page - 1) // items_per_page)
     if st.session_state.grid_page >= total_pages: st.session_state.grid_page = 0
 
-    page_data = review_data.iloc[
-        st.session_state.grid_page * items_per_page :
-        (st.session_state.grid_page + 1) * items_per_page]
+    page_data = review_data.iloc[st.session_state.grid_page * items_per_page : (st.session_state.grid_page + 1) * items_per_page]
+    cur_sids = page_data['PRODUCT_SET_SID'].tolist()
 
-    # ── IMAGE QUALITY CHECKS (cached 24h) ────────────────────────────────────
+    def cb_process_batch(show_warning, sids, active_reason):
+        flagged = [s for s in sids if st.session_state.get(f"grid_chk_{s}")]
+        if not flagged:
+            if show_warning: st.session_state.main_toasts.append(("No items selected.", "⚠️"))
+            return
+        if active_reason == "Other Reason (Custom)":
+            custom_cmt = st.session_state.get("grid_custom_comment", "").strip()
+            if not custom_cmt: st.session_state.main_toasts.append(("Please enter a custom comment first.", "⚠️")); return
+            code, cmt, flag_key = "1000007 - Other Reason", custom_cmt, "Other Reason (Custom)"
+        else:
+            flag_key = get_batch_labels()[active_reason]
+            code, cmt = support_files['flags_mapping'].get(flag_key, ("1000007 - Other Reason", "Manual rejection"))
+        st.session_state.final_report.loc[st.session_state.final_report['ProductSetSid'].isin(flagged), ['Status', 'Reason', 'Comment', 'FLAG']] = ['Rejected', code, cmt, flag_key]
+        for s in flagged:
+            st.session_state[f"quick_rej_{s}"] = True
+            st.session_state[f"quick_rej_reason_{s}"] = flag_key
+            st.session_state.pop(f"grid_chk_{s}", None)
+        st.session_state.exports_cache.clear()
+        st.session_state.display_df_cache.clear()
+        st.session_state.main_toasts.append((f"Batch rejected {len(flagged)} items", "✅"))
+
+    def cb_prev(sids, active_reason): cb_process_batch(False, sids, active_reason); st.session_state.grid_page -= 1; st.session_state.do_scroll_top = True
+    def cb_next(sids, active_reason): cb_process_batch(False, sids, active_reason); st.session_state.grid_page += 1; st.session_state.do_scroll_top = True
+    def cb_sel_all(sids):
+        for s in sids: st.session_state[f"grid_chk_{s}"] = True
+    def cb_desel_all(sids):
+        for s in sids: st.session_state.pop(f"grid_chk_{s}", None)
+    def cb_reject_all(sids, active_reason): cb_process_batch(True, sids, active_reason)
+
+    with st_yled.sticky_header(background_color="#FFFFFF", padding="15px 10px", key="sticky-nav-top"):
+        col_pg1, col_pg2, col_pg3, col_sel, col_desel, col_rej, col_spacer = st.columns([0.8, 1.2, 0.8, 0.6, 0.6, 1.5, 1.5])
+        col_pg1.button(":material/arrow_back: Prev", key="pt", disabled=(st.session_state.grid_page == 0), use_container_width=True, on_click=cb_prev, args=(cur_sids, grid_reason))
+        col_pg2.markdown(f"<p style='text-align: center; margin: 0; padding: 10px 0; font-weight: 600;'>Page {st.session_state.grid_page + 1} of {total_pages}</p>", unsafe_allow_html=True)
+        col_pg3.button("Next :material/arrow_forward:", key="nt", disabled=(st.session_state.grid_page >= total_pages - 1), use_container_width=True, on_click=cb_next, args=(cur_sids, grid_reason))
+        col_sel.button("Select All", key="sel_all_top", use_container_width=True, on_click=cb_sel_all, args=(cur_sids,))
+        col_desel.button("Deselect All", key="desel_all_top", use_container_width=True, on_click=cb_desel_all, args=(cur_sids,))
+        col_rej.button(f":material/block: Reject All — {grid_reason}", key="reject_active_top", type="primary", use_container_width=True, on_click=cb_reject_all, args=(cur_sids, grid_reason))
+
+    if st.session_state.get('do_scroll_top', False):
+        components.html("""<script>const doc = window.parent.document;const main = doc.querySelector('.main') || doc.querySelector('[data-testid="stAppViewContainer"]');if (main) { main.scrollTo({top: 0, behavior: 'smooth'}); }</script>""", height=0, width=0)
+        st.session_state.do_scroll_top = False
+
+    # FIX 5: Use cached image checker — no re-download on rerun
     page_warnings = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        ftrs = {
-            executor.submit(analyze_image_quality_cached, str(r.get('MAIN_IMAGE','')).strip()):
-            str(r['PRODUCT_SET_SID'])
+        future_to_sid = {
+            executor.submit(analyze_image_quality_cached, str(r.get('MAIN_IMAGE', '')).strip()): str(r['PRODUCT_SET_SID'])
             for _, r in page_data.iterrows()
         }
-        for fut in concurrent.futures.as_completed(ftrs):
-            w = fut.result()
-            if w: page_warnings[ftrs[fut]] = w
-
-    rejected_sids_set   = {sid for sid in page_data['PRODUCT_SET_SID'] if st.session_state.get(f"quick_rej_{sid}")}
-    rejected_reasons_map = {sid: st.session_state.get(f"quick_rej_reason_{sid}", '') for sid in rejected_sids_set}
+        for future in concurrent.futures.as_completed(future_to_sid):
+            page_warnings[future_to_sid[future]] = future.result()
 
     cols_per_row = 3 if st.session_state.layout_mode == "centered" else 4
+    for i in range(0, len(page_data), cols_per_row):
+        cols = st.columns(cols_per_row)
+        for j, (_, row) in enumerate(page_data.iloc[i:i+cols_per_row].iterrows()):
+            with cols[j]:
+                sid_for_row = str(row['PRODUCT_SET_SID'])
+                render_product_card(row, support_files['flags_mapping'], st.session_state.get('selected_country', 'Kenya'), page_warnings.get(sid_for_row, []))
 
-    batch_options_dict = {
-        "Poor Image Quality": "Poor Image Quality",
-        "Wrong Category":     "Wrong Category",
-        "Suspected Fake":     "Suspected Fake",
-        "Restricted Brand":   "Restricted Brand",
-        "Wrong Brand":        "Wrong Brand",
-        "Prohibited Product": "Prohibited Product",
-        "Other Custom":       "OTHER_CUSTOM",
-    }
+    if st.session_state.grid_page < total_pages - 1:
+        next_page_data = review_data.iloc[(st.session_state.grid_page + 1) * items_per_page : (st.session_state.grid_page + 2) * items_per_page]
+        next_urls = [str(u).strip() for u in next_page_data['MAIN_IMAGE'].values if str(u).startswith('http')]
+        if next_urls:
+            js_array = json.dumps(next_urls)
+            components.html(f"""<script>setTimeout(function() {{ var urls = {js_array}; urls.forEach(function(url) {{ var img = new Image(); img.src = url; }}); }}, 1500);</script>""", height=0, width=0)
 
-    # ── RENDER THE SELF-CONTAINED HTML GRID ──────────────────────────────────
-    # Everything (nav, cards, JS) lives inside ONE components.html() iframe.
-    # onclick handlers work natively here — no st.markdown() sanitisation issues.
-    grid_html = _build_grid_html(
-        page_data, support_files['flags_mapping'],
-        st.session_state.get('selected_country', 'Kenya'),
-        page_warnings, rejected_sids_set, rejected_reasons_map,
-        cols_per_row, st.session_state.grid_page, total_pages,
-        batch_options_dict, "Poor Image Quality"
-    )
+    st.divider()
 
-    # Height: nav (~70px) + cards (~320px per row) + buffer
-    n_rows  = max(1, (len(page_data) + cols_per_row - 1) // cols_per_row)
-    grid_h  = 90 + n_rows * 340
-    components.html(grid_html, height=grid_h, scrolling=False)
+    with st.container():
+        col_pg1_b, col_pg2_b, col_pg3_b, col_sel_b, col_desel_b, col_rej_b, col_spacer_b = st.columns([0.8, 1.2, 0.8, 0.6, 0.6, 1.5, 1.5])
+        col_pg1_b.button(":material/arrow_back: Prev", key="pb", disabled=(st.session_state.grid_page == 0), use_container_width=True, on_click=cb_prev, args=(cur_sids, grid_reason))
+        col_pg2_b.markdown(f"<p style='text-align: center; margin: 0; padding: 10px 0; font-weight: 600;'>Page {st.session_state.grid_page + 1} of {total_pages}</p>", unsafe_allow_html=True)
+        col_pg3_b.button("Next :material/arrow_forward:", key="nb", disabled=(st.session_state.grid_page >= total_pages - 1), use_container_width=True, on_click=cb_next, args=(cur_sids, grid_reason))
+        col_sel_b.button("Select All", key="sel_all_bot", use_container_width=True, on_click=cb_sel_all, args=(cur_sids,))
+        col_desel_b.button("Deselect All", key="desel_all_bot", use_container_width=True, on_click=cb_desel_all, args=(cur_sids,))
+        col_rej_b.button(f":material/block: Reject All — {grid_reason}", key="reject_active_bot", type="primary", use_container_width=True, on_click=cb_reject_all, args=(cur_sids, grid_reason))
 
 
 # ==========================================
 # SECTION 3: EXPORTS
+# --- FIX 6: Wrapped in @st.fragment to isolate reruns ---
 # ==========================================
 @st.fragment
 def render_exports_section():
