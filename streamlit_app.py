@@ -1322,6 +1322,9 @@ REASON_MAP = {
 # -------------------------------------------------
 # HTML GRID BUILDER
 # -------------------------------------------------
+# -------------------------------------------------
+# HTML GRID BUILDER
+# -------------------------------------------------
 def build_fast_grid_html(
     page_data,
     flags_mapping,
@@ -1341,7 +1344,7 @@ def build_fast_grid_html(
         sid = str(row["PRODUCT_SET_SID"])
         img_url = str(row.get("MAIN_IMAGE", "")).strip()
         
-        # --- FIX ADDED HERE: HTTP TO HTTPS UPGRADE ---
+        # --- HTTP TO HTTPS UPGRADE TO PREVENT CLOUD BLOCKING ---
         if img_url.startswith("http://"):
             img_url = img_url.replace("http://", "https://")
             
@@ -1367,7 +1370,6 @@ def build_fast_grid_html(
   *{{box-sizing:border-box;margin:0;padding:0;font-family:sans-serif;}}
   body{{background:#f5f5f5;padding:8px;}}
 
-  /* ── sticky control bar ── */
   .ctrl-bar{{
     position:sticky;top:0;z-index:100;
     display:flex;align-items:center;gap:8px;flex-wrap:wrap;
@@ -1394,7 +1396,6 @@ def build_fast_grid_html(
   }}
   .desel-btn:hover{{background:#f5f5f5;}}
 
-  /* ── grid & cards ── */
   .grid{{display:grid;grid-template-columns:repeat({cols_per_row},1fr);gap:12px;}}
   .card{{border:2px solid #e0e0e0;border-radius:8px;padding:10px;background:#fff;
          position:relative;transition:border-color .15s,box-shadow .15s;}}
@@ -1452,10 +1453,13 @@ def build_fast_grid_html(
 <div class="grid" id="card-grid"></div>
 
 <script>
-const CARDS     = {cards_json};
-const COMMITTED = {committed_json};
+// FIX: Using var instead of const/let prevents "already declared" crashes on Cloud re-renders!
+var CARDS     = {cards_json};
+var COMMITTED = {committed_json};
 
-let selected = {{}};
+// Save selection globally so it survives re-renders
+window._gridSelected = window._gridSelected || {{}};
+var selected = window._gridSelected;
 
 // ── OFFICIAL NATIVE COMPONENT BRIDGE ──────────────────────────────────────────
 function sendMsg(type, payload) {{
@@ -1554,27 +1558,24 @@ function quickReject(sid, reasonKey) {{
   updateSelCount();
 }}
 
-// ── BATCH REJECT LOGIC WITH NATIVE BRIDGE SENDMSG ─────────────────────────────
 function doBatchReject() {{
   const toReject = Object.keys(selected);
   if (toReject.length === 0) {{ alert('No products selected.'); return; }}
   const reasonKey = document.getElementById('batch-reason').value;
   const payload   = {{}};
-  
   toReject.forEach(sid => {{
     payload[sid]    = reasonKey;
     COMMITTED[sid]  = reasonKey;
     delete selected[sid];
   }});
-  
-  // Sends payload to python via the native bridge
   sendMsg('reject', payload);
   renderAll();
   updateSelCount();
 }}
 
 function doDeselAll() {{
-  selected = {{}};
+  // clear the global object without reassigning a new reference
+  for (const k in selected) delete selected[k];
   renderAll();
   updateSelCount();
 }}
