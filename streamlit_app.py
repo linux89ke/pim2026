@@ -1296,6 +1296,7 @@ def build_fast_grid_html(
     cols_per_row: int,
     cmd: str = "",
     cmd_reason: str = "",
+    clear_selection: bool = False,
 ) -> str:
     O = JUMIA_COLORS["primary_orange"]
     G = JUMIA_COLORS["success_green"]
@@ -1380,6 +1381,7 @@ const COMMITTED  = {committed_json};
 const CMD        = {cmd_json};
 const LS_PENDING  = "{LS_PENDING}";
 const LS_SELECTED = "{LS_SELECTED}";
+const CLEAR_SELECTION = {str(clear_selection).lower()};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function lsGet(key) {{
@@ -1393,6 +1395,10 @@ function lsDel(key) {{
 }}
 
 // ── Load persisted selection (survives iframe re-renders) ─────────────────────
+if (CLEAR_SELECTION) {{
+  lsDel(LS_SELECTED);
+}}
+
 // Filter out any sids that are already committed on this page
 let selected = lsGet(LS_SELECTED) || {{}};
 Object.keys(COMMITTED).forEach(sid => {{ delete selected[sid]; }});
@@ -1870,7 +1876,8 @@ def render_image_grid():
     grid_cmd = ""
     grid_cmd_reason = ""
 
-    if raw_pending and isinstance(raw_pending, str) and raw_pending not in ("0", "null"):
+    # Ensure it's explicitly a string and not empty, null, or integer 0.
+    if raw_pending and isinstance(raw_pending, str) and raw_pending not in ("0", "null", ""):
         try:
             pending = json.loads(raw_pending)
             if isinstance(pending, dict) and pending:
@@ -1954,6 +1961,8 @@ def render_image_grid():
         if st.button("◀ Prev", use_container_width=True, disabled=st.session_state.grid_page == 0):
             st.session_state.grid_page = max(0, st.session_state.grid_page - 1)
             st.session_state.do_scroll_top = True
+            st.session_state.clear_selection_on_load = True
+            st.session_state.grid_msg_counter += 1
             st.rerun(scope="fragment")
     with ctrl_cols[1]:
         st.markdown(
@@ -1965,6 +1974,8 @@ def render_image_grid():
         if st.button("Next ▶", use_container_width=True, disabled=st.session_state.grid_page >= total_pages - 1):
             st.session_state.grid_page += 1
             st.session_state.do_scroll_top = True
+            st.session_state.clear_selection_on_load = True
+            st.session_state.grid_msg_counter += 1
             st.rerun(scope="fragment")
     with ctrl_cols[3]:
         chosen_label = st.selectbox(
@@ -1983,12 +1994,9 @@ def render_image_grid():
         # Step 1: inject CMD into the grid so it moves LS_SELECTED → LS_PENDING
         grid_cmd        = "batch_reject"
         grid_cmd_reason = chosen_key
-        # Step 2: increment counter so st_javascript re-reads on the NEXT rerun
-        st.session_state.grid_msg_counter += 1
     elif do_desel:
         grid_cmd        = "deselect"
         grid_cmd_reason = ""
-        st.session_state.grid_msg_counter += 1
 
     # ── Image quality checks ──────────────────────────────────────────────────
     page_start = st.session_state.grid_page * ipp
@@ -2012,6 +2020,8 @@ def render_image_grid():
     }
 
     cols_per_row = 3 if st.session_state.layout_mode == "centered" else 4
+    
+    do_clear_selection = st.session_state.pop("clear_selection_on_load", False)
 
     grid_html = build_fast_grid_html(
         page_data,
@@ -2022,6 +2032,7 @@ def render_image_grid():
         cols_per_row,
         cmd=grid_cmd,
         cmd_reason=grid_cmd_reason,
+        clear_selection=do_clear_selection,
     )
     components.html(grid_html, height=1300, scrolling=True)
 
