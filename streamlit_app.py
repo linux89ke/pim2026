@@ -1692,6 +1692,21 @@ def render_image_grid():
 def render_exports_section():
     if st.session_state.final_report.empty or st.session_state.file_mode == 'post_qc':
         return
+
+    if "support_files" not in st.session_state:
+        st.error("Support files not loaded – restart the app")
+        return
+
+    if st.session_state.final_report.empty or st.session_state.file_mode == 'post_qc':
+        return
+    fr = st.session_state.final_report
+    data = st.session_state.all_data_map
+    app_df = fr[fr['Status'] == 'Approved']
+    rej_df = fr[fr['Status'] == 'Rejected']
+    c_code = st.session_state.selected_country[:2].upper()
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    reasons_df = support_files.get('reasons', pd.DataFrame())
+    support_files = st.session_state.support_files
     fr = st.session_state.final_report
     data = st.session_state.all_data_map
     app_df = fr[fr['Status'] == 'Approved']
