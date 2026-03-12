@@ -148,16 +148,6 @@ if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
 if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = False
 if 'display_df_cache' not in st.session_state: st.session_state.display_df_cache = {}
 
-if 'main_bridge_counter' not in st.session_state: st.session_state.main_bridge_counter = 0
-
-# Session state counters for dynamic keys
-if 'desel_counter' not in st.session_state: st.session_state.desel_counter = 0
-if 'batch_counter' not in st.session_state: st.session_state.batch_counter = 0  
-if 'clear_counter' not in st.session_state: st.session_state.clear_counter = 0
-if 'ls_processed_flag' not in st.session_state: st.session_state.ls_processed_flag = False
-
-if 'ls_read_trigger' not in st.session_state: st.session_state.ls_read_trigger = 0
-
 try: st.set_page_config(page_title="Product Tool", layout=st.session_state.layout_mode)
 except: pass
 
@@ -1251,318 +1241,6 @@ REASON_MAP = {
 }
 
 # -------------------------------------------------
-# PROCESS GRID ACTIONS
-# -------------------------------------------------
-def _process_grid_selections(raw_json: str, support_files: dict) -> int:
-    """Parse {sid: reason_key} JSON and apply rejections. Returns count."""
-    if not raw_json or not isinstance(raw_json, str) or raw_json in ("0", "null", ""):
-        return 0
-    try:
-        pending = json.loads(raw_json)
-        if not isinstance(pending, dict) or not pending:
-            return 0
-        reason_groups: dict[str, list] = {}
-        for sid, reason_key in pending.items():
-            reason_groups.setdefault(reason_key, []).append(sid)
-        total = 0
-        for reason_key, sids in reason_groups.items():
-            flag_name = REASON_MAP.get(reason_key, "Other Reason (Custom)")
-            code, cmt = support_files["flags_mapping"].get(
-                flag_name, ("1000007 - Other Reason", "Manual rejection")
-            )
-            apply_rejection(sids, code, cmt, flag_name)
-            for s in sids:
-                st.session_state[f"quick_rej_{s}"] = True
-                st.session_state[f"quick_rej_reason_{s}"] = flag_name
-            total += len(sids)
-        return total
-    except Exception as e:
-        logger.error(f"Grid selections parse error: {e}")
-        return 0
-
-# -------------------------------------------------
-# HTML GRID BUILDER
-# -------------------------------------------------
-def build_fast_grid_html(
-    page_data,
-    flags_mapping,
-    country,
-    page_warnings,
-    rejected_state,
-    cols_per_row,
-    # kept for API compat — no longer used
-    cmd="",
-    cmd_reason="",
-    clear_selection=False,
-    saved_selected=None,
-):
-    O = JUMIA_COLORS["primary_orange"]
-    G = JUMIA_COLORS["success_green"]
-    R = JUMIA_COLORS["jumia_red"]
-
-    committed_json = json.dumps(rejected_state)
-
-    cards_data = []
-    for _, row in page_data.iterrows():
-        sid = str(row["PRODUCT_SET_SID"])
-        img_url = str(row.get("MAIN_IMAGE", "")).strip()
-        if not img_url.startswith("http"):
-            img_url = "https://via.placeholder.com/150?text=No+Image"
-        cards_data.append({
-            "sid":      sid,
-            "img":      img_url,
-            "name":     str(row.get("NAME", "")),
-            "brand":    str(row.get("BRAND", "Unknown Brand")),
-            "cat":      str(row.get("CATEGORY", "Unknown Category")),
-            "seller":   str(row.get("SELLER_NAME", "Unknown Seller")),
-            "warnings": page_warnings.get(sid, []),
-        })
-    cards_json = json.dumps(cards_data)
-
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  *{{box-sizing:border-box;margin:0;padding:0;font-family:sans-serif;}}
-  body{{background:#f5f5f5;padding:8px;}}
-
-  /* ── sticky control bar ── */
-  .ctrl-bar{{
-    position:sticky;top:0;z-index:100;
-    display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-    padding:8px 12px;background:#fff;
-    border:1px solid #e0e0e0;border-radius:8px;margin-bottom:12px;
-    box-shadow:0 2px 6px rgba(0,0,0,.08);
-  }}
-  .sel-count{{font-weight:700;color:{O};font-size:13px;min-width:80px;}}
-  .reason-sel{{
-    flex:1;min-width:160px;padding:6px 10px;
-    border:1px solid #ccc;border-radius:4px;font-size:12px;
-    background:#fff;cursor:pointer;outline:none;
-  }}
-  .batch-btn{{
-    padding:7px 14px;background:{O};color:#fff;
-    border:none;border-radius:4px;font-weight:700;font-size:12px;
-    cursor:pointer;white-space:nowrap;
-  }}
-  .batch-btn:hover{{opacity:.88;}}
-  .desel-btn{{
-    padding:7px 12px;background:#fff;color:#555;
-    border:1px solid #ccc;border-radius:4px;font-size:12px;
-    cursor:pointer;white-space:nowrap;
-  }}
-  .desel-btn:hover{{background:#f5f5f5;}}
-
-  /* ── grid & cards ── */
-  .grid{{display:grid;grid-template-columns:repeat({cols_per_row},1fr);gap:12px;}}
-  .card{{border:2px solid #e0e0e0;border-radius:8px;padding:10px;background:#fff;
-         position:relative;transition:border-color .15s,box-shadow .15s;}}
-  .card.selected{{border-color:{G};box-shadow:0 0 0 3px rgba(76,175,80,.2);
-                  background:rgba(76,175,80,.04);}}
-  .card.committed-rej{{border-color:#bbb;opacity:.5;}}
-  .card-img-wrap{{position:relative;cursor:pointer;}}
-  .card-img{{width:100%;aspect-ratio:1;object-fit:contain;border-radius:6px;display:block;}}
-  .card.committed-rej .card-img{{filter:grayscale(80%);}}
-  .tick{{position:absolute;bottom:6px;right:6px;width:22px;height:22px;border-radius:50%;
-         background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;
-         color:transparent;font-size:13px;font-weight:900;pointer-events:none;}}
-  .card.selected .tick{{background:{G};color:#fff;}}
-  .warn-wrap{{position:absolute;top:6px;right:6px;display:flex;flex-direction:column;gap:3px;
-              z-index:5;pointer-events:none;}}
-  .warn-badge{{background:rgba(255,193,7,.95);color:#313133;font-size:9px;font-weight:800;
-               padding:3px 7px;border-radius:10px;}}
-  .rej-overlay{{display:none;position:absolute;inset:0;background:rgba(255,255,255,.88);
-                border-radius:6px;flex-direction:column;align-items:center;
-                justify-content:center;z-index:20;gap:5px;padding:8px;text-align:center;}}
-  .card.committed-rej .rej-overlay{{display:flex;}}
-  .rej-badge{{background:{R};color:#fff;padding:3px 10px;border-radius:10px;
-              font-size:11px;font-weight:700;}}
-  .rej-label{{font-size:10px;color:{R};font-weight:600;max-width:120px;}}
-  .meta{{font-size:11px;margin-top:8px;line-height:1.4;}}
-  .meta .nm{{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
-  .meta .br{{color:{O};font-weight:700;margin:2px 0;}}
-  .meta .ct{{color:#666;font-size:10px;}}
-  .meta .sl{{color:#999;font-size:9px;margin-top:4px;border-top:1px dashed #eee;padding-top:4px;}}
-  .acts{{display:flex;gap:4px;margin-top:8px;}}
-  .act-btn{{flex:1;padding:6px;font-size:11px;border:none;border-radius:4px;cursor:pointer;
-            font-weight:700;color:#fff;background:{O};}}
-  .act-more{{flex:1;font-size:11px;border:1px solid #ccc;border-radius:4px;outline:none;
-             cursor:pointer;background:#fff;}}
-</style>
-</head>
-<body>
-
-<div class="ctrl-bar">
-  <span class="sel-count" id="sel-count-bar">0 selected</span>
-  <select class="reason-sel" id="batch-reason">
-    <option value="REJECT_POOR_IMAGE">Poor Image Quality</option>
-    <option value="REJECT_WRONG_CAT">Wrong Category</option>
-    <option value="REJECT_FAKE">Suspected Fake</option>
-    <option value="REJECT_BRAND">Restricted Brand</option>
-    <option value="REJECT_WRONG_BRAND">Wrong Brand</option>
-    <option value="REJECT_PROHIBITED">Prohibited Product</option>
-    <option value="REJECT_COLOR">Missing Color</option>
-  </select>
-  <button class="batch-btn" onclick="doBatchReject()">✗ Batch Reject Selected</button>
-  <button class="desel-btn"  onclick="doDeselAll()">☐ Deselect All</button>
-  <span style="font-size:11px;color:#999;">Click image to select</span>
-</div>
-
-<div class="grid" id="card-grid"></div>
-
-<script>
-const CARDS     = {cards_json};
-const COMMITTED = {committed_json};   // already-rejected sids → reason label
-
-// Selection lives ONLY in JS — no async bridge needed
-let selected = {{}};
-
-// ── postMessage helper ────────────────────────────────────────────────────────
-function sendMsg(type, payload) {{
-  try {{
-    var par = window.parent;
-    var doc = par.document;
-    var inputs = doc.querySelectorAll('input[type="text"]');
-    var bridge = null;
-    for (var i = 0; i < inputs.length; i++) {{
-      if (inputs[i].getAttribute('aria-label') === 'jtbridge' || inputs[i].placeholder === 'JTBRIDGE_UNIQUE_DO_NOT_USE') {{
-        bridge = inputs[i]; break;
-      }}
-    }}
-    if (!bridge) {{ console.warn('jtbridge not found'); return; }}
-    var msg = JSON.stringify({{action: type, payload: payload}});
-    // Must use parent's own prototype — the grid iframe has a different one
-    Object.getOwnPropertyDescriptor(
-      par.HTMLInputElement.prototype, 'value'
-    ).set.call(bridge, msg);
-    // React onChange fires on 'input' event
-    bridge.dispatchEvent(new par.Event('input', {{bubbles: true}}));
-    // Streamlit only submits on Enter — this is the part that was missing
-    bridge.dispatchEvent(new par.KeyboardEvent('keydown', {{
-      bubbles: true, cancelable: true,
-      key: 'Enter', code: 'Enter', keyCode: 13, which: 13
-    }}));
-  }} catch(ex) {{
-    console.error('jtbridge sendMsg error:', ex);
-  }}
-}}
-
-// ── UI helpers ────────────────────────────────────────────────────────────────
-function updateSelCount() {{
-  const n = Object.keys(selected).length;
-  document.getElementById('sel-count-bar').textContent = n + ' selected';
-}}
-
-// ── Card rendering ────────────────────────────────────────────────────────────
-function renderCard(card) {{
-  const {{sid, img, name, brand, cat, seller, warnings}} = card;
-  const isCommitted = sid in COMMITTED;
-  const isSelected  = !isCommitted && (sid in selected);
-
-  let cls = 'card';
-  if (isCommitted)     cls += ' committed-rej';
-  else if (isSelected) cls += ' selected';
-
-  const shortName = name.length > 38 ? name.slice(0,38)+'…' : name;
-  const warnHtml  = warnings.map(w => `<span class="warn-badge">${{w}}</span>`).join('');
-  const rejLabel  = isCommitted ? (COMMITTED[sid]||'').replace(/_/g,' ') : '';
-
-  const rejOverlay = isCommitted ? `
-    <div class="rej-overlay">
-      <div class="rej-badge">REJECTED</div>
-      <div class="rej-label">${{rejLabel}}</div>
-    </div>` : '';
-
-  const actHtml = !isCommitted ? `
-    <div class="acts">
-      <button class="act-btn"
-        onclick="event.stopPropagation();quickReject('${{sid}}','REJECT_POOR_IMAGE')">
-        Poor Img
-      </button>
-      <select class="act-more"
-        onchange="if(this.value){{event.stopPropagation();quickReject('${{sid}}',this.value);this.value=''}}">
-        <option value="">More…</option>
-        <option value="REJECT_WRONG_CAT">Wrong Category</option>
-        <option value="REJECT_FAKE">Fake Product</option>
-        <option value="REJECT_BRAND">Restricted Brand</option>
-        <option value="REJECT_PROHIBITED">Prohibited</option>
-        <option value="REJECT_COLOR">Wrong Color</option>
-        <option value="REJECT_WRONG_BRAND">Wrong Brand</option>
-      </select>
-    </div>` : '';
-
-  return `<div class="${{cls}}" id="card-${{sid}}">
-    <div class="card-img-wrap" onclick="toggleSelect('${{sid}}')">
-      <div class="warn-wrap">${{warnHtml}}</div>
-      <img class="card-img" src="${{img}}" loading="lazy"
-           onerror="this.src='https://via.placeholder.com/150?text=No+Image'">
-      ${{rejOverlay}}<div class="tick">✓</div>
-    </div>
-    <div class="meta">
-      <div class="nm" title="${{name}}">${{shortName}}</div>
-      <div class="br">${{brand}}</div>
-      <div class="ct">${{cat}}</div>
-      <div class="sl">${{seller}}</div>
-    </div>${{actHtml}}</div>`;
-}}
-
-function renderAll() {{
-  document.getElementById('card-grid').innerHTML = CARDS.map(renderCard).join('');
-  updateSelCount();
-}}
-
-function replaceCard(sid) {{
-  const el = document.getElementById('card-'+sid);
-  if (!el) return;
-  const card = CARDS.find(c => c.sid === sid);
-  if (card) {{ const t=document.createElement('div'); t.innerHTML=renderCard(card); el.replaceWith(t.firstElementChild); }}
-}}
-
-// ── Actions ───────────────────────────────────────────────────────────────────
-function toggleSelect(sid) {{
-  if (sid in COMMITTED) return;
-  if (sid in selected) delete selected[sid];
-  else selected[sid] = true;
-  replaceCard(sid);
-  updateSelCount();
-}}
-
-function quickReject(sid, reasonKey) {{
-  delete selected[sid];
-  COMMITTED[sid] = reasonKey;
-  sendMsg('reject', {{[sid]: reasonKey}});
-  replaceCard(sid);
-  updateSelCount();
-}}
-
-function doBatchReject() {{
-  const toReject = Object.keys(selected);
-  if (toReject.length === 0) {{ alert('No products selected.'); return; }}
-  const reasonKey = document.getElementById('batch-reason').value;
-  const payload   = {{}};
-  toReject.forEach(sid => {{
-    payload[sid]    = reasonKey;
-    COMMITTED[sid]  = reasonKey;
-    delete selected[sid];
-  }});
-  sendMsg('reject', payload);
-  renderAll();   // re-render all cards to show committed state
-  updateSelCount();
-}}
-
-function doDeselAll() {{
-  selected = {{}};
-  renderAll();
-  updateSelCount();
-}}
-
-renderAll();
-</script>
-</body>
-</html>"""
-
-# -------------------------------------------------
 # UI COMPONENTS
 # -------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -1750,18 +1428,8 @@ if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.grid_page = 0
     st.session_state.exports_cache = {}
     st.session_state.display_df_cache = {}
-    
-    if 'main_bridge_counter' not in st.session_state: st.session_state.main_bridge_counter = 0
 
-    # Reset all JS-bridge counters on new file load
-    st.session_state.desel_counter = 0
-    st.session_state.batch_counter = 0
-    st.session_state.clear_counter = 0
-    st.session_state.ls_processed_flag = False
-
-    st.session_state.ls_read_trigger = 0
-
-    keys_to_delete = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_"))]
+    keys_to_delete = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_", "grid_sel_"))]
     for k in keys_to_delete: del st.session_state[k]
 
     if process_signature == "empty": st.session_state.last_processed_files = "empty"
@@ -1843,42 +1511,6 @@ if st.session_state.get('last_processed_files') != process_signature:
             st.code(traceback.format_exc())
             st.session_state.last_processed_files = "error"
 
-
-_bridge_val = st.text_input(
-    "jtbridge", value="",
-    placeholder="JTBRIDGE_UNIQUE_DO_NOT_USE",
-    key=f"main_bridge_{st.session_state.main_bridge_counter}",
-    label_visibility="collapsed",
-)
-if _bridge_val:
-    try:
-        _msg = json.loads(_bridge_val)
-        if _msg.get("action") == "reject":
-            _payload = _msg.get("payload", {})
-            if isinstance(_payload, dict) and _payload:
-                _rgroups: dict = {}
-                for _sid, _rkey in _payload.items():
-                    _rgroups.setdefault(_rkey, []).append(_sid)
-                _total = 0
-                for _rkey, _sids in _rgroups.items():
-                    _flag = REASON_MAP.get(_rkey, "Other Reason (Custom)")
-                    _code, _cmt = support_files["flags_mapping"].get(
-                        _flag, ("1000007 - Other Reason", "Manual rejection"))
-                    st.session_state.final_report.loc[
-                        st.session_state.final_report["ProductSetSid"].isin(_sids),
-                        ["Status", "Reason", "Comment", "FLAG"]
-                    ] = ["Rejected", _code, _cmt, _flag]
-                    for _s in _sids:
-                        st.session_state[f"quick_rej_{_s}"]        = True
-                        st.session_state[f"quick_rej_reason_{_s}"] = _flag
-                    _total += len(_sids)
-                st.session_state.exports_cache.clear()
-                st.session_state.display_df_cache.clear()
-                st.session_state.main_toasts.append((f"Rejected {_total} product(s)", "✅"))
-                st.session_state.main_bridge_counter += 1
-    except Exception as _e:
-        logger.error(f"Bridge parse error: {_e}")
-
 # ==========================================
 # POST-QC RESULTS SECTION
 # ==========================================
@@ -1939,11 +1571,12 @@ def render_image_grid():
         for k in st.session_state.keys()
         if k.startswith("quick_rej_") and "reason" not in k
     }
-    mask           = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
-    valid_grid_df  = fr[mask]
+    mask          = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
+    valid_grid_df = fr[mask]
 
+    # ── Filters & pagination controls ────────────────────────────────────────
     c1, c2, c3 = st.columns([1.5, 1.5, 2])
-    with c1: search_n  = st.text_input("Search by Name",            placeholder="Product name…")
+    with c1: search_n  = st.text_input("Search by Name", placeholder="Product name…")
     with c2: search_sc = st.text_input("Search by Seller/Category", placeholder="Seller or Category…")
     with c3:
         st.session_state.grid_items_per_page = st.select_slider(
@@ -1957,14 +1590,11 @@ def render_image_grid():
         data[available_cols],
         left_on="ProductSetSid", right_on="PRODUCT_SET_SID", how="left",
     )
+
     if search_n:
-        review_data = review_data[
-            review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)
-        ]
+        review_data = review_data[review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)]
     if search_sc:
-        mc = (review_data["CATEGORY"].astype(str).str.contains(search_sc, case=False, na=False)
-              if "CATEGORY" in review_data.columns
-              else pd.Series(False, index=review_data.index))
+        mc = review_data["CATEGORY"].astype(str).str.contains(search_sc, case=False, na=False) if "CATEGORY" in review_data.columns else pd.Series(False, index=review_data.index)
         ms = review_data["SELLER_NAME"].astype(str).str.contains(search_sc, case=False, na=False)
         review_data = review_data[mc | ms]
 
@@ -1973,13 +1603,10 @@ def render_image_grid():
     if st.session_state.grid_page >= total_pages:
         st.session_state.grid_page = 0
 
-    # ── Pagination controls only (batch controls are now inside the iframe) ───
     pg_cols = st.columns([1, 2, 1])
     with pg_cols[0]:
-        if st.button("◀ Prev", use_container_width=True,
-                     disabled=st.session_state.grid_page == 0):
+        if st.button("◀ Prev", use_container_width=True, disabled=st.session_state.grid_page == 0):
             st.session_state.grid_page = max(0, st.session_state.grid_page - 1)
-            st.session_state.do_scroll_top = True
             st.rerun(scope="fragment")
     with pg_cols[1]:
         st.markdown(
@@ -1989,53 +1616,163 @@ def render_image_grid():
             unsafe_allow_html=True,
         )
     with pg_cols[2]:
-        if st.button("Next ▶", use_container_width=True,
-                     disabled=st.session_state.grid_page >= total_pages - 1):
+        if st.button("Next ▶", use_container_width=True, disabled=st.session_state.grid_page >= total_pages - 1):
             st.session_state.grid_page += 1
-            st.session_state.do_scroll_top = True
             st.rerun(scope="fragment")
 
-    # ── Image quality checks ──────────────────────────────────────────────────
     page_start = st.session_state.grid_page * ipp
-    page_data  = review_data.iloc[page_start : page_start + ipp]
+    page_data  = review_data.iloc[page_start : page_start + ipp].reset_index(drop=True)
 
-    page_warnings: dict = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
-        future_to_sid = {
-            ex.submit(analyze_image_quality_cached,
-                      str(r.get("MAIN_IMAGE", "")).strip()): str(r["PRODUCT_SET_SID"])
-            for _, r in page_data.iterrows()
-        }
-        for future in concurrent.futures.as_completed(future_to_sid):
-            warns = future.result()
-            if warns:
-                page_warnings[future_to_sid[future]] = warns
+    # ── Batch controls (pure Python — reads checkboxes from session_state) ───
+    O = JUMIA_COLORS['primary_orange']
+    R = JUMIA_COLORS['jumia_red']
 
-    rejected_state = {
-        sid: st.session_state[f"quick_rej_reason_{sid}"]
-        for sid in page_data["PRODUCT_SET_SID"].astype(str)
-        if st.session_state.get(f"quick_rej_{sid}")
-    }
+    sel_sids = [
+        str(row["PRODUCT_SET_SID"])
+        for _, row in page_data.iterrows()
+        if st.session_state.get(f"grid_sel_{row['PRODUCT_SET_SID']}")
+        and not st.session_state.get(f"quick_rej_{row['PRODUCT_SET_SID']}")
+    ]
 
+    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1, 2, 1, 1])
+    with ctrl1:
+        st.markdown(f"<div style='padding:8px 0;font-weight:700;color:{O}'>{len(sel_sids)} selected</div>", unsafe_allow_html=True)
+    with ctrl2:
+        batch_reason = st.selectbox(
+            "Batch reason", label_visibility="collapsed",
+            options=["REJECT_POOR_IMAGE","REJECT_WRONG_CAT","REJECT_FAKE",
+                     "REJECT_BRAND","REJECT_WRONG_BRAND","REJECT_PROHIBITED","REJECT_COLOR"],
+            format_func=lambda x: REASON_MAP.get(x, x),
+            key="grid_batch_reason"
+        )
+    with ctrl3:
+        if st.button("✗ Batch Reject", type="primary", use_container_width=True, disabled=len(sel_sids) == 0):
+            flag  = REASON_MAP.get(batch_reason, "Other Reason (Custom)")
+            code, cmt = support_files["flags_mapping"].get(flag, ("1000007 - Other Reason", "Manual rejection"))
+
+            st.session_state.final_report.loc[
+                st.session_state.final_report["ProductSetSid"].isin(sel_sids),
+                ["Status","Reason","Comment","FLAG"]
+            ] = ["Rejected", code, cmt, flag]
+
+            for s in sel_sids:
+                st.session_state[f"quick_rej_{s}"]        = True
+                st.session_state[f"quick_rej_reason_{s}"] = flag
+                st.session_state.pop(f"grid_sel_{s}", None)
+
+            st.session_state.exports_cache.clear()
+            st.session_state.display_df_cache.clear()
+            st.session_state.main_toasts.append((f"Rejected {len(sel_sids)} product(s)", "✅"))
+            st.rerun(scope="app")
+    with ctrl4:
+        if st.button("☐ Deselect All", use_container_width=True):
+            for _, row in page_data.iterrows():
+                st.session_state.pop(f"grid_sel_{row['PRODUCT_SET_SID']}", None)
+            st.rerun(scope="fragment")
+
+    # ── Card grid (pure Streamlit columns) ───────────────────────────────────
     cols_per_row = 3 if st.session_state.layout_mode == "centered" else 4
 
-    grid_html = build_fast_grid_html(
-        page_data,
-        support_files["flags_mapping"],
-        st.session_state.selected_country,
-        page_warnings,
-        rejected_state,
-        cols_per_row,
-    )
-    components.html(grid_html, height=1400, scrolling=True)
+    for row_start in range(0, len(page_data), cols_per_row):
+        row_items = page_data.iloc[row_start : row_start + cols_per_row]
+        cols = st.columns(cols_per_row)
 
-    if st.session_state.get("do_scroll_top", False):
-        components.html(
-            "<script>window.parent.document.querySelector('.main')"
-            ".scrollTo({top:0,behavior:'smooth'});</script>",
-            height=0,
-        )
-        st.session_state.do_scroll_top = False
+        for col_idx, (_, row) in enumerate(row_items.iterrows()):
+            sid      = str(row["PRODUCT_SET_SID"])
+            img_url  = str(row.get("MAIN_IMAGE", "")).strip()
+            is_rejected = st.session_state.get(f"quick_rej_{sid}", False)
+            rej_reason  = st.session_state.get(f"quick_rej_reason_{sid}", "")
+
+            with cols[col_idx]:
+                # Card container with border colour
+                border = R if is_rejected else JUMIA_COLORS['border_gray']
+                bg     = "#fff5f5" if is_rejected else "#ffffff"
+
+                st.markdown(
+                    f"<div style='border:2px solid {border};border-radius:8px;"
+                    f"padding:8px;background:{bg};margin-bottom:4px;'>",
+                    unsafe_allow_html=True
+                )
+
+                # Image
+                if img_url.startswith("http"):
+                    st.image(img_url, use_container_width=True)
+                else:
+                    st.markdown(
+                        "<div style='aspect-ratio:1;background:#eee;border-radius:6px;"
+                        "display:flex;align-items:center;justify-content:center;"
+                        "font-size:11px;color:#999'>No Image</div>",
+                        unsafe_allow_html=True
+                    )
+
+                # Meta
+                name   = str(row.get("NAME",   ""))
+                brand  = str(row.get("BRAND",  ""))
+                cat    = str(row.get("CATEGORY",""))
+                seller = str(row.get("SELLER_NAME",""))
+
+                st.markdown(
+                    f"<div style='font-size:11px;line-height:1.4;margin:4px 0'>"
+                    f"<b style='font-size:12px'>{name[:45]}{'…' if len(name)>45 else ''}</b><br>"
+                    f"<span style='color:{O};font-weight:700'>{brand}</span><br>"
+                    f"<span style='color:#666'>{cat}</span><br>"
+                    f"<span style='color:#999;font-size:10px'>{seller}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+                if is_rejected:
+                    st.markdown(
+                        f"<div style='background:{R};color:white;border-radius:6px;"
+                        f"padding:4px 8px;font-size:11px;font-weight:700;text-align:center;"
+                        f"margin:4px 0'>REJECTED — {rej_reason}</div>",
+                        unsafe_allow_html=True
+                    )
+                else:
+                    # Selection checkbox
+                    st.checkbox(
+                        "Select",
+                        key=f"grid_sel_{sid}",
+                        label_visibility="collapsed"
+                    )
+
+                    # Quick reject buttons
+                    qa, qb = st.columns(2)
+                    with qa:
+                        if st.button("Poor Img", key=f"qi_poor_{sid}", use_container_width=True):
+                            flag = "Poor images"
+                            code, cmt = support_files["flags_mapping"].get(flag, ("1000007 - Other Reason", "Poor Image Quality"))
+                            st.session_state.final_report.loc[
+                                st.session_state.final_report["ProductSetSid"] == sid,
+                                ["Status","Reason","Comment","FLAG"]
+                            ] = ["Rejected", code, cmt, flag]
+                            st.session_state[f"quick_rej_{sid}"]        = True
+                            st.session_state[f"quick_rej_reason_{sid}"] = flag
+                            st.session_state.exports_cache.clear()
+                            st.session_state.display_df_cache.clear()
+                            st.rerun(scope="app")
+                    with qb:
+                        more_reason = st.selectbox(
+                            "More", label_visibility="collapsed",
+                            options=["","REJECT_WRONG_CAT","REJECT_FAKE","REJECT_BRAND",
+                                     "REJECT_PROHIBITED","REJECT_COLOR","REJECT_WRONG_BRAND"],
+                            format_func=lambda x: "More…" if x == "" else REASON_MAP.get(x, x),
+                            key=f"qi_more_{sid}"
+                        )
+                        if more_reason:
+                            flag = REASON_MAP.get(more_reason, "Other Reason (Custom)")
+                            code, cmt = support_files["flags_mapping"].get(flag, ("1000007 - Other Reason", "Manual rejection"))
+                            st.session_state.final_report.loc[
+                                st.session_state.final_report["ProductSetSid"] == sid,
+                                ["Status","Reason","Comment","FLAG"]
+                            ] = ["Rejected", code, cmt, flag]
+                            st.session_state[f"quick_rej_{sid}"]        = True
+                            st.session_state[f"quick_rej_reason_{sid}"] = flag
+                            st.session_state.exports_cache.clear()
+                            st.session_state.display_df_cache.clear()
+                            st.rerun(scope="app")
+
+                st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ==========================================
