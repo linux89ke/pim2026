@@ -1585,7 +1585,7 @@ def render_image_grid():
         for k in st.session_state.keys()
         if k.startswith("quick_rej_") and "reason" not in k
     }
-        mask = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
+    mask = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
     valid_grid_df = fr[mask]
 
     c1, c2, c3 = st.columns([1.5, 1.5, 2])
