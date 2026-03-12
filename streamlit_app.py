@@ -3,33 +3,47 @@ import pandas as pd
 import streamlit.components.v1 as components
 import json
 from datetime import datetime
-import hashlib
-import re
-import logging
+import random
 
 # ────────────────────────────────────────────────
-#  Minimal version for testing the grid + batch fix
+#  Minimal test app – Batch reject grid with pending → confirm pattern
+#  Fixed: all columns now have exactly the same length
 # ────────────────────────────────────────────────
 
-st.set_page_config(page_title="Grid Batch Reject Test", layout="wide")
+st.set_page_config(page_title="Grid Batch Reject Test (Fixed)", layout="wide")
 
-# Fake data generator
+# ── Test data generator ──────────────────────────────────────────────────────
+
 @st.cache_data
-def generate_test_data(n=120):
+def generate_test_data(n=180):
     sids = [f"PSID_{i:05d}" for i in range(1, n+1)]
+    
+    brand_pool = ["Samsung", "Apple", "Xiaomi", "Tecno", "Generic", "Huawei", "Oppo", "Vivo", "Nokia", "Infinix"]
+    cat_pool   = ["Phones", "Laptops", "Fashion", "Home", "Beauty", "Accessories", "Electronics"]
+    seller_pool = ["ShopZ", "MegaDeals", "TrendyHub", "TechWorld", "FashionNova", "GadgetPro", "HomeEssentials"]
+    
+    # Make sure every list has exactly n items
+    brands  = [random.choice(brand_pool) for _ in range(n)]
+    cats    = [random.choice(cat_pool)   for _ in range(n)]
+    sellers = [random.choice(seller_pool) for _ in range(n)]
+    
     df = pd.DataFrame({
         "PRODUCT_SET_SID": sids,
         "NAME": [f"Product Amazing Thing {i}" for i in range(1, n+1)],
-        "BRAND": ["Samsung", "Apple", "Xiaomi", "Tecno", "Generic"][:n%5+1]* (n//5 + 1),
-        "CATEGORY": ["Phones", "Laptops", "Fashion", "Home", "Beauty"][:n%5+1]* (n//5 + 1),
-        "SELLER_NAME": ["ShopZ", "MegaDeals", "TrendyHub", "TechWorld"][:n%4+1]* (n//4 + 1),
-        "MAIN_IMAGE": ["https://picsum.photos/seed/{}/300".format(i) for i in range(1, n+1)],
-        "GLOBAL_PRICE": [99.99 + i*5 for i in range(n)],
+        "BRAND": brands,
+        "CATEGORY": cats,
+        "SELLER_NAME": sellers,
+        "MAIN_IMAGE": [f"https://picsum.photos/seed/{i}/300/300" for i in range(1, n+1)],
+        "GLOBAL_PRICE": [round(49.99 + i*4.5, 2) for i in range(n)],
     })
     return df
 
+# ── Session state initialization ─────────────────────────────────────────────
+
 if 'committed' not in st.session_state:
-    st.session_state.committed = {}           # sid → reason_key
+    st.session_state.committed = {}           # sid → reason_key (final)
+if 'pending' not in st.session_state:
+    st.session_state.pending = {}             # sid → reason_key (waiting for confirm)
 if 'grid_page' not in st.session_state:
     st.session_state.grid_page = 0
 if 'ipp' not in st.session_state:
@@ -37,11 +51,13 @@ if 'ipp' not in st.session_state:
 if 'bridge' not in st.session_state:
     st.session_state.bridge = ""
 
+# ── Load data ────────────────────────────────────────────────────────────────
+
 data = generate_test_data(180)
 
-# ── JavaScript Grid ───────────────────────────────────────────────────────────
+# ── JavaScript + HTML grid ───────────────────────────────────────────────────
 
-def build_grid_html(page_df, committed):
+def build_grid_html(page_df, committed, pending):
 
     cards = []
     for _, r in page_df.iterrows():
@@ -49,7 +65,7 @@ def build_grid_html(page_df, committed):
         cards.append({
             "sid": sid,
             "img": r["MAIN_IMAGE"],
-            "name": r["NAME"][:60] + "…" if len(r["NAME"]) > 60 else r["NAME"],
+            "name": r["NAME"][:58] + "…" if len(r["NAME"]) > 58 else r["NAME"],
             "brand": r["BRAND"],
             "cat": r["CATEGORY"],
             "seller": r["SELLER_NAME"],
@@ -57,6 +73,7 @@ def build_grid_html(page_df, committed):
 
     cards_json = json.dumps(cards)
     committed_json = json.dumps(committed)
+    pending_json = json.dumps(pending)
 
     return f"""
 <!DOCTYPE html>
@@ -64,44 +81,51 @@ def build_grid_html(page_df, committed):
 <head>
 <meta charset="utf-8">
 <style>
-  * {{ margin:0; padding:0; box-sizing:border-box; font-family:sans-serif; }}
-  body {{ background:#f8f9fa; padding:16px; }}
+  * {{ margin:0; padding:0; box-sizing:border-box; font-family:system-ui, sans-serif; }}
+  body {{ background:#f9fafb; padding:16px; }}
   .toolbar {{
-    position: sticky; top:0; z-index:10;
-    background:white; padding:12px 16px; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.1);
-    margin-bottom:16px; display:flex; justify-content:space-between; align-items:center; gap:16px;
+    position:sticky; top:0; z-index:10;
+    background:white; padding:12px 20px; border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,0.08);
+    margin-bottom:20px; display:flex; justify-content:space-between; align-items:center; gap:16px;
     flex-wrap:wrap;
   }}
-  .stats {{ font-weight:bold; color:#e65100; }}
-  .grid {{ display:grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap:16px; }}
+  .stats {{ font-weight:600; color:#c2410c; }}
+  .grid {{ display:grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap:16px; }}
   .card {{
-    border:2px solid #e0e0e0; border-radius:12px; overflow:hidden; background:white;
+    border:2px solid #e5e7eb; border-radius:12px; overflow:hidden; background:white;
     transition: all 0.18s ease; position:relative;
   }}
-  .card.selected   {{ border-color:#4caf50; box-shadow:0 0 0 3px rgba(76,175,80,0.2); }}
-  .card.committed  {{ opacity:0.5; filter:grayscale(0.4); border-color:#aaa; }}
-  .card.pending    {{ border-color:#ff9800; box-shadow:0 0 0 3px rgba(255,152,0,0.3); }}
-  .img-wrap {{ position:relative; cursor:pointer; height:240px; background:#f0f0f0; }}
+  .card.selected   {{ border-color:#16a34a; box-shadow:0 0 0 3px rgba(22,163,74,0.15); }}
+  .card.committed  {{ opacity:0.54; filter:grayscale(0.5); border-color:#9ca3af; }}
+  .card.pending    {{ border-color:#ea580c; box-shadow:0 0 0 3px rgba(234,88,12,0.2); }}
+  .img-wrap {{ position:relative; cursor:pointer; height:260px; background:#f3f4f6; }}
   img {{ width:100%; height:100%; object-fit:contain; }}
   .tick {{
-    position:absolute; bottom:8px; right:8px; width:28px; height:28px;
-    background:rgba(0,0,0,0.4); border-radius:50%; color:white; font-weight:bold;
-    display:flex; align-items:center; justify-content:center; pointer-events:none;
+    position:absolute; bottom:10px; right:10px; width:32px; height:32px;
+    background:rgba(0,0,0,0.45); border-radius:50%; color:white; font-weight:bold;
+    display:flex; align-items:center; justify-content:center; pointer-events:none; font-size:18px;
   }}
-  .card.selected .tick {{ background:#4caf50; }}
-  .meta {{ padding:10px; font-size:13px; }}
-  .name {{ font-weight:600; line-height:1.3; max-height:40px; overflow:hidden; }}
-  .brand {{ color:#e65100; font-weight:700; margin:4px 0 2px; }}
-  .cat, .seller {{ color:#555; font-size:12px; }}
-  .status {{ position:absolute; top:8px; right:8px; padding:4px 10px; border-radius:12px; font-size:11px; font-weight:bold; }}
-  .status-pending  {{ background:#ff9800; color:white; }}
-  .status-rejected {{ background:#d32f2f; color:white; }}
-  .actions {{ padding:0 10px 12px; display:flex; gap:8px; }}
-  button, select {{ padding:6px 12px; border-radius:6px; border:none; cursor:pointer; font-weight:600; }}
-  .quick-btn {{ background:#e65100; color:white; flex:1; }}
-  .more {{ background:#eee; color:#333; }}
-  #confirm-batch {{ background:#d32f2f; color:white; font-weight:bold; padding:8px 16px; border:none; border-radius:6px; cursor:pointer; }}
-  #confirm-batch:disabled {{ opacity:0.5; cursor:not-allowed; background:#ccc; }}
+  .card.selected .tick {{ background:#16a34a; }}
+  .meta {{ padding:12px; font-size:13.5px; line-height:1.4; }}
+  .name {{ font-weight:600; max-height:44px; overflow:hidden; }}
+  .brand {{ color:#c2410c; font-weight:700; margin:4px 0 3px; }}
+  .cat, .seller {{ color:#4b5563; font-size:12.5px; }}
+  .status {{
+    position:absolute; top:10px; right:10px; padding:5px 12px;
+    border-radius:999px; font-size:11px; font-weight:700; color:white;
+  }}
+  .status-pending  {{ background:#ea580c; }}
+  .status-rejected {{ background:#dc2626; }}
+  .actions {{ padding:0 12px 14px; display:flex; gap:10px; }}
+  button, select {{
+    padding:7px 14px; border-radius:8px; border:none; cursor:pointer;
+    font-weight:600; font-size:13px;
+  }}
+  .quick-btn {{ background:#c2410c; color:white; flex:1; }}
+  .more     {{ background:#e5e7eb; color:#1f2937; }}
+  #batch-btn       {{ background:#c2410c; color:white; }}
+  #confirm-batch   {{ background:#dc2626; color:white; font-weight:bold; padding:9px 18px; }}
+  #confirm-batch:disabled {{ opacity:0.5; cursor:not-allowed; background:#9ca3af; }}
 </style>
 </head>
 <body>
@@ -109,9 +133,9 @@ def build_grid_html(page_df, committed):
 <div class="toolbar">
   <div>
     <span class="stats" id="sel">0 selected</span>
-    <span style="margin-left:16px;">Page {st.session_state.grid_page + 1}</span>
+    <span style="margin-left:20px; color:#6b7280;">Page {st.session_state.grid_page + 1}</span>
   </div>
-  <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+  <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
     <select id="reason">
       <option value="POOR_IMAGE">Poor Image</option>
       <option value="WRONG_CAT">Wrong Category</option>
@@ -119,8 +143,8 @@ def build_grid_html(page_df, committed):
       <option value="PROHIBITED">Prohibited</option>
       <option value="BRAND">Restricted Brand</option>
     </select>
-    <button id="batch-btn">Batch Reject →</button>
-    <span id="pending">Pending: 0</span>
+    <button id="batch-btn">Batch → Pending</button>
+    <span id="pending-count" style="font-weight:600; color:#ea580c;">Pending: 0</span>
     <button id="confirm-batch" disabled>CONFIRM REJECT</button>
     <button onclick="deselectAll()">Deselect All</button>
   </div>
@@ -131,15 +155,16 @@ def build_grid_html(page_df, committed):
 <script>
 const CARDS = {cards_json};
 const COMMITTED = {committed_json};
+const PENDING_FROM_PYTHON = {pending_json};
 
 let selected = {{}};
-let pending = {{}};
+let pending = {{ ...PENDING_FROM_PYTHON }};
 
 function $(id) {{ return document.getElementById(id); }}
 
 function updateUI() {{
   $('sel').textContent = Object.keys(selected).length + " selected";
-  $('pending').textContent = "Pending: " + Object.keys(pending).length;
+  $('pending-count').textContent = "Pending: " + Object.keys(pending).length;
   $('confirm-batch').disabled = Object.keys(pending).length === 0;
 }}
 
@@ -147,21 +172,21 @@ function render() {{
   const html = CARDS.map(c => {{
     const sid = c.sid;
     let cls = 'card';
-    let status = '';
+    let statusHtml = '';
     if (sid in COMMITTED) {{
       cls += ' committed';
-      status = `<div class="status status-rejected">REJECTED</div>`;
+      statusHtml = `<div class="status status-rejected">REJECTED</div>`;
     }} else if (sid in pending) {{
       cls += ' pending';
-      status = `<div class="status status-pending">PENDING</div>`;
+      statusHtml = `<div class="status status-pending">PENDING</div>`;
     }} else if (sid in selected) {{
       cls += ' selected';
     }}
     return `
       <div class="${{cls}}" id="c${{sid}}">
-        ${{status}}
+        ${{statusHtml}}
         <div class="img-wrap" onclick="toggle('${{sid}}')">
-          <img src="${{c.img}}" loading="lazy" onerror="this.src='https://via.placeholder.com/240?text=×'">
+          <img src="${{c.img}}" loading="lazy" onerror="this.src='https://via.placeholder.com/260?text=×'">
           <div class="tick">✓</div>
         </div>
         <div class="meta">
@@ -200,8 +225,13 @@ function updateCard(sid) {{
   const c = CARDS.find(x => x.sid === sid);
   if (!c) return;
   const tmp = document.createElement('div');
-  tmp.innerHTML = renderCard(c);  // we'll define renderCard separately if needed
+  tmp.innerHTML = renderOneCard(c);  // fallback rendering
   el.replaceWith(tmp.firstChild);
+}}
+
+function renderOneCard(c) {{
+  // minimal version for replace – full logic is in render()
+  return `<div class="card"><div class="img-wrap"><img src="${c.img}"></div><div class="meta"><div class="name">${c.name}</div></div></div>`;
 }}
 
 function quickReject(sid, reason) {{
@@ -213,9 +243,9 @@ function quickReject(sid, reason) {{
   send('pending_change', {{sid, reason}});
 }}
 
-function batchStart() {{
+function batchToPending() {{
   const reason = $('reason').value;
-  if (!reason) return;
+  if (!reason) return alert("Select a reason first");
   Object.keys(selected).forEach(sid => {{
     if (!(sid in COMMITTED)) pending[sid] = reason;
   }});
@@ -227,7 +257,7 @@ function batchStart() {{
 function confirmBatch() {{
   if (Object.keys(pending).length === 0) return;
   send('batch_confirm', pending);
-  // Move pending → committed locally (optimistic)
+  // optimistic UI update
   Object.assign(COMMITTED, pending);
   pending = {{}};
   render();
@@ -240,83 +270,100 @@ function deselectAll() {{
 }}
 
 function send(type, payload) {{
-  window.parent.postMessage({{type:"grid", action:type, payload}}, "*");
+  window.parent.postMessage({{type:"grid_msg", action:type, payload}}, "*");
 }}
 
-$('batch-btn').onclick = batchStart;
+$('batch-btn').onclick = batchToPending;
 $('confirm-batch').onclick = confirmBatch;
 
 render();
 </script>
 </body>
 </html>
-"""
+    """
 
-# ── Bridge ───────────────────────────────────────────────────────────────────
+# ── Message bridge ───────────────────────────────────────────────────────────
 
 components.html("""
 <script>
-window.addEventListener("message", function(e) {
-  if (!e.data || e.data.type !== "grid") return;
-  const el = [...document.querySelectorAll('input[type="text"]')]
-    .find(inp => inp.getAttribute("aria-label")?.includes("bridge"));
-  if (!el) return;
-  el.value = JSON.stringify(e.data);
-  el.dispatchEvent(new Event("input", {bubbles:true}));
+window.addEventListener("message", e => {
+  if (!e.data || e.data.type !== "grid_msg") return;
+  const inputs = document.querySelectorAll('input[type="text"]');
+  let bridge = null;
+  for (const inp of inputs) {
+    if (inp.getAttribute("aria-label")?.includes("bridge")) {
+      bridge = inp;
+      break;
+    }
+  }
+  if (!bridge) return;
+  bridge.value = JSON.stringify(e.data);
+  bridge.dispatchEvent(new Event("input", {bubbles: true}));
 });
 </script>
 """, height=0)
 
-bridge = st.text_input("bridge", value=st.session_state.bridge, label_visibility="collapsed", key="bridge_input")
+bridge_input = st.text_input(
+    "bridge",
+    value=st.session_state.bridge,
+    label_visibility="collapsed",
+    key="bridge_input_unique"
+)
 
-if bridge and bridge != st.session_state.bridge:
+if bridge_input and bridge_input != st.session_state.bridge:
     try:
-        msg = json.loads(bridge)
+        msg = json.loads(bridge_input)
         act = msg.get("action")
         pay = msg.get("payload", {})
 
         if act == "pending_change":
-            st.toast(f"Pending change: {pay.get('sid')} → {pay.get('reason')}", icon="🟠")
+            st.toast(f"→ Pending: {pay.get('sid')} – {pay.get('reason')}", icon="🟠")
 
         elif act == "batch_confirm":
             count = len(pay)
             for sid, reason in pay.items():
                 st.session_state.committed[sid] = reason
-            st.toast(f"✅ Confirmed batch rejection of {count} items", icon="🟢")
-            st.session_state.bridge = ""
+            st.session_state.pending.clear()
+            st.toast(f"✅ Rejected {count} items (committed)", icon="🟢")
             st.rerun()
 
     except Exception as e:
-        st.error(f"Bridge parse error: {e}")
+        st.error(f"Bridge error: {e}")
     finally:
-        st.session_state.bridge = bridge
+        st.session_state.bridge = bridge_input
 
-# ── UI ───────────────────────────────────────────────────────────────────────
+# ── Main UI ──────────────────────────────────────────────────────────────────
 
-st.title("Batch Reject Grid – Race Condition Test")
+st.title("Batch Rejection Grid – Race Condition Safe Test")
+st.caption("Select many cards quickly → Batch → Pending → Confirm")
 
 c1, c2, c3 = st.columns([1,1,2])
 with c1:
-    st.session_state.ipp = st.select_slider("Items/page", [12,24,36,48,72], value=st.session_state.ipp)
+    st.session_state.ipp = st.select_slider("Items per page", [12, 24, 36, 48, 72], value=st.session_state.ipp)
 with c2:
-    if st.button("Reset committed"):
+    if st.button("Reset all committed"):
         st.session_state.committed.clear()
+        st.session_state.pending.clear()
         st.rerun()
 
 page_start = st.session_state.grid_page * st.session_state.ipp
 page_end   = page_start + st.session_state.ipp
 page_df    = data.iloc[page_start:page_end]
 
-st.caption(f"Showing {len(page_df)} items  |  committed = {len(st.session_state.committed)}")
+st.caption(f"Showing {len(page_df)} items  |  committed: {len(st.session_state.committed)}  |  pending: {len(st.session_state.pending)}")
 
-html = build_grid_html(page_df, st.session_state.committed)
-components.html(html, height=1400, scrolling=True)
+html_content = build_grid_html(
+    page_df,
+    st.session_state.committed,
+    st.session_state.pending
+)
+components.html(html_content, height=1450, scrolling=True)
 
 # Pagination
 pc, nc = st.columns(2)
 with pc:
-    if st.button("← Prev", disabled=st.session_state.grid_page <= 0):
-        st.session_state.grid_page -= 1
+    if st.button("← Previous", disabled=st.session_state.grid_page <= 0):
+        st.session_state.grid_page = max(0, st.session_state.grid_page - 1)
         st.rerun()
 with nc:
     if st.button("Next →", disabled=page_end >= len(data)):
@@ -324,11 +371,14 @@ with nc:
         st.rerun()
 
 st.markdown("---")
-st.write("**How to test the fix:**")
 st.markdown("""
-1. Click several images quickly to select
-2. Choose reason → **Batch Reject →**
-3. See orange **Pending** counter rise
-4. Click **CONFIRM REJECT** → should reject reliably
-5. Try very fast clicking → pending should still collect everything
+### How to test the improved behavior
+
+1. Click many images **very quickly** to select them
+2. Choose a reason → click **Batch → Pending**
+3. Watch orange **Pending** counter increase
+4. Click **CONFIRM REJECT** → should process all reliably
+5. Fast clicking should no longer lose selections (they stay in pending)
+
+The key fix: batch only collects locally → one single confirmation message is sent.
 """)
