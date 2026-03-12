@@ -148,15 +148,8 @@ if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
 if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = False
 if 'display_df_cache' not in st.session_state: st.session_state.display_df_cache = {}
 
-# Session state counters for dynamic keys
-if 'desel_counter' not in st.session_state: st.session_state.desel_counter = 0
-if 'batch_counter' not in st.session_state: st.session_state.batch_counter = 0  
-if 'clear_counter' not in st.session_state: st.session_state.clear_counter = 0
-if 'ls_processed_flag' not in st.session_state: st.session_state.ls_processed_flag = False
-
-# Replaced st_javascript read trigger with the new bridge init
-if 'ls_read_trigger' not in st.session_state: st.session_state.ls_read_trigger = 0
 if 'grid_bridge' not in st.session_state: st.session_state.grid_bridge = ""
+if 'grid_msg_counter' not in st.session_state: st.session_state.grid_msg_counter = 0
 
 try: st.set_page_config(page_title="Product Tool", layout=st.session_state.layout_mode)
 except: pass
@@ -1284,23 +1277,22 @@ def _process_grid_selections(raw_json: str, support_files: dict) -> int:
 # HTML GRID BUILDER
 # -------------------------------------------------
 def build_fast_grid_html(
-    page_data: pd.DataFrame,
-    flags_mapping: dict,
-    country: str,
-    page_warnings: dict,
-    rejected_state: dict,
-    cols_per_row: int,
-    cmd: str = "",
-    cmd_reason: str = "",
-    clear_selection: bool = False,
-    saved_selected: dict = None,
-) -> str:
+    page_data,
+    flags_mapping,
+    country,
+    page_warnings,
+    rejected_state,
+    cols_per_row,
+    cmd="",
+    cmd_reason="",
+    clear_selection=False,
+    saved_selected=None,
+):
     O = JUMIA_COLORS["primary_orange"]
     G = JUMIA_COLORS["success_green"]
     R = JUMIA_COLORS["jumia_red"]
 
     committed_json = json.dumps(rejected_state)
-    cmd_json = json.dumps({"cmd": cmd, "reason": cmd_reason, "savedSelected": saved_selected or {}})
 
     cards_data = []
     for _, row in page_data.iterrows():
@@ -1326,10 +1318,35 @@ def build_fast_grid_html(
 <style>
   *{{box-sizing:border-box;margin:0;padding:0;font-family:sans-serif;}}
   body{{background:#f5f5f5;padding:8px;}}
-  .info-bar{{display:flex;align-items:center;gap:12px;padding:8px 12px;background:#fff;
-             border:1px solid #e0e0e0;border-radius:8px;margin-bottom:12px;
-             font-size:12px;flex-wrap:wrap;color:#555;}}
-  .sel-count{{font-weight:700;color:{O};}}
+
+  /* ── sticky control bar ── */
+  .ctrl-bar{{
+    position:sticky;top:0;z-index:100;
+    display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+    padding:8px 12px;background:#fff;
+    border:1px solid #e0e0e0;border-radius:8px;margin-bottom:12px;
+    box-shadow:0 2px 6px rgba(0,0,0,.08);
+  }}
+  .sel-count{{font-weight:700;color:{O};font-size:13px;min-width:80px;}}
+  .reason-sel{{
+    flex:1;min-width:160px;padding:6px 10px;
+    border:1px solid #ccc;border-radius:4px;font-size:12px;
+    background:#fff;cursor:pointer;outline:none;
+  }}
+  .batch-btn{{
+    padding:7px 14px;background:{O};color:#fff;
+    border:none;border-radius:4px;font-weight:700;font-size:12px;
+    cursor:pointer;white-space:nowrap;
+  }}
+  .batch-btn:hover{{opacity:.88;}}
+  .desel-btn{{
+    padding:7px 12px;background:#fff;color:#555;
+    border:1px solid #ccc;border-radius:4px;font-size:12px;
+    cursor:pointer;white-space:nowrap;
+  }}
+  .desel-btn:hover{{background:#f5f5f5;}}
+
+  /* ── grid & cards ── */
   .grid{{display:grid;grid-template-columns:repeat({cols_per_row},1fr);gap:12px;}}
   .card{{border:2px solid #e0e0e0;border-radius:8px;padding:10px;background:#fff;
          position:relative;transition:border-color .15s,box-shadow .15s;}}
@@ -1367,63 +1384,63 @@ def build_fast_grid_html(
 </style>
 </head>
 <body>
-<div class="info-bar">
-  <span>Click image to <b>select</b> &nbsp;|&nbsp; Use <b>Batch Reject</b> above</span>
+
+<div class="ctrl-bar">
   <span class="sel-count" id="sel-count-bar">0 selected</span>
+  <select class="reason-sel" id="batch-reason">
+    <option value="REJECT_POOR_IMAGE">Poor Image Quality</option>
+    <option value="REJECT_WRONG_CAT">Wrong Category</option>
+    <option value="REJECT_FAKE">Suspected Fake</option>
+    <option value="REJECT_BRAND">Restricted Brand</option>
+    <option value="REJECT_WRONG_BRAND">Wrong Brand</option>
+    <option value="REJECT_PROHIBITED">Prohibited Product</option>
+    <option value="REJECT_COLOR">Missing Color</option>
+  </select>
+  <button class="batch-btn" onclick="doBatchReject()">✗ Batch Reject Selected</button>
+  <button class="desel-btn"  onclick="doDeselAll()">☐ Deselect All</button>
+  <span style="font-size:11px;color:#999;">Click image to select</span>
 </div>
+
 <div class="grid" id="card-grid"></div>
+
 <script>
 const CARDS     = {cards_json};
-const COMMITTED = {committed_json};
-const CMD       = {cmd_json};
-const CLEAR_SELECTION = {str(clear_selection).lower()};
+const COMMITTED = {committed_json};   // already-rejected sids → reason label
 
-// ── In-memory selection (no localStorage — different origin from parent) ──────
+// Selection lives ONLY in JS — no async bridge needed
 let selected = {{}};
 
-// Restore selection from CMD.savedSelected if present (survives re-renders)
-if (CMD.savedSelected) {{
-  selected = CMD.savedSelected;
+// ── postMessage helper ────────────────────────────────────────────────────────
+function sendMsg(type, payload) {{
+  window.parent.postMessage({{type:"jtGrid", action:type, payload:payload}}, "*");
 }}
 
-// Clear if requested (page navigation)
-if (CLEAR_SELECTION) {{
-  selected = {{}};
-}}
-
-// Remove already-committed sids from selection
-Object.keys(COMMITTED).forEach(sid => {{ delete selected[sid]; }});
-
+// ── UI helpers ────────────────────────────────────────────────────────────────
 function updateSelCount() {{
   const n = Object.keys(selected).length;
   document.getElementById('sel-count-bar').textContent = n + ' selected';
-}}
-
-// ── postMessage to parent ─────────────────────────────────────────────────────
-function sendMsg(type, payload) {{
-  window.parent.postMessage({{type: "jtGrid", action: type, payload: payload}}, "*");
 }}
 
 // ── Card rendering ────────────────────────────────────────────────────────────
 function renderCard(card) {{
   const {{sid, img, name, brand, cat, seller, warnings}} = card;
   const isCommitted = sid in COMMITTED;
-  const isSelected  = (sid in selected) && !isCommitted;
-  
+  const isSelected  = !isCommitted && (sid in selected);
+
   let cls = 'card';
   if (isCommitted)     cls += ' committed-rej';
   else if (isSelected) cls += ' selected';
-  
+
   const shortName = name.length > 38 ? name.slice(0,38)+'…' : name;
   const warnHtml  = warnings.map(w => `<span class="warn-badge">${{w}}</span>`).join('');
   const rejLabel  = isCommitted ? (COMMITTED[sid]||'').replace(/_/g,' ') : '';
-  
+
   const rejOverlay = isCommitted ? `
     <div class="rej-overlay">
       <div class="rej-badge">REJECTED</div>
       <div class="rej-label">${{rejLabel}}</div>
     </div>` : '';
-    
+
   const actHtml = !isCommitted ? `
     <div class="acts">
       <button class="act-btn"
@@ -1441,7 +1458,7 @@ function renderCard(card) {{
         <option value="REJECT_WRONG_BRAND">Wrong Brand</option>
       </select>
     </div>` : '';
-    
+
   return `<div class="${{cls}}" id="card-${{sid}}">
     <div class="card-img-wrap" onclick="toggleSelect('${{sid}}')">
       <div class="warn-wrap">${{warnHtml}}</div>
@@ -1469,47 +1486,43 @@ function replaceCard(sid) {{
   if (card) {{ const t=document.createElement('div'); t.innerHTML=renderCard(card); el.replaceWith(t.firstElementChild); }}
 }}
 
+// ── Actions ───────────────────────────────────────────────────────────────────
 function toggleSelect(sid) {{
   if (sid in COMMITTED) return;
   if (sid in selected) delete selected[sid];
-  else selected[sid] = 'SELECTED';
-  // Notify parent of updated selection (so it can pass it back on re-render)
-  sendMsg('selection_update', selected);
+  else selected[sid] = true;
   replaceCard(sid);
   updateSelCount();
 }}
 
 function quickReject(sid, reasonKey) {{
   delete selected[sid];
-  sendMsg('selection_update', selected);
-  // Send rejection directly to parent via postMessage
-  sendMsg('reject', {{[sid]: reasonKey}});
-  // Optimistic UI
   COMMITTED[sid] = reasonKey;
+  sendMsg('reject', {{[sid]: reasonKey}});
   replaceCard(sid);
   updateSelCount();
 }}
 
-// ── Handle CMD (batch_reject / deselect) ──────────────────────────────────────
-(function handleCmd() {{
-  const {{cmd, reason}} = CMD;
-  if (cmd === 'batch_reject') {{
-    const toReject = Object.keys(selected);
-    if (toReject.length > 0) {{
-      const payload = {{}};
-      toReject.forEach(sid => {{
-        payload[sid] = reason;
-        COMMITTED[sid] = reason;
-      }});
-      sendMsg('reject', payload);
-      selected = {{}};
-      sendMsg('selection_update', selected);
-    }}
-  }} else if (cmd === 'deselect') {{
-    selected = {{}};
-    sendMsg('selection_update', selected);
-  }}
-}})();
+function doBatchReject() {{
+  const toReject = Object.keys(selected);
+  if (toReject.length === 0) {{ alert('No products selected.'); return; }}
+  const reasonKey = document.getElementById('batch-reason').value;
+  const payload   = {{}};
+  toReject.forEach(sid => {{
+    payload[sid]    = reasonKey;
+    COMMITTED[sid]  = reasonKey;
+    delete selected[sid];
+  }});
+  sendMsg('reject', payload);
+  renderAll();   // re-render all cards to show committed state
+  updateSelCount();
+}}
+
+function doDeselAll() {{
+  selected = {{}};
+  renderAll();
+  updateSelCount();
+}}
 
 renderAll();
 </script>
@@ -1704,13 +1717,11 @@ if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.grid_page = 0
     st.session_state.exports_cache = {}
     st.session_state.display_df_cache = {}
-    # Reset all JS-bridge counters on new file load
-    st.session_state.desel_counter = 0
-    st.session_state.batch_counter = 0
-    st.session_state.clear_counter = 0
-    st.session_state.ls_processed_flag = False
-    st.session_state.ls_read_trigger = 0
+    
+    # Bridge variables
     st.session_state.grid_bridge = ""
+    st.session_state.grid_msg_counter = 0
+
     keys_to_delete = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_"))]
     for k in keys_to_delete: del st.session_state[k]
 
@@ -1837,7 +1848,6 @@ if uploaded_files and not st.session_state.final_report.empty and st.session_sta
 # ==========================================
 # SECTION 2: MANUAL IMAGE REVIEW
 # ==========================================
-
 @st.fragment
 def render_image_grid():
     if st.session_state.final_report.empty or st.session_state.file_mode == "post_qc":
@@ -1848,16 +1858,14 @@ def render_image_grid():
 
     if "grid_msg_counter" not in st.session_state:
         st.session_state.grid_msg_counter = 0
-    if "grid_selection" not in st.session_state:
-        st.session_state.grid_selection = {}
     if "grid_bridge" not in st.session_state:
         st.session_state.grid_bridge = ""
 
-    # ── postMessage listener injected into PARENT page ────────────────────────
+    # ── postMessage listener injected into parent page ────────────────────────
+    # Only needs to handle 'reject' now — no selection_update
     components.html("""
     <script>
     (function() {
-      // Bind to the parent window since that's where the grid posts messages to!
       var target = window.parent || window;
       if (target._jtListenerActive) return;
       target._jtListenerActive = true;
@@ -1865,7 +1873,8 @@ def render_image_grid():
         if (!e.data || e.data.type !== "jtGrid") return;
         var action  = e.data.action;
         var payload = e.data.payload;
-        // Find the hidden Streamlit text input and update it
+        if (action !== "reject") return;   // only care about rejections now
+        // Find the hidden bridge input by aria-label
         var inputs = target.document.querySelectorAll('input[type="text"]');
         var bridge = null;
         inputs.forEach(function(inp) {
@@ -1873,7 +1882,7 @@ def render_image_grid():
         });
         if (!bridge) return;
         var msg = JSON.stringify({action: action, payload: payload});
-        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
         setter.call(bridge, msg);
         bridge.dispatchEvent(new Event('input', {bubbles: true}));
       });
@@ -1881,7 +1890,7 @@ def render_image_grid():
     </script>
     """, height=0)
 
-    # ── Hidden bridge input — Streamlit reads this natively ───────────────────
+    # ── Hidden bridge input ───────────────────────────────────────────────────
     bridge_val = st.text_input(
         "jtbridge",
         value=st.session_state.grid_bridge,
@@ -1889,47 +1898,43 @@ def render_image_grid():
         label_visibility="collapsed",
     )
 
-    # ── Process message from iframe ───────────────────────────────────────────
+    # ── Process ONLY reject messages from iframe ──────────────────────────────
     if bridge_val and bridge_val not in ("", "0"):
         try:
-            msg = json.loads(bridge_val)
-            action  = msg.get("action", "")
-            payload = msg.get("payload", {})
-            
-            if action == "selection_update":
-                st.session_state.grid_selection = payload
-                st.session_state.grid_msg_counter += 1
-                st.rerun(scope="fragment")
-            elif action == "reject" and isinstance(payload, dict) and payload:
-                reason_groups: dict[str, list] = {}
-                for sid, reason_key in payload.items():
-                    reason_groups.setdefault(reason_key, []).append(sid)
-                
-                total = 0
-                for reason_key, sids in reason_groups.items():
-                    flag_name = REASON_MAP.get(reason_key, "Other Reason (Custom)")
-                    code, cmt = support_files["flags_mapping"].get(
-                        flag_name, ("1000007 - Other Reason", "Manual rejection")
-                    )
-                    apply_rejection(sids, code, cmt, flag_name)
-                    for s in sids:
-                        st.session_state[f"quick_rej_{s}"] = True
-                        st.session_state[f"quick_rej_reason_{s}"] = flag_name
-                        # Remove from in-memory selection
-                        st.session_state.grid_selection.pop(s, None)
-                    total += len(sids)
-                
-                st.session_state.main_toasts.append((f"Rejected {total} product(s)", "✅"))
-                st.session_state.exports_cache.clear()
-                st.session_state.display_df_cache.clear()
-                st.session_state.grid_msg_counter += 1
-                st.rerun(scope="app")
+            msg    = json.loads(bridge_val)
+            action = msg.get("action", "")
+
+            if action == "reject":
+                payload = msg.get("payload", {})
+                if isinstance(payload, dict) and payload:
+                    reason_groups: dict = {}
+                    for sid, reason_key in payload.items():
+                        reason_groups.setdefault(reason_key, []).append(sid)
+
+                    total = 0
+                    for reason_key, sids in reason_groups.items():
+                        flag_name = REASON_MAP.get(reason_key, "Other Reason (Custom)")
+                        code, cmt = support_files["flags_mapping"].get(
+                            flag_name, ("1000007 - Other Reason", "Manual rejection")
+                        )
+                        apply_rejection(sids, code, cmt, flag_name)
+                        for s in sids:
+                            st.session_state[f"quick_rej_{s}"]        = True
+                            st.session_state[f"quick_rej_reason_{s}"] = flag_name
+                        total += len(sids)
+
+                    st.session_state.main_toasts.append((f"Rejected {total} product(s)", "✅"))
+                    st.session_state.exports_cache.clear()
+                    st.session_state.display_df_cache.clear()
+                    st.session_state.grid_msg_counter += 1
+                    # Full app rerun so the Flags Breakdown expander updates
+                    st.rerun(scope="app")
         except Exception as e:
             logger.error(f"Grid bridge parse error: {e}")
         finally:
             st.session_state.grid_bridge = ""
 
-    # ── Build UI ──────────────────────────────────────────────────────────────
+    # ── Build display data ────────────────────────────────────────────────────
     fr   = st.session_state.final_report
     data = st.session_state.all_data_map
 
@@ -1938,11 +1943,11 @@ def render_image_grid():
         for k in st.session_state.keys()
         if k.startswith("quick_rej_") and "reason" not in k
     }
-    mask = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
-    valid_grid_df = fr[mask]
+    mask           = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
+    valid_grid_df  = fr[mask]
 
     c1, c2, c3 = st.columns([1.5, 1.5, 2])
-    with c1: search_n  = st.text_input("Search by Name", placeholder="Product name…")
+    with c1: search_n  = st.text_input("Search by Name",            placeholder="Product name…")
     with c2: search_sc = st.text_input("Search by Seller/Category", placeholder="Seller or Category…")
     with c3:
         st.session_state.grid_items_per_page = st.select_slider(
@@ -1957,10 +1962,13 @@ def render_image_grid():
         left_on="ProductSetSid", right_on="PRODUCT_SET_SID", how="left",
     )
     if search_n:
-        review_data = review_data[review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)]
+        review_data = review_data[
+            review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)
+        ]
     if search_sc:
         mc = (review_data["CATEGORY"].astype(str).str.contains(search_sc, case=False, na=False)
-              if "CATEGORY" in review_data.columns else pd.Series(False, index=review_data.index))
+              if "CATEGORY" in review_data.columns
+              else pd.Series(False, index=review_data.index))
         ms = review_data["SELLER_NAME"].astype(str).str.contains(search_sc, case=False, na=False)
         review_data = review_data[mc | ms]
 
@@ -1969,83 +1977,27 @@ def render_image_grid():
     if st.session_state.grid_page >= total_pages:
         st.session_state.grid_page = 0
 
-    batch_reason_options = [
-        ("Poor Image Quality",  "REJECT_POOR_IMAGE"),
-        ("Wrong Category",      "REJECT_WRONG_CAT"),
-        ("Suspected Fake",      "REJECT_FAKE"),
-        ("Restricted Brand",    "REJECT_BRAND"),
-        ("Wrong Brand",         "REJECT_WRONG_BRAND"),
-        ("Prohibited Product",  "REJECT_PROHIBITED"),
-    ]
-    batch_labels = [l for l, _ in batch_reason_options]
-
-    ctrl_cols = st.columns([1, 1, 1, 2, 2, 2])
-    with ctrl_cols[0]:
-        if st.button("◀ Prev", use_container_width=True, disabled=st.session_state.grid_page == 0):
+    # ── Pagination controls only (batch controls are now inside the iframe) ───
+    pg_cols = st.columns([1, 2, 1])
+    with pg_cols[0]:
+        if st.button("◀ Prev", use_container_width=True,
+                     disabled=st.session_state.grid_page == 0):
             st.session_state.grid_page = max(0, st.session_state.grid_page - 1)
             st.session_state.do_scroll_top = True
-            st.session_state.grid_selection = {}
-            st.session_state.grid_msg_counter += 1
             st.rerun(scope="fragment")
-    with ctrl_cols[1]:
+    with pg_cols[1]:
         st.markdown(
             f"<div style='text-align:center;padding:8px 0;font-weight:700;'>"
-            f"Page {st.session_state.grid_page+1} / {total_pages}</div>",
+            f"Page {st.session_state.grid_page+1} / {total_pages}"
+            f" &nbsp;·&nbsp; {len(review_data)} items</div>",
             unsafe_allow_html=True,
         )
-    with ctrl_cols[2]:
-        if st.button("Next ▶", use_container_width=True, disabled=st.session_state.grid_page >= total_pages - 1):
+    with pg_cols[2]:
+        if st.button("Next ▶", use_container_width=True,
+                     disabled=st.session_state.grid_page >= total_pages - 1):
             st.session_state.grid_page += 1
             st.session_state.do_scroll_top = True
-            st.session_state.grid_selection = {}
-            st.session_state.grid_msg_counter += 1
             st.rerun(scope="fragment")
-    with ctrl_cols[3]:
-        chosen_label = st.selectbox(
-            "Batch reason", batch_labels,
-            label_visibility="collapsed",
-            key="grid_batch_reason",
-        )
-    with ctrl_cols[4]:
-        do_batch = st.button("✗ Batch Reject Selected", use_container_width=True, type="primary")
-    with ctrl_cols[5]:
-        do_desel = st.button("☐ Deselect All", use_container_width=True)
-
-    chosen_key = dict(batch_reason_options).get(chosen_label, "REJECT_POOR_IMAGE")
-
-    # Batch reject — process directly in Python using stored selection
-    if do_batch:
-        current_selection = st.session_state.grid_selection
-        if current_selection:
-            reason_groups: dict[str, list] = {}
-            for sid, _ in current_selection.items():
-                reason_groups.setdefault(chosen_key, []).append(sid)
-            
-            total = 0
-            for reason_key, sids in reason_groups.items():
-                flag_name = REASON_MAP.get(reason_key, "Other Reason (Custom)")
-                code, cmt = support_files["flags_mapping"].get(
-                    flag_name, ("1000007 - Other Reason", "Manual rejection")
-                )
-                apply_rejection(sids, code, cmt, flag_name)
-                for s in sids:
-                    st.session_state[f"quick_rej_{s}"] = True
-                    st.session_state[f"quick_rej_reason_{s}"] = flag_name
-                total += len(sids)
-            
-            st.session_state.grid_selection = {}
-            st.session_state.main_toasts.append((f"Rejected {total} product(s)", "✅"))
-            st.session_state.exports_cache.clear()
-            st.session_state.display_df_cache.clear()
-            st.session_state.grid_msg_counter += 1
-            st.rerun(scope="app")
-        else:
-            st.toast("No products selected", icon="⚠️")
-
-    if do_desel:
-        st.session_state.grid_selection = {}
-        st.session_state.grid_msg_counter += 1
-        st.rerun(scope="fragment")
 
     # ── Image quality checks ──────────────────────────────────────────────────
     page_start = st.session_state.grid_page * ipp
@@ -2054,7 +2006,8 @@ def render_image_grid():
     page_warnings: dict = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
         future_to_sid = {
-            ex.submit(analyze_image_quality_cached, str(r.get("MAIN_IMAGE", "")).strip()): str(r["PRODUCT_SET_SID"])
+            ex.submit(analyze_image_quality_cached,
+                      str(r.get("MAIN_IMAGE", "")).strip()): str(r["PRODUCT_SET_SID"])
             for _, r in page_data.iterrows()
         }
         for future in concurrent.futures.as_completed(future_to_sid):
@@ -2070,11 +2023,6 @@ def render_image_grid():
 
     cols_per_row = 3 if st.session_state.layout_mode == "centered" else 4
 
-    # Pass current selection into iframe via CMD.savedSelected so it survives re-renders
-    grid_cmd = ""
-    grid_cmd_reason = ""
-    saved_selected = st.session_state.grid_selection
-
     grid_html = build_fast_grid_html(
         page_data,
         support_files["flags_mapping"],
@@ -2082,12 +2030,8 @@ def render_image_grid():
         page_warnings,
         rejected_state,
         cols_per_row,
-        cmd=grid_cmd,
-        cmd_reason=grid_cmd_reason,
-        clear_selection=False,
-        saved_selected=saved_selected,
     )
-    components.html(grid_html, height=1300, scrolling=True)
+    components.html(grid_html, height=1400, scrolling=True)
 
     if st.session_state.get("do_scroll_top", False):
         components.html(
