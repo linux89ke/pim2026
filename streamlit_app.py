@@ -1,133 +1,251 @@
-import streamlit as st
 import pandas as pd
+import streamlit as st
 import streamlit.components.v1 as components
+import st_yled
+from io import BytesIO
+from datetime import datetime
+import re
+import logging
+from typing import Dict, List, Tuple, Optional, Set
+import traceback
 import json
+import zipfile
+import os
+import concurrent.futures
+from dataclasses import dataclass
+import base64
+import time
+import hashlib
+import requests
+from PIL import Image
 import random
 
+try:
+    from postqc import detect_file_type, normalize_post_qc, run_checks as run_post_qc_checks, render_post_qc_section
+except ImportError:
+    pass
+
 # ────────────────────────────────────────────────
-#   Batch Rejection Grid Test – Fully Fixed Version
-#   (March 2025 style – safe against fast clicking)
+# JUMIA THEME & CONSTANTS (unchanged)
 # ────────────────────────────────────────────────
 
-st.set_page_config(page_title="Batch Reject Grid – Fixed", layout="wide")
+JUMIA_COLORS = {
+    'primary_orange': '#F68B1E',
+    'secondary_orange': '#FF9933',
+    'jumia_red': '#E73C17',
+    'dark_gray': '#313133',
+    'medium_gray': '#5A5A5C',
+    'light_gray': '#F5F5F5',
+    'border_gray': '#E0E0E0',
+    'success_green': '#4CAF50',
+    'warning_yellow': '#FFC107',
+    'white': '#FFFFFF',
+    'black': '#000000'
+}
 
-# ── Test data ────────────────────────────────────────────────────────────────
+PRODUCTSETS_COLS = ["ProductSetSid", "ParentSKU", "Status", "Reason", "Comment", "FLAG", "SellerName"]
+REJECTION_REASONS_COLS = ['CODE - REJECTION_REASON', 'COMMENT']
+FULL_DATA_COLS = [
+    "PRODUCT_SET_SID", "ACTIVE_STATUS_COUNTRY", "NAME", "BRAND", "CATEGORY", "CATEGORY_CODE",
+    "COLOR", "COLOR_FAMILY", "MAIN_IMAGE", "VARIATION", "PARENTSKU", "SELLER_NAME", "SELLER_SKU",
+    "GLOBAL_PRICE", "GLOBAL_SALE_PRICE", "TAX_CLASS", "FLAG", "LISTING_STATUS",
+    "PRODUCT_WARRANTY", "WARRANTY_DURATION", "WARRANTY_ADDRESS", "WARRANTY_TYPE", "COUNT_VARIATIONS",
+    "LIST_VARIATIONS"
+]
+GRID_COLS = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'CATEGORY', 'SELLER_NAME', 'MAIN_IMAGE', 'GLOBAL_SALE_PRICE', 'GLOBAL_PRICE', 'COLOR']
 
-@st.cache_data
-def generate_test_data(n=180):
-    sids = [f"PSID_{i:05d}" for i in range(1, n+1)]
+FX_RATE = 128.0
+COUNTRY_CURRENCY = {
+    "Kenya": {"code": "KES", "symbol": "KSh", "pair": "USD/KES"},
+    "Uganda": {"code": "UGX", "symbol": "USh", "pair": "USD/UGX"},
+    "Nigeria": {"code": "NGN", "symbol": "₦", "pair": "USD/NGN"},
+    "Ghana": {"code": "GHS", "symbol": "GH₵", "pair": "USD/GHS"},
+    "Morocco": {"code": "MAD", "symbol": "MAD", "pair": "USD/MAD"},
+}
 
-    brand_pool  = ["Samsung", "Apple", "Xiaomi", "Tecno", "Generic", "Huawei", "Oppo", "Vivo", "Nokia", "Infinix"]
-    cat_pool    = ["Phones", "Laptops", "Fashion", "Home", "Beauty", "Accessories", "Electronics"]
-    seller_pool = ["ShopZ", "MegaDeals", "TrendyHub", "TechWorld", "FashionNova", "GadgetPro", "HomeEssentials"]
+# ... (keep all your original @st.cache_data functions: fetch_exchange_rate, format_local_price, etc.)
 
-    brands  = [random.choice(brand_pool)  for _ in range(n)]
-    cats    = [random.choice(cat_pool)    for _ in range(n)]
-    sellers = [random.choice(seller_pool) for _ in range(n)]
+SPLIT_LIMIT = 9998
+NEW_FILE_MAPPING = { ... }  # keep your original mapping
 
-    df = pd.DataFrame({
-        "PRODUCT_SET_SID": sids,
-        "NAME":           [f"Product Amazing Thing {i}" for i in range(1, n+1)],
-        "BRAND":          brands,
-        "CATEGORY":       cats,
-        "SELLER_NAME":    sellers,
-        "MAIN_IMAGE":     [f"https://picsum.photos/seed/{i}/300/300" for i in range(1, n+1)],
-        "GLOBAL_PRICE":   [round(49.99 + i * 4.5, 2) for i in range(n)],
-    })
-    return df
+logger = logging.getLogger(__name__)
 
-data = generate_test_data(180)
+# Session state initialization (expanded with pending)
+if 'layout_mode' not in st.session_state: st.session_state.layout_mode = "wide"
+if 'final_report' not in st.session_state: st.session_state.final_report = pd.DataFrame()
+if 'all_data_map' not in st.session_state: st.session_state.all_data_map = pd.DataFrame()
+if 'post_qc_summary' not in st.session_state: st.session_state.post_qc_summary = pd.DataFrame()
+if 'post_qc_results' not in st.session_state: st.session_state.post_qc_results = {}
+if 'post_qc_data' not in st.session_state: st.session_state.post_qc_data = pd.DataFrame()
+if 'file_mode' not in st.session_state: st.session_state.file_mode = None
+if 'intersection_sids' not in st.session_state: st.session_state.intersection_sids = set()
+if 'intersection_count' not in st.session_state: st.session_state.intersection_count = 0
+if 'grid_page' not in st.session_state: st.session_state.grid_page = 0
+if 'grid_items_per_page' not in st.session_state: st.session_state.grid_items_per_page = 50
+if 'main_toasts' not in st.session_state: st.session_state.main_toasts = []
+if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
+if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = False
+if 'display_df_cache' not in st.session_state: st.session_state.display_df_cache = {}
+if 'committed' not in st.session_state: st.session_state.committed = {}     # sid → reason (final)
+if 'pending' not in st.session_state: st.session_state.pending = {}         # sid → reason (waiting confirm)
+if 'grid_bridge' not in st.session_state: st.session_state.grid_bridge = ""
+if 'grid_msg_counter' not in st.session_state: st.session_state.grid_msg_counter = 0
 
-# ── Session state ────────────────────────────────────────────────────────────
+try: st.set_page_config(page_title="Product Tool", layout=st.session_state.layout_mode)
+except: pass
 
-if 'committed' not in st.session_state:
-    st.session_state.committed = {}     # sid → reason (final)
-if 'pending' not in st.session_state:
-    st.session_state.pending = {}       # sid → reason (waiting confirm)
-if 'grid_page' not in st.session_state:
-    st.session_state.grid_page = 0
-if 'ipp' not in st.session_state:
-    st.session_state.ipp = 24
-if 'bridge' not in st.session_state:
-    st.session_state.bridge = ""
+st_yled.init()
 
-# ── Grid HTML + JS ───────────────────────────────────────────────────────────
+# Your original global CSS (unchanged)
+st.markdown(f"""<style>...</style>""", unsafe_allow_html=True)  # ← paste your full CSS here
 
-def build_grid_html(page_df, committed, pending):
+# ... keep get_default_country(), country selection, toasts, clean_category_code(), normalize_text(), etc.
 
-    cards = []
-    for _, r in page_df.iterrows():
-        sid = str(r["PRODUCT_SET_SID"])
-        cards.append({
-            "sid": sid,
-            "img": r["MAIN_IMAGE"],
-            "name": r["NAME"][:58] + "…" if len(r["NAME"]) > 58 else r["NAME"],
-            "brand": r["BRAND"],
-            "cat": r["CATEGORY"],
-            "seller": r["SELLER_NAME"],
-        })
+# ────────────────────────────────────────────────
+# LOAD SUPPORT FILES (unchanged)
+# ────────────────────────────────────────────────
 
-    cards_json    = json.dumps(cards)
-    committed_json = json.dumps(committed)
-    pending_json   = json.dumps(pending)
+try:
+    support_files = load_support_files_lazy()
+except Exception as e:
+    st.error(f"Failed to load configs: {e}")
+    st.stop()
 
-    return f"""
+# ────────────────────────────────────────────────
+# FILE UPLOAD & PROCESSING (mostly unchanged)
+# ────────────────────────────────────────────────
+
+st.header(":material/upload_file: Upload Files", anchor=False)
+country_choice = st.segmented_control("Country", ["Kenya", "Uganda", "Nigeria", "Ghana", "Morocco"],
+                                      default=st.session_state.get('selected_country', 'Kenya'))
+if country_choice:
+    st.session_state.selected_country = country_choice
+
+country_validator = CountryValidator(st.session_state.selected_country)
+
+uploaded_files = st.file_uploader("Upload CSV or XLSX files", type=['csv', 'xlsx'], accept_multiple_files=True)
+
+# Your original file processing logic here (keep as-is)
+# When files change → reset states including committed & pending
+if uploaded_files:
+    # ... your signature + reset logic ...
+    st.session_state.committed.clear()
+    st.session_state.pending.clear()
+
+    # ... rest of upload / validation / caching logic ...
+
+# ────────────────────────────────────────────────
+# IMPROVED GRID (fast click + batch safe)
+# ────────────────────────────────────────────────
+
+@st.fragment
+def render_image_grid():
+    if st.session_state.final_report.empty or st.session_state.file_mode == "post_qc":
+        return
+
+    st.markdown("---")
+    st.header(":material/pageview: Manual Image & Category Review", anchor=False)
+
+    fr = st.session_state.final_report
+    data = st.session_state.all_data_map
+
+    committed_rej_sids = set(st.session_state.committed.keys())
+    mask = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
+    valid_grid_df = fr[mask]
+
+    # Search & filter
+    c1, c2, c3 = st.columns([1.5, 1.5, 2])
+    with c1: search_n = st.text_input("Search by Name", key="search_name")
+    with c2: search_sc = st.text_input("Seller or Category", key="search_sc")
+    with c3: st.session_state.grid_items_per_page = st.select_slider("Items/page", [20,50,100,200],
+                                                                     value=st.session_state.grid_items_per_page)
+
+    review_data = pd.merge(
+        valid_grid_df[["ProductSetSid"]],
+        data[GRID_COLS],
+        left_on="ProductSetSid", right_on="PRODUCT_SET_SID", how="left"
+    )
+
+    if search_n:
+        review_data = review_data[review_data["NAME"].str.contains(search_n, case=False, na=False)]
+    if search_sc:
+        mc = review_data["CATEGORY"].str.contains(search_sc, case=False, na=False) if "CATEGORY" in review_data else False
+        ms = review_data["SELLER_NAME"].str.contains(search_sc, case=False, na=False)
+        review_data = review_data[mc | ms]
+
+    ipp = st.session_state.grid_items_per_page
+    total_pages = max(1, (len(review_data) + ipp - 1) // ipp)
+    if st.session_state.grid_page >= total_pages: st.session_state.grid_page = 0
+
+    # Pagination controls
+    pg1, pg2, pg3 = st.columns([1,2,1])
+    with pg1:
+        if st.button("◀ Prev", disabled=st.session_state.grid_page == 0):
+            st.session_state.grid_page -= 1
+            st.rerun(scope="fragment")
+    with pg2:
+        st.markdown(f"**Page {st.session_state.grid_page+1} / {total_pages}**  ·  {len(review_data)} items")
+    with pg3:
+        if st.button("Next ▶", disabled=st.session_state.grid_page >= total_pages-1):
+            st.session_state.grid_page += 1
+            st.rerun(scope="fragment")
+
+    page_start = st.session_state.grid_page * ipp
+    page_data = review_data.iloc[page_start : page_start + ipp]
+
+    # Image quality (unchanged)
+    page_warnings = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        futures = {ex.submit(analyze_image_quality_cached, str(r.get("MAIN_IMAGE","")).strip()): str(r["PRODUCT_SET_SID"])
+                   for _, r in page_data.iterrows()}
+        for future in concurrent.futures.as_completed(futures):
+            warns = future.result()
+            if warns: page_warnings[futures[future]] = warns
+
+    cols_per_row = 3 if st.session_state.layout_mode == "centered" else 4
+
+    grid_html = f"""
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
-  * {{margin:0;padding:0;box-sizing:border-box;font-family:system-ui,sans-serif;}}
-  body {{background:#f9fafb;padding:16px;}}
-  .toolbar {{
-    position:sticky;top:0;z-index:10;
-    background:white;padding:12px 20px;border-radius:10px;
-    box-shadow:0 2px 10px rgba(0,0,0,0.08);margin-bottom:20px;
-    display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;
-  }}
-  .stats {{font-weight:600;color:#c2410c;}}
-  .grid {{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px;}}
-  .card {{
-    border:2px solid #e5e7eb;border-radius:12px;overflow:hidden;background:white;
-    transition:all .18s;position:relative;
-  }}
-  .card.selected   {{border-color:#16a34a;box-shadow:0 0 0 3px rgba(22,163,74,.15);}}
-  .card.committed  {{opacity:.54;filter:grayscale(.5);border-color:#9ca3af;}}
-  .card.pending    {{border-color:#ea580c;box-shadow:0 0 0 3px rgba(234,88,12,.2);}}
-  .img-wrap {{position:relative;cursor:pointer;height:260px;background:#f3f4f6;}}
-  img {{width:100%;height:100%;object-fit:contain;}}
-  .tick {{
-    position:absolute;bottom:10px;right:10px;width:32px;height:32px;
-    background:rgba(0,0,0,.45);border-radius:50%;color:white;font-weight:bold;
-    display:flex;align-items:center;justify-content:center;pointer-events:none;font-size:18px;
-  }}
-  .card.selected .tick {{background:#16a34a;}}
-  .meta {{padding:12px;font-size:13.5px;line-height:1.4;}}
-  .name {{font-weight:600;max-height:44px;overflow:hidden;}}
-  .brand {{color:#c2410c;font-weight:700;margin:4px 0 3px;}}
-  .cat,.seller {{color:#4b5563;font-size:12.5px;}}
-  .status {{
-    position:absolute;top:10px;right:10px;padding:5px 12px;
-    border-radius:999px;font-size:11px;font-weight:700;color:white;
-  }}
-  .status-pending  {{background:#ea580c;}}
-  .status-rejected {{background:#dc2626;}}
-  .actions {{padding:0 12px 14px;display:flex;gap:10px;}}
-  button,select {{padding:7px 14px;border-radius:8px;border:none;cursor:pointer;font-weight:600;font-size:13px;}}
-  .quick-btn {{background:#c2410c;color:white;flex:1;}}
-  .more      {{background:#e5e7eb;color:#1f2937;}}
-  #batch-btn       {{background:#c2410c;color:white;}}
-  #confirm-batch   {{background:#dc2626;color:white;font-weight:bold;padding:9px 18px;}}
-  #confirm-batch:disabled {{opacity:.5;cursor:not-allowed;background:#9ca3af;}}
+  *{{margin:0;padding:0;box-sizing:border-box;font-family:system-ui,sans-serif;}}
+  body{{background:#f9fafb;padding:16px;}}
+  .ctrl-bar{{position:sticky;top:0;z-index:10;background:white;padding:12px 20px;border-radius:10px;
+            box-shadow:0 2px 10px rgba(0,0,0,0.08);margin-bottom:20px;display:flex;justify-content:space-between;
+            align-items:center;gap:16px;flex-wrap:wrap;}}
+  .stats{{font-weight:600;color:#c2410c;}}
+  .grid{{display:grid;grid-template-columns:repeat({cols_per_row},1fr);gap:16px;}}
+  .card{{border:2px solid #e5e7eb;border-radius:12px;overflow:hidden;background:white;transition:all .18s;position:relative;}}
+  .card.selected{{border-color:#16a34a;box-shadow:0 0 0 3px rgba(22,163,74,.15);}}
+  .card.committed{{opacity:.54;filter:grayscale(.5);border-color:#9ca3af;}}
+  .card.pending{{border-color:#ea580c;box-shadow:0 0 0 3px rgba(234,88,12,.2);}}
+  .img-wrap{{position:relative;cursor:pointer;height:260px;background:#f3f4f6;}}
+  img{{width:100%;height:100%;object-fit:contain;}}
+  .tick{{position:absolute;bottom:10px;right:10px;width:32px;height:32px;background:rgba(0,0,0,.45);border-radius:50%;
+         color:white;font-weight:bold;display:flex;align-items:center;justify-content:center;pointer-events:none;font-size:18px;}}
+  .card.selected .tick{{background:#16a34a;}}
+  .meta{{padding:12px;font-size:13.5px;line-height:1.4;}}
+  .name{{font-weight:600;max-height:44px;overflow:hidden;}}
+  .brand{{color:#c2410c;font-weight:700;margin:4px 0 3px;}}
+  .cat,.seller{{color:#4b5563;font-size:12.5px;}}
+  .status{{position:absolute;top:10px;right:10px;padding:5px 12px;border-radius:999px;font-size:11px;font-weight:700;color:white;}}
+  .status-pending{{background:#ea580c;}}
+  .status-rejected{{background:#dc2626;}}
+  .actions{{padding:0 12px 14px;display:flex;gap:10px;}}
+  button,select{{padding:7px 14px;border-radius:8px;border:none;cursor:pointer;font-weight:600;font-size:13px;}}
+  .quick-btn{{background:#c2410c;color:white;flex:1;}}
+  .more{{background:#e5e7eb;color:#1f2937;}}
+  #batch-btn{{background:#c2410c;color:white;}}
+  #confirm-batch{{background:#dc2626;color:white;font-weight:bold;padding:9px 18px;}}
+  #confirm-batch:disabled{{opacity:.5;cursor:not-allowed;background:#9ca3af;}}
 </style>
 </head>
 <body>
 
-<div class="toolbar">
-  <div>
-    <span class="stats" id="sel">0 selected</span>
-    <span style="margin-left:20px;color:#6b7280;">Page {st.session_state.grid_page + 1}</span>
-  </div>
+<div class="ctrl-bar">
+  <div><span class="stats" id="sel">0 selected</span> <span style="margin-left:20px;color:#6b7280;">Page {st.session_state.grid_page + 1}</span></div>
   <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;">
     <select id="reason">
       <option value="POOR_IMAGE">Poor Image</option>
@@ -146,12 +264,12 @@ def build_grid_html(page_df, committed, pending):
 <div class="grid" id="grid"></div>
 
 <script>
-const CARDS     = {cards_json};
-const COMMITTED = {committed_json};
-const PENDING   = {pending_json};
+const CARDS = {json.dumps(cards)};
+const COMMITTED = {json.dumps(st.session_state.committed)};
+const PENDING_FROM_PY = {json.dumps(st.session_state.pending)};
 
 let selected = {{}};
-let pending  = {{...PENDING}};
+let pending  = {{...PENDING_FROM_PY}};
 
 function $(id){{return document.getElementById(id);}}
 
@@ -218,7 +336,6 @@ function quickReject(sid, reason){{
   pending[sid] = reason;
   render();
   updateUI();
-  send('pending_change', {{sid, reason}});
 }}
 
 function batchToPending(){{
@@ -257,102 +374,31 @@ render();
 </script>
 </body>
 </html>
-"""
+    """
 
-# ── Bridge ───────────────────────────────────────────────────────────────────
+    components.html(grid_html, height=1450, scrolling=True)
 
-components.html("""
-<script>
-window.addEventListener("message", e => {
-  if (!e.data || e.data.type !== "grid_msg") return;
-  const inputs = document.querySelectorAll('input[type="text"]');
-  let bridge = null;
-  for (const inp of inputs) {
-    if (inp.getAttribute("aria-label")?.includes("bridge")) {
-      bridge = inp; break;
-    }
-  }
-  if (!bridge) return;
-  bridge.value = JSON.stringify(e.data);
-  bridge.dispatchEvent(new Event("input", {bubbles:true}));
-});
-</script>
-""", height=0)
+    # Process bridge messages (only batch_confirm for now)
+    bridge_val = st.text_input("bridge", value=st.session_state.grid_bridge, key=f"bridge_{st.session_state.grid_msg_counter}",
+                               label_visibility="collapsed")
 
-bridge = st.text_input(
-    "bridge",
-    value=st.session_state.bridge,
-    label_visibility="collapsed",
-    key="bridge_input"
-)
+    if bridge_val and bridge_val != st.session_state.grid_bridge:
+        try:
+            msg = json.loads(bridge_val)
+            if msg.get("action") == "batch_confirm":
+                payload = msg.get("payload", {})
+                count = len(payload)
+                for sid, reason in payload.items():
+                    st.session_state.committed[sid] = reason
+                st.session_state.pending.clear()
+                st.toast(f"✅ Committed {count} rejections", icon="🟢")
+                st.rerun(scope="app")
+        except:
+            pass
+        finally:
+            st.session_state.grid_bridge = bridge_val
 
-if bridge and bridge != st.session_state.bridge:
-    try:
-        msg = json.loads(bridge)
-        act = msg.get("action")
-        pay = msg.get("payload", {})
+# Keep your render_flag_expander, bulk_approve_dialog, exports, etc. unchanged
 
-        if act == "pending_change":
-            st.toast(f"→ Pending: {pay.get('sid')} – {pay.get('reason')}", icon="🟠")
-
-        elif act == "batch_confirm":
-            count = len(pay)
-            for sid, reason in pay.items():
-                st.session_state.committed[sid] = reason
-            st.session_state.pending.clear()
-            st.toast(f"✅ Committed rejection of {count} items", icon="🟢")
-            st.rerun()
-
-    except Exception as e:
-        st.error(f"Bridge parse error: {e}")
-    finally:
-        st.session_state.bridge = bridge
-
-# ── UI ───────────────────────────────────────────────────────────────────────
-
-st.title("Batch Rejection Grid – Fast Click Safe")
-st.caption("Select many cards quickly → Batch → Pending → Confirm")
-
-c1, c2, c3 = st.columns([1,1,2])
-with c1: st.session_state.ipp = st.select_slider("Items/page", [12,24,36,48,72], value=st.session_state.ipp)
-with c2:
-    if st.button("Reset everything"):
-        st.session_state.committed.clear()
-        st.session_state.pending.clear()
-        st.rerun()
-
-page_start = st.session_state.grid_page * st.session_state.ipp
-page_end   = page_start + st.session_state.ipp
-page_df    = data.iloc[page_start:page_end]
-
-st.caption(f"Showing {len(page_df)} items  |  committed: {len(st.session_state.committed)}  |  pending: {len(st.session_state.pending)}")
-
-components.html(
-    build_grid_html(page_df, st.session_state.committed, st.session_state.pending),
-    height=1450,
-    scrolling=True
-)
-
-# Pagination
-pc, nc = st.columns(2)
-with pc:
-    if st.button("← Prev", disabled=st.session_state.grid_page <= 0):
-        st.session_state.grid_page = max(0, st.session_state.grid_page - 1)
-        st.rerun()
-with nc:
-    if st.button("Next →", disabled=page_end >= len(data)):
-        st.session_state.grid_page += 1
-        st.rerun()
-
-st.markdown("---")
-st.markdown("""
-### Test instructions
-
-1. Click many images **very quickly** → they should stay selected
-2. Pick a reason → **Batch → Pending**
-3. See orange **Pending** count rise
-4. Click **CONFIRM REJECT** → all pending items become rejected
-5. Fast multi-clicking should no longer lose items
-
-The batch is now collected locally in JS → only one message is sent on confirm.
-""")
+render_image_grid()
+render_exports_section()  # your original export fragment
