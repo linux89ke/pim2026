@@ -96,6 +96,7 @@ def format_local_price(usd_price, country: str) -> str:
 
 SPLIT_LIMIT = 9998
 
+# --- EXPANDED FILE MAPPING TO CATCH ALL IMAGE COLUMN NAMES ---
 NEW_FILE_MAPPING = {
     'cod_productset_sid': 'PRODUCT_SET_SID',
     "2qz3wx4ec5rv6b7hnj8kl;'[]": 'PRODUCT_SET_SID',
@@ -114,7 +115,16 @@ NEW_FILE_MAPPING = {
     'color family': 'COLOR_FAMILY',
     'COLOUR FAMILY': 'COLOR_FAMILY',
     'list_seller_skus': 'SELLER_SKU',
+    # Added all image variants
     'image1': 'MAIN_IMAGE',
+    'image_1': 'MAIN_IMAGE',
+    'main_image': 'MAIN_IMAGE',
+    'main image': 'MAIN_IMAGE',
+    'image': 'MAIN_IMAGE',
+    'img': 'MAIN_IMAGE',
+    'img_url': 'MAIN_IMAGE',
+    'image_url': 'MAIN_IMAGE',
+    'photo': 'MAIN_IMAGE',
     'dsc_status': 'LISTING_STATUS',
     'dsc_shop_email': 'SELLER_EMAIL',
     'product_warranty': 'PRODUCT_WARRANTY',
@@ -218,7 +228,7 @@ def get_grid_component():
             .card.selected {border-color:var(--G);box-shadow:0 0 0 3px rgba(76,175,80,.2);
                             background:rgba(76,175,80,.04);}
             .card.committed-rej {border-color:#bbb;opacity:.5;}
-            .card-img-wrap {position:relative;cursor:pointer;}
+            .card-img-wrap {position:relative;cursor:pointer; background: #fff;}
             .card-img {width:100%;aspect-ratio:1;object-fit:contain;border-radius:6px;display:block;}
             .card.committed-rej .card-img {filter:grayscale(80%);}
             .tick {position:absolute;bottom:6px;right:6px;width:22px;height:22px;border-radius:50%;
@@ -926,6 +936,11 @@ def standardize_input_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns=renamed)
     for col in ['ACTIVE_STATUS_COUNTRY', 'CATEGORY_CODE', 'BRAND', 'TAX_CLASS', 'NAME', 'SELLER_NAME']:
         if col in df.columns: df[col] = df[col].astype(str)
+        
+    # FORCE MAIN_IMAGE to exist so GRID_COLS doesn't drop it
+    if 'MAIN_IMAGE' not in df.columns:
+        df['MAIN_IMAGE'] = ''
+        
     return df
 
 def validate_input_schema(df: pd.DataFrame) -> Tuple[bool, List[str]]:
@@ -1521,278 +1536,6 @@ REASON_MAP = {
 }
 
 # -------------------------------------------------
-# NATIVE CLOUD BRIDGE COMPONENT (DATA-DRIVEN)
-# -------------------------------------------------
-@st.cache_resource
-def get_grid_component():
-    """Creates a bidirectional Streamlit component to render the grid natively."""
-    tmp_dir = tempfile.mkdtemp()
-    index_path = os.path.join(tmp_dir, "index.html")
-    with open(index_path, "w", encoding="utf-8") as f:
-        f.write("""
-        <!DOCTYPE html>
-        <html>
-        <head>
-          <meta charset="utf-8">
-          <script src="https://cdnjs.cloudflare.com/ajax/libs/streamlit-component-lib/1.3.0/streamlit.js"></script>
-          <style>
-            * {box-sizing:border-box;margin:0;padding:0;font-family:sans-serif;}
-            body {padding:8px; background: transparent;}
-
-            :root {
-                --O: #F68B1E;
-                --G: #4CAF50;
-                --R: #E73C17;
-            }
-
-            .ctrl-bar {
-                position:sticky;top:0;z-index:100;
-                display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-                padding:8px 12px;background:#fff;
-                border:1px solid #e0e0e0;border-radius:8px;margin-bottom:12px;
-                box-shadow:0 2px 6px rgba(0,0,0,.08);
-            }
-            .sel-count {font-weight:700;color:var(--O);font-size:13px;min-width:80px;}
-            .reason-sel {
-                flex:1;min-width:160px;padding:6px 10px;
-                border:1px solid #ccc;border-radius:4px;font-size:12px;
-                background:#fff;cursor:pointer;outline:none;
-            }
-            .batch-btn {
-                padding:7px 14px;background:var(--O);color:#fff;
-                border:none;border-radius:4px;font-weight:700;font-size:12px;
-                cursor:pointer;white-space:nowrap;
-            }
-            .batch-btn:hover {opacity:.88;}
-            .desel-btn {
-                padding:7px 12px;background:#fff;color:#555;
-                border:1px solid #ccc;border-radius:4px;font-size:12px;
-                cursor:pointer;white-space:nowrap;
-            }
-            .desel-btn:hover {background:#f5f5f5;}
-
-            .grid {display:grid; gap:12px;}
-            .card {border:2px solid #e0e0e0;border-radius:8px;padding:10px;background:#fff;
-                   position:relative;transition:border-color .15s,box-shadow .15s;}
-            .card.selected {border-color:var(--G);box-shadow:0 0 0 3px rgba(76,175,80,.2);
-                            background:rgba(76,175,80,.04);}
-            .card.committed-rej {border-color:#bbb;opacity:.5;}
-            .card-img-wrap {position:relative;cursor:pointer;}
-            .card-img {width:100%;aspect-ratio:1;object-fit:contain;border-radius:6px;display:block;}
-            .card.committed-rej .card-img {filter:grayscale(80%);}
-            .tick {position:absolute;bottom:6px;right:6px;width:22px;height:22px;border-radius:50%;
-                   background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;
-                   color:transparent;font-size:13px;font-weight:900;pointer-events:none;}
-            .card.selected .tick {background:var(--G);color:#fff;}
-            .warn-wrap {position:absolute;top:6px;right:6px;display:flex;flex-direction:column;gap:3px;
-                        z-index:5;pointer-events:none;}
-            .warn-badge {background:rgba(255,193,7,.95);color:#313133;font-size:9px;font-weight:800;
-                         padding:3px 7px;border-radius:10px;}
-            .rej-overlay {display:none;position:absolute;inset:0;background:rgba(255,255,255,.88);
-                          border-radius:6px;flex-direction:column;align-items:center;
-                          justify-content:center;z-index:20;gap:5px;padding:8px;text-align:center;}
-            .card.committed-rej .rej-overlay {display:flex;}
-            .rej-badge {background:var(--R);color:#fff;padding:3px 10px;border-radius:10px;
-                        font-size:11px;font-weight:700;}
-            .rej-label {font-size:10px;color:var(--R);font-weight:600;max-width:120px;}
-            .meta {font-size:11px;margin-top:8px;line-height:1.4;}
-            .meta .nm {font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-            .meta .br {color:var(--O);font-weight:700;margin:2px 0;}
-            .meta .ct {color:#666;font-size:10px;}
-            .meta .sl {color:#999;font-size:9px;margin-top:4px;border-top:1px dashed #eee;padding-top:4px;}
-            .acts {display:flex;gap:4px;margin-top:8px;}
-            .act-btn {flex:1;padding:6px;font-size:11px;border:none;border-radius:4px;cursor:pointer;
-                      font-weight:700;color:#fff;background:var(--O);}
-            .act-more {flex:1;font-size:11px;border:1px solid #ccc;border-radius:4px;outline:none;
-                       cursor:pointer;background:#fff;}
-          </style>
-        </head>
-        <body>
-          <div class="ctrl-bar">
-            <span class="sel-count" id="sel-count-bar">0 selected</span>
-            <select class="reason-sel" id="batch-reason">
-              <option value="REJECT_POOR_IMAGE">Poor Image Quality</option>
-              <option value="REJECT_WRONG_CAT">Wrong Category</option>
-              <option value="REJECT_FAKE">Suspected Fake</option>
-              <option value="REJECT_BRAND">Restricted Brand</option>
-              <option value="REJECT_WRONG_BRAND">Wrong Brand</option>
-              <option value="REJECT_PROHIBITED">Prohibited Product</option>
-              <option value="REJECT_COLOR">Missing Color</option>
-            </select>
-            <button class="batch-btn" onclick="doBatchReject()">✗ Batch Reject Selected</button>
-            <button class="desel-btn"  onclick="doDeselAll()">☐ Deselect All</button>
-          </div>
-
-          <div class="grid" id="card-grid"></div>
-
-          <script>
-            let CARDS = [];
-            let COMMITTED = {};
-            let cols_per_row = 4;
-            
-            // Keep selection state alive between page loads
-            window._gridSelected = window._gridSelected || {};
-            let selected = window._gridSelected;
-
-            function sendMsgToPython(type, payload) {
-                Streamlit.setComponentValue({action: type, payload: payload});
-            }
-
-            function escapeHtml(unsafe) {
-                return (unsafe || "").toString()
-                    .replace(/&/g, "&amp;")
-                    .replace(/</g, "&lt;")
-                    .replace(/>/g, "&gt;")
-                    .replace(/"/g, "&quot;")
-                    .replace(/'/g, "&#039;");
-            }
-
-            function updateSelCount() {
-                const n = Object.keys(selected).length;
-                document.getElementById('sel-count-bar').textContent = n + ' selected';
-            }
-
-            function renderCard(card) {
-                const sid = card.sid;
-                const img = escapeHtml(card.img);
-                const name = card.name;
-                const brand = card.brand;
-                const cat = card.cat;
-                const seller = card.seller;
-                const warnings = card.warnings || [];
-                
-                const isCommitted = sid in COMMITTED;
-                const isSelected  = !isCommitted && (sid in selected);
-
-                let cls = 'card';
-                if (isCommitted)     cls += ' committed-rej';
-                else if (isSelected) cls += ' selected';
-
-                const shortName = name.length > 38 ? name.slice(0,38)+'…' : name;
-                const warnHtml  = warnings.map(w => `<span class="warn-badge">${escapeHtml(w)}</span>`).join('');
-                const rejLabel  = isCommitted ? escapeHtml((COMMITTED[sid]||'').replace(/_/g,' ')) : '';
-
-                const rejOverlay = isCommitted ? `
-                    <div class="rej-overlay">
-                      <div class="rej-badge">REJECTED</div>
-                      <div class="rej-label">${rejLabel}</div>
-                    </div>` : '';
-
-                const actHtml = !isCommitted ? `
-                    <div class="acts">
-                      <button class="act-btn" onclick="event.stopPropagation();quickReject('${sid}','REJECT_POOR_IMAGE')">Poor Img</button>
-                      <select class="act-more" onchange="if(this.value){event.stopPropagation();quickReject('${sid}',this.value);this.value=''}">
-                        <option value="">More…</option>
-                        <option value="REJECT_WRONG_CAT">Wrong Category</option>
-                        <option value="REJECT_FAKE">Fake Product</option>
-                        <option value="REJECT_BRAND">Restricted Brand</option>
-                        <option value="REJECT_PROHIBITED">Prohibited</option>
-                        <option value="REJECT_COLOR">Wrong Color</option>
-                        <option value="REJECT_WRONG_BRAND">Wrong Brand</option>
-                      </select>
-                    </div>` : '';
-
-                return `
-                    <div class="${cls}" id="card-${sid}">
-                      <div class="card-img-wrap" onclick="toggleSelect('${sid}')">
-                        <div class="warn-wrap">${warnHtml}</div>
-                        <img class="card-img" src="${img}" loading="lazy" onerror="this.src='https://via.placeholder.com/150?text=No+Image'">
-                        ${rejOverlay}<div class="tick">✓</div>
-                      </div>
-                      <div class="meta">
-                        <div class="nm" title="${escapeHtml(name)}">${escapeHtml(shortName)}</div>
-                        <div class="br">${escapeHtml(brand)}</div>
-                        <div class="ct">${escapeHtml(cat)}</div>
-                        <div class="sl">${escapeHtml(seller)}</div>
-                      </div>
-                      ${actHtml}
-                    </div>`;
-            }
-
-            function renderAll() {
-                const grid = document.getElementById('card-grid');
-                grid.style.gridTemplateColumns = `repeat(${cols_per_row}, 1fr)`;
-                grid.innerHTML = CARDS.map(renderCard).join('');
-                updateSelCount();
-            }
-
-            function replaceCard(sid) {
-                const el = document.getElementById('card-'+sid);
-                if (!el) return;
-                const card = CARDS.find(c => c.sid === sid);
-                if (card) { 
-                    const t = document.createElement('div'); 
-                    t.innerHTML = renderCard(card); 
-                    el.replaceWith(t.firstElementChild); 
-                }
-            }
-
-            window.toggleSelect = function(sid) {
-                if (sid in COMMITTED) return;
-                if (sid in selected) delete selected[sid];
-                else selected[sid] = true;
-                replaceCard(sid);
-                updateSelCount();
-            };
-
-            window.quickReject = function(sid, reasonKey) {
-                delete selected[sid];
-                COMMITTED[sid] = reasonKey;
-                sendMsgToPython('reject', {[sid]: reasonKey});
-                replaceCard(sid);
-                updateSelCount();
-            };
-
-            window.doBatchReject = function() {
-                const toReject = Object.keys(selected);
-                if (toReject.length === 0) { alert('No products selected.'); return; }
-                const reasonKey = document.getElementById('batch-reason').value;
-                const payload = {};
-                toReject.forEach(sid => {
-                    payload[sid] = reasonKey;
-                    COMMITTED[sid] = reasonKey;
-                    delete selected[sid];
-                });
-                sendMsgToPython('reject', payload);
-                renderAll();
-                updateSelCount();
-            };
-
-            window.doDeselAll = function() {
-                Object.keys(selected).forEach(k => delete selected[k]);
-                renderAll();
-                updateSelCount();
-            };
-
-            function onRender(event) {
-                const args = event.detail.args;
-                
-                // If Python sends us new cards, re-render the grid natively
-                if (args.cards) {
-                    const newSignature = JSON.stringify(args.cards.map(c => c.sid)) + JSON.stringify(args.committed);
-                    if (window._lastSignature !== newSignature) {
-                        window._lastSignature = newSignature;
-                        CARDS = args.cards;
-                        COMMITTED = args.committed || {};
-                        cols_per_row = args.cols_per_row || 4;
-                        renderAll();
-                    }
-                }
-                Streamlit.setFrameHeight(args.height || 1400);
-            }
-            
-            Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
-            Streamlit.setComponentReady();
-          </script>
-        </body>
-        </html>
-        """)
-    return components.declare_component("bidirectional_grid", path=tmp_dir)
-
-# Initialize it once
-grid_component = get_grid_component()
-
-# -------------------------------------------------
 # UI COMPONENTS & ANALYTICS
 # -------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -2145,12 +1888,19 @@ def render_image_grid():
             value=st.session_state.grid_items_per_page,
         )
 
+    # -------------------------------------------------------------
+    # FALLBACK CHECK: If MAIN_IMAGE somehow still got dropped, re-add it
+    # -------------------------------------------------------------
+    if 'MAIN_IMAGE' not in data.columns:
+        data['MAIN_IMAGE'] = ''
+        
     available_cols = [c for c in GRID_COLS if c in data.columns]
     review_data = pd.merge(
         valid_grid_df[["ProductSetSid"]],
         data[available_cols],
         left_on="ProductSetSid", right_on="PRODUCT_SET_SID", how="left",
     )
+    
     if search_n:
         review_data = review_data[
             review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)
@@ -2214,8 +1964,16 @@ def render_image_grid():
     for _, row in page_data.iterrows():
         sid = str(row["PRODUCT_SET_SID"])
         img_url = str(row.get("MAIN_IMAGE", "")).strip()
+        
+        # -------------------------------------------------------------
+        # FIX FOR MIXED CONTENT BLOCKING ON STREAMLIT CLOUD (HTTPS)
+        # -------------------------------------------------------------
+        if img_url.startswith("http://"):
+            img_url = img_url.replace("http://", "https://")
+            
         if not img_url.startswith("http"):
             img_url = "https://via.placeholder.com/150?text=No+Image"
+            
         cards_data.append({
             "sid":      sid,
             "img":      img_url,
