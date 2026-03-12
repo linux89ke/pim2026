@@ -11,15 +11,19 @@ import traceback
 import json
 import zipfile
 import os
+import tempfile
 import concurrent.futures
 from dataclasses import dataclass
 import base64
 import time
 import hashlib
-
-# --- IMPORTS FOR IMAGE ADVISOR ---
 import requests
 from PIL import Image
+
+try:
+    from postqc import detect_file_type, normalize_post_qc, run_checks as run_post_qc_checks, render_post_qc_section
+except ImportError:
+    pass
 
 # -------------------------------------------------
 # JUMIA THEME COLORS & GLOBAL CSS
@@ -51,6 +55,9 @@ FULL_DATA_COLS = [
     "PRODUCT_WARRANTY", "WARRANTY_DURATION", "WARRANTY_ADDRESS", "WARRANTY_TYPE", "COUNT_VARIATIONS",
     "LIST_VARIATIONS"
 ]
+
+GRID_COLS = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'CATEGORY', 'SELLER_NAME', 'MAIN_IMAGE', 'GLOBAL_SALE_PRICE', 'GLOBAL_PRICE', 'COLOR']
+
 FX_RATE = 128.0
 
 COUNTRY_CURRENCY = {
@@ -123,8 +130,6 @@ NEW_FILE_MAPPING = {
 
 logger = logging.getLogger(__name__)
 
-from postqc import detect_file_type, normalize_post_qc, run_checks as run_post_qc_checks, render_post_qc_section
-
 # -------------------------------------------------
 # INITIALIZATION & CONTEXT
 # -------------------------------------------------
@@ -141,14 +146,79 @@ if 'grid_page' not in st.session_state: st.session_state.grid_page = 0
 if 'grid_items_per_page' not in st.session_state: st.session_state.grid_items_per_page = 50
 if 'main_toasts' not in st.session_state: st.session_state.main_toasts = []
 if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
-if 'bg_executor' not in st.session_state: st.session_state.bg_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = False
 if 'display_df_cache' not in st.session_state: st.session_state.display_df_cache = {}
+if 'main_bridge_counter' not in st.session_state: st.session_state.main_bridge_counter = 0
+
+if 'desel_counter' not in st.session_state: st.session_state.desel_counter = 0
+if 'batch_counter' not in st.session_state: st.session_state.batch_counter = 0  
+if 'clear_counter' not in st.session_state: st.session_state.clear_counter = 0
+if 'ls_processed_flag' not in st.session_state: st.session_state.ls_processed_flag = False
+if 'ls_read_trigger' not in st.session_state: st.session_state.ls_read_trigger = 0
 
 try: st.set_page_config(page_title="Product Tool", layout=st.session_state.layout_mode)
 except: pass
 
 st_yled.init()
+
+# -------------------------------------------------
+# NATIVE CLOUD BRIDGE COMPONENT
+# -------------------------------------------------
+@st.cache_resource
+def get_grid_component():
+    """Creates an official bidirectional Streamlit component to bypass Cloud CORS limits."""
+    tmp_dir = tempfile.mkdtemp()
+    index_path = os.path.join(tmp_dir, "index.html")
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <script src="https://cdnjs.cloudflare.com/ajax/libs/streamlit-component-lib/1.3.0/streamlit.js"></script>
+        </head>
+        <body style="margin: 0; padding: 0; background: transparent;">
+          <div id="root"></div>
+          <script>
+            window.sendMsgToPython = function(type, payload) {
+                Streamlit.setComponentValue({action: type, payload: payload});
+            };
+
+            let lastHtml = "";
+            function onRender(event) {
+                const args = event.detail.args;
+                const root = document.getElementById("root");
+                
+                // Only re-inject if Python explicitly sends brand new HTML data
+                if (args.html_content && lastHtml !== args.html_content) {
+                    lastHtml = args.html_content;
+                    root.innerHTML = args.html_content;
+                    
+                    // Clean up old scripts to prevent memory leaks
+                    document.querySelectorAll('.injected-script').forEach(s => s.remove());
+                    
+                    // Wire up the new scripts
+                    const scripts = root.querySelectorAll("script");
+                    scripts.forEach(script => {
+                        const newScript = document.createElement("script");
+                        newScript.className = "injected-script";
+                        newScript.text = script.innerHTML;
+                        document.body.appendChild(newScript);
+                    });
+                }
+                
+                Streamlit.setFrameHeight(args.height || 1400);
+            }
+            Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
+            Streamlit.setComponentReady();
+          </script>
+        </body>
+        </html>
+        """)
+    return components.declare_component("bidirectional_grid", path=tmp_dir)
+
+# Initialize it once
+grid_component = get_grid_component()
 
 # --- GLOBAL CSS ---
 st.markdown(f"""
@@ -207,21 +277,6 @@ st.markdown(f"""
         div[data-baseweb="segmented-control"] button[aria-pressed="true"] {{ background-color: {JUMIA_COLORS['primary_orange']} !important; color: white !important; }}
         input[type="checkbox"]:checked {{ background-color: {JUMIA_COLORS['primary_orange']} !important; border-color: {JUMIA_COLORS['primary_orange']} !important; }}
         div[data-testid="stCheckbox"] {{ margin-top: 5px; margin-bottom: 5px; }}
-
-        .prod-name-tip {{ position: relative; cursor: default; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; display: block; margin-bottom: 5px; }}
-        .prod-name-tip::after {{ content: attr(data-full); display: none; position: absolute; bottom: 120%; left: 0; background: {JUMIA_COLORS['dark_gray']}; color: #fff; padding: 7px 11px; border-radius: 6px; font-size: 12px; font-weight: 500; white-space: normal; max-width: 260px; line-height: 1.45; z-index: 9999; box-shadow: 0 4px 14px rgba(0,0,0,0.28); pointer-events: none; }}
-        .prod-name-tip:hover::after {{ display: block; }}
-
-        .color-badge {{ display: inline-block; padding: 2px 9px; border-radius: 12px; font-size: 10px; font-weight: 600; letter-spacing: 0.3px; border: 1px solid {JUMIA_COLORS['border_gray']}; background: {JUMIA_COLORS['light_gray']}; color: {JUMIA_COLORS['dark_gray']}; margin-bottom: 5px; cursor: default; transition: background 0.18s, color 0.18s, border-color 0.18s; }}
-        .color-badge:hover {{ background: {JUMIA_COLORS['primary_orange']}; color: #fff; border-color: {JUMIA_COLORS['primary_orange']}; }}
-
-        .batch-info-box {{ padding: 10px 14px; border-radius: 6px; border-left: 4px solid {JUMIA_COLORS['primary_orange']}; margin-top: 10px; }}
-        div[data-testid="stVerticalBlock"] div[data-testid="stPopover"] {{ overflow: visible !important; }}
-        div[data-testid="stVerticalBlockBorderWrapper"] {{ overflow: visible !important; }}
-
-        .rejected-card-overlay {{ position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(231, 60, 23, 0.9); color: white; padding: 8px 16px; border-radius: 20px; font-weight: bold; font-size: 12px; white-space: nowrap; display: flex; align-items: center; }}
-        
-        div[data-testid="stVerticalBlockBorderWrapper"] .stButton > button {{ white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; font-size: 11px !important; padding: 6px 4px !important; min-height: 36px !important; line-height: 1.2 !important; }}
     </style>
 """, unsafe_allow_html=True)
 
@@ -270,7 +325,6 @@ def create_match_key(row: pd.Series) -> str:
     color = normalize_text(row.get('COLOR', ''))
     return f"{brand}|{name}|{color}"
 
-# --- FIX 1: df_hash utility ---
 def df_hash(df: pd.DataFrame) -> str:
     try:
         return hashlib.md5(pd.util.hash_pandas_object(df, index=True).values).hexdigest()
@@ -299,15 +353,6 @@ for base_color, variants in COLOR_PATTERNS.items():
 @dataclass
 class ProductAttributes:
     base_name: str; colors: Set[str]; sizes: Set[str]; storage: Set[str]; memory: Set[str]; quantities: Set[str]; raw_name: str
-    def get_variant_key(self) -> str:
-        parts = [self.base_name]
-        if self.colors: parts.append("_color_" + "_".join(sorted(self.colors)))
-        if self.sizes: parts.append("_size_" + "_".join(sorted(self.sizes)))
-        if self.storage: parts.append("_storage_" + "_".join(sorted(self.storage)))
-        if self.memory: parts.append("_memory_" + "_".join(sorted(self.memory)))
-        if self.quantities: parts.append("_qty_" + "_".join(sorted(self.quantities)))
-        return "|".join(parts).lower()
-    def get_base_key(self) -> str: return self.base_name.lower()
 
 def extract_colors(text: str, explicit_color: Optional[str] = None) -> Set[str]:
     colors = set()
@@ -320,33 +365,6 @@ def extract_colors(text: str, explicit_color: Optional[str] = None) -> Set[str]:
         if re.search(r'\b' + re.escape(variant) + r'\b', text_lower): colors.add(base)
     return colors
 
-def extract_sizes(text: str) -> Set[str]:
-    sizes = set()
-    text_lower = str(text).lower() if text else ""
-    size_map = { r'\bxxs\b|2xs': 'xxs', r'\bxs\b|xsmall': 'xs', r'\bs\b|small': 'small', r'\bm\b|medium': 'medium', r'\bl\b|large': 'large', r'\bxl\b|xlarge': 'xl', r'\bxxl\b|2xl': 'xxl', r'\bxxxl\b|3xl': 'xxxl' }
-    for pattern, size in size_map.items():
-        if re.search(pattern, text_lower): sizes.add(size)
-    for match in re.finditer(r'\b(\d+(?:\.\d+)?)\s*(?:inch|inches|")\b', text_lower): sizes.add(f"{match.group(1)}inch")
-    return sizes
-
-def extract_storage(text: str) -> Set[str]:
-    storage = set()
-    for match in re.finditer(r'\b(\d+)\s*(?:gb|tb)\b', str(text).lower() if text else ""): storage.add(f"{match.group(1)}{'tb' if 'tb' in match.group(0) else 'gb'}")
-    return storage
-
-def extract_memory(text: str) -> Set[str]:
-    memory = set()
-    for match in re.finditer(r'\b(\d+)\s*(?:gb|mb)\s*(?:ram|memory|ddr)\b', str(text).lower() if text else ""):
-        if 2 <= int(match.group(1)) <= 128: memory.add(f"{match.group(1)}gb")
-    return memory
-
-def extract_quantities(text: str) -> Set[str]:
-    quantities = set()
-    patterns = [r'\b(\d+)[- ]?pack\b', r'\bpack\s+of\s+(\d+)\b', r'\b(\d+)[- ]?(?:pieces?|pcs?)\b']
-    for pattern in patterns:
-        for match in re.finditer(pattern, str(text).lower() if text else ""): quantities.add(f"{match.group(1)}pack")
-    return quantities
-
 def remove_attributes(text: str) -> str:
     base = str(text).lower() if text else ""
     for variant in COLOR_VARIANT_TO_BASE.keys(): base = re.sub(r'\b' + re.escape(variant) + r'\b', '', base)
@@ -358,7 +376,7 @@ def remove_attributes(text: str) -> str:
 
 def extract_product_attributes(name: str, explicit_color: Optional[str] = None, brand: Optional[str] = None) -> ProductAttributes:
     name_str = str(name).strip() if pd.notna(name) else ""
-    attrs = ProductAttributes(base_name="", colors=extract_colors(name_str, explicit_color), sizes=extract_sizes(name_str), storage=extract_storage(name_str), memory=extract_memory(name_str), quantities=extract_quantities(name_str), raw_name=name_str)
+    attrs = ProductAttributes(base_name="", colors=extract_colors(name_str, explicit_color), sizes=set(), storage=set(), memory=set(), quantities=set(), raw_name=name_str)
     base_name = remove_attributes(name_str)
     if brand and pd.notna(brand):
         brand_lower = str(brand).lower().strip()
@@ -386,9 +404,7 @@ def load_excel_file(filename: str, column: Optional[str] = None):
     except Exception: return [] if column else pd.DataFrame()
 
 def safe_excel_read(filename: str, sheet_name, usecols=None) -> pd.DataFrame:
-    if not os.path.exists(filename):
-        logger.warning(f"Local file not found: {filename}")
-        return pd.DataFrame()
+    if not os.path.exists(filename): return pd.DataFrame()
     try:
         df = pd.read_excel(filename, sheet_name=sheet_name, usecols=usecols, engine='openpyxl', dtype=str)
         return df.dropna(how='all')
@@ -396,7 +412,6 @@ def safe_excel_read(filename: str, sheet_name, usecols=None) -> pd.DataFrame:
         logger.error(f"Error reading tab '{sheet_name}' from {filename}: {e}")
         return pd.DataFrame()
 
-# --- LOCAL: PROHIBITED PRODUCTS ---
 @st.cache_data(ttl=3600)
 def load_prohibited_from_local() -> Dict[str, List[Dict]]:
     FILE_NAME = "Prohibbited.xlsx"
@@ -423,12 +438,10 @@ def load_prohibited_from_local() -> Dict[str, List[Dict]]:
                         categories.update([clean_category_code(c.strip()) for c in split_cats if c.strip()])
                 country_rules.append({'keyword': keyword, 'categories': categories})
             prohibited_by_country[tab] = country_rules
-        except Exception as e:
-            logger.error(f"⚠️ **File Error:** Failed to load {FILE_NAME} - Tab **{tab}**. (Error: {e})")
+        except Exception:
             prohibited_by_country[tab] = []
     return prohibited_by_country
 
-# --- LOCAL: RESTRICTED BRANDS ---
 @st.cache_data(ttl=3600)
 def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
     FILE_NAME = "Restricted_Brands.xlsx"
@@ -465,12 +478,10 @@ def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
                     data['categories'] = set()
                 country_rules.append({'brand': b_lower, 'brand_raw': data['brand_raw'], 'sellers': data['sellers'], 'categories': data['categories'], 'variations': list(data['variations'])})
             config_by_country[country_name] = country_rules
-        except Exception as e:
-            logger.error(f"⚠️ **File Error:** Failed to load {FILE_NAME} - Tab **{tab_name}**. (Error: {e})")
+        except Exception:
             config_by_country[country_name] = []
     return config_by_country
 
-# --- LOCAL: REFURBISHED DATA ---
 @st.cache_data(ttl=3600)
 def load_refurb_data_from_local() -> dict:
     FILE_NAME = "Refurb.xlsx"
@@ -484,8 +495,7 @@ def load_refurb_data_from_local() -> dict:
                 phones_set = set(df.iloc[:, 0].dropna().astype(str).str.strip().str.lower()) - {"", "nan", "phones"}
                 laptops_set = set(df.iloc[:, 1].dropna().astype(str).str.strip().str.lower()) - {"", "nan", "laptops"}
                 result["sellers"][tab] = {"Phones": phones_set, "Laptops": laptops_set}
-        except Exception as e:
-            logger.error(f"⚠️ **File Error:** Failed to load {FILE_NAME} - Sellers Tab **{tab}**. (Error: {e})")
+        except Exception:
             result["sellers"][tab] = {"Phones": set(), "Laptops": set()}
     try:
         df_cats = safe_excel_read(FILE_NAME, sheet_name="Categories", usecols=[0, 1])
@@ -494,18 +504,15 @@ def load_refurb_data_from_local() -> dict:
             df_cats.columns = [str(c).strip() for c in df_cats.columns]
             result["categories"]["Phones"] = {clean_category_code(c) for c in df_cats.iloc[:, 0].dropna().astype(str) if c.strip() and c.strip().lower() not in ("phones", "phone", "nan")}
             result["categories"]["Laptops"] = {clean_category_code(c) for c in df_cats.iloc[:, 1].dropna().astype(str) if c.strip() and c.strip().lower() not in ("laptops", "laptop", "nan")}
-    except Exception as e: logger.error(f"Error loading {FILE_NAME}: {e}")
+    except Exception: pass
     try:
         df_names = safe_excel_read(FILE_NAME, sheet_name="Name", usecols=[0])
         if not df_names.empty:
             first_col = df_names.columns[0]
             result["keywords"] = {k for k in df_names[first_col].dropna().astype(str).str.strip().str.lower() if k and k not in ("name", "keyword", "keywords", "words", "nan")}
-    except Exception as e:
-        logger.error(f"Error loading {FILE_NAME}: {e}")
-        result["keywords"] = {"refurb", "refurbished", "renewed"}
+    except Exception: result["keywords"] = {"refurb", "refurbished", "renewed"}
     return result
 
-# --- LOCAL: PERFUME DATA ---
 @st.cache_data(ttl=3600)
 def load_perfume_data_from_local() -> Dict:
     FILE_NAME = "Perfume.xlsx"
@@ -519,28 +526,23 @@ def load_perfume_data_from_local() -> Dict:
                 seller_col = next((c for c in df.columns if 'seller' in c.lower()), df.columns[0])
                 sellers = set(df[seller_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "sellername", "seller name", "seller"])]))
                 result["sellers"][tab] = sellers
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            result["sellers"][tab] = set()
+        except Exception: result["sellers"][tab] = set()
     try:
         df_kw = safe_excel_read(FILE_NAME, sheet_name="Keywords")
         if not df_kw.empty:
             df_kw.columns = [str(c).strip() for c in df_kw.columns]
             kw_col = next((c for c in df_kw.columns if 'brand' in c.lower() or 'keyword' in c.lower()), df_kw.columns[0])
-            keywords = set(df_kw[kw_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "brand", "keyword", "keywords"])]))
-            result["keywords"] = keywords
-    except Exception as e: result["keywords"] = set()
+            result["keywords"] = set(df_kw[kw_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "brand", "keyword", "keywords"])]))
+    except Exception: result["keywords"] = set()
     try:
         df_cats = safe_excel_read(FILE_NAME, sheet_name="Categories")
         if not df_cats.empty:
             df_cats.columns = [str(c).strip() for c in df_cats.columns]
             cat_col = next((c for c in df_cats.columns if 'cat' in c.lower()), df_cats.columns[0])
-            cat_codes = set(df_cats[cat_col].dropna().astype(str).apply(clean_category_code).pipe(lambda s: s[~s.isin(["", "nan", "categories", "category"])]))
-            result["category_codes"] = cat_codes
-    except Exception as e: result["category_codes"] = set()
+            result["category_codes"] = set(df_cats[cat_col].dropna().astype(str).apply(clean_category_code).pipe(lambda s: s[~s.isin(["", "nan", "categories", "category"])]))
+    except Exception: result["category_codes"] = set()
     return result
 
-# --- LOCAL: BOOKS DATA ---
 @st.cache_data(ttl=3600)
 def load_books_data_from_local() -> Dict:
     FILE_NAME = "Books_sellers.xlsx"
@@ -552,20 +554,17 @@ def load_books_data_from_local() -> Dict:
             if not df.empty:
                 df.columns = [str(c).strip() for c in df.columns]
                 seller_col = next((c for c in df.columns if 'seller' in c.lower()), df.columns[0])
-                sellers = set(df[seller_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "sellername", "seller name", "seller"])]))
-                result["sellers"][tab] = sellers
-        except Exception as e: result["sellers"][tab] = set()
+                result["sellers"][tab] = set(df[seller_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "sellername", "seller name", "seller"])]))
+        except Exception: result["sellers"][tab] = set()
     try:
         df_cats = safe_excel_read(FILE_NAME, sheet_name="Categories")
         if not df_cats.empty:
             df_cats.columns = [str(c).strip() for c in df_cats.columns]
             cat_col = next((c for c in df_cats.columns if 'cat' in c.lower()), df_cats.columns[0])
-            cat_codes = set(df_cats[cat_col].dropna().astype(str).apply(clean_category_code).pipe(lambda s: s[~s.isin(["", "nan", "categories", "category"])]))
-            result["category_codes"] = cat_codes
-    except Exception as e: result["category_codes"] = set()
+            result["category_codes"] = set(df_cats[cat_col].dropna().astype(str).apply(clean_category_code).pipe(lambda s: s[~s.isin(["", "nan", "categories", "category"])]))
+    except Exception: result["category_codes"] = set()
     return result
 
-# --- LOCAL: JERSEYS DATA ---
 @st.cache_data(ttl=3600)
 def load_jerseys_from_local() -> Dict:
     FILE_NAME = "Jersey_validation.xlsx"
@@ -577,28 +576,25 @@ def load_jerseys_from_local() -> Dict:
             if not df.empty:
                 df.columns = [str(c).strip() for c in df.columns]
                 kw_col = next((c for c in df.columns if "keyword" in c.lower()), df.columns[0])
-                keywords = set(df[kw_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "keywords", "keyword"])]))
-                result["keywords"][tab] = keywords
+                result["keywords"][tab] = set(df[kw_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "keywords", "keyword"])]))
                 ex_col = next((c for c in df.columns if "exempt" in c.lower() or "seller" in c.lower()), None)
                 if ex_col:
-                    exempted = set(df[ex_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "exempted sellers", "seller"])]))
-                    result["exempted"][tab] = exempted
-        except Exception as e: logger.error(f"Error: {e}")
+                    result["exempted"][tab] = set(df[ex_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "exempted sellers", "seller"])]))
+        except Exception: pass
     try:
         df_cats = safe_excel_read(FILE_NAME, sheet_name="categories")
         if not df_cats.empty:
             df_cats.columns = [str(c).strip().lower() for c in df_cats.columns]
             cat_col = next((c for c in df_cats.columns if "cat" in c), df_cats.columns[0])
             result["categories"] = set(df_cats[cat_col].dropna().astype(str).apply(clean_category_code).pipe(lambda s: s[~s.isin(["", "nan", "categories", "category"])]))
-    except Exception as e: logger.error(f"Error: {e}")
+    except Exception: pass
     return result
 
-# --- LOCAL: SUSPECTED FAKE DATA ---
 @st.cache_data(ttl=3600)
 def load_suspected_fake_from_local() -> pd.DataFrame:
     try:
         if os.path.exists('suspected_fake.xlsx'): return pd.read_excel('suspected_fake.xlsx', sheet_name=0, engine='openpyxl', dtype=str)
-    except Exception as e: logger.warning(f"Error: {e}")
+    except Exception: pass
     return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
@@ -639,27 +635,13 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, Tuple[str, str]]:
                     comment = str(row['comment']).strip()
                     if flag and flag.lower() != 'nan': custom_mapping[flag] = (reason, comment)
                 if custom_mapping: return custom_mapping
-    except Exception as e: logger.error(f"Error loading external {filename}: {e}")
+    except Exception: pass
     return default_mapping
 
 @st.cache_data(ttl=3600)
 def load_all_support_files() -> Dict:
     def safe_load_txt(f): return load_txt_file(f) if os.path.exists(f) else []
-
-    fashion_paths = []
-    try:
-        fash_file = 'fashion brands.xlsx'
-        if os.path.exists(fash_file):
-            df_fash = pd.read_excel(fash_file, dtype=str)
-            df_fash.columns = df_fash.columns.astype(str).str.strip().str.lower()
-            path_col = next((col for col in df_fash.columns if 'path' in col), None)
-            if path_col:
-                fashion_paths = df_fash[path_col].dropna().astype(str).tolist()
-    except Exception as e:
-        logger.error(f"Error loading fashion brands: {e}")
-
     return {
-        'postqc_fashion_cats': fashion_paths,
         'blacklisted_words': safe_load_txt('blacklisted.txt'),
         'book_category_codes': safe_load_txt('Books_cat.txt'),
         'books_data': load_books_data_from_local(),
@@ -1094,53 +1076,35 @@ def check_incomplete_smartphone_name(data: pd.DataFrame, smartphone_category_cod
     if not flagged.empty: flagged['Comment_Detail'] = "Name missing Storage/Memory spec (e.g., 64GB)"
     return flagged.drop_duplicates(subset=['PRODUCT_SET_SID'])
 
-# --- FIX 4: Fast O(n) duplicate check replacing O(n²) TF-IDF ---
 def check_duplicate_products(data: pd.DataFrame, exempt_categories: List[str] = None, similarity_threshold: float = 0.70, known_colors: List[str] = None, **kwargs) -> pd.DataFrame:
-    if not {'NAME', 'SELLER_NAME', 'BRAND'}.issubset(data.columns):
-        return pd.DataFrame(columns=data.columns)
-
+    if not {'NAME', 'SELLER_NAME', 'BRAND'}.issubset(data.columns): return pd.DataFrame(columns=data.columns)
     d = data.copy()
     if exempt_categories and 'CATEGORY_CODE' in d.columns:
-        d = d[~d['CATEGORY_CODE'].apply(clean_category_code).isin(
-            set(clean_category_code(c) for c in exempt_categories))]
-    if d.empty:
-        return pd.DataFrame(columns=data.columns)
-
-    # Fast exact normalized key — O(n)
+        d = d[~d['CATEGORY_CODE'].apply(clean_category_code).isin(set(clean_category_code(c) for c in exempt_categories))]
+    if d.empty: return pd.DataFrame(columns=data.columns)
     d['_norm_name'] = d['NAME'].astype(str).apply(lambda x: re.sub(r'\s+', '', normalize_text(x)))
     d['_norm_brand'] = d['BRAND'].astype(str).str.lower().str.strip()
     d['_norm_seller'] = d['SELLER_NAME'].astype(str).str.lower().str.strip()
     d['_dedup_key'] = d['_norm_seller'] + '|' + d['_norm_brand'] + '|' + d['_norm_name']
-
     seen_keys: dict = {}
     rej: set = set()
     details: dict = {}
-
     for _, row in d.iterrows():
         key = row['_dedup_key']
         sid = str(row['PRODUCT_SET_SID'])
         if key in seen_keys:
             rej.add(sid)
             details[sid] = {'base': str(row['NAME'])[:40]}
-        else:
-            seen_keys[key] = sid
-
-    if not rej:
-        return pd.DataFrame(columns=data.columns)
-
+        else: seen_keys[key] = sid
+    if not rej: return pd.DataFrame(columns=data.columns)
     rdf = d[d['PRODUCT_SET_SID'].astype(str).isin(rej)].copy()
-    rdf['Comment_Detail'] = rdf['PRODUCT_SET_SID'].apply(
-        lambda sid: f"Duplicate: '{details[str(sid)]['base']}'" if str(sid) in details else "Duplicate detected"
-    )
+    rdf['Comment_Detail'] = rdf['PRODUCT_SET_SID'].apply(lambda sid: f"Duplicate: '{details[str(sid)]['base']}'" if str(sid) in details else "Duplicate detected")
     base_cols = data.columns.tolist()
     extra_cols = [c for c in ['Comment_Detail'] if c not in base_cols]
     return rdf[base_cols + extra_cols].drop_duplicates(subset=['PRODUCT_SET_SID'])
 
-
 # -------------------------------------------------
 # MASTER VALIDATION RUNNER
-# --- FIX 2: Removed st.write from ThreadPoolExecutor ---
-# --- FIX 1: Wrapped in cached_validate_products below ---
 # -------------------------------------------------
 def validate_products(data: pd.DataFrame, support_files: Dict, country_validator: CountryValidator, data_has_warranty_cols: bool, common_sids: Optional[set] = None, skip_validators: Optional[List[str]] = None):
     data['PRODUCT_SET_SID'] = data['PRODUCT_SET_SID'].astype(str).str.strip()
@@ -1181,7 +1145,6 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
     restricted_keys = {}
     validation_errors = []
 
-    # FIX 2: Use spinner instead of st.status + st.write to avoid per-check rerenders
     with st.spinner("Validating products... This may take a moment."):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             future_to_name = {}
@@ -1251,19 +1214,11 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
         if c not in final_df.columns: final_df[c] = ""
     return country_validator.ensure_status_column(final_df), results
 
-
-# --- FIX 1: Cached wrapper for validate_products ---
 @st.cache_data(show_spinner=False, ttl=3600)
 def cached_validate_products(data_hash: str, _data: pd.DataFrame, _support_files: Dict, country_code: str, data_has_warranty_cols: bool):
-    """Cache validation results keyed by data hash + country. 
-    Prevents re-running 21 checks on every button click or widget interaction."""
-    country_name = next(
-        (k for k, v in CountryValidator.COUNTRY_CONFIG.items() if v['code'] == country_code),
-        "Kenya"
-    )
+    country_name = next((k for k, v in CountryValidator.COUNTRY_CONFIG.items() if v['code'] == country_code), "Kenya")
     cv = CountryValidator(country_name)
     return validate_products(_data, _support_files, cv, data_has_warranty_cols)
-
 
 # -------------------------------------------------
 # EXPORTS UTILITIES
@@ -1326,7 +1281,7 @@ def prepare_full_data_merged(data_df, final_report_df):
     except Exception: return pd.DataFrame()
 
 # -------------------------------------------------
-# UI COMPONENTS & FRAGMENTS
+# UTILITIES FOR BRIDGE & DATA MUTATION
 # -------------------------------------------------
 def apply_rejection(sids: list, reason_code: str, comment: str, flag_name: str):
     st.session_state.final_report.loc[st.session_state.final_report['ProductSetSid'].isin(sids), ['Status', 'Reason', 'Comment', 'FLAG']] = ['Rejected', reason_code, comment, flag_name]
@@ -1341,131 +1296,284 @@ def restore_single_item(sid):
     st.session_state.display_df_cache.clear()
     st.session_state.main_toasts.append("Restored item to previous state!")
 
-def quick_reject_item(sid, reason_code, comment, flag_name, toast_name):
-    apply_rejection([sid], reason_code, comment, flag_name)
-    st.session_state[f"quick_rej_{sid}"] = True
-    st.session_state[f"quick_rej_reason_{sid}"] = flag_name
-    st.session_state[f"toast_{sid}"] = f"{toast_name} Rejected: {flag_name}"
+REASON_MAP = {
+    "REJECT_POOR_IMAGE": "Poor images",
+    "REJECT_WRONG_CAT": "Wrong Category",
+    "REJECT_FAKE": "Suspected Fake product",
+    "REJECT_BRAND": "Restricted brands",
+    "REJECT_PROHIBITED": "Prohibited products",
+    "REJECT_COLOR": "Missing COLOR",
+    "REJECT_WRONG_BRAND": "Generic branded products with genuine brands",
+    "OTHER_CUSTOM": "Other Reason (Custom)"
+}
 
-def strip_html(text): return re.sub('<[^<]+?>', '', text) if isinstance(text, str) else text
+# -------------------------------------------------
+# HTML GRID BUILDER
+# -------------------------------------------------
+def build_fast_grid_html(
+    page_data,
+    flags_mapping,
+    country,
+    page_warnings,
+    rejected_state,
+    cols_per_row,
+):
+    O = JUMIA_COLORS["primary_orange"]
+    G = JUMIA_COLORS["success_green"]
+    R = JUMIA_COLORS["jumia_red"]
 
-# --- FIX 5: Image quality cache persisted via st.cache_data (survives reruns) ---
+    committed_json = json.dumps(rejected_state)
+
+    cards_data = []
+    for _, row in page_data.iterrows():
+        sid = str(row["PRODUCT_SET_SID"])
+        img_url = str(row.get("MAIN_IMAGE", "")).strip()
+        if not img_url.startswith("http"):
+            img_url = "https://via.placeholder.com/150?text=No+Image"
+        cards_data.append({
+            "sid":      sid,
+            "img":      img_url,
+            "name":     str(row.get("NAME", "")),
+            "brand":    str(row.get("BRAND", "Unknown Brand")),
+            "cat":      str(row.get("CATEGORY", "Unknown Category")),
+            "seller":   str(row.get("SELLER_NAME", "Unknown Seller")),
+            "warnings": page_warnings.get(sid, []),
+        })
+    cards_json = json.dumps(cards_data)
+
+    return f"""
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0;font-family:sans-serif;}}
+  body{{padding:8px;}}
+
+  /* ── sticky control bar ── */
+  .ctrl-bar{{
+    position:sticky;top:0;z-index:100;
+    display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+    padding:8px 12px;background:#fff;
+    border:1px solid #e0e0e0;border-radius:8px;margin-bottom:12px;
+    box-shadow:0 2px 6px rgba(0,0,0,.08);
+  }}
+  .sel-count{{font-weight:700;color:{O};font-size:13px;min-width:80px;}}
+  .reason-sel{{
+    flex:1;min-width:160px;padding:6px 10px;
+    border:1px solid #ccc;border-radius:4px;font-size:12px;
+    background:#fff;cursor:pointer;outline:none;
+  }}
+  .batch-btn{{
+    padding:7px 14px;background:{O};color:#fff;
+    border:none;border-radius:4px;font-weight:700;font-size:12px;
+    cursor:pointer;white-space:nowrap;
+  }}
+  .batch-btn:hover{{opacity:.88;}}
+  .desel-btn{{
+    padding:7px 12px;background:#fff;color:#555;
+    border:1px solid #ccc;border-radius:4px;font-size:12px;
+    cursor:pointer;white-space:nowrap;
+  }}
+  .desel-btn:hover{{background:#f5f5f5;}}
+
+  /* ── grid & cards ── */
+  .grid{{display:grid;grid-template-columns:repeat({cols_per_row},1fr);gap:12px;}}
+  .card{{border:2px solid #e0e0e0;border-radius:8px;padding:10px;background:#fff;
+         position:relative;transition:border-color .15s,box-shadow .15s;}}
+  .card.selected{{border-color:{G};box-shadow:0 0 0 3px rgba(76,175,80,.2);
+                  background:rgba(76,175,80,.04);}}
+  .card.committed-rej{{border-color:#bbb;opacity:.5;}}
+  .card-img-wrap{{position:relative;cursor:pointer;}}
+  .card-img{{width:100%;aspect-ratio:1;object-fit:contain;border-radius:6px;display:block;}}
+  .card.committed-rej .card-img{{filter:grayscale(80%);}}
+  .tick{{position:absolute;bottom:6px;right:6px;width:22px;height:22px;border-radius:50%;
+         background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;
+         color:transparent;font-size:13px;font-weight:900;pointer-events:none;}}
+  .card.selected .tick{{background:{G};color:#fff;}}
+  .warn-wrap{{position:absolute;top:6px;right:6px;display:flex;flex-direction:column;gap:3px;
+              z-index:5;pointer-events:none;}}
+  .warn-badge{{background:rgba(255,193,7,.95);color:#313133;font-size:9px;font-weight:800;
+               padding:3px 7px;border-radius:10px;}}
+  .rej-overlay{{display:none;position:absolute;inset:0;background:rgba(255,255,255,.88);
+                border-radius:6px;flex-direction:column;align-items:center;
+                justify-content:center;z-index:20;gap:5px;padding:8px;text-align:center;}}
+  .card.committed-rej .rej-overlay{{display:flex;}}
+  .rej-badge{{background:{R};color:#fff;padding:3px 10px;border-radius:10px;
+              font-size:11px;font-weight:700;}}
+  .rej-label{{font-size:10px;color:{R};font-weight:600;max-width:120px;}}
+  .meta{{font-size:11px;margin-top:8px;line-height:1.4;}}
+  .meta .nm{{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+  .meta .br{{color:{O};font-weight:700;margin:2px 0;}}
+  .meta .ct{{color:#666;font-size:10px;}}
+  .meta .sl{{color:#999;font-size:9px;margin-top:4px;border-top:1px dashed #eee;padding-top:4px;}}
+  .acts{{display:flex;gap:4px;margin-top:8px;}}
+  .act-btn{{flex:1;padding:6px;font-size:11px;border:none;border-radius:4px;cursor:pointer;
+            font-weight:700;color:#fff;background:{O};}}
+  .act-more{{flex:1;font-size:11px;border:1px solid #ccc;border-radius:4px;outline:none;
+             cursor:pointer;background:#fff;}}
+</style>
+
+<div class="ctrl-bar">
+  <span class="sel-count" id="sel-count-bar">0 selected</span>
+  <select class="reason-sel" id="batch-reason">
+    <option value="REJECT_POOR_IMAGE">Poor Image Quality</option>
+    <option value="REJECT_WRONG_CAT">Wrong Category</option>
+    <option value="REJECT_FAKE">Suspected Fake</option>
+    <option value="REJECT_BRAND">Restricted Brand</option>
+    <option value="REJECT_WRONG_BRAND">Wrong Brand</option>
+    <option value="REJECT_PROHIBITED">Prohibited Product</option>
+    <option value="REJECT_COLOR">Missing Color</option>
+  </select>
+  <button class="batch-btn" onclick="doBatchReject()">✗ Batch Reject Selected</button>
+  <button class="desel-btn"  onclick="doDeselAll()">☐ Deselect All</button>
+  <span style="font-size:11px;color:#999;">Click image to select</span>
+</div>
+
+<div class="grid" id="card-grid"></div>
+
+<script>
+var CARDS     = {cards_json};
+var COMMITTED = {committed_json};
+
+window._gridSelected = window._gridSelected || {{}};
+var selected = window._gridSelected;
+
+// ── OFFICIAL STREAMLIT BRIDGE ────────────────────────────────────────────────
+function sendMsg(type, payload) {{
+  if (window.sendMsgToPython) {{
+      window.sendMsgToPython(type, payload);
+  }} else {{
+      console.warn('Python bridge not ready');
+  }}
+}}
+
+// ── UI helpers ────────────────────────────────────────────────────────────────
+function updateSelCount() {{
+  const n = Object.keys(selected).length;
+  document.getElementById('sel-count-bar').textContent = n + ' selected';
+}}
+
+// ── Card rendering ────────────────────────────────────────────────────────────
+function renderCard(card) {{
+  const {{sid, img, name, brand, cat, seller, warnings}} = card;
+  const isCommitted = sid in COMMITTED;
+  const isSelected  = !isCommitted && (sid in selected);
+
+  let cls = 'card';
+  if (isCommitted)     cls += ' committed-rej';
+  else if (isSelected) cls += ' selected';
+
+  const shortName = name.length > 38 ? name.slice(0,38)+'…' : name;
+  const warnHtml  = warnings.map(w => `<span class="warn-badge">${{w}}</span>`).join('');
+  const rejLabel  = isCommitted ? (COMMITTED[sid]||'').replace(/_/g,' ') : '';
+
+  const rejOverlay = isCommitted ? `
+    <div class="rej-overlay">
+      <div class="rej-badge">REJECTED</div>
+      <div class="rej-label">${{rejLabel}}</div>
+    </div>` : '';
+
+  const actHtml = !isCommitted ? `
+    <div class="acts">
+      <button class="act-btn"
+        onclick="event.stopPropagation();quickReject('${{sid}}','REJECT_POOR_IMAGE')">
+        Poor Img
+      </button>
+      <select class="act-more"
+        onchange="if(this.value){{event.stopPropagation();quickReject('${{sid}}',this.value);this.value=''}}">
+        <option value="">More…</option>
+        <option value="REJECT_WRONG_CAT">Wrong Category</option>
+        <option value="REJECT_FAKE">Fake Product</option>
+        <option value="REJECT_BRAND">Restricted Brand</option>
+        <option value="REJECT_PROHIBITED">Prohibited</option>
+        <option value="REJECT_COLOR">Wrong Color</option>
+        <option value="REJECT_WRONG_BRAND">Wrong Brand</option>
+      </select>
+    </div>` : '';
+
+  return `<div class="${{cls}}" id="card-${{sid}}">
+    <div class="card-img-wrap" onclick="toggleSelect('${{sid}}')">
+      <div class="warn-wrap">${{warnHtml}}</div>
+      <img class="card-img" src="${{img}}" loading="lazy"
+           onerror="this.src='https://via.placeholder.com/150?text=No+Image'">
+      ${{rejOverlay}}<div class="tick">✓</div>
+    </div>
+    <div class="meta">
+      <div class="nm" title="${{name}}">${{shortName}}</div>
+      <div class="br">${{brand}}</div>
+      <div class="ct">${{cat}}</div>
+      <div class="sl">${{seller}}</div>
+    </div>${{actHtml}}</div>`;
+}}
+
+function renderAll() {{
+  document.getElementById('card-grid').innerHTML = CARDS.map(renderCard).join('');
+  updateSelCount();
+}}
+
+function replaceCard(sid) {{
+  const el = document.getElementById('card-'+sid);
+  if (!el) return;
+  const card = CARDS.find(c => c.sid === sid);
+  if (card) {{ const t=document.createElement('div'); t.innerHTML=renderCard(card); el.replaceWith(t.firstElementChild); }}
+}}
+
+// ── Actions ───────────────────────────────────────────────────────────────────
+function toggleSelect(sid) {{
+  if (sid in COMMITTED) return;
+  if (sid in selected) delete selected[sid];
+  else selected[sid] = true;
+  replaceCard(sid);
+  updateSelCount();
+}}
+
+function quickReject(sid, reasonKey) {{
+  delete selected[sid];
+  COMMITTED[sid] = reasonKey;
+  sendMsg('reject', {{[sid]: reasonKey}});
+  replaceCard(sid);
+  updateSelCount();
+}}
+
+function doBatchReject() {{
+  const toReject = Object.keys(selected);
+  if (toReject.length === 0) {{ alert('No products selected.'); return; }}
+  const reasonKey = document.getElementById('batch-reason').value;
+  const payload   = {{}};
+  toReject.forEach(sid => {{
+    payload[sid]    = reasonKey;
+    COMMITTED[sid]  = reasonKey;
+    delete selected[sid];
+  }});
+  sendMsg('reject', payload);
+  renderAll();
+  updateSelCount();
+}}
+
+function doDeselAll() {{
+  Object.keys(selected).forEach(k => delete selected[k]);
+  renderAll();
+  updateSelCount();
+}}
+
+renderAll();
+</script>"""
+
+# -------------------------------------------------
+# UI COMPONENTS
+# -------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
 def analyze_image_quality_cached(url: str) -> List[str]:
-    """Cached image quality check — persists across reruns for 24 hours."""
-    if not url or not str(url).startswith("http"):
-        return []
+    if not url or not str(url).startswith("http"): return []
     warnings = []
     try:
         resp = requests.get(url, timeout=2, stream=True)
         if resp.status_code == 200:
             img = Image.open(resp.raw)
             w, h = img.size
-            if w < 300 or h < 300:
-                warnings.append("Low Resolution")
+            if w < 300 or h < 300: warnings.append("Low Resolution")
             ratio = h / w if w > 0 else 1
-            if ratio > 1.5:
-                warnings.append("Tall (Screenshot?)")
-            elif ratio < 0.6:
-                warnings.append("Wide Aspect")
-    except Exception:
-        pass
+            if ratio > 1.5: warnings.append("Tall (Screenshot?)")
+            elif ratio < 0.6: warnings.append("Wide Aspect")
+    except Exception: pass
     return warnings
-
-def render_product_card(row, flags_mapping, country: str = 'Kenya', advisor_warnings=None):
-    if advisor_warnings is None: advisor_warnings = []
-    sid = str(row['PRODUCT_SET_SID'])
-    toast_key = f"toast_{sid}"
-    raw_name = str(row.get('NAME', ''))
-    name_text = raw_name[:35] + ("..." if len(raw_name) > 35 else "")
-    raw_name_attr = (raw_name.replace('&', '&amp;').replace('"', '&quot;').replace("'", '&#39;').replace('<', '&lt;').replace('>', '&gt;'))
-    toast_name = raw_name[:25] + "..." if len(raw_name) > 25 else raw_name
-    cat_text = str(row.get('CATEGORY', 'Unknown Category'))
-    brand_text = str(row.get('BRAND', 'Unknown Brand')).strip()
-    seller_text = str(row.get('SELLER_NAME', 'Unknown Seller'))
-    color_val = str(row.get('COLOR', '')).strip()
-    color_display = color_val if color_val and color_val.lower() not in ['nan', '', 'none', 'null'] else ''
-
-    if toast_key in st.session_state:
-        msg = st.session_state.pop(toast_key)
-        if isinstance(msg, tuple): st.toast(msg[0], icon=msg[1])
-        else: st.toast(msg)
-
-    img_url = str(row.get('MAIN_IMAGE', '')).strip()
-    if not img_url.startswith('http'): img_url = "https://via.placeholder.com/150?text=No+Image"
-
-    is_rejected = st.session_state.get(f"quick_rej_{sid}")
-    reason = st.session_state.get(f"quick_rej_reason_{sid}")
-    color_badge_html = (f"<span class='color-badge'>{color_display}</span><br>" if color_display else "")
-
-    def _to_float(v):
-        try:
-            f = float(v)
-            return f if f > 0 else None
-        except (TypeError, ValueError): return None
-            
-    raw_price = _to_float(row.get('GLOBAL_SALE_PRICE')) or _to_float(row.get('GLOBAL_PRICE')) or 0
-    price_str = format_local_price(raw_price, country)
-    price_overlay_html = (f"<div style='position:absolute;bottom:8px;left:8px;background:rgba(0,0,0,0.72);color:#fff;font-size:12px;font-weight:700;padding:3px 8px;border-radius:6px;letter-spacing:0.3px;z-index:5;'>{price_str}</div>" if price_str else "")
-
-    img_code, img_cmt = flags_mapping.get('Poor images', ('1000042', 'Poor Image Quality'))
-    cat_code, cat_cmt = flags_mapping.get('Wrong Category', ('1000004', 'Wrong Category'))
-    fake_code, fake_cmt = flags_mapping.get('Suspected Fake product', ('1000023', 'Fake Product'))
-    brnd_code, brnd_cmt = flags_mapping.get('Restricted brands', ('1000024', 'Restricted brands'))
-    proh_code, proh_cmt = flags_mapping.get('Prohibited products', ('1000007', 'Prohibited product'))
-    color_code, color_cmt = flags_mapping.get('Missing COLOR', ('1000005', 'Missing/Wrong Color'))
-    wrong_brand_code, wrong_brand_cmt = flags_mapping.get('Generic branded products with genuine brands', ('1000007', 'Use the displayed brand on the product instead of Generic.'))
-
-    with st.container(border=True):
-        if is_rejected:
-            st.markdown(f"""<div style="position: relative;"><img src="{img_url}" loading="lazy" style="width: 100%; aspect-ratio: 1 / 1; object-fit: contain; background-color: #FFFFFF; border-radius: 8px; border: 1px solid #eee; opacity: 0.4; filter: grayscale(100%);"><div class="rejected-card-overlay"><span class="material-symbols-outlined" style="margin-right: 6px; font-size: 16px;">block</span> REJECTED</div></div>""", unsafe_allow_html=True)
-            st.markdown(f"""<div style="font-size: 13px; line-height: 1.4; margin: 8px 0;"><span class="prod-name-tip" data-full="{raw_name_attr}">{name_text}</span>{color_badge_html}<div class="prod-meta-text" style="font-size: 11px; margin-bottom: 4px;">{cat_text}</div><div class="prod-brand-text" style="font-weight: 600; margin-bottom: 8px;">{brand_text}</div><div class="prod-meta-text" style="font-size: 10px; padding-top: 8px; border-top: 1px dashed #E0E0E0;">{seller_text}</div></div>""", unsafe_allow_html=True)
-            col_msg, col_btn = st.columns([3.5, 1])
-            with col_msg: st.markdown(f"""<div style="background: linear-gradient(135deg, {JUMIA_COLORS['jumia_red']}, #FF6B6B); color: white; padding: 8px 12px; border-radius: 6px; font-weight: bold; font-size: 11px; text-align: center;">{reason}</div>""", unsafe_allow_html=True)
-            with col_btn: st.button(":material/undo:", key=f"res_{sid}", on_click=restore_single_item, args=(sid,), use_container_width=True, help="Undo rejection")
-        else:
-            col_chk, col_zm = st.columns([3, 1.5], vertical_alignment="center")
-            with col_chk: st.checkbox("Select", key=f"grid_chk_{sid}")
-            with col_zm:
-                with st.popover(":material/search:", use_container_width=True):
-                    st.image(img_url, use_container_width=True)
-                    st.caption(raw_name)
-
-            is_checked = st.session_state.get(f"grid_chk_{sid}", False)
-            warnings_html = ""
-            if advisor_warnings:
-                badges = "".join([f'<div style="background:rgba(255,193,7,0.95);color:#313133;font-size:10px;font-weight:800;padding:4px 8px;border-radius:12px;box-shadow:0 2px 4px rgba(0,0,0,0.2);display:flex;align-items:center;margin-bottom:4px;"><span class="material-symbols-outlined" style="font-size:13px;margin-right:4px;">warning</span>{w}</div>' for w in advisor_warnings])
-                warnings_html = f'<div style="position:absolute;top:8px;right:8px;display:flex;flex-direction:column;z-index:10;">{badges}</div>'
-
-            border_style = "3px solid #4CAF50" if is_checked else "1px solid #eee"
-            box_shadow = "0 0 0 3px rgba(76,175,80,0.2), 0 4px 16px rgba(76,175,80,0.15)" if is_checked else "none"
-            green_overlay = ("<div style='position:absolute;inset:0;background:rgba(76,175,80,0.1);border-radius:8px;pointer-events:none;z-index:2;'></div>" if is_checked else "")
-            tick_html = ("<div style='position:absolute;bottom:10px;right:10px;width:28px;height:28px;background:#4CAF50;border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,0.3);z-index:10;'><span class='material-symbols-outlined' style='color:#fff;font-size:18px;line-height:1;font-weight:bold;'>check</span></div>" if is_checked else "")
-            img_div_id = f"imgclick-{sid}"
-
-            st.markdown(f'<div id="{img_div_id}" style="position:relative;cursor:pointer;border-radius:10px;border:{border_style};box-shadow:{box_shadow};transition:border 0.15s ease,box-shadow 0.15s ease;overflow:hidden;margin-bottom:8px;">{warnings_html}{green_overlay}<img src="{img_url}" loading="lazy" style="width:100%;aspect-ratio: 1 / 1;object-fit:contain;background-color:#FFFFFF;border-radius:8px;display:block;">{price_overlay_html}{tick_html}</div>', unsafe_allow_html=True)
-
-            st.markdown(f"""<div style="font-size:13px;line-height:1.4;margin:8px 0;"><span class='prod-name-tip' data-full="{raw_name_attr}">{name_text}</span>{color_badge_html}<div class='prod-meta-text' style="font-size:11px;margin-bottom:4px;">{cat_text}</div><div class='prod-brand-text' style="color:{JUMIA_COLORS['primary_orange']};font-weight:600;margin-bottom:8px;">{brand_text}</div><div class='prod-meta-text' style="font-size:10px;padding-top:8px;border-top:1px dashed #E0E0E0;">{seller_text}</div></div>""", unsafe_allow_html=True)
-
-            col_img, col_more = st.columns([1.2, 0.8], gap="small")
-            with col_img: st.button("Poor Image", key=f"btn_img_{sid}", use_container_width=True, on_click=quick_reject_item, args=(sid, img_code, img_cmt, 'Poor images', toast_name), type="primary", help="Reject: Poor Image Quality")
-            with col_more:
-                with st.popover("✕ More", use_container_width=True):
-                    st.markdown("<p style='font-size:12px;font-weight:700;margin:0 0 8px 0;'>Select rejection reason:</p>", unsafe_allow_html=True)
-                    st.button("Wrong Category",     key=f"cat_{sid}",   use_container_width=True, on_click=quick_reject_item, args=(sid, cat_code,         cat_cmt,         'Wrong Category',                                toast_name))
-                    st.button("Fake Product",       key=f"fake_{sid}",  use_container_width=True, on_click=quick_reject_item, args=(sid, fake_code,        fake_cmt,        'Suspected Fake product',                        toast_name))
-                    st.button("Restricted Brand",   key=f"brnd_{sid}",  use_container_width=True, on_click=quick_reject_item, args=(sid, brnd_code,        brnd_cmt,        'Restricted brands',                             toast_name))
-                    st.button("Prohibited Product", key=f"proh_{sid}",  use_container_width=True, on_click=quick_reject_item, args=(sid, proh_code,        proh_cmt,        'Prohibited products',                           toast_name))
-                    st.button("Wrong Color",        key=f"colr_{sid}",  use_container_width=True, on_click=quick_reject_item, args=(sid, color_code,       color_cmt,       'Missing COLOR',                                 toast_name))
-                    st.button("Wrong Brand",        key=f"wbrnd_{sid}", use_container_width=True, on_click=quick_reject_item, args=(sid, wrong_brand_code, wrong_brand_cmt, 'Generic branded products with genuine brands',  toast_name))
-                    st.divider()
-                    st.markdown("<p style='font-size:11px;font-weight:700;margin:0 0 4px 0;'>Other Reason (Custom)</p>", unsafe_allow_html=True)
-                    custom_cmt_input = st.text_area("Custom comment", placeholder="Type rejection reason...", key=f"custom_cmt_{sid}", height=70, label_visibility="collapsed")
-                    def _apply_custom(sid=sid, toast_name=toast_name):
-                        cmt = st.session_state.get(f"custom_cmt_{sid}", "").strip()
-                        if not cmt: st.session_state.main_toasts.append(("Please enter a custom comment.", "⚠️")); return
-                        quick_reject_item(sid, "1000007 - Other Reason", cmt, "Other Reason (Custom)", toast_name)
-                    st.button("Apply Custom Rejection", key=f"custom_apply_{sid}", use_container_width=True, type="primary", on_click=_apply_custom)
 
 @st.dialog("Confirm Bulk Approval")
 def bulk_approve_dialog(sids_to_process, title, subset_data, data_has_warranty_cols_check, support_files, country_validator):
@@ -1490,9 +1598,7 @@ def bulk_approve_dialog(sids_to_process, title, subset_data, data_has_warranty_c
             st.session_state.display_df_cache.clear()
         st.rerun()
 
-# --- FIX 3: Cache merged display DataFrames in render_flag_expander ---
 def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_check, support_files, country_validator):
-    # Build display df once and cache it — avoids repeated pd.merge on every interaction
     cache_key = f"display_df_{title}"
     base_display_cols = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'CATEGORY', 'COLOR', 'GLOBAL_SALE_PRICE', 'GLOBAL_PRICE', 'PARENTSKU', 'SELLER_NAME']
     current_display_cols = base_display_cols.copy()
@@ -1507,8 +1613,7 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
             left_on='ProductSetSid', right_on='PRODUCT_SET_SID', how='left'
         )[[c for c in current_display_cols if c in data.columns]]
         st.session_state.display_df_cache[cache_key] = df_display
-    else:
-        df_display = st.session_state.display_df_cache[cache_key]
+    else: df_display = st.session_state.display_df_cache[cache_key]
 
     c1, c2 = st.columns([1, 1])
     with c1: search_term = st.text_input("Search", placeholder="Name, Brand...", key=f"s_{title}")
@@ -1518,7 +1623,9 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
     if search_term: df_view = df_view[df_view.apply(lambda x: x.astype(str).str.contains(search_term, case=False).any(), axis=1)]
     if seller_filter: df_view = df_view[df_view['SELLER_NAME'].isin(seller_filter)]
     df_view = df_view.reset_index(drop=True)
-    if 'NAME' in df_view.columns: df_view['NAME'] = df_view['NAME'].apply(strip_html)
+    if 'NAME' in df_view.columns:
+        def strip_html(text): return re.sub('<[^<]+?>', '', text) if isinstance(text, str) else text
+        df_view['NAME'] = df_view['NAME'].apply(strip_html)
 
     event = st.dataframe(
         df_view, hide_index=True, use_container_width=True, selection_mode="multi-row", on_select="rerun",
@@ -1575,9 +1682,9 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
                     st.session_state.display_df_cache.clear()
                     st.rerun()
 
-# -------------------------------------------------
+# ==========================================
 # APP INITIALIZATION
-# -------------------------------------------------
+# ==========================================
 try: support_files = load_support_files_lazy()
 except Exception as e: st.error(f"Failed to load configs: {e}"); st.stop()
 
@@ -1592,7 +1699,6 @@ logo_base64 = get_image_base64("jumia logo.png") or get_image_base64("jumia_logo
 logo_html = f"<img src='data:image/png;base64,{logo_base64}' style='height: 42px; margin-right: 15px;'>" if logo_base64 else "<span class='material-symbols-outlined' style='font-size: 42px; margin-right: 15px;'>verified_user</span>"
 
 st.markdown(f"""<div class="back-to-top" onclick="window.parent.document.querySelector('.main').scrollTo({{top: 0, behavior: 'smooth'}});" title="Back to Top"><span class="material-symbols-outlined">arrow_upward</span></div>""", unsafe_allow_html=True)
-
 st.markdown(f"""<div style='background: linear-gradient(135deg, {JUMIA_COLORS['primary_orange']}, {JUMIA_COLORS['secondary_orange']}); padding: 25px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(246, 139, 30, 0.3);'><h1 style='color: white; margin: 0; font-size: 36px; display: flex; align-items: center;'>{logo_html}Product Validation Tool</h1></div>""", unsafe_allow_html=True)
 
 with st.sidebar:
@@ -1638,6 +1744,17 @@ if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.grid_page = 0
     st.session_state.exports_cache = {}
     st.session_state.display_df_cache = {}
+    
+    if 'main_bridge_counter' not in st.session_state: st.session_state.main_bridge_counter = 0
+
+    # Reset all JS-bridge counters on new file load
+    st.session_state.desel_counter = 0
+    st.session_state.batch_counter = 0
+    st.session_state.clear_counter = 0
+    st.session_state.ls_processed_flag = False
+
+    st.session_state.ls_read_trigger = 0
+
     keys_to_delete = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_"))]
     for k in keys_to_delete: del st.session_state[k]
 
@@ -1691,7 +1808,9 @@ if st.session_state.get('last_processed_files') != process_signature:
                 is_valid, errors = validate_input_schema(data_prop)
                 if is_valid:
                     data_filtered, det_names = filter_by_country(data_prop, country_validator)
-                    if data_filtered.empty: st.error(f"No {country_validator.country} products found. Detected countries: {', '.join(det_names) if det_names else 'None'}", icon=":material/error:"); st.stop()
+                    if data_filtered.empty:
+                        st.error(f"No {country_validator.country} products found. Detected countries: {', '.join(det_names) if det_names else 'None'}", icon=":material/error:")
+                        st.stop()
                     actual_counts = data_filtered.groupby('PRODUCT_SET_SID')['PRODUCT_SET_SID'].transform('count')
                     if 'COUNT_VARIATIONS' in data_filtered.columns:
                         file_counts = pd.to_numeric(data_filtered['COUNT_VARIATIONS'], errors='coerce').fillna(1)
@@ -1704,7 +1823,6 @@ if st.session_state.get('last_processed_files') != process_signature:
                         if c in data.columns: data[c] = data[c].astype(str).fillna('')
                     if 'COLOR_FAMILY' not in data.columns: data['COLOR_FAMILY'] = ""
 
-                    # FIX 1: Use cached validation — won't re-run on button clicks
                     data_hash = df_hash(data) + country_validator.code
                     final_report, _ = cached_validate_products(data_hash, data, support_files, country_validator.code, data_has_warranty)
 
@@ -1718,6 +1836,7 @@ if st.session_state.get('last_processed_files') != process_signature:
             st.error(f"Processing error: {e}")
             st.code(traceback.format_exc())
             st.session_state.last_processed_files = "error"
+
 
 # ==========================================
 # POST-QC RESULTS SECTION
@@ -1762,140 +1881,158 @@ if uploaded_files and not st.session_state.final_report.empty and st.session_sta
 
 # ==========================================
 # SECTION 2: MANUAL IMAGE REVIEW
-# --- FIX 6: Wrapped in @st.fragment to isolate reruns ---
 # ==========================================
 @st.fragment
 def render_image_grid():
-    if st.session_state.final_report.empty or st.session_state.file_mode == 'post_qc':
+    if st.session_state.final_report.empty or st.session_state.file_mode == "post_qc":
         return
 
     st.markdown("---")
     st.header(":material/pageview: Manual Image & Category Review", anchor=False)
 
-    components.html("""<script>const doc = window.parent.document;if (!doc.getElementById("global-img-click-listener")) {let scriptTag = doc.createElement("script");scriptTag.id = "global-img-click-listener";scriptTag.text = `document.addEventListener("click", function(e) {let target = e.target.closest('div[id^="imgclick-"]');if (target) {e.preventDefault();e.stopPropagation();let card = target.closest('[data-testid="stVerticalBlockBorderWrapper"]') || target.closest('[data-testid="stVerticalBlock"]');if (card) {let cb = card.querySelector('input[type="checkbox"]');if (cb) cb.click();}}});`;doc.body.appendChild(scriptTag);}</script>""", height=0, width=0)
+    fr   = st.session_state.final_report
+    data = st.session_state.all_data_map
 
-    fr = st.session_state.final_report
-    quick_rej_sids = [k.replace("quick_rej_", "") for k in st.session_state.keys() if k.startswith("quick_rej_") and "reason" not in k]
-    mask = (fr['Status'] == 'Approved') | (fr['ProductSetSid'].isin(quick_rej_sids))
-    valid_grid_df = fr[mask]
+    committed_rej_sids = {
+        k.replace("quick_rej_", "")
+        for k in st.session_state.keys()
+        if k.startswith("quick_rej_") and "reason" not in k
+    }
+    mask           = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
+    valid_grid_df  = fr[mask]
 
-    c_rev_1, c_rev_2, c_rev_3 = st.columns([1.5, 1.5, 2])
-    with c_rev_1: search_n = st.text_input("Search by Name", placeholder="Product name...")
-    with c_rev_2: search_sc = st.text_input("Search by Seller / Category", placeholder="Seller or Category...")
-    with c_rev_3: st.session_state.grid_items_per_page = st.select_slider("Items per page", options=[20, 50, 100, 200], value=st.session_state.grid_items_per_page)
+    c1, c2, c3 = st.columns([1.5, 1.5, 2])
+    with c1: search_n  = st.text_input("Search by Name",            placeholder="Product name…")
+    with c2: search_sc = st.text_input("Search by Seller/Category", placeholder="Seller or Category…")
+    with c3:
+        st.session_state.grid_items_per_page = st.select_slider(
+            "Items per page", options=[20, 50, 100, 200],
+            value=st.session_state.grid_items_per_page,
+        )
 
-    def get_batch_labels(): return {"Poor Image Quality": "Poor images", "Wrong Category": "Wrong Category", "Suspected Fake": "Suspected Fake product", "Restricted Brand": "Restricted brands", "Wrong Brand": "Generic branded products with genuine brands", "Other Reason (Custom)": "Other Reason (Custom)"}
-
-    with st.container(border=True):
-        st.markdown(f"<p style='font-weight: 700; margin: 0 0 10px 0;'>Batch Rejection Mode</p>", unsafe_allow_html=True)
-        grid_reason = st.segmented_control("Select rejection reason for batch actions:", list(get_batch_labels().keys()), default="Poor Image Quality", label_visibility="collapsed")
-        if not grid_reason: grid_reason = "Poor Image Quality"
-
-        grid_custom_comment = ""
-        if grid_reason == "Other Reason (Custom)":
-            grid_custom_comment = st.text_area("Custom rejection comment", placeholder="Type your rejection reason here...", key="grid_custom_comment", height=80)
-            if not grid_custom_comment.strip(): st.warning("Please enter a custom comment before rejecting.", icon="⚠️")
-
-        active_label = grid_reason if grid_reason != "Other Reason (Custom)" else f"Other: {grid_custom_comment[:40]}..." if grid_custom_comment.strip() else "Other Reason (Custom) — enter comment above"
-        st.markdown(f"""<div class='batch-info-box' style='background: var(--background-color, {JUMIA_COLORS['light_gray']});'><span style='font-size: 12px; font-weight: 600;'>Active Reason:</span><span style='font-size: 13px; font-weight: 700; margin-left: 8px;'>{active_label}</span></div>""", unsafe_allow_html=True)
-
-    review_data = pd.merge(valid_grid_df[['ProductSetSid']], st.session_state.all_data_map, left_on='ProductSetSid', right_on='PRODUCT_SET_SID', how='left')
-
-    if search_n: review_data = review_data[review_data['NAME'].astype(str).str.contains(search_n, case=False, na=False)]
+    available_cols = [c for c in GRID_COLS if c in data.columns]
+    review_data = pd.merge(
+        valid_grid_df[["ProductSetSid"]],
+        data[available_cols],
+        left_on="ProductSetSid", right_on="PRODUCT_SET_SID", how="left",
+    )
+    if search_n:
+        review_data = review_data[
+            review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)
+        ]
     if search_sc:
-        mc = review_data['CATEGORY'].astype(str).str.contains(search_sc, case=False, na=False) if 'CATEGORY' in review_data.columns else False
-        ms = review_data['SELLER_NAME'].astype(str).str.contains(search_sc, case=False, na=False)
+        mc = (review_data["CATEGORY"].astype(str).str.contains(search_sc, case=False, na=False)
+              if "CATEGORY" in review_data.columns
+              else pd.Series(False, index=review_data.index))
+        ms = review_data["SELLER_NAME"].astype(str).str.contains(search_sc, case=False, na=False)
         review_data = review_data[mc | ms]
 
-    items_per_page = st.session_state.grid_items_per_page
-    total_pages = max(1, (len(review_data) + items_per_page - 1) // items_per_page)
-    if st.session_state.grid_page >= total_pages: st.session_state.grid_page = 0
+    ipp         = st.session_state.grid_items_per_page
+    total_pages = max(1, (len(review_data) + ipp - 1) // ipp)
+    if st.session_state.grid_page >= total_pages:
+        st.session_state.grid_page = 0
 
-    page_data = review_data.iloc[st.session_state.grid_page * items_per_page : (st.session_state.grid_page + 1) * items_per_page]
-    cur_sids = page_data['PRODUCT_SET_SID'].tolist()
+    # ── Pagination controls only (batch controls are now inside the iframe) ───
+    pg_cols = st.columns([1, 2, 1])
+    with pg_cols[0]:
+        if st.button("◀ Prev", use_container_width=True,
+                     disabled=st.session_state.grid_page == 0):
+            st.session_state.grid_page = max(0, st.session_state.grid_page - 1)
+            st.session_state.do_scroll_top = True
+            st.rerun(scope="fragment")
+    with pg_cols[1]:
+        st.markdown(
+            f"<div style='text-align:center;padding:8px 0;font-weight:700;'>"
+            f"Page {st.session_state.grid_page+1} / {total_pages}"
+            f" &nbsp;·&nbsp; {len(review_data)} items</div>",
+            unsafe_allow_html=True,
+        )
+    with pg_cols[2]:
+        if st.button("Next ▶", use_container_width=True,
+                     disabled=st.session_state.grid_page >= total_pages - 1):
+            st.session_state.grid_page += 1
+            st.session_state.do_scroll_top = True
+            st.rerun(scope="fragment")
 
-    def cb_process_batch(show_warning, sids, active_reason):
-        flagged = [s for s in sids if st.session_state.get(f"grid_chk_{s}")]
-        if not flagged:
-            if show_warning: st.session_state.main_toasts.append(("No items selected.", "⚠️"))
-            return
-        if active_reason == "Other Reason (Custom)":
-            custom_cmt = st.session_state.get("grid_custom_comment", "").strip()
-            if not custom_cmt: st.session_state.main_toasts.append(("Please enter a custom comment first.", "⚠️")); return
-            code, cmt, flag_key = "1000007 - Other Reason", custom_cmt, "Other Reason (Custom)"
-        else:
-            flag_key = get_batch_labels()[active_reason]
-            code, cmt = support_files['flags_mapping'].get(flag_key, ("1000007 - Other Reason", "Manual rejection"))
-        st.session_state.final_report.loc[st.session_state.final_report['ProductSetSid'].isin(flagged), ['Status', 'Reason', 'Comment', 'FLAG']] = ['Rejected', code, cmt, flag_key]
-        for s in flagged:
-            st.session_state[f"quick_rej_{s}"] = True
-            st.session_state[f"quick_rej_reason_{s}"] = flag_key
-            st.session_state.pop(f"grid_chk_{s}", None)
-        st.session_state.exports_cache.clear()
-        st.session_state.display_df_cache.clear()
-        st.session_state.main_toasts.append((f"Batch rejected {len(flagged)} items", "✅"))
+    # ── Image quality checks ──────────────────────────────────────────────────
+    page_start = st.session_state.grid_page * ipp
+    page_data  = review_data.iloc[page_start : page_start + ipp]
 
-    def cb_prev(sids, active_reason): cb_process_batch(False, sids, active_reason); st.session_state.grid_page -= 1; st.session_state.do_scroll_top = True
-    def cb_next(sids, active_reason): cb_process_batch(False, sids, active_reason); st.session_state.grid_page += 1; st.session_state.do_scroll_top = True
-    def cb_sel_all(sids):
-        for s in sids: st.session_state[f"grid_chk_{s}"] = True
-    def cb_desel_all(sids):
-        for s in sids: st.session_state.pop(f"grid_chk_{s}", None)
-    def cb_reject_all(sids, active_reason): cb_process_batch(True, sids, active_reason)
-
-    with st_yled.sticky_header(background_color="#FFFFFF", padding="15px 10px", key="sticky-nav-top"):
-        col_pg1, col_pg2, col_pg3, col_sel, col_desel, col_rej, col_spacer = st.columns([0.8, 1.2, 0.8, 0.6, 0.6, 1.5, 1.5])
-        col_pg1.button(":material/arrow_back: Prev", key="pt", disabled=(st.session_state.grid_page == 0), use_container_width=True, on_click=cb_prev, args=(cur_sids, grid_reason))
-        col_pg2.markdown(f"<p style='text-align: center; margin: 0; padding: 10px 0; font-weight: 600;'>Page {st.session_state.grid_page + 1} of {total_pages}</p>", unsafe_allow_html=True)
-        col_pg3.button("Next :material/arrow_forward:", key="nt", disabled=(st.session_state.grid_page >= total_pages - 1), use_container_width=True, on_click=cb_next, args=(cur_sids, grid_reason))
-        col_sel.button("Select All", key="sel_all_top", use_container_width=True, on_click=cb_sel_all, args=(cur_sids,))
-        col_desel.button("Deselect All", key="desel_all_top", use_container_width=True, on_click=cb_desel_all, args=(cur_sids,))
-        col_rej.button(f":material/block: Reject All — {grid_reason}", key="reject_active_top", type="primary", use_container_width=True, on_click=cb_reject_all, args=(cur_sids, grid_reason))
-
-    if st.session_state.get('do_scroll_top', False):
-        components.html("""<script>const doc = window.parent.document;const main = doc.querySelector('.main') || doc.querySelector('[data-testid="stAppViewContainer"]');if (main) { main.scrollTo({top: 0, behavior: 'smooth'}); }</script>""", height=0, width=0)
-        st.session_state.do_scroll_top = False
-
-    # FIX 5: Use cached image checker — no re-download on rerun
-    page_warnings = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    page_warnings: dict = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
         future_to_sid = {
-            executor.submit(analyze_image_quality_cached, str(r.get('MAIN_IMAGE', '')).strip()): str(r['PRODUCT_SET_SID'])
+            ex.submit(analyze_image_quality_cached,
+                      str(r.get("MAIN_IMAGE", "")).strip()): str(r["PRODUCT_SET_SID"])
             for _, r in page_data.iterrows()
         }
         for future in concurrent.futures.as_completed(future_to_sid):
-            page_warnings[future_to_sid[future]] = future.result()
+            warns = future.result()
+            if warns:
+                page_warnings[future_to_sid[future]] = warns
+
+    rejected_state = {
+        sid: st.session_state[f"quick_rej_reason_{sid}"]
+        for sid in page_data["PRODUCT_SET_SID"].astype(str)
+        if st.session_state.get(f"quick_rej_{sid}")
+    }
 
     cols_per_row = 3 if st.session_state.layout_mode == "centered" else 4
-    for i in range(0, len(page_data), cols_per_row):
-        cols = st.columns(cols_per_row)
-        for j, (_, row) in enumerate(page_data.iloc[i:i+cols_per_row].iterrows()):
-            with cols[j]:
-                sid_for_row = str(row['PRODUCT_SET_SID'])
-                render_product_card(row, support_files['flags_mapping'], st.session_state.get('selected_country', 'Kenya'), page_warnings.get(sid_for_row, []))
 
-    if st.session_state.grid_page < total_pages - 1:
-        next_page_data = review_data.iloc[(st.session_state.grid_page + 1) * items_per_page : (st.session_state.grid_page + 2) * items_per_page]
-        next_urls = [str(u).strip() for u in next_page_data['MAIN_IMAGE'].values if str(u).startswith('http')]
-        if next_urls:
-            js_array = json.dumps(next_urls)
-            components.html(f"""<script>setTimeout(function() {{ var urls = {js_array}; urls.forEach(function(url) {{ var img = new Image(); img.src = url; }}); }}, 1500);</script>""", height=0, width=0)
+    grid_html = build_fast_grid_html(
+        page_data,
+        support_files["flags_mapping"],
+        st.session_state.selected_country,
+        page_warnings,
+        rejected_state,
+        cols_per_row,
+    )
+    
+    # ── NATIVE STREAMLIT CLOUD BRIDGE COMPONENT CALL ───
+    _msg = grid_component(
+        html_content=grid_html, 
+        height=1400, 
+        key=f"grid_comp_{st.session_state.grid_page}_{st.session_state.main_bridge_counter}"
+    )
 
-    st.divider()
+    if _msg and isinstance(_msg, dict) and _msg.get("action") == "reject":
+        _payload = _msg.get("payload", {})
+        if _payload:
+            _rgroups = {}
+            for _sid, _rkey in _payload.items():
+                _rgroups.setdefault(_rkey, []).append(_sid)
+                
+            _total = 0
+            for _rkey, _sids in _rgroups.items():
+                _flag = REASON_MAP.get(_rkey, "Other Reason (Custom)")
+                _code, _cmt = support_files["flags_mapping"].get(_flag, ("1000007 - Other Reason", "Manual rejection"))
+                
+                st.session_state.final_report.loc[
+                    st.session_state.final_report["ProductSetSid"].isin(_sids),
+                    ["Status", "Reason", "Comment", "FLAG"]
+                ] = ["Rejected", _code, _cmt, _flag]
+                
+                for _s in _sids:
+                    st.session_state[f"quick_rej_{_s}"] = True
+                    st.session_state[f"quick_rej_reason_{_s}"] = _flag
+                _total += len(_sids)
+                
+            st.session_state.exports_cache.clear()
+            st.session_state.display_df_cache.clear()
+            st.session_state.main_toasts.append((f"Rejected {_total} product(s)", "✅"))
+            st.session_state.main_bridge_counter += 1
+            st.rerun()
 
-    with st.container():
-        col_pg1_b, col_pg2_b, col_pg3_b, col_sel_b, col_desel_b, col_rej_b, col_spacer_b = st.columns([0.8, 1.2, 0.8, 0.6, 0.6, 1.5, 1.5])
-        col_pg1_b.button(":material/arrow_back: Prev", key="pb", disabled=(st.session_state.grid_page == 0), use_container_width=True, on_click=cb_prev, args=(cur_sids, grid_reason))
-        col_pg2_b.markdown(f"<p style='text-align: center; margin: 0; padding: 10px 0; font-weight: 600;'>Page {st.session_state.grid_page + 1} of {total_pages}</p>", unsafe_allow_html=True)
-        col_pg3_b.button("Next :material/arrow_forward:", key="nb", disabled=(st.session_state.grid_page >= total_pages - 1), use_container_width=True, on_click=cb_next, args=(cur_sids, grid_reason))
-        col_sel_b.button("Select All", key="sel_all_bot", use_container_width=True, on_click=cb_sel_all, args=(cur_sids,))
-        col_desel_b.button("Deselect All", key="desel_all_bot", use_container_width=True, on_click=cb_desel_all, args=(cur_sids,))
-        col_rej_b.button(f":material/block: Reject All — {grid_reason}", key="reject_active_bot", type="primary", use_container_width=True, on_click=cb_reject_all, args=(cur_sids, grid_reason))
+    if st.session_state.get("do_scroll_top", False):
+        components.html(
+            "<script>window.parent.document.querySelector('.main')"
+            ".scrollTo({top:0,behavior:'smooth'});</script>",
+            height=0,
+        )
+        st.session_state.do_scroll_top = False
 
 
 # ==========================================
 # SECTION 3: EXPORTS
-# --- FIX 6: Wrapped in @st.fragment to isolate reruns ---
 # ==========================================
 @st.fragment
 def render_exports_section():
@@ -1943,7 +2080,8 @@ def render_exports_section():
                                 del st.session_state.exports_cache[export_key]
                                 st.rerun()
 
-
-# Call the fragmented sections
+# ==========================================
+# CALL FRAGMENTS
+# ==========================================
 render_image_grid()
 render_exports_section()
