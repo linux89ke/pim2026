@@ -1576,6 +1576,11 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
 def render_image_grid():
     if st.session_state.final_report.empty or st.session_state.file_mode == "post_qc":
         return
+
+    if "support_files" not in st.session_state:
+        st.error("Support files not loaded – restart the app")
+        return
+    support_files = st.session_state.support_files
     st.markdown("---")
     st.header(":material/pageview: Manual Image & Category Review", anchor=False)
     fr = st.session_state.final_report
