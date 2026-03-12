@@ -1289,16 +1289,18 @@ def build_fast_grid_html(
     page_warnings: dict,
     rejected_state: dict,
     cols_per_row: int,
+    cmd: str = "",        # NEW: "batch_reject", "deselect", or ""
+    cmd_reason: str = "", # NEW: reason key for batch_reject
 ) -> str:
-    O  = JUMIA_COLORS["primary_orange"]
-    G  = JUMIA_COLORS["success_green"]
-    R  = JUMIA_COLORS["jumia_red"]
+    O = JUMIA_COLORS["primary_orange"]
+    G = JUMIA_COLORS["success_green"]
+    R = JUMIA_COLORS["jumia_red"]
 
     committed_json = json.dumps(rejected_state)
 
     cards_data = []
     for _, row in page_data.iterrows():
-        sid     = str(row["PRODUCT_SET_SID"])
+        sid = str(row["PRODUCT_SET_SID"])
         img_url = str(row.get("MAIN_IMAGE", "")).strip()
         if not img_url.startswith("http"):
             img_url = "https://via.placeholder.com/150?text=No+Image"
@@ -1311,9 +1313,10 @@ def build_fast_grid_html(
             "seller":   str(row.get("SELLER_NAME", "Unknown Seller")),
             "warnings": page_warnings.get(sid, []),
         })
-    cards_json = json.dumps(cards_data)
+    cards_json   = json.dumps(cards_data)
+    cmd_json     = json.dumps({"cmd": cmd, "reason": cmd_reason})
 
-    html = f"""<!DOCTYPE html>
+    return f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -1325,26 +1328,29 @@ def build_fast_grid_html(
              font-size:12px;flex-wrap:wrap;color:#555;}}
   .sel-count{{font-weight:700;color:{O};}}
   .grid{{display:grid;grid-template-columns:repeat({cols_per_row},1fr);gap:12px;}}
-  .card{{border:2px solid #e0e0e0;border-radius:8px;padding:10px;background:#fff;position:relative;
-         transition:border-color .15s,box-shadow .15s;}}
-  .card.selected{{border-color:{G};box-shadow:0 0 0 3px rgba(76,175,80,.2);background:rgba(76,175,80,.04);}}
+  .card{{border:2px solid #e0e0e0;border-radius:8px;padding:10px;background:#fff;
+         position:relative;transition:border-color .15s,box-shadow .15s;}}
+  .card.selected{{border-color:{G};box-shadow:0 0 0 3px rgba(76,175,80,.2);
+                  background:rgba(76,175,80,.04);}}
   .card.committed-rej{{border-color:#bbb;opacity:.5;}}
   .card-img-wrap{{position:relative;cursor:pointer;}}
   .card-img{{width:100%;aspect-ratio:1;object-fit:contain;border-radius:6px;display:block;}}
   .card.committed-rej .card-img{{filter:grayscale(80%);}}
   .tick{{position:absolute;bottom:6px;right:6px;width:22px;height:22px;border-radius:50%;
          background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;
-         color:transparent;font-size:13px;font-weight:900;transition:all .15s;pointer-events:none;}}
+         color:transparent;font-size:13px;font-weight:900;transition:all .15s;
+         pointer-events:none;}}
   .card.selected .tick{{background:{G};color:#fff;}}
   .warn-wrap{{position:absolute;top:6px;right:6px;display:flex;flex-direction:column;gap:3px;
               z-index:5;pointer-events:none;}}
   .warn-badge{{background:rgba(255,193,7,.95);color:#313133;font-size:9px;font-weight:800;
                padding:3px 7px;border-radius:10px;}}
   .rej-overlay{{display:none;position:absolute;inset:0;background:rgba(255,255,255,.88);
-                border-radius:6px;flex-direction:column;align-items:center;justify-content:center;
-                z-index:20;gap:5px;padding:8px;text-align:center;}}
+                border-radius:6px;flex-direction:column;align-items:center;
+                justify-content:center;z-index:20;gap:5px;padding:8px;text-align:center;}}
   .card.committed-rej .rej-overlay{{display:flex;}}
-  .rej-badge{{background:{R};color:#fff;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:700;}}
+  .rej-badge{{background:{R};color:#fff;padding:3px 10px;border-radius:10px;
+              font-size:11px;font-weight:700;}}
   .rej-label{{font-size:10px;color:{R};font-weight:600;max-width:120px;}}
   .meta{{font-size:11px;margin-top:8px;line-height:1.4;}}
   .meta .nm{{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
@@ -1360,54 +1366,44 @@ def build_fast_grid_html(
 </head>
 <body>
 <div class="info-bar">
-  <span>Click image to <b>select</b> &nbsp;|&nbsp; Use <b>Batch Reject</b> above the grid to reject selected</span>
+  <span>Click image to <b>select</b> &nbsp;|&nbsp; Use <b>Batch Reject</b> above to reject selected</span>
   <span class="sel-count" id="sel-count-bar">0 selected</span>
 </div>
 <div class="grid" id="card-grid"></div>
 <script>
 const CARDS     = {cards_json};
 const COMMITTED = {committed_json};
-const LS_KEY    = '_grid_pending';
+const CMD       = {cmd_json};          // command injected by Python on re-render
 
-let selectedSids = new Set();
+let selectedSids = new Map();          // Map<sid, reasonKey>
 
-(function() {{
+// ── Write a message to the PARENT frame so st_javascript can read it ────────
+function writeToParent(payload) {{
   try {{
-    const raw = localStorage.getItem(LS_KEY);
-    if (raw) {{
-      const obj = JSON.parse(raw);
-      Object.keys(obj).forEach(sid => {{
-        if (!(sid in COMMITTED)) selectedSids.add(sid + '|' + obj[sid]);
-      }});
-    }}
-  }} catch(e) {{}}
-}})();
-
-function saveToLS() {{
-  const obj = {{}};
-  selectedSids.forEach(entry => {{
-    const pipe = entry.indexOf('|');
-    const sid    = entry.slice(0, pipe);
-    const reason = entry.slice(pipe + 1);
-    obj[sid] = reason;
-  }});
-  try {{ localStorage.setItem(LS_KEY, JSON.stringify(obj)); }} catch(e) {{}}
-  document.getElementById('sel-count-bar').textContent = selectedSids.size + ' selected';
+    // Direct property write — st_javascript reads window._stGridMsg in parent
+    window.parent._stGridMsg = JSON.stringify(payload);
+  }} catch(e) {{ /* cross-origin; silently ignore */ }}
 }}
 
+function updateSelCount() {{
+  document.getElementById('sel-count-bar').textContent =
+    selectedSids.size + ' selected';
+}}
+
+// ── Card rendering ──────────────────────────────────────────────────────────
 function renderCard(card) {{
   const {{sid, img, name, brand, cat, seller, warnings}} = card;
   const isCommitted = sid in COMMITTED;
-  const selEntry = [...selectedSids].find(e => e.startsWith(sid + '|'));
-  const isSelected = !!selEntry && !isCommitted;
+  const isSelected  = selectedSids.has(sid) && !isCommitted;
 
   let cls = 'card';
-  if (isCommitted) cls += ' committed-rej';
+  if (isCommitted)     cls += ' committed-rej';
   else if (isSelected) cls += ' selected';
 
   const shortName = name.length > 38 ? name.slice(0,38)+'…' : name;
-  const warnHtml  = warnings.map(w => `<span class="warn-badge">${{w}}</span>`).join('');
-  const rejLabel  = isCommitted ? COMMITTED[sid].replace(/_/g,' ') : '';
+  const warnHtml  = warnings.map(w =>
+    `<span class="warn-badge">${{w}}</span>`).join('');
+  const rejLabel  = isCommitted ? (COMMITTED[sid]||'').replace(/_/g,' ') : '';
 
   const rejOverlay = isCommitted ? `
     <div class="rej-overlay">
@@ -1417,8 +1413,16 @@ function renderCard(card) {{
 
   const actHtml = !isCommitted ? `
     <div class="acts">
-      <button class="act-btn" onclick="quickReject(event,'${{sid}}','REJECT_POOR_IMAGE')">Poor Img</button>
-      <select class="act-more" onchange="if(this.value){{quickReject(event,'${{sid}}',this.value);this.value=''}}">
+      <button class="act-btn"
+        onclick="event.stopPropagation();quickReject('${{sid}}','REJECT_POOR_IMAGE')">
+        Poor Img
+      </button>
+      <select class="act-more"
+        onchange="if(this.value){{
+          event.stopPropagation();
+          quickReject('${{sid}}',this.value);
+          this.value='';
+        }}">
         <option value="">More…</option>
         <option value="REJECT_WRONG_CAT">Wrong Category</option>
         <option value="REJECT_FAKE">Fake Product</option>
@@ -1430,7 +1434,7 @@ function renderCard(card) {{
     </div>` : '';
 
   return `<div class="${{cls}}" id="card-${{sid}}">
-    <div class="card-img-wrap" onclick="toggleSelect('${{sid}}')" >
+    <div class="card-img-wrap" onclick="toggleSelect('${{sid}}')">
       <div class="warn-wrap">${{warnHtml}}</div>
       <img class="card-img" src="${{img}}" loading="lazy"
            onerror="this.src='https://via.placeholder.com/150?text=No+Image'">
@@ -1445,51 +1449,61 @@ function renderCard(card) {{
 }}
 
 function renderAll() {{
-  document.getElementById('card-grid').innerHTML = CARDS.map(renderCard).join('');
-  document.getElementById('sel-count-bar').textContent = selectedSids.size + ' selected';
+  document.getElementById('card-grid').innerHTML =
+    CARDS.map(renderCard).join('');
+}}
+
+function replaceCard(sid) {{
+  const el = document.getElementById('card-'+sid);
+  if (!el) return;
+  const card = CARDS.find(c => c.sid === sid);
+  if (!card) return;
+  const tmp = document.createElement('div');
+  tmp.innerHTML = renderCard(card);
+  el.replaceWith(tmp.firstElementChild);
 }}
 
 function toggleSelect(sid) {{
   if (sid in COMMITTED) return;
-  const ex = [...selectedSids].find(e => e.startsWith(sid+'|'));
-  if (ex) {{ selectedSids.delete(ex); }}
-  else {{ selectedSids.add(sid+'|SELECTED'); }}
-  const el = document.getElementById('card-'+sid);
-  if (el) {{
-    const card = CARDS.find(c=>c.sid===sid);
-    if (card) {{ const t=document.createElement('div'); t.innerHTML=renderCard(card); el.replaceWith(t.firstElementChild); }}
+  if (selectedSids.has(sid)) selectedSids.delete(sid);
+  else selectedSids.set(sid, 'SELECTED');
+  replaceCard(sid);
+  updateSelCount();
+  // Selection alone doesn't trigger a rerun — only reject actions do
+}}
+
+function quickReject(sid, reasonKey) {{
+  selectedSids.delete(sid);
+  COMMITTED[sid] = reasonKey;   // optimistic UI
+  replaceCard(sid);
+  updateSelCount();
+  writeToParent({{action: 'quick_reject', sid: sid, reason: reasonKey}});
+}}
+
+// ── Handle Python-injected command (batch_reject / deselect) ─────────────────
+// Python re-renders this iframe with CMD.cmd set; we process it on load.
+(function handlePythonCommand() {{
+  const {{cmd, reason}} = CMD;
+  if (cmd === 'batch_reject') {{
+    const toReject = [...selectedSids.keys()];
+    if (toReject.length === 0) return;
+    toReject.forEach(sid => {{
+      COMMITTED[sid] = reason;
+      selectedSids.delete(sid);
+    }});
+    renderAll();
+    updateSelCount();
+    writeToParent({{action: 'batch_reject', sids: toReject, reason: reason}});
+  }} else if (cmd === 'deselect') {{
+    selectedSids.clear();
+    // renderAll called below
   }}
-  saveToLS();
-}}
-
-function notifyStreamlit() {{
-  try {{
-    const trigger = window.parent.document.querySelector('button[title="hidden_trigger_btn"]');
-    if (trigger) trigger.click();
-  }} catch(e) {{}}
-}}
-
-function quickReject(evt, sid, reasonKey) {{
-  evt.stopPropagation();
-  const ex = [...selectedSids].find(e => e.startsWith(sid+'|'));
-  if (ex) selectedSids.delete(ex);
-  selectedSids.add(sid+'|'+reasonKey);
-  saveToLS();
-
-  const el = document.getElementById('card-'+sid);
-  if (el) {{
-    const card = CARDS.find(c=>c.sid===sid);
-    if (card) {{ const t=document.createElement('div'); t.innerHTML=renderCard(card); el.replaceWith(t.firstElementChild); }}
-  }}
-  notifyStreamlit();
-}}
+}})();
 
 renderAll();
 </script>
 </body>
 </html>"""
-    return html
-
 
 # -------------------------------------------------
 # UI COMPONENTS
@@ -1819,107 +1833,67 @@ def render_image_grid():
     st.markdown("---")
     st.header(":material/pageview: Manual Image & Category Review", anchor=False)
 
-    # --- Hidden trigger button to allow JavaScript to instantly ping Streamlit ---
-    st.markdown("""<style>
-    button[title="hidden_trigger_btn"] {
-        opacity: 0 !important;
-        position: fixed !important;
-        bottom: -200px !important;
-        width: 1px !important;
-        height: 1px !important;
-        pointer-events: auto !important;
-    }
-    </style>""", unsafe_allow_html=True)
-    js_triggered = st.button("•", key="hidden_process", help="hidden_trigger_btn")
-    if js_triggered:
-        st.session_state.ls_read_trigger += 1
+    # ── 1. READ the message written by the grid iframe ────────────────────────
+    # st_javascript runs in the parent frame and can read window._stGridMsg.
+    # We use a counter-based key so each rerun gets a fresh read.
+    if "grid_msg_counter" not in st.session_state:
+        st.session_state.grid_msg_counter = 0
 
-    # ── Batch reason options — defined here so both branches can access them ──
-    batch_reason_options = [
-        ("Poor Image Quality",  "REJECT_POOR_IMAGE"),
-        ("Wrong Category",      "REJECT_WRONG_CAT"),
-        ("Suspected Fake",      "REJECT_FAKE"),
-        ("Restricted Brand",    "REJECT_BRAND"),
-        ("Wrong Brand",         "REJECT_WRONG_BRAND"),
-        ("Prohibited Product",  "REJECT_PROHIBITED"),
-    ]
-    batch_labels = [l for l, _ in batch_reason_options]
+    raw_msg = st_javascript(
+        "return (window._stGridMsg !== undefined && window._stGridMsg !== null)"
+        " ? (function(){ var v=window._stGridMsg; window._stGridMsg=null; return v; })()"
+        " : null;",
+        key=f"grid_msg_read_{st.session_state.grid_msg_counter}",
+    )
 
-    # ── Deselect pending — handle at top before any st_javascript read ──
-    # Uses counter-based key to prevent DuplicateWidgetID on repeated clicks
-    if st.session_state.pop("_deselect_pending", False):
-        st.session_state.desel_counter += 1
-        st_javascript(
-            "localStorage.removeItem('_grid_pending');",
-            key=f"ls_desel_exec_{st.session_state.desel_counter}"
-        )
-        st.session_state.ls_processed_flag = False
-        # Don't return — fall through so grid still renders
-    else:
-        # Read localStorage with a dynamic key so it forces a re-read when triggered
-        ls_data = st_javascript(
-            "return localStorage.getItem('_grid_pending') || null;",
-            key=f"ls_read_{st.session_state.ls_read_trigger}"
-        )
+    # ── 2. PROCESS the message immediately (before rendering any widgets) ─────
+    grid_cmd = ""        # command to inject into the NEXT grid render
+    grid_cmd_reason = ""
 
-        # Normalize: treat 0 (int), "0", "null", None as "nothing pending"
-        ls_is_empty = ls_data in (0, "0", "null", None, "")
+    if raw_msg and isinstance(raw_msg, str) and raw_msg not in ("0", "null"):
+        try:
+            msg = json.loads(raw_msg)
+            action = msg.get("action", "")
 
-        # Reset processed flag when localStorage is empty
-        if ls_is_empty:
-            st.session_state.ls_processed_flag = False
+            if action == "quick_reject":
+                sid    = msg["sid"]
+                reason = msg["reason"]
+                flag_name = REASON_MAP.get(reason, "Other Reason (Custom)")
+                code, cmt = support_files["flags_mapping"].get(
+                    flag_name, ("1000007 - Other Reason", "Manual rejection")
+                )
+                apply_rejection([sid], code, cmt, flag_name)
+                st.session_state[f"quick_rej_{sid}"] = True
+                st.session_state[f"quick_rej_reason_{sid}"] = flag_name
+                st.session_state.main_toasts.append((f"Rejected 1 product", "✅"))
+                st.session_state.exports_cache.clear()
+                st.session_state.display_df_cache.clear()
+                st.session_state.grid_msg_counter += 1
+                st.rerun(scope="app")
 
-        # ── Batch reject — flag was set on previous render, now ls_data is available ──
-        if st.session_state.get("_batch_reject_pending") and not ls_is_empty:
-            st.session_state.pop("_batch_reject_pending")
-            chosen_label_val = st.session_state.pop("_batch_reject_reason", batch_labels[0])
-            chosen_key = dict(batch_reason_options).get(chosen_label_val, "REJECT_POOR_IMAGE")
-            flag_name = REASON_MAP.get(chosen_key, "Other Reason (Custom)")
-            code, cmt = support_files["flags_mapping"].get(flag_name, ("1000007 - Other Reason", "Manual rejection"))
-            try:
-                obj = json.loads(ls_data)
-                sids = list(obj.keys())
+            elif action == "batch_reject":
+                sids   = msg.get("sids", [])
+                reason = msg.get("reason", "REJECT_POOR_IMAGE")
                 if sids:
+                    flag_name = REASON_MAP.get(reason, "Other Reason (Custom)")
+                    code, cmt = support_files["flags_mapping"].get(
+                        flag_name, ("1000007 - Other Reason", "Manual rejection")
+                    )
                     apply_rejection(sids, code, cmt, flag_name)
                     for s in sids:
                         st.session_state[f"quick_rej_{s}"] = True
                         st.session_state[f"quick_rej_reason_{s}"] = flag_name
-                    st.session_state.batch_counter += 1
-                    st_javascript(
-                        "localStorage.removeItem('_grid_pending');",
-                        key=f"ls_clr_batch_{st.session_state.batch_counter}"
+                    st.session_state.main_toasts.append(
+                        (f"Batch rejected {len(sids)} product(s)", "✅")
                     )
-                    st.session_state.ls_processed_flag = False
-                    st.session_state.main_toasts.append((f"Batch rejected {len(sids)} product(s)", "✅"))
                     st.session_state.exports_cache.clear()
                     st.session_state.display_df_cache.clear()
+                    st.session_state.grid_msg_counter += 1
                     st.rerun(scope="app")
-            except Exception as e:
-                logger.error(f"Batch reject parse error: {e}")
+        except Exception as e:
+            logger.error(f"Grid message parse error: {e}")
 
-        # ── Auto-process individual card quick-rejects ──────────
-        # Only process if ls_data has content AND we haven't already processed it this render
-        elif not ls_is_empty and not st.session_state.ls_processed_flag:
-            st.session_state.ls_processed_flag = True
-            count = _process_grid_selections(ls_data, support_files)
-            if count > 0:
-                st.session_state.clear_counter += 1
-                st_javascript(
-                    "localStorage.removeItem('_grid_pending');",
-                    key=f"ls_clear_{st.session_state.clear_counter}"
-                )
-                st.session_state.ls_processed_flag = False
-                st.session_state.main_toasts.append((f"Rejected {count} product(s)", "✅"))
-                st.session_state.exports_cache.clear()
-                st.session_state.display_df_cache.clear()
-                st.session_state.final_report = st.session_state.final_report.copy()
-                st.rerun(scope="app")
-            else:
-                # Nothing actionable in localStorage (e.g. only SELECTED entries, no real rejections)
-                st.session_state.ls_processed_flag = False
-            # NOTE: No return here — grid still renders below
-
-    # ── Render grid UI ────────────────────────────────────────────────────────
+    # ── 3. RENDER grid UI ─────────────────────────────────────────────────────
     fr   = st.session_state.final_report
     data = st.session_state.all_data_map
 
@@ -1933,8 +1907,10 @@ def render_image_grid():
 
     # Search & filter
     c1, c2, c3 = st.columns([1.5, 1.5, 2])
-    with c1: search_n  = st.text_input("Search by Name", placeholder="Product name…")
-    with c2: search_sc = st.text_input("Search by Seller/Category", placeholder="Seller or Category…")
+    with c1:
+        search_n  = st.text_input("Search by Name", placeholder="Product name…")
+    with c2:
+        search_sc = st.text_input("Search by Seller/Category", placeholder="Seller or Category…")
     with c3:
         st.session_state.grid_items_per_page = st.select_slider(
             "Items per page", options=[20, 50, 100, 200],
@@ -1948,9 +1924,15 @@ def render_image_grid():
         left_on="ProductSetSid", right_on="PRODUCT_SET_SID", how="left",
     )
     if search_n:
-        review_data = review_data[review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)]
+        review_data = review_data[
+            review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)
+        ]
     if search_sc:
-        mc = review_data["CATEGORY"].astype(str).str.contains(search_sc, case=False, na=False) if "CATEGORY" in review_data.columns else pd.Series(False, index=review_data.index)
+        mc = (
+            review_data["CATEGORY"].astype(str).str.contains(search_sc, case=False, na=False)
+            if "CATEGORY" in review_data.columns
+            else pd.Series(False, index=review_data.index)
+        )
         ms = review_data["SELLER_NAME"].astype(str).str.contains(search_sc, case=False, na=False)
         review_data = review_data[mc | ms]
 
@@ -1959,10 +1941,22 @@ def render_image_grid():
     if st.session_state.grid_page >= total_pages:
         st.session_state.grid_page = 0
 
+    # ── Batch-reason options ──────────────────────────────────────────────────
+    batch_reason_options = [
+        ("Poor Image Quality",  "REJECT_POOR_IMAGE"),
+        ("Wrong Category",      "REJECT_WRONG_CAT"),
+        ("Suspected Fake",      "REJECT_FAKE"),
+        ("Restricted Brand",    "REJECT_BRAND"),
+        ("Wrong Brand",         "REJECT_WRONG_BRAND"),
+        ("Prohibited Product",  "REJECT_PROHIBITED"),
+    ]
+    batch_labels = [l for l, _ in batch_reason_options]
+
     # ── Controls row ──────────────────────────────────────────────────────────
     ctrl_cols = st.columns([1, 1, 1, 2, 2, 2])
     with ctrl_cols[0]:
-        if st.button("◀ Prev", use_container_width=True, disabled=st.session_state.grid_page == 0):
+        if st.button("◀ Prev", use_container_width=True,
+                     disabled=st.session_state.grid_page == 0):
             st.session_state.grid_page = max(0, st.session_state.grid_page - 1)
             st.session_state.do_scroll_top = True
             st.rerun(scope="fragment")
@@ -1970,10 +1964,11 @@ def render_image_grid():
         st.markdown(
             f"<div style='text-align:center;padding:8px 0;font-weight:700;'>"
             f"Page {st.session_state.grid_page+1} / {total_pages}</div>",
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
     with ctrl_cols[2]:
-        if st.button("Next ▶", use_container_width=True, disabled=st.session_state.grid_page >= total_pages - 1):
+        if st.button("Next ▶", use_container_width=True,
+                     disabled=st.session_state.grid_page >= total_pages - 1):
             st.session_state.grid_page += 1
             st.session_state.do_scroll_top = True
             st.rerun(scope="fragment")
@@ -1981,19 +1976,25 @@ def render_image_grid():
         chosen_label = st.selectbox(
             "Batch reason", batch_labels,
             label_visibility="collapsed",
-            key="grid_batch_reason"
+            key="grid_batch_reason",
         )
     with ctrl_cols[4]:
-        if st.button("✗ Batch Reject Selected", use_container_width=True, type="primary"):
-            st.session_state["_batch_reject_pending"] = True
-            st.session_state["_batch_reject_reason"] = chosen_label
-            st.session_state.ls_read_trigger += 1   # ← force fresh localStorage read
-            st.rerun(scope="fragment")
+        do_batch = st.button(
+            "✗ Batch Reject Selected", use_container_width=True, type="primary"
+        )
     with ctrl_cols[5]:
-        if st.button("☐ Deselect All", use_container_width=True):
-            st.session_state["_deselect_pending"] = True
-            st.session_state.ls_read_trigger += 1   # ← force fresh localStorage read
-            st.rerun(scope="fragment")
+        do_desel = st.button("☐ Deselect All", use_container_width=True)
+
+    # Resolve the chosen reason key
+    chosen_key = dict(batch_reason_options).get(chosen_label, "REJECT_POOR_IMAGE")
+
+    # Set the command to inject into this render of the grid
+    if do_batch:
+        grid_cmd        = "batch_reject"
+        grid_cmd_reason = chosen_key
+    elif do_desel:
+        grid_cmd        = "deselect"
+        grid_cmd_reason = ""
 
     # ── Image quality checks ──────────────────────────────────────────────────
     page_start = st.session_state.grid_page * ipp
@@ -2002,12 +2003,16 @@ def render_image_grid():
     page_warnings: dict = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
         future_to_sid = {
-            ex.submit(analyze_image_quality_cached, str(r.get("MAIN_IMAGE","")).strip()): str(r["PRODUCT_SET_SID"])
+            ex.submit(
+                analyze_image_quality_cached,
+                str(r.get("MAIN_IMAGE", "")).strip()
+            ): str(r["PRODUCT_SET_SID"])
             for _, r in page_data.iterrows()
         }
         for future in concurrent.futures.as_completed(future_to_sid):
             warns = future.result()
-            if warns: page_warnings[future_to_sid[future]] = warns
+            if warns:
+                page_warnings[future_to_sid[future]] = warns
 
     rejected_state = {
         sid: st.session_state[f"quick_rej_reason_{sid}"]
@@ -2016,17 +2021,29 @@ def render_image_grid():
     }
 
     cols_per_row = 3 if st.session_state.layout_mode == "centered" else 4
+
+    # ── Render the grid (cmd is injected so the iframe handles it on load) ────
     grid_html = build_fast_grid_html(
-        page_data, support_files["flags_mapping"],
+        page_data,
+        support_files["flags_mapping"],
         st.session_state.selected_country,
-        page_warnings, rejected_state, cols_per_row,
+        page_warnings,
+        rejected_state,
+        cols_per_row,
+        cmd=grid_cmd,
+        cmd_reason=grid_cmd_reason,
     )
     components.html(grid_html, height=1300, scrolling=True)
 
+    # Increment counter so the st_javascript key changes on next rerun,
+    # forcing a fresh read of window._stGridMsg
+    st.session_state.grid_msg_counter += 1
+
     if st.session_state.get("do_scroll_top", False):
-        st.components.v1.html(
+        components.html(
             "<script>window.parent.document.querySelector('.main')"
-            ".scrollTo({top:0,behavior:'smooth'});</script>", height=0,
+            ".scrollTo({top:0,behavior:'smooth'});</script>",
+            height=0,
         )
         st.session_state.do_scroll_top = False
 
