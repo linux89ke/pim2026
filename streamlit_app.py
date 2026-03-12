@@ -115,7 +115,6 @@ NEW_FILE_MAPPING = {
     'color family': 'COLOR_FAMILY',
     'COLOUR FAMILY': 'COLOR_FAMILY',
     'list_seller_skus': 'SELLER_SKU',
-    # Added all image variants
     'image1': 'MAIN_IMAGE',
     'image_1': 'MAIN_IMAGE',
     'main_image': 'MAIN_IMAGE',
@@ -160,23 +159,17 @@ if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = Fal
 if 'display_df_cache' not in st.session_state: st.session_state.display_df_cache = {}
 if 'main_bridge_counter' not in st.session_state: st.session_state.main_bridge_counter = 0
 
-if 'desel_counter' not in st.session_state: st.session_state.desel_counter = 0
-if 'batch_counter' not in st.session_state: st.session_state.batch_counter = 0  
-if 'clear_counter' not in st.session_state: st.session_state.clear_counter = 0
-if 'ls_processed_flag' not in st.session_state: st.session_state.ls_processed_flag = False
-if 'ls_read_trigger' not in st.session_state: st.session_state.ls_read_trigger = 0
-
 try: st.set_page_config(page_title="Product Tool", layout=st.session_state.layout_mode)
 except: pass
 
 st_yled.init()
 
 # -------------------------------------------------
-# NATIVE CLOUD BRIDGE COMPONENT
+# PURE DATA-DRIVEN NATIVE COMPONENT
 # -------------------------------------------------
 @st.cache_resource
 def get_grid_component():
-    """Creates an official bidirectional Streamlit component to bypass Cloud CORS limits."""
+    """A clean, data-driven component that avoids HTML string injection."""
     tmp_dir = tempfile.mkdtemp()
     index_path = os.path.join(tmp_dir, "index.html")
     with open(index_path, "w", encoding="utf-8") as f:
@@ -186,36 +179,188 @@ def get_grid_component():
         <head>
           <meta charset="utf-8">
           <script src="https://cdnjs.cloudflare.com/ajax/libs/streamlit-component-lib/1.3.0/streamlit.js"></script>
+          <style>
+            * {box-sizing:border-box;margin:0;padding:0;font-family:sans-serif;}
+            body {padding:8px; background: transparent;}
+            :root { --O: #F68B1E; --G: #4CAF50; --R: #E73C17; }
+            .ctrl-bar {
+                position:sticky;top:0;z-index:100; display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+                padding:8px 12px;background:#fff; border:1px solid #e0e0e0;border-radius:8px;margin-bottom:12px;
+                box-shadow:0 2px 6px rgba(0,0,0,.08);
+            }
+            .sel-count {font-weight:700;color:var(--O);font-size:13px;min-width:80px;}
+            .reason-sel { flex:1;min-width:160px;padding:6px 10px; border:1px solid #ccc;border-radius:4px;font-size:12px; background:#fff;cursor:pointer;outline:none; }
+            .batch-btn { padding:7px 14px;background:var(--O);color:#fff; border:none;border-radius:4px;font-weight:700;font-size:12px; cursor:pointer;white-space:nowrap; }
+            .batch-btn:hover {opacity:.88;}
+            .desel-btn { padding:7px 12px;background:#fff;color:#555; border:1px solid #ccc;border-radius:4px;font-size:12px; cursor:pointer;white-space:nowrap; }
+            .desel-btn:hover {background:#f5f5f5;}
+            .grid {display:grid; gap:12px;}
+            .card {border:2px solid #e0e0e0;border-radius:8px;padding:10px;background:#fff; position:relative;transition:border-color .15s,box-shadow .15s;}
+            .card.selected {border-color:var(--G);box-shadow:0 0 0 3px rgba(76,175,80,.2); background:rgba(76,175,80,.04);}
+            .card.committed-rej {border-color:#bbb;opacity:.5;}
+            .card-img-wrap {position:relative;cursor:pointer; background: #fff;}
+            .card-img {width:100%; height:150px; object-fit:contain; border-radius:6px; display:block;}
+            .card.committed-rej .card-img {filter:grayscale(80%);}
+            .tick {position:absolute;bottom:6px;right:6px;width:22px;height:22px;border-radius:50%; background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center; color:transparent;font-size:13px;font-weight:900;pointer-events:none;}
+            .card.selected .tick {background:var(--G);color:#fff;}
+            .warn-wrap {position:absolute;top:6px;right:6px;display:flex;flex-direction:column;gap:3px; z-index:5;pointer-events:none;}
+            .warn-badge {background:rgba(255,193,7,.95);color:#313133;font-size:9px;font-weight:800; padding:3px 7px;border-radius:10px;}
+            .rej-overlay {display:none;position:absolute;inset:0;background:rgba(255,255,255,.88); border-radius:6px;flex-direction:column;align-items:center; justify-content:center;z-index:20;gap:5px;padding:8px;text-align:center;}
+            .card.committed-rej .rej-overlay {display:flex;}
+            .rej-badge {background:var(--R);color:#fff;padding:3px 10px;border-radius:10px; font-size:11px;font-weight:700;}
+            .rej-label {font-size:10px;color:var(--R);font-weight:600;max-width:120px;}
+            .meta {font-size:11px;margin-top:8px;line-height:1.4;}
+            .meta .nm {font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+            .meta .br {color:var(--O);font-weight:700;margin:2px 0;}
+            .meta .ct {color:#666;font-size:10px;}
+            .meta .sl {color:#999;font-size:9px;margin-top:4px;border-top:1px dashed #eee;padding-top:4px;}
+            .acts {display:flex;gap:4px;margin-top:8px;}
+            .act-btn {flex:1;padding:6px;font-size:11px;border:none;border-radius:4px;cursor:pointer; font-weight:700;color:#fff;background:var(--O);}
+            .act-more {flex:1;font-size:11px;border:1px solid #ccc;border-radius:4px;outline:none; cursor:pointer;background:#fff;}
+          </style>
         </head>
-        <body style="margin: 0; padding: 0; background: transparent;">
-          <div id="root"></div>
+        <body>
+          <div class="ctrl-bar">
+            <span class="sel-count" id="sel-count-bar">0 selected</span>
+            <select class="reason-sel" id="batch-reason">
+              <option value="REJECT_POOR_IMAGE">Poor Image Quality</option>
+              <option value="REJECT_WRONG_CAT">Wrong Category</option>
+              <option value="REJECT_FAKE">Suspected Fake</option>
+              <option value="REJECT_BRAND">Restricted Brand</option>
+              <option value="REJECT_WRONG_BRAND">Wrong Brand</option>
+              <option value="REJECT_PROHIBITED">Prohibited Product</option>
+              <option value="REJECT_COLOR">Missing Color</option>
+            </select>
+            <button class="batch-btn" onclick="doBatchReject()">✗ Batch Reject Selected</button>
+            <button class="desel-btn"  onclick="doDeselAll()">☐ Deselect All</button>
+          </div>
+          <div class="grid" id="card-grid"></div>
+
           <script>
-            // Official native bridge to Python
-            window.sendMsgToPython = function(type, payload) {
+            let CARDS = [];
+            let COMMITTED = {};
+            let cols_per_row = 4;
+            window._gridSelected = window._gridSelected || {};
+            let selected = window._gridSelected;
+
+            function sendMsgToPython(type, payload) {
                 Streamlit.setComponentValue({action: type, payload: payload});
+            }
+
+            function escapeHtml(unsafe) {
+                return (unsafe || "").toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+            }
+
+            function updateSelCount() {
+                document.getElementById('sel-count-bar').textContent = Object.keys(selected).length + ' selected';
+            }
+
+            function renderCard(card) {
+                const sid = card.sid;
+                const img = escapeHtml(card.img);
+                const isCommitted = sid in COMMITTED;
+                const isSelected  = !isCommitted && (sid in selected);
+                const cls = 'card' + (isCommitted ? ' committed-rej' : (isSelected ? ' selected' : ''));
+                const shortName = card.name.length > 38 ? escapeHtml(card.name.slice(0,38))+'…' : escapeHtml(card.name);
+                const warnHtml = (card.warnings || []).map(w => `<span class="warn-badge">${escapeHtml(w)}</span>`).join('');
+                const rejLabel = isCommitted ? escapeHtml((COMMITTED[sid]||'').replace(/_/g,' ')) : '';
+                
+                const rejOverlay = isCommitted ? `<div class="rej-overlay"><div class="rej-badge">REJECTED</div><div class="rej-label">${rejLabel}</div></div>` : '';
+                const actHtml = !isCommitted ? `
+                    <div class="acts">
+                      <button class="act-btn" onclick="event.stopPropagation();window.quickReject('${sid}','REJECT_POOR_IMAGE')">Poor Img</button>
+                      <select class="act-more" onchange="if(this.value){event.stopPropagation();window.quickReject('${sid}',this.value);this.value=''}">
+                        <option value="">More…</option>
+                        <option value="REJECT_WRONG_CAT">Wrong Category</option>
+                        <option value="REJECT_FAKE">Fake Product</option>
+                        <option value="REJECT_BRAND">Restricted Brand</option>
+                        <option value="REJECT_PROHIBITED">Prohibited</option>
+                        <option value="REJECT_COLOR">Wrong Color</option>
+                        <option value="REJECT_WRONG_BRAND">Wrong Brand</option>
+                      </select>
+                    </div>` : '';
+
+                return `
+                    <div class="${cls}" id="card-${sid}">
+                      <div class="card-img-wrap" onclick="window.toggleSelect('${sid}')">
+                        <div class="warn-wrap">${warnHtml}</div>
+                        <img class="card-img" src="${img}" loading="lazy" onerror="this.src='https://via.placeholder.com/150?text=No+Image'">
+                        ${rejOverlay}<div class="tick">✓</div>
+                      </div>
+                      <div class="meta">
+                        <div class="nm" title="${escapeHtml(card.name)}">${shortName}</div>
+                        <div class="br">${escapeHtml(card.brand)}</div>
+                        <div class="ct">${escapeHtml(card.cat)}</div>
+                        <div class="sl">${escapeHtml(card.seller)}</div>
+                      </div>
+                      ${actHtml}
+                    </div>`;
+            }
+
+            function renderAll() {
+                const grid = document.getElementById('card-grid');
+                grid.style.gridTemplateColumns = `repeat(${cols_per_row}, 1fr)`;
+                grid.innerHTML = CARDS.map(renderCard).join('');
+                updateSelCount();
+            }
+
+            function replaceCard(sid) {
+                const el = document.getElementById('card-'+sid);
+                const card = CARDS.find(c => c.sid === sid);
+                if (el && card) { 
+                    const t = document.createElement('div'); 
+                    t.innerHTML = renderCard(card); 
+                    el.replaceWith(t.firstElementChild); 
+                }
+            }
+
+            window.toggleSelect = function(sid) {
+                if (sid in COMMITTED) return;
+                if (sid in selected) delete selected[sid]; else selected[sid] = true;
+                replaceCard(sid); updateSelCount();
             };
 
-            let lastHtml = "";
+            window.quickReject = function(sid, reasonKey) {
+                delete selected[sid];
+                COMMITTED[sid] = reasonKey;
+                sendMsgToPython('reject', {[sid]: reasonKey});
+                replaceCard(sid); updateSelCount();
+            };
+
+            window.doBatchReject = function() {
+                const toReject = Object.keys(selected);
+                if (toReject.length === 0) { alert('No products selected.'); return; }
+                const reasonKey = document.getElementById('batch-reason').value;
+                const payload = {};
+                toReject.forEach(sid => {
+                    payload[sid] = reasonKey;
+                    COMMITTED[sid] = reasonKey;
+                    delete selected[sid];
+                });
+                sendMsgToPython('reject', payload);
+                renderAll(); updateSelCount();
+            };
+
+            window.doDeselAll = function() {
+                Object.keys(selected).forEach(k => delete selected[k]);
+                renderAll(); updateSelCount();
+            };
+
             function onRender(event) {
                 const args = event.detail.args;
-                const root = document.getElementById("root");
-                
-                // Only inject if it's new content to prevent re-triggering scripts infinitely
-                if (args.html_content && root.innerHTML !== args.html_content) {
-                    root.innerHTML = args.html_content;
-                    
-                    // Re-evaluate injected scripts to wire up the buttons
-                    const scripts = root.querySelectorAll("script");
-                    scripts.forEach(script => {
-                        const newScript = document.createElement("script");
-                        newScript.className = "injected-script";
-                        newScript.text = script.innerHTML;
-                        document.body.appendChild(newScript);
-                    });
+                if (args.cards) {
+                    const newSignature = JSON.stringify(args.cards.map(c => c.sid)) + JSON.stringify(args.committed);
+                    if (window._lastSignature !== newSignature) {
+                        window._lastSignature = newSignature;
+                        CARDS = args.cards;
+                        COMMITTED = args.committed || {};
+                        cols_per_row = args.cols_per_row || 4;
+                        renderAll();
+                    }
                 }
-                
                 Streamlit.setFrameHeight(args.height || 1400);
             }
+            
             Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
             Streamlit.setComponentReady();
           </script>
@@ -224,7 +369,7 @@ def get_grid_component():
         """)
     return components.declare_component("bidirectional_grid", path=tmp_dir)
 
-# Initialize it once
+# Initialize component once
 grid_component = get_grid_component()
 
 # --- GLOBAL CSS ---
@@ -286,25 +431,6 @@ st.markdown(f"""
         div[data-testid="stCheckbox"] {{ margin-top: 5px; margin-bottom: 5px; }}
     </style>
 """, unsafe_allow_html=True)
-
-def get_default_country():
-    try:
-        lang = st.context.headers.get("Accept-Language", "")
-        if "KE" in lang: return "Kenya"
-        if "UG" in lang: return "Uganda"
-        if "NG" in lang: return "Nigeria"
-        if "GH" in lang: return "Ghana"
-        if "MA" in lang: return "Morocco"
-    except: pass
-    return "Kenya"
-
-if 'selected_country' not in st.session_state: st.session_state.selected_country = get_default_country()
-
-if st.session_state.main_toasts:
-    for msg in st.session_state.main_toasts:
-        if isinstance(msg, tuple): st.toast(msg[0], icon=msg[1])
-        else: st.toast(msg)
-    st.session_state.main_toasts.clear()
 
 # -------------------------------------------------
 # UTILITIES & EXTRACTION
@@ -721,7 +847,7 @@ def standardize_input_data(df: pd.DataFrame) -> pd.DataFrame:
     for col in ['ACTIVE_STATUS_COUNTRY', 'CATEGORY_CODE', 'BRAND', 'TAX_CLASS', 'NAME', 'SELLER_NAME']:
         if col in df.columns: df[col] = df[col].astype(str)
         
-    # --- FIX: FORCE MAIN_IMAGE COLUMN TO EXIST ---
+    # --- FORCE MAIN_IMAGE COLUMN TO EXIST ---
     if 'MAIN_IMAGE' not in df.columns:
         df['MAIN_IMAGE'] = ''
         
@@ -1293,300 +1419,7 @@ def prepare_full_data_merged(data_df, final_report_df):
     except Exception: return pd.DataFrame()
 
 # -------------------------------------------------
-# UTILITIES FOR BRIDGE & DATA MUTATION
-# -------------------------------------------------
-def apply_rejection(sids: list, reason_code: str, comment: str, flag_name: str):
-    st.session_state.final_report.loc[st.session_state.final_report['ProductSetSid'].isin(sids), ['Status', 'Reason', 'Comment', 'FLAG']] = ['Rejected', reason_code, comment, flag_name]
-    st.session_state.exports_cache.clear()
-    st.session_state.display_df_cache.clear()
-
-def restore_single_item(sid):
-    st.session_state.final_report.loc[st.session_state.final_report['ProductSetSid'] == sid, ['Status', 'Reason', 'Comment', 'FLAG']] = ['Approved', '', '', 'Approved by User']
-    st.session_state.pop(f"quick_rej_{sid}", None)
-    st.session_state.pop(f"quick_rej_reason_{sid}", None)
-    st.session_state.exports_cache.clear()
-    st.session_state.display_df_cache.clear()
-    st.session_state.main_toasts.append("Restored item to previous state!")
-
-REASON_MAP = {
-    "REJECT_POOR_IMAGE": "Poor images",
-    "REJECT_WRONG_CAT": "Wrong Category",
-    "REJECT_FAKE": "Suspected Fake product",
-    "REJECT_BRAND": "Restricted brands",
-    "REJECT_PROHIBITED": "Prohibited products",
-    "REJECT_COLOR": "Missing COLOR",
-    "REJECT_WRONG_BRAND": "Generic branded products with genuine brands",
-    "OTHER_CUSTOM": "Other Reason (Custom)"
-}
-
-# -------------------------------------------------
-# HTML GRID BUILDER
-# -------------------------------------------------
-# -------------------------------------------------
-# HTML GRID BUILDER
-# -------------------------------------------------
-def build_fast_grid_html(
-    page_data,
-    flags_mapping,
-    country,
-    page_warnings,
-    rejected_state,
-    cols_per_row,
-):
-    O = JUMIA_COLORS["primary_orange"]
-    G = JUMIA_COLORS["success_green"]
-    R = JUMIA_COLORS["jumia_red"]
-
-    committed_json = json.dumps(rejected_state)
-
-    cards_data = []
-    for _, row in page_data.iterrows():
-        sid = str(row["PRODUCT_SET_SID"])
-        img_url = str(row.get("MAIN_IMAGE", "")).strip()
-        
-        # --- HTTP TO HTTPS UPGRADE TO PREVENT CLOUD BLOCKING ---
-        if img_url.startswith("http://"):
-            img_url = img_url.replace("http://", "https://")
-            
-        if not img_url.startswith("http"):
-            img_url = "https://via.placeholder.com/150?text=No+Image"
-            
-        cards_data.append({
-            "sid":      sid,
-            "img":      img_url,
-            "name":     str(row.get("NAME", "")),
-            "brand":    str(row.get("BRAND", "Unknown Brand")),
-            "cat":      str(row.get("CATEGORY", "Unknown Category")),
-            "seller":   str(row.get("SELLER_NAME", "Unknown Seller")),
-            "warnings": page_warnings.get(sid, []),
-        })
-    cards_json = json.dumps(cards_data)
-
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  *{{box-sizing:border-box;margin:0;padding:0;font-family:sans-serif;}}
-  body{{background:#f5f5f5;padding:8px;}}
-
-  .ctrl-bar{{
-    position:sticky;top:0;z-index:100;
-    display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-    padding:8px 12px;background:#fff;
-    border:1px solid #e0e0e0;border-radius:8px;margin-bottom:12px;
-    box-shadow:0 2px 6px rgba(0,0,0,.08);
-  }}
-  .sel-count{{font-weight:700;color:{O};font-size:13px;min-width:80px;}}
-  .reason-sel{{
-    flex:1;min-width:160px;padding:6px 10px;
-    border:1px solid #ccc;border-radius:4px;font-size:12px;
-    background:#fff;cursor:pointer;outline:none;
-  }}
-  .batch-btn{{
-    padding:7px 14px;background:{O};color:#fff;
-    border:none;border-radius:4px;font-weight:700;font-size:12px;
-    cursor:pointer;white-space:nowrap;
-  }}
-  .batch-btn:hover{{opacity:.88;}}
-  .desel-btn{{
-    padding:7px 12px;background:#fff;color:#555;
-    border:1px solid #ccc;border-radius:4px;font-size:12px;
-    cursor:pointer;white-space:nowrap;
-  }}
-  .desel-btn:hover{{background:#f5f5f5;}}
-
-  .grid{{display:grid;grid-template-columns:repeat({cols_per_row},1fr);gap:12px;}}
-  .card{{border:2px solid #e0e0e0;border-radius:8px;padding:10px;background:#fff;
-         position:relative;transition:border-color .15s,box-shadow .15s;}}
-  .card.selected{{border-color:{G};box-shadow:0 0 0 3px rgba(76,175,80,.2);
-                  background:rgba(76,175,80,.04);}}
-  .card.committed-rej{{border-color:#bbb;opacity:.5;}}
-  .card-img-wrap{{position:relative;cursor:pointer;}}
-  .card-img{{width:100%;aspect-ratio:1;object-fit:contain;border-radius:6px;display:block;}}
-  .card.committed-rej .card-img{{filter:grayscale(80%);}}
-  .tick{{position:absolute;bottom:6px;right:6px;width:22px;height:22px;border-radius:50%;
-         background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;
-         color:transparent;font-size:13px;font-weight:900;pointer-events:none;}}
-  .card.selected .tick{{background:{G};color:#fff;}}
-  .warn-wrap{{position:absolute;top:6px;right:6px;display:flex;flex-direction:column;gap:3px;
-              z-index:5;pointer-events:none;}}
-  .warn-badge{{background:rgba(255,193,7,.95);color:#313133;font-size:9px;font-weight:800;
-               padding:3px 7px;border-radius:10px;}}
-  .rej-overlay{{display:none;position:absolute;inset:0;background:rgba(255,255,255,.88);
-                border-radius:6px;flex-direction:column;align-items:center;
-                justify-content:center;z-index:20;gap:5px;padding:8px;text-align:center;}}
-  .card.committed-rej .rej-overlay{{display:flex;}}
-  .rej-badge{{background:{R};color:#fff;padding:3px 10px;border-radius:10px;
-              font-size:11px;font-weight:700;}}
-  .rej-label{{font-size:10px;color:{R};font-weight:600;max-width:120px;}}
-  .meta{{font-size:11px;margin-top:8px;line-height:1.4;}}
-  .meta .nm{{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
-  .meta .br{{color:{O};font-weight:700;margin:2px 0;}}
-  .meta .ct{{color:#666;font-size:10px;}}
-  .meta .sl{{color:#999;font-size:9px;margin-top:4px;border-top:1px dashed #eee;padding-top:4px;}}
-  .acts{{display:flex;gap:4px;margin-top:8px;}}
-  .act-btn{{flex:1;padding:6px;font-size:11px;border:none;border-radius:4px;cursor:pointer;
-            font-weight:700;color:#fff;background:{O};}}
-  .act-more{{flex:1;font-size:11px;border:1px solid #ccc;border-radius:4px;outline:none;
-             cursor:pointer;background:#fff;}}
-</style>
-</head>
-<body>
-
-<div class="ctrl-bar">
-  <span class="sel-count" id="sel-count-bar">0 selected</span>
-  <select class="reason-sel" id="batch-reason">
-    <option value="REJECT_POOR_IMAGE">Poor Image Quality</option>
-    <option value="REJECT_WRONG_CAT">Wrong Category</option>
-    <option value="REJECT_FAKE">Suspected Fake</option>
-    <option value="REJECT_BRAND">Restricted Brand</option>
-    <option value="REJECT_WRONG_BRAND">Wrong Brand</option>
-    <option value="REJECT_PROHIBITED">Prohibited Product</option>
-    <option value="REJECT_COLOR">Missing Color</option>
-  </select>
-  <button class="batch-btn" onclick="doBatchReject()">✗ Batch Reject Selected</button>
-  <button class="desel-btn"  onclick="doDeselAll()">☐ Deselect All</button>
-  <span style="font-size:11px;color:#999;">Click image to select</span>
-</div>
-
-<div class="grid" id="card-grid"></div>
-
-<script>
-// FIX: Using var instead of const/let prevents "already declared" crashes on Cloud re-renders!
-var CARDS     = {cards_json};
-var COMMITTED = {committed_json};
-
-// Save selection globally so it survives re-renders
-window._gridSelected = window._gridSelected || {{}};
-var selected = window._gridSelected;
-
-// ── OFFICIAL NATIVE COMPONENT BRIDGE ──────────────────────────────────────────
-function sendMsg(type, payload) {{
-  if (window.sendMsgToPython) {{
-      window.sendMsgToPython(type, payload);
-  }} else {{
-      console.warn('Python bridge not ready');
-  }}
-}}
-
-// ── UI helpers ────────────────────────────────────────────────────────────────
-function updateSelCount() {{
-  const n = Object.keys(selected).length;
-  document.getElementById('sel-count-bar').textContent = n + ' selected';
-}}
-
-// ── Card rendering ────────────────────────────────────────────────────────────
-function renderCard(card) {{
-  const {{sid, img, name, brand, cat, seller, warnings}} = card;
-  const isCommitted = sid in COMMITTED;
-  const isSelected  = !isCommitted && (sid in selected);
-
-  let cls = 'card';
-  if (isCommitted)     cls += ' committed-rej';
-  else if (isSelected) cls += ' selected';
-
-  const shortName = name.length > 38 ? name.slice(0,38)+'…' : name;
-  const warnHtml  = warnings.map(w => `<span class="warn-badge">${{w}}</span>`).join('');
-  const rejLabel  = isCommitted ? (COMMITTED[sid]||'').replace(/_/g,' ') : '';
-
-  const rejOverlay = isCommitted ? `
-    <div class="rej-overlay">
-      <div class="rej-badge">REJECTED</div>
-      <div class="rej-label">${{rejLabel}}</div>
-    </div>` : '';
-
-  const actHtml = !isCommitted ? `
-    <div class="acts">
-      <button class="act-btn"
-        onclick="event.stopPropagation();quickReject('${{sid}}','REJECT_POOR_IMAGE')">
-        Poor Img
-      </button>
-      <select class="act-more"
-        onchange="if(this.value){{event.stopPropagation();quickReject('${{sid}}',this.value);this.value=''}}">
-        <option value="">More…</option>
-        <option value="REJECT_WRONG_CAT">Wrong Category</option>
-        <option value="REJECT_FAKE">Fake Product</option>
-        <option value="REJECT_BRAND">Restricted Brand</option>
-        <option value="REJECT_PROHIBITED">Prohibited</option>
-        <option value="REJECT_COLOR">Wrong Color</option>
-        <option value="REJECT_WRONG_BRAND">Wrong Brand</option>
-      </select>
-    </div>` : '';
-
-  return `<div class="${{cls}}" id="card-${{sid}}">
-    <div class="card-img-wrap" onclick="toggleSelect('${{sid}}')">
-      <div class="warn-wrap">${{warnHtml}}</div>
-      <img class="card-img" src="${{img}}" loading="lazy"
-           onerror="this.src='https://via.placeholder.com/150?text=No+Image'">
-      ${{rejOverlay}}<div class="tick">✓</div>
-    </div>
-    <div class="meta">
-      <div class="nm" title="${{name}}">${{shortName}}</div>
-      <div class="br">${{brand}}</div>
-      <div class="ct">${{cat}}</div>
-      <div class="sl">${{seller}}</div>
-    </div>${{actHtml}}</div>`;
-}}
-
-function renderAll() {{
-  document.getElementById('card-grid').innerHTML = CARDS.map(renderCard).join('');
-  updateSelCount();
-}}
-
-function replaceCard(sid) {{
-  const el = document.getElementById('card-'+sid);
-  if (!el) return;
-  const card = CARDS.find(c => c.sid === sid);
-  if (card) {{ const t=document.createElement('div'); t.innerHTML=renderCard(card); el.replaceWith(t.firstElementChild); }}
-}}
-
-// ── Actions ───────────────────────────────────────────────────────────────────
-function toggleSelect(sid) {{
-  if (sid in COMMITTED) return;
-  if (sid in selected) delete selected[sid];
-  else selected[sid] = true;
-  replaceCard(sid);
-  updateSelCount();
-}}
-
-function quickReject(sid, reasonKey) {{
-  delete selected[sid];
-  COMMITTED[sid] = reasonKey;
-  sendMsg('reject', {{[sid]: reasonKey}});
-  replaceCard(sid);
-  updateSelCount();
-}}
-
-function doBatchReject() {{
-  const toReject = Object.keys(selected);
-  if (toReject.length === 0) {{ alert('No products selected.'); return; }}
-  const reasonKey = document.getElementById('batch-reason').value;
-  const payload   = {{}};
-  toReject.forEach(sid => {{
-    payload[sid]    = reasonKey;
-    COMMITTED[sid]  = reasonKey;
-    delete selected[sid];
-  }});
-  sendMsg('reject', payload);
-  renderAll();
-  updateSelCount();
-}}
-
-function doDeselAll() {{
-  // clear the global object without reassigning a new reference
-  for (const k in selected) delete selected[k];
-  renderAll();
-  updateSelCount();
-}}
-
-renderAll();
-</script>
-</body>
-</html>"""
-
-# -------------------------------------------------
-# UI COMPONENTS
+# UI COMPONENTS & ANALYTICS
 # -------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
 def analyze_image_quality_cached(url: str) -> List[str]:
@@ -1776,7 +1609,6 @@ if st.session_state.get('last_processed_files') != process_signature:
     
     if 'main_bridge_counter' not in st.session_state: st.session_state.main_bridge_counter = 0
 
-    # Reset all JS-bridge counters on new file load
     st.session_state.desel_counter = 0
     st.session_state.batch_counter = 0
     st.session_state.clear_counter = 0
@@ -1906,10 +1738,20 @@ if uploaded_files and not st.session_state.final_report.empty and st.session_sta
                 render_flag_expander(title, df_flagged, data, all(c in data.columns for c in ['PRODUCT_WARRANTY', 'WARRANTY_DURATION']), support_files, country_validator)
     else: st.success("All products passed validation — no rejections found.")
 
-
 # ==========================================
 # SECTION 2: MANUAL IMAGE REVIEW
 # ==========================================
+REASON_MAP = {
+    "REJECT_POOR_IMAGE": "Poor images",
+    "REJECT_WRONG_CAT": "Wrong Category",
+    "REJECT_FAKE": "Suspected Fake product",
+    "REJECT_BRAND": "Restricted brands",
+    "REJECT_PROHIBITED": "Prohibited products",
+    "REJECT_COLOR": "Missing COLOR",
+    "REJECT_WRONG_BRAND": "Generic branded products with genuine brands",
+    "OTHER_CUSTOM": "Other Reason (Custom)"
+}
+
 @st.fragment
 def render_image_grid():
     if st.session_state.final_report.empty or st.session_state.file_mode == "post_qc":
@@ -1938,7 +1780,6 @@ def render_image_grid():
             value=st.session_state.grid_items_per_page,
         )
 
-    # --- FIX ADDED HERE: ENSURE MAIN_IMAGE ISN'T DROPPED ---
     if 'MAIN_IMAGE' not in data.columns:
         data['MAIN_IMAGE'] = ''
 
@@ -2006,24 +1847,39 @@ def render_image_grid():
         if st.session_state.get(f"quick_rej_{sid}")
     }
 
+    # Prepare data for the native component
+    cards_data = []
+    for _, row in page_data.iterrows():
+        sid = str(row["PRODUCT_SET_SID"])
+        img_url = str(row.get("MAIN_IMAGE", "")).strip()
+        
+        if img_url.startswith("http://"):
+            img_url = img_url.replace("http://", "https://")
+        if not img_url.startswith("http"):
+            img_url = "https://via.placeholder.com/150?text=No+Image"
+            
+        cards_data.append({
+            "sid":      sid,
+            "img":      img_url,
+            "name":     str(row.get("NAME", "")),
+            "brand":    str(row.get("BRAND", "Unknown Brand")),
+            "cat":      str(row.get("CATEGORY", "Unknown Category")),
+            "seller":   str(row.get("SELLER_NAME", "Unknown Seller")),
+            "warnings": page_warnings.get(sid, []),
+        })
+
     cols_per_row = 3 if st.session_state.layout_mode == "centered" else 4
 
-    grid_html = build_fast_grid_html(
-        page_data,
-        support_files["flags_mapping"],
-        st.session_state.selected_country,
-        page_warnings,
-        rejected_state,
-        cols_per_row,
-    )
-    
-    # ── NATIVE STREAMLIT CLOUD BRIDGE COMPONENT CALL ───
+    # ── CALL NATIVE COMPONENT ──
     _msg = grid_component(
-        html_content=grid_html, 
-        height=1400, 
+        cards=cards_data,
+        committed=rejected_state,
+        cols_per_row=cols_per_row,
+        height=1400,
         key=f"grid_comp_{st.session_state.grid_page}_{st.session_state.main_bridge_counter}"
     )
 
+    # ── HANDLE BRIDGE DATA ──
     if _msg and isinstance(_msg, dict) and _msg.get("action") == "reject":
         _payload = _msg.get("payload", {})
         if _payload:
@@ -2054,8 +1910,7 @@ def render_image_grid():
 
     if st.session_state.get("do_scroll_top", False):
         components.html(
-            "<script>window.parent.document.querySelector('.main')"
-            ".scrollTo({top:0,behavior:'smooth'});</script>",
+            "<script>window.parent.document.querySelector('.main').scrollTo({top:0,behavior:'smooth'});</script>",
             height=0,
         )
         st.session_state.do_scroll_top = False
