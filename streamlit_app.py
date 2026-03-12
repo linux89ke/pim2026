@@ -1585,5 +1585,158 @@ def render_image_grid():
         for k in st.session_state.keys()
         if k.startswith("quick_rej_") and "reason" not in k
     }
-    mask = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
-    valid_grid_df
+        mask = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
+    valid_grid_df = fr[mask]
+
+    c1, c2, c3 = st.columns([1.5, 1.5, 2])
+    with c1: 
+        search_n = st.text_input("Search by Name", placeholder="Product name…")
+    with c2: 
+        search_sc = st.text_input("Search by Seller/Category", placeholder="Seller or Category…")
+    with c3:
+        st.session_state.grid_items_per_page = st.select_slider(
+            "Items per page", options=[20, 50, 100, 200],
+            value=st.session_state.grid_items_per_page,
+        )
+
+    available_cols = [c for c in GRID_COLS if c in data.columns]
+    review_data = pd.merge(
+        valid_grid_df[["ProductSetSid"]],
+        data[available_cols],
+        left_on="ProductSetSid", right_on="PRODUCT_SET_SID", how="left",
+    )
+
+    if search_n:
+        review_data = review_data[
+            review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)
+        ]
+    if search_sc:
+        mc = (review_data["CATEGORY"].astype(str).str.contains(search_sc, case=False, na=False)
+              if "CATEGORY" in review_data.columns else pd.Series(False, index=review_data.index))
+        ms = review_data["SELLER_NAME"].astype(str).str.contains(search_sc, case=False, na=False)
+        review_data = review_data[mc | ms]
+
+    ipp = st.session_state.grid_items_per_page
+    total_pages = max(1, (len(review_data) + ipp - 1) // ipp)
+    if st.session_state.grid_page >= total_pages:
+        st.session_state.grid_page = 0
+
+    pg_cols = st.columns([1, 2, 1])
+    with pg_cols[0]:
+        if st.button("◀ Prev", use_container_width=True,
+                     disabled=st.session_state.grid_page == 0):
+            st.session_state.grid_page = max(0, st.session_state.grid_page - 1)
+            st.session_state.do_scroll_top = True
+            st.rerun(scope="fragment")
+    with pg_cols[1]:
+        st.markdown(
+            f"<div style='text-align:center;padding:8px 0;font-weight:700;'>"
+            f"Page {st.session_state.grid_page+1} / {total_pages}"
+            f" · {len(review_data)} items</div>",
+            unsafe_allow_html=True,
+        )
+    with pg_cols[2]:
+        if st.button("Next ▶", use_container_width=True,
+                     disabled=st.session_state.grid_page >= total_pages - 1):
+            st.session_state.grid_page += 1
+            st.session_state.do_scroll_top = True
+            st.rerun(scope="fragment")
+
+    page_start = st.session_state.grid_page * ipp
+    page_data = review_data.iloc[page_start : page_start + ipp]
+
+    page_warnings: dict = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        future_to_sid = {
+            ex.submit(analyze_image_quality_cached,
+                      str(r.get("MAIN_IMAGE", "")).strip()): str(r["PRODUCT_SET_SID"])
+            for _, r in page_data.iterrows()
+        }
+        for future in concurrent.futures.as_completed(future_to_sid):
+            warns = future.result()
+            if warns:
+                page_warnings[future_to_sid[future]] = warns
+
+    rejected_state = {
+        sid: st.session_state[f"quick_rej_reason_{sid}"]
+        for sid in page_data["PRODUCT_SET_SID"].astype(str)
+        if st.session_state.get(f"quick_rej_{sid}")
+    }
+
+    cols_per_row = 3 if st.session_state.layout_mode == "centered" else 4
+    grid_html = build_fast_grid_html(
+        page_data,
+        support_files["flags_mapping"],
+        st.session_state.selected_country,
+        page_warnings,
+        rejected_state,
+        cols_per_row,
+    )
+
+    components.html(grid_html, height=1400, scrolling=True)
+
+    if st.session_state.get("do_scroll_top", False):
+        components.html(
+            "<script>window.parent.document.querySelector('.main')"
+            ".scrollTo({top:0,behavior:'smooth'});</script>",
+            height=0,
+        )
+        st.session_state.do_scroll_top = False
+
+@st.fragment
+def render_exports_section():
+    if st.session_state.final_report.empty or st.session_state.file_mode == 'post_qc':
+        return
+    fr = st.session_state.final_report
+    data = st.session_state.all_data_map
+    app_df = fr[fr['Status'] == 'Approved']
+    rej_df = fr[fr['Status'] == 'Rejected']
+    c_code = st.session_state.selected_country[:2].upper()
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    reasons_df = support_files.get('reasons', pd.DataFrame())
+    st.markdown("---")
+    st.markdown(f"""<div style='background: linear-gradient(135deg, {JUMIA_COLORS['primary_orange']}, {JUMIA_COLORS['secondary_orange']}); padding: 20px 24px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(246, 139, 30, 0.25);'><h2 style='color: white; margin: 0; font-size: 24px; font-weight: 700;'>Download Reports</h2><p style='color: rgba(255,255,255,0.9); margin: 6px 0 0 0; font-size: 13px;'>Export validation results in Excel or ZIP format</p></div>""", unsafe_allow_html=True)
+    exports_config = [
+        ("Final Report", fr, 'assignment', 'Complete validation report with all statuses', lambda df: generate_smart_export(df, f"{c_code}_Final_{date_str}", 'simple', reasons_df)),
+        ("Rejected Only", rej_df, 'block', 'Products that failed validation', lambda df: generate_smart_export(df, f"{c_code}_Rejected_{date_str}", 'simple', reasons_df)),
+        ("Approved Only", app_df, 'check_circle', 'Products that passed validation', lambda df: generate_smart_export(df, f"{c_code}_Approved_{date_str}", 'simple', reasons_df)),
+        ("Full Data", data, 'database', 'Complete dataset with validation flags', lambda df: generate_smart_export(prepare_full_data_merged(df, fr), f"{c_code}_Full_{date_str}", 'full')),
+    ]
+    cols_count = 4 if st.session_state.layout_mode == "wide" else 2
+    for i in range(0, len(exports_config), cols_count):
+        cols = st.columns(cols_count)
+        for j, col in enumerate(cols):
+            if i + j < len(exports_config):
+                title, df, icon, desc, func = exports_config[i + j]
+                with col:
+                    with st.container(border=True):
+                        st.markdown(f"""<div style='text-align: center; margin-bottom: 15px;'><div style='font-size: 48px; margin-bottom: 8px;' class='material-symbols-outlined'>{icon}</div><div style='font-size: 18px; font-weight: 700;'>{title}</div><div style='font-size: 11px; margin-top: 4px; opacity: 0.7;'>{desc}</div><div style='background: {JUMIA_COLORS['light_gray']}; color: {JUMIA_COLORS['primary_orange']}; padding: 8px; border-radius: 6px; margin-top: 12px; font-weight: 600;'>{len(df):,} rows</div></div>""", unsafe_allow_html=True)
+                        export_key = title
+                        if export_key not in st.session_state.exports_cache:
+                            if st.button("Generate", key=f"gen_{title}", type="primary", use_container_width=True, icon=":material/download:"):
+                                with st.spinner(f"Generating {title}..."):
+                                    res, fname, mime = func(df)
+                                    st.session_state.exports_cache[export_key] = {"data": res.getvalue(), "fname": fname, "mime": mime}
+                                st.rerun()
+                        else:
+                            cache = st.session_state.exports_cache[export_key]
+                            st.download_button("Download", data=cache["data"], file_name=cache["fname"], mime=cache["mime"], use_container_width=True, type="primary", icon=":material/file_download:", key=f"dl_{title}")
+                            if st.button("Clear", key=f"clr_{title}", use_container_width=True):
+                                del st.session_state.exports_cache[export_key]
+                                st.rerun()
+
+# ──────────────────────────────────────────────────────────────
+# MAIN APP FLOW
+# ──────────────────────────────────────────────────────────────
+st.header(":material/upload_file: Upload Files", anchor=False)
+current_country = st.session_state.get('selected_country', 'Kenya')
+country_choice = st.segmented_control("Country", ["Kenya", "Uganda", "Nigeria", "Ghana", "Morocco"], default=current_country)
+if country_choice: st.session_state.selected_country = country_choice
+
+uploaded_files = st.file_uploader("Upload CSV or XLSX files", type=['csv', 'xlsx'], accept_multiple_files=True, key="daily_files")
+
+# ... (the rest of your upload processing logic, validation, post-qc handling, metrics display, expanders, etc. goes here exactly as in your original script)
+
+# Final calls
+render_image_grid()
+render_exports_section()
