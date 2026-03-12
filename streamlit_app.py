@@ -1,15 +1,4 @@
 
-
-
-The issue happens because the hidden Streamlit "submit" button is being hidden using `display: none;`, which causes browsers to clear its internal `innerText`. Thus, the JavaScript fails to find the button and never clicks it! 
-
-Additionally, Streamlit (which uses React) sometimes needs a tiny fraction of a millisecond to register the text input's new value before the button is clicked. If they happen simultaneously, it sends a "blank" value to the backend. 
-
-We can fix this by changing how the button is hidden (`opacity: 0`), looking for it via `textContent`, and giving it a small 50ms delay to guarantee synchronization. 
-
-Here is the fully fixed code:
-
-```python
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -2088,4 +2077,3 @@ def render_exports_section():
 # ==========================================
 render_image_grid()
 render_exports_section()
-```
