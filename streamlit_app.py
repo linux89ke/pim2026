@@ -155,7 +155,18 @@ if 'main_toasts' not in st.session_state: st.session_state.main_toasts = []
 if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
 if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = False
 if 'display_df_cache' not in st.session_state: st.session_state.display_df_cache = {}
+
 if 'main_bridge_counter' not in st.session_state: st.session_state.main_bridge_counter = 0
+
+# Track search state so we can restore pages
+if 'search_active' not in st.session_state: st.session_state.search_active = False
+if 'pre_search_page' not in st.session_state: st.session_state.pre_search_page = 0
+
+if 'desel_counter' not in st.session_state: st.session_state.desel_counter = 0
+if 'batch_counter' not in st.session_state: st.session_state.batch_counter = 0  
+if 'clear_counter' not in st.session_state: st.session_state.clear_counter = 0
+if 'ls_processed_flag' not in st.session_state: st.session_state.ls_processed_flag = False
+if 'ls_read_trigger' not in st.session_state: st.session_state.ls_read_trigger = 0
 
 try: st.set_page_config(page_title="Product Tool", layout=st.session_state.layout_mode)
 except: pass
@@ -656,7 +667,6 @@ def standardize_input_data(df: pd.DataFrame) -> pd.DataFrame:
     for col in ['ACTIVE_STATUS_COUNTRY', 'CATEGORY_CODE', 'BRAND', 'TAX_CLASS', 'NAME', 'SELLER_NAME']:
         if col in df.columns: df[col] = df[col].astype(str)
         
-    # Force column to exist
     if 'MAIN_IMAGE' not in df.columns:
         df['MAIN_IMAGE'] = ''
         
@@ -1276,7 +1286,6 @@ def build_fast_grid_html(
         sid = str(row["PRODUCT_SET_SID"])
         img_url = str(row.get("MAIN_IMAGE", "")).strip()
         
-        # --- HTTP TO HTTPS UPGRADE ---
         if img_url.startswith("http://"):
             img_url = img_url.replace("http://", "https://")
         if not img_url.startswith("http"):
@@ -1301,7 +1310,6 @@ def build_fast_grid_html(
   *{{box-sizing:border-box;margin:0;padding:0;font-family:sans-serif;}}
   body{{background:#f5f5f5;padding:8px;}}
 
-  /* ── sticky control bar ── */
   .ctrl-bar{{
     position:sticky;top:0;z-index:100;
     display:flex;align-items:center;gap:8px;flex-wrap:wrap;
@@ -1328,7 +1336,6 @@ def build_fast_grid_html(
   }}
   .desel-btn:hover{{background:#f5f5f5;}}
 
-  /* ── grid & cards ── */
   .grid{{display:grid;grid-template-columns:repeat({cols_per_row},1fr);gap:12px;}}
   .card{{border:2px solid #e0e0e0;border-radius:8px;padding:10px;background:#fff;
          position:relative;transition:border-color .15s,box-shadow .15s;}}
@@ -1342,9 +1349,12 @@ def build_fast_grid_html(
   /* Already committed to Python (Grey) */
   .card.committed-rej{{border-color:#bbb;opacity:.6;}}
   
-  .card-img-wrap{{position:relative;cursor:pointer;}}
-  .card-img{{width:100%;aspect-ratio:1;object-fit:contain;border-radius:6px;display:block;}}
+  .card-img-wrap{{position:relative;cursor:pointer; overflow:hidden; border-radius:6px;}}
+  .card-img{{width:100%;aspect-ratio:1;object-fit:contain;border-radius:6px;display:block; transition: transform 0.25s ease-in-out;}}
   .card.committed-rej .card-img{{filter:grayscale(80%);}}
+  
+  /* HOVER ZOOM */
+  .card-img-wrap:hover .card-img {{ transform: scale(1.15); }}
   
   .tick{{position:absolute;bottom:6px;right:6px;width:22px;height:22px;border-radius:50%;
          background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;
@@ -1399,8 +1409,8 @@ def build_fast_grid_html(
     <option value="REJECT_COLOR">Missing Color</option>
   </select>
   <button class="batch-btn" onclick="doBatchReject()">✗ Batch Reject Selected</button>
-  <button class="desel-btn"  onclick="doDeselAll()">☐ Deselect All</button>
-  <span style="font-size:11px;color:#999;">Click image to select</span>
+  <button class="desel-btn" onclick="window.doSelectAll()">☑ Select All</button>
+  <button class="desel-btn" onclick="doDeselAll()">☐ Deselect All</button>
 </div>
 
 <div class="grid" id="card-grid"></div>
@@ -1430,7 +1440,7 @@ if (window.parent) {{
         let btn = e.target.closest('button');
         if (!btn) return;
         let txt = btn.innerText;
-        if (txt.includes('Next ▶') || txt.includes('◀ Prev') || txt.includes('Generate') || txt.includes('Download')) {{
+        if (txt.includes('Next') || txt.includes('Prev') || txt.includes('Generate') || txt.includes('Download') || txt.includes('Jump')) {{
             let selCount = Object.keys(window._gridSelected).length;
             let stagedCount = Object.keys(window._stagedRejections).length;
             let total = selCount + stagedCount;
@@ -1441,7 +1451,6 @@ if (window.parent) {{
                     e.preventDefault();
                     e.stopPropagation();
                 }} else {{
-                    // User chose to proceed and lose work, clear the dicts
                     for(let k in window._gridSelected) delete window._gridSelected[k];
                     for(let k in window._stagedRejections) delete window._stagedRejections[k];
                 }}
@@ -1565,6 +1574,16 @@ function replaceCard(sid) {{
 }}
 
 // ── Actions ───────────────────────────────────────────────────────────────────
+window.doSelectAll = function() {{
+  CARDS.forEach(c => {{
+      if (!(c.sid in COMMITTED) && !(c.sid in staged)) {{
+          selected[c.sid] = true;
+      }}
+  }});
+  renderAll();
+  updateSelCount();
+}}
+
 window.toggleSelect = function(sid) {{
   if (sid in COMMITTED) return;
   if (sid in staged) {{ delete staged[sid]; }}
@@ -1599,20 +1618,11 @@ window.doBatchReject = function() {{
   const payload   = {{}};
   let count = 0;
   
-  // Add red staged items with their specific reason
-  for (let sid in staged) {{
-      payload[sid] = staged[sid];
-      count++;
-  }}
-  // Add green selected items with general batch reason
-  for (let sid in selected) {{
-      payload[sid] = batchReason;
-      count++;
-  }}
+  for (let sid in staged) {{ payload[sid] = staged[sid]; count++; }}
+  for (let sid in selected) {{ payload[sid] = batchReason; count++; }}
   
   if (count === 0) {{ alert('No products selected or staged for rejection.'); return; }}
   
-  // Optimistic UI updates
   for (let sid in payload) {{
       COMMITTED[sid] = payload[sid];
       delete selected[sid];
@@ -1831,8 +1841,9 @@ if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.batch_counter = 0
     st.session_state.clear_counter = 0
     st.session_state.ls_processed_flag = False
-
     st.session_state.ls_read_trigger = 0
+    st.session_state.search_active = False
+    st.session_state.pre_search_page = 0
 
     keys_to_delete = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_"))]
     for k in keys_to_delete: del st.session_state[k]
@@ -1916,7 +1927,6 @@ if st.session_state.get('last_processed_files') != process_signature:
             st.code(traceback.format_exc())
             st.session_state.last_processed_files = "error"
 
-
 _bridge_val = st.text_input(
     "jtbridge", value="",
     placeholder="JTBRIDGE_UNIQUE_DO_NOT_USE",
@@ -1951,7 +1961,6 @@ if _bridge_val:
                 st.session_state.main_bridge_counter += 1
                 st.rerun()
                 
-        # --- NEW: UNDO ACTION CAPTURE ---
         elif _msg.get("action") == "undo":
             _payload = _msg.get("payload", {})
             _total_restored = 0
@@ -2047,6 +2056,20 @@ def render_image_grid():
         data[available_cols],
         left_on="ProductSetSid", right_on="PRODUCT_SET_SID", how="left",
     )
+    
+    # --- SEARCH STATE RESTORATION ---
+    is_searching = bool(search_n or search_sc)
+    if 'search_active' not in st.session_state: st.session_state.search_active = False
+    if 'pre_search_page' not in st.session_state: st.session_state.pre_search_page = 0
+
+    if is_searching and not st.session_state.search_active:
+        st.session_state.pre_search_page = st.session_state.grid_page
+        st.session_state.grid_page = 0
+        st.session_state.search_active = True
+    elif not is_searching and st.session_state.search_active:
+        st.session_state.grid_page = st.session_state.pre_search_page
+        st.session_state.search_active = False
+
     if search_n:
         review_data = review_data[
             review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)
@@ -2063,37 +2086,57 @@ def render_image_grid():
     if st.session_state.grid_page >= total_pages:
         st.session_state.grid_page = 0
 
-    pg_cols = st.columns([1, 2, 1])
+    # --- ADVANCED PAGINATION ---
+    pg_cols = st.columns([1, 2, 1], vertical_alignment="center")
     with pg_cols[0]:
-        if st.button("◀ Prev", use_container_width=True,
-                     disabled=st.session_state.grid_page == 0):
+        if st.button("◀ Prev Page", use_container_width=True, disabled=st.session_state.grid_page == 0):
             st.session_state.grid_page = max(0, st.session_state.grid_page - 1)
             st.session_state.do_scroll_top = True
             st.rerun(scope="fragment")
+            
     with pg_cols[1]:
-        st.markdown(
-            f"<div style='text-align:center;padding:8px 0;font-weight:700;'>"
-            f"Page {st.session_state.grid_page+1} / {total_pages}"
-            f" &nbsp;·&nbsp; {len(review_data)} items</div>",
-            unsafe_allow_html=True,
+        new_page = st.number_input(
+            f"Jump to Page (Total: {total_pages} | {len(review_data)} items)", 
+            min_value=1, 
+            max_value=max(1, total_pages), 
+            value=st.session_state.grid_page + 1,
+            step=1
         )
+        if new_page - 1 != st.session_state.grid_page:
+            st.session_state.grid_page = new_page - 1
+            st.session_state.do_scroll_top = True
+            st.rerun(scope="fragment")
+            
     with pg_cols[2]:
-        if st.button("Next ▶", use_container_width=True,
-                     disabled=st.session_state.grid_page >= total_pages - 1):
+        if st.button("Next Page ▶", use_container_width=True, disabled=st.session_state.grid_page >= total_pages - 1):
             st.session_state.grid_page += 1
             st.session_state.do_scroll_top = True
             st.rerun(scope="fragment")
 
     page_start = st.session_state.grid_page * ipp
     page_data  = review_data.iloc[page_start : page_start + ipp]
+    
+    # Identify next page to pre-fetch images in the background
+    next_page_start = (st.session_state.grid_page + 1) * ipp
+    if next_page_start < len(review_data):
+        next_page_data = review_data.iloc[next_page_start : next_page_start + ipp]
+    else:
+        next_page_data = pd.DataFrame()
 
+    # --- MASSIVELY PARALLEL CACHED IMAGE FETCHING ---
     page_warnings: dict = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+        # Process current page
         future_to_sid = {
-            ex.submit(analyze_image_quality_cached,
-                      str(r.get("MAIN_IMAGE", "")).strip()): str(r["PRODUCT_SET_SID"])
+            ex.submit(analyze_image_quality_cached, str(r.get("MAIN_IMAGE", "")).strip()): str(r["PRODUCT_SET_SID"])
             for _, r in page_data.iterrows()
         }
+        
+        # Fire-and-forget pre-fetch for NEXT page so it loads instantly later
+        for _, r in next_page_data.iterrows():
+            ex.submit(analyze_image_quality_cached, str(r.get("MAIN_IMAGE", "")).strip())
+            
+        # Collect current page warnings
         for future in concurrent.futures.as_completed(future_to_sid):
             warns = future.result()
             if warns:
@@ -2115,7 +2158,6 @@ def render_image_grid():
         rejected_state,
         cols_per_row,
     )
-    
     components.html(grid_html, height=1400, scrolling=True)
 
     if st.session_state.get("do_scroll_top", False):
