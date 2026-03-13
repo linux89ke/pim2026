@@ -11,6 +11,8 @@ import traceback
 import json
 import zipfile
 import os
+import shutil
+import pickle
 import concurrent.futures
 from dataclasses import dataclass
 import base64
@@ -23,6 +25,25 @@ try:
     from postqc import detect_file_type, normalize_post_qc, run_checks as run_post_qc_checks, render_post_qc_section
 except ImportError:
     pass
+
+# -------------------------------------------------
+# CACHE DIRECTORIES & HELPERS
+# -------------------------------------------------
+PARQUET_CACHE_DIR = "app_cache_parquet"
+FLAG_CACHE_DIR = "app_cache_flags"
+os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
+os.makedirs(FLAG_CACHE_DIR, exist_ok=True)
+
+def save_df_parquet(df, filename):
+    try: df.to_parquet(os.path.join(PARQUET_CACHE_DIR, filename))
+    except Exception as e: logger.warning(f"Failed to save parquet: {e}")
+
+def load_df_parquet(filename):
+    path = os.path.join(PARQUET_CACHE_DIR, filename)
+    if os.path.exists(path):
+        try: return pd.read_parquet(path)
+        except Exception: pass
+    return None
 
 # -------------------------------------------------
 # JUMIA THEME COLORS & GLOBAL CSS
@@ -155,7 +176,6 @@ if 'main_toasts' not in st.session_state: st.session_state.main_toasts = []
 if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
 if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = False
 if 'display_df_cache' not in st.session_state: st.session_state.display_df_cache = {}
-
 if 'main_bridge_counter' not in st.session_state: st.session_state.main_bridge_counter = 0
 
 if 'search_active' not in st.session_state: st.session_state.search_active = False
@@ -706,8 +726,55 @@ def propagate_metadata(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # -------------------------------------------------
-# VALIDATION CHECKS
+# CACHE-AWARE VALIDATION CHECKS
 # -------------------------------------------------
+FLAG_RELEVANT_COLS = {
+    "Wrong Category": ["CATEGORY"],
+    "Restricted brands": ["NAME", "BRAND", "SELLER_NAME", "CATEGORY_CODE"],
+    "Suspected Fake product": ["CATEGORY_CODE", "BRAND", "GLOBAL_SALE_PRICE", "GLOBAL_PRICE"],
+    "Seller Not approved to sell Refurb": ["PRODUCT_SET_SID", "CATEGORY_CODE", "SELLER_NAME", "NAME"],
+    "Product Warranty": ["PRODUCT_WARRANTY", "WARRANTY_DURATION", "CATEGORY_CODE"],
+    "Seller Approve to sell books": ["CATEGORY_CODE", "SELLER_NAME"],
+    "Seller Approved to Sell Perfume": ["CATEGORY_CODE", "SELLER_NAME", "BRAND", "NAME"],
+    "Counterfeit Sneakers": ["CATEGORY_CODE", "NAME", "BRAND"],
+    "Suspected counterfeit Jerseys": ["CATEGORY_CODE", "NAME", "SELLER_NAME"],
+    "Prohibited products": ["NAME", "CATEGORY_CODE"],
+    "Unnecessary words in NAME": ["NAME"],
+    "Single-word NAME": ["CATEGORY_CODE", "NAME"],
+    "Generic BRAND Issues": ["CATEGORY_CODE", "BRAND"],
+    "Fashion brand issues": ["CATEGORY_CODE", "BRAND"],
+    "BRAND name repeated in NAME": ["BRAND", "NAME"],
+    "Wrong Variation": ["COUNT_VARIATIONS", "CATEGORY_CODE"],
+    "Generic branded products with genuine brands": ["NAME", "BRAND", "CATEGORY"],
+    "Missing COLOR": ["CATEGORY_CODE", "NAME", "COLOR"],
+    "Missing Weight/Volume": ["CATEGORY_CODE", "NAME"],
+    "Incomplete Smartphone Name": ["CATEGORY_CODE", "NAME"],
+    "Duplicate product": ["NAME", "SELLER_NAME", "BRAND", "CATEGORY_CODE"]
+}
+
+def compute_flag_input_hash(data: pd.DataFrame, flag_name: str, kwargs: dict) -> str:
+    cols = FLAG_RELEVANT_COLS.get(flag_name, data.columns.tolist())
+    available_cols = [c for c in cols if c in data.columns]
+    if not available_cols: return "empty"
+    df_hash_str = df_hash(data[available_cols])
+    kwargs_repr = ""
+    for k, v in kwargs.items():
+        if k == 'data': continue
+        if isinstance(v, pd.DataFrame): kwargs_repr += df_hash(v)
+        else: kwargs_repr += repr(v)
+    return hashlib.md5((df_hash_str + kwargs_repr).encode()).hexdigest()
+
+def run_cached_check(func, cache_path, ckwargs):
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'rb') as f: return pickle.load(f)
+        except Exception: pass
+    res = func(**ckwargs)
+    try:
+        with open(cache_path, 'wb') as f: pickle.dump(res, f)
+    except Exception: pass
+    return res
+
 def check_miscellaneous_category(data: pd.DataFrame) -> pd.DataFrame:
     if 'CATEGORY' not in data.columns: return pd.DataFrame(columns=data.columns)
     flagged = data[data['CATEGORY'].astype(str).str.contains("miscellaneous", case=False, na=False)].copy()
@@ -1109,7 +1176,11 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
                 if country_validator.should_skip_validation(name): continue
                 ckwargs = {'data': data, **kwargs}
                 if name in ["Generic BRAND Issues", "Fashion brand issues"]: ckwargs['valid_category_codes_fas'] = support_files.get('category_fas', [])
-                future_to_name[executor.submit(func, **ckwargs)] = name
+                
+                flag_hash = compute_flag_input_hash(data, name, ckwargs)
+                cache_path = os.path.join(FLAG_CACHE_DIR, f"{flag_hash}.pkl")
+                future_to_name[executor.submit(run_cached_check, func, cache_path, ckwargs)] = name
+                
             for future in concurrent.futures.as_completed(future_to_name):
                 name = future_to_name[future]
                 try:
@@ -1285,6 +1356,7 @@ def build_fast_grid_html(
         sid = str(row["PRODUCT_SET_SID"])
         img_url = str(row.get("MAIN_IMAGE", "")).strip()
         
+        # --- HTTP TO HTTPS UPGRADE ---
         if img_url.startswith("http://"):
             img_url = img_url.replace("http://", "https://")
         if not img_url.startswith("http"):
@@ -1309,84 +1381,55 @@ def build_fast_grid_html(
   *{{box-sizing:border-box;margin:0;padding:0;font-family:sans-serif;}}
   body{{background:#f5f5f5;padding:8px;}}
 
-  /* ── UPGRADED STICKY CONTROL BAR ── */
+  /* ── STICKY CONTROL BAR ── */
   .ctrl-bar{{
     position: -webkit-sticky;
     position: sticky;
-    top: 8px;
-    z-index: 9999;
+    top: 0;
+    z-index: 99999;
     display:flex;align-items:center;gap:8px;flex-wrap:wrap;
     padding:8px 12px;
-    background: rgba(255, 255, 255, 0.90);
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
-    border:1px solid rgba(224, 224, 224, 0.8);
-    border-radius:8px;margin-bottom:12px;
+    background: rgba(255, 255, 255, 0.95);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border-bottom: 2px solid {O};
+    border-radius: 4px;
+    margin-bottom:12px;
     box-shadow: 0 4px 16px rgba(0,0,0,0.15);
   }}
   .sel-count{{font-weight:700;color:{O};font-size:13px;min-width:80px;}}
-  .reason-sel{{
-    flex:1;min-width:160px;padding:6px 10px;
-    border:1px solid #ccc;border-radius:4px;font-size:12px;
-    background:#fff;cursor:pointer;outline:none;
-  }}
-  .batch-btn{{
-    padding:7px 14px;background:{O};color:#fff;
-    border:none;border-radius:4px;font-weight:700;font-size:12px;
-    cursor:pointer;white-space:nowrap;
-  }}
+  .reason-sel{{flex:1;min-width:160px;padding:6px 10px;border:1px solid #ccc;border-radius:4px;font-size:12px;background:#fff;cursor:pointer;outline:none;}}
+  .batch-btn{{padding:7px 14px;background:{O};color:#fff;border:none;border-radius:4px;font-weight:700;font-size:12px;cursor:pointer;white-space:nowrap;}}
   .batch-btn:hover{{opacity:.88;}}
-  .desel-btn{{
-    padding:7px 12px;background:#fff;color:#555;
-    border:1px solid #ccc;border-radius:4px;font-size:12px;
-    cursor:pointer;white-space:nowrap;
-  }}
+  .desel-btn{{padding:7px 12px;background:#fff;color:#555;border:1px solid #ccc;border-radius:4px;font-size:12px;cursor:pointer;white-space:nowrap;}}
   .desel-btn:hover{{background:#f5f5f5;}}
 
-  /* ── grid & cards ── */
+  /* ── GRID & CARDS ── */
   .grid{{display:grid;grid-template-columns:repeat({cols_per_row},1fr);gap:12px;}}
-  .card{{border:2px solid #e0e0e0;border-radius:8px;padding:10px;background:#fff;
-         position:relative;transition:border-color .15s,box-shadow .15s;}}
-         
-  /* Selected for general batch (Green) */
+  .card{{border:2px solid #e0e0e0;border-radius:8px;padding:10px;background:#fff;position:relative;transition:border-color .15s,box-shadow .15s;}}
   .card.selected{{border-color:{G};box-shadow:0 0 0 3px rgba(76,175,80,.2); background:rgba(76,175,80,.04);}}
-  
-  /* Selected via individual button (Red/Staged) */
   .card.staged-rej{{border-color:{R};box-shadow:0 0 0 3px rgba(231,60,23,.2); background:rgba(231,60,23,.04);}}
-  
-  /* Already committed to Python (Grey) */
   .card.committed-rej{{border-color:#bbb;opacity:.6;}}
   
   .card-img-wrap{{position:relative;cursor:pointer; overflow:hidden; border-radius:6px;}}
   .card-img{{width:100%;aspect-ratio:1;object-fit:contain;border-radius:6px;display:block; transition: transform 0.25s ease-in-out;}}
   .card.committed-rej .card-img{{filter:grayscale(80%);}}
-  
-  /* HOVER ZOOM */
   .card-img-wrap:hover .card-img {{ transform: scale(1.15); }}
   
-  .tick{{position:absolute;bottom:6px;right:6px;width:22px;height:22px;border-radius:50%;
-         background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;
-         color:transparent;font-size:13px;font-weight:900;pointer-events:none;}}
+  .tick{{position:absolute;bottom:6px;right:6px;width:22px;height:22px;border-radius:50%;background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;color:transparent;font-size:13px;font-weight:900;pointer-events:none;}}
   .card.selected .tick{{background:{G};color:#fff;}}
   .card.staged-rej .tick{{background:{R};color:#fff;}}
   
-  .warn-wrap{{position:absolute;top:6px;right:6px;display:flex;flex-direction:column;gap:3px;
-              z-index:5;pointer-events:none;}}
-  .warn-badge{{background:rgba(255,193,7,.95);color:#313133;font-size:9px;font-weight:800;
-               padding:3px 7px;border-radius:10px;}}
+  .warn-wrap{{position:absolute;top:6px;right:6px;display:flex;flex-direction:column;gap:3px;z-index:5;pointer-events:none;}}
+  .warn-badge{{background:rgba(255,193,7,.95);color:#313133;font-size:9px;font-weight:800;padding:3px 7px;border-radius:10px;}}
                
-  .rej-overlay{{display:none;position:absolute;inset:0;background:rgba(255,255,255,.90);
-                border-radius:6px;flex-direction:column;align-items:center;
-                justify-content:center;z-index:20;gap:5px;padding:8px;text-align:center;}}
+  .rej-overlay{{display:none;position:absolute;inset:0;background:rgba(255,255,255,.90);border-radius:6px;flex-direction:column;align-items:center;justify-content:center;z-index:20;gap:5px;padding:8px;text-align:center;}}
   .card.committed-rej .rej-overlay{{display:flex;}}
   .card.staged-rej .rej-overlay.staged{{display:flex;}}
   
   .rej-badge{{background:{R};color:#fff;padding:3px 10px;border-radius:10px; font-size:11px;font-weight:700;}}
   .rej-badge.pending{{background:{O};}}
-  
   .rej-label{{font-size:10px;color:{R};font-weight:600;max-width:120px;}}
-  
-  /* UNDO BUTTON */
   .undo-btn{{margin-top:8px; padding:6px 12px; background:#313133; color:#fff; border:none; border-radius:4px; font-size:11px; font-weight:bold; cursor:pointer; box-shadow:0 2px 4px rgba(0,0,0,0.2);}}
   .undo-btn:hover{{background:#000;}}
 
@@ -1397,10 +1440,8 @@ def build_fast_grid_html(
   .meta .sl{{color:#999;font-size:9px;margin-top:4px;border-top:1px dashed #eee;padding-top:4px;}}
   
   .acts{{display:flex;gap:4px;margin-top:8px;}}
-  .act-btn{{flex:1;padding:6px;font-size:11px;border:none;border-radius:4px;cursor:pointer;
-            font-weight:700;color:#fff;background:{O};}}
-  .act-more{{flex:1;font-size:11px;border:1px solid #ccc;border-radius:4px;outline:none;
-             cursor:pointer;background:#fff;}}
+  .act-btn{{flex:1;padding:6px;font-size:11px;border:none;border-radius:4px;cursor:pointer;font-weight:700;color:#fff;background:{O};}}
+  .act-more{{flex:1;font-size:11px;border:1px solid #ccc;border-radius:4px;outline:none;cursor:pointer;background:#fff;}}
 </style>
 </head>
 <body>
@@ -1436,73 +1477,64 @@ function escapeHtml(unsafe) {{
 var CARDS     = {cards_json};
 var COMMITTED = {committed_json};
 
-// KEEP STATE ALIVE ACROSS RE-RENDERS
 window._gridSelected = window._gridSelected || {{}};
 window._stagedRejections = window._stagedRejections || {{}};
 var selected = window._gridSelected;
 var staged = window._stagedRejections;
 
-// ── 1. ANTI-JUMP SCROLL RESTORATION ENGINE ──
-function saveScroll() {{
-    try {{
+// ── SAFE SCROLL CACHE ──
+try {{
+    window.addEventListener("beforeunload", function() {{
         sessionStorage.setItem("jt_iframe_scroll", window.scrollY);
         if (window.parent && window.parent.document) {{
             var main = window.parent.document.querySelector('.main');
             if (main) window.parent.sessionStorage.setItem("jt_parent_scroll", main.scrollTop);
         }}
-    }} catch(e) {{}}
-}}
-
-function restoreScroll() {{
-    try {{
+    }});
+    window.addEventListener("load", function() {{
         var iScroll = sessionStorage.getItem("jt_iframe_scroll");
-        if (iScroll) {{
-            window.scrollTo(0, parseInt(iScroll));
-            sessionStorage.removeItem("jt_iframe_scroll");
-        }}
+        if (iScroll) {{ setTimeout(function() {{ window.scrollTo(0, parseInt(iScroll)); }}, 20); }}
 
         if (window.parent && window.parent.document) {{
-            var main = window.parent.document.querySelector('.main');
             var pScroll = window.parent.sessionStorage.getItem("jt_parent_scroll");
-            if (main && pScroll) {{
-                setTimeout(() => {{ 
-                    main.scrollTo({{top: parseInt(pScroll), behavior: 'instant'}}); 
-                    window.parent.sessionStorage.removeItem("jt_parent_scroll");
-                }}, 20);
-            }}
-        }}
-    }} catch(e) {{}}
-}}
-restoreScroll();
-
-// ── 2. NAVIGATION / DOWNLOAD INTERCEPTOR ──
-if (window.parent) {{
-    window.parent._jtClickListener = function(e) {{
-        let btn = e.target.closest('button');
-        if (!btn) return;
-        let txt = btn.innerText;
-        if (txt.includes('Next') || txt.includes('Prev') || txt.includes('Generate') || txt.includes('Download') || txt.includes('Jump')) {{
-            let selCount = Object.keys(window._gridSelected).length;
-            let stagedCount = Object.keys(window._stagedRejections).length;
-            let total = selCount + stagedCount;
-            
-            if (total > 0) {{
-                let msg = "Wait! You have " + total + " products selected but NOT rejected yet.\\n\\nClick 'Cancel' to stay on this page and hit 'Batch Reject Selected'.\\n\\nClick 'OK' to ignore them and proceed anyway.";
-                if (!confirm(msg)) {{
-                    e.preventDefault();
-                    e.stopPropagation();
-                }} else {{
-                    for(let k in window._gridSelected) delete window._gridSelected[k];
-                    for(let k in window._stagedRejections) delete window._stagedRejections[k];
+            if (pScroll) {{
+                var main = window.parent.document.querySelector('.main');
+                if (main) {{
+                    setTimeout(function() {{ main.scrollTo({{top: parseInt(pScroll), behavior: 'instant'}}); }}, 30);
                 }}
             }}
         }}
-    }};
-    window.parent.document.removeEventListener('click', window.parent._jtClickListener, true);
-    window.parent.document.addEventListener('click', window.parent._jtClickListener, true);
+    }});
+}} catch(e) {{}}
+
+// ── SAFE PAGE NAVIGATION INTERCEPTOR ──
+try {{
+    if (window.parent && window.parent.document) {{
+        window.parent._jtClickListener = function(e) {{
+            let btn = e.target.closest('button');
+            if (!btn) return;
+            let txt = btn.innerText;
+            if (txt.includes('Next') || txt.includes('Prev') || txt.includes('Generate') || txt.includes('Download') || txt.includes('Jump')) {{
+                let total = Object.keys(window._gridSelected).length + Object.keys(window._stagedRejections).length;
+                if (total > 0) {{
+                    if (!confirm("Wait! You have " + total + " products selected.\\nClick 'Cancel' to stay and Batch Reject.\\nClick 'OK' to ignore them.")) {{
+                        e.preventDefault(); e.stopPropagation();
+                    }} else {{
+                        for(let k in window._gridSelected) delete window._gridSelected[k];
+                        for(let k in window._stagedRejections) delete window._stagedRejections[k];
+                    }}
+                }}
+            }}
+        }};
+        window.parent.document.removeEventListener('click', window.parent._jtClickListener, true);
+        window.parent.document.addEventListener('click', window.parent._jtClickListener, true);
+    }}
+}} catch(e) {{
+    // Fails silently if CORS blocks it, preventing the blank screen crash!
+    console.warn("Interceptor blocked by Streamlit Sandbox");
 }}
 
-// ── 3. postMessage BRIDGE WITH ANTI-YANK ──
+// ── postMessage BRIDGE ──
 function sendMsg(type, payload) {{
   try {{
     var par = window.parent;
@@ -1514,39 +1546,34 @@ function sendMsg(type, payload) {{
       }}
     }}
     if (!bridge) return;
-    
-    // CACHE POSITIONS BEFORE DOING ANYTHING
-    saveScroll();
+
+    var currIframeScroll = window.scrollY;
     var main = par.document.querySelector('.main');
     var currParentScroll = main ? main.scrollTop : 0;
-    var currIframeScroll = window.scrollY;
 
     var msg = JSON.stringify({{action: type, payload: payload}});
-    
-    // NEUTRALIZE BROWSER FOCUS JUMP
+
+    // Prevent screen yank!
     bridge.focus({{ preventScroll: true }});
-    // Double-enforce: instantly snap back if the browser ignored preventScroll
     if (main) main.scrollTop = currParentScroll;
     window.scrollTo(0, currIframeScroll);
 
     Object.getOwnPropertyDescriptor(par.HTMLInputElement.prototype, 'value').set.call(bridge, msg);
     bridge.dispatchEvent(new par.Event('input', {{bubbles: true}}));
-    
+
     setTimeout(function() {{
         bridge.blur();
-        if (main) main.scrollTop = currParentScroll; // Fix potential blur jump
+        if (main) main.scrollTop = currParentScroll;
         bridge.dispatchEvent(new par.KeyboardEvent('keydown', {{bubbles: true, cancelable: true, key: 'Enter', keyCode: 13}}));
     }}, 150);
-  }} catch(ex) {{ console.error('jtbridge sendMsg error:', ex); }}
+  }} catch(ex) {{ console.error('jtbridge error:', ex); }}
 }}
 
-// ── UI helpers ────────────────────────────────────────────────────────────────
 function updateSelCount() {{
   const n = Object.keys(selected).length + Object.keys(staged).length;
-  document.getElementById('sel-count-bar').textContent = n + ' items pending reject';
+  document.getElementById('sel-count-bar').textContent = n + ' items pending';
 }}
 
-// ── Card rendering ────────────────────────────────────────────────────────────
 function renderCard(card) {{
   const sid = card.sid;
   const img = escapeHtml(card.img);
@@ -1627,7 +1654,6 @@ function replaceCard(sid) {{
   if (card) {{ const t=document.createElement('div'); t.innerHTML=renderCard(card); el.replaceWith(t.firstElementChild); }}
 }}
 
-// ── Actions ───────────────────────────────────────────────────────────────────
 window.doSelectAll = function() {{
   CARDS.forEach(c => {{
       if (!(c.sid in COMMITTED) && !(c.sid in staged)) {{
@@ -1671,18 +1697,18 @@ window.doBatchReject = function() {{
   const batchReason = document.getElementById('batch-reason').value;
   const payload   = {{}};
   let count = 0;
-  
+
   for (let sid in staged) {{ payload[sid] = staged[sid]; count++; }}
   for (let sid in selected) {{ payload[sid] = batchReason; count++; }}
-  
+
   if (count === 0) {{ alert('No products selected or staged for rejection.'); return; }}
-  
+
   for (let sid in payload) {{
       COMMITTED[sid] = payload[sid];
       delete selected[sid];
       delete staged[sid];
   }}
-  
+
   sendMsg('reject', payload);
   renderAll();
   updateSelCount();
@@ -1850,6 +1876,12 @@ with st.sidebar:
     if st.button("🔄 Clear Cache & Reload Data", use_container_width=True, type="secondary", help="Forces a reload of all support rules from local files."):
         st.cache_data.clear()
         st.session_state.display_df_cache = {}
+        if os.path.exists(PARQUET_CACHE_DIR):
+            shutil.rmtree(PARQUET_CACHE_DIR)
+            os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
+        if os.path.exists(FLAG_CACHE_DIR):
+            shutil.rmtree(FLAG_CACHE_DIR)
+            os.makedirs(FLAG_CACHE_DIR, exist_ok=True)
         st.rerun()
     st.markdown("---")
     st.header("Display Settings")
@@ -1902,85 +1934,98 @@ if st.session_state.get('last_processed_files') != process_signature:
     keys_to_delete = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_"))]
     for k in keys_to_delete: del st.session_state[k]
 
-    if process_signature == "empty": st.session_state.last_processed_files = "empty"
+    if process_signature == "empty": 
+        st.session_state.last_processed_files = "empty"
     else:
-        try:
-            all_dfs = []
-            file_sids_sets = []
-            detected_modes = []
-            for uf in uploaded_files:
-                uf.seek(0)
-                if uf.name.endswith('.xlsx'): raw_data = pd.read_excel(uf, engine='openpyxl', dtype=str)
-                else:
-                    try:
-                        raw_data = pd.read_csv(uf, dtype=str)
-                        if len(raw_data.columns) <= 1:
+        sig_hash = hashlib.md5(process_signature.encode()).hexdigest()
+        cached_data = load_df_parquet(f"{sig_hash}_data.parquet")
+        cached_report = load_df_parquet(f"{sig_hash}_report.parquet")
+        
+        if cached_data is not None and cached_report is not None:
+            st.session_state.final_report = cached_report
+            st.session_state.all_data_map = cached_data
+            st.session_state.last_processed_files = process_signature
+            st.toast("⚡ Loaded from cache", icon="⚡")
+        else:
+            try:
+                all_dfs = []
+                file_sids_sets = []
+                detected_modes = []
+                for uf in uploaded_files:
+                    uf.seek(0)
+                    if uf.name.endswith('.xlsx'): raw_data = pd.read_excel(uf, engine='openpyxl', dtype=str)
+                    else:
+                        try:
+                            raw_data = pd.read_csv(uf, dtype=str)
+                            if len(raw_data.columns) <= 1:
+                                uf.seek(0)
+                                raw_data = pd.read_csv(uf, sep=';', encoding='ISO-8859-1', dtype=str)
+                        except:
                             uf.seek(0)
                             raw_data = pd.read_csv(uf, sep=';', encoding='ISO-8859-1', dtype=str)
-                    except:
-                        uf.seek(0)
-                        raw_data = pd.read_csv(uf, sep=';', encoding='ISO-8859-1', dtype=str)
-                detected_modes.append(detect_file_type(raw_data))
-                all_dfs.append(raw_data)
+                    detected_modes.append(detect_file_type(raw_data))
+                    all_dfs.append(raw_data)
 
-            file_mode = detected_modes[0] if detected_modes else 'pre_qc'
-            st.session_state.file_mode = file_mode
+                file_mode = detected_modes[0] if detected_modes else 'pre_qc'
+                st.session_state.file_mode = file_mode
 
-            if file_mode == 'post_qc':
-                norm_dfs = [normalize_post_qc(df) for df in all_dfs]
-                merged = pd.concat(norm_dfs, ignore_index=True)
-                merged_dedup = merged.drop_duplicates(subset=['PRODUCT_SET_SID'], keep='first')
-                with st.spinner("Running Post-QC checks..."):
-                    summary_df, results = run_post_qc_checks(merged_dedup, support_files)
-                st.session_state.post_qc_summary = summary_df
-                st.session_state.post_qc_results = results
-                st.session_state.post_qc_data = merged_dedup
-                st.session_state.last_processed_files = process_signature
-            else:
-                std_dfs = []
-                for raw_data in all_dfs:
-                    std_data = standardize_input_data(raw_data)
-                    if 'PRODUCT_SET_SID' in std_data.columns:
-                        std_data['PRODUCT_SET_SID'] = std_data['PRODUCT_SET_SID'].astype(str).str.strip()
-                        file_sids_sets.append(set(std_data['PRODUCT_SET_SID'].unique()))
-                    std_dfs.append(std_data)
-                merged_data = pd.concat(std_dfs, ignore_index=True)
-                if len(file_sids_sets) > 1: st.session_state.intersection_sids = set.intersection(*file_sids_sets)
-                else: st.session_state.intersection_sids = set()
-                st.session_state.intersection_count = len(st.session_state.intersection_sids)
-                data_prop = propagate_metadata(merged_data)
-                is_valid, errors = validate_input_schema(data_prop)
-                if is_valid:
-                    data_filtered, det_names = filter_by_country(data_prop, country_validator)
-                    if data_filtered.empty:
-                        st.error(f"No {country_validator.country} products found. Detected countries: {', '.join(det_names) if det_names else 'None'}", icon=":material/error:")
-                        st.stop()
-                    actual_counts = data_filtered.groupby('PRODUCT_SET_SID')['PRODUCT_SET_SID'].transform('count')
-                    if 'COUNT_VARIATIONS' in data_filtered.columns:
-                        file_counts = pd.to_numeric(data_filtered['COUNT_VARIATIONS'], errors='coerce').fillna(1)
-                        data_filtered['COUNT_VARIATIONS'] = actual_counts.combine(file_counts, max)
-                    else: data_filtered['COUNT_VARIATIONS'] = actual_counts
-                    data = data_filtered.drop_duplicates(subset=['PRODUCT_SET_SID'], keep='first')
-                    if '_IS_MULTI_COUNTRY' not in data.columns: data['_IS_MULTI_COUNTRY'] = False
-                    data_has_warranty = all(c in data.columns for c in ['PRODUCT_WARRANTY', 'WARRANTY_DURATION'])
-                    for c in ['NAME', 'BRAND', 'COLOR', 'SELLER_NAME', 'CATEGORY_CODE', 'LIST_VARIATIONS']:
-                        if c in data.columns: data[c] = data[c].astype(str).fillna('')
-                    if 'COLOR_FAMILY' not in data.columns: data['COLOR_FAMILY'] = ""
-
-                    data_hash = df_hash(data) + country_validator.code
-                    final_report, _ = cached_validate_products(data_hash, data, support_files, country_validator.code, data_has_warranty)
-
-                    st.session_state.final_report = final_report
-                    st.session_state.all_data_map = data
+                if file_mode == 'post_qc':
+                    norm_dfs = [normalize_post_qc(df) for df in all_dfs]
+                    merged = pd.concat(norm_dfs, ignore_index=True)
+                    merged_dedup = merged.drop_duplicates(subset=['PRODUCT_SET_SID'], keep='first')
+                    with st.spinner("Running Post-QC checks..."):
+                        summary_df, results = run_post_qc_checks(merged_dedup, support_files)
+                    st.session_state.post_qc_summary = summary_df
+                    st.session_state.post_qc_results = results
+                    st.session_state.post_qc_data = merged_dedup
                     st.session_state.last_processed_files = process_signature
                 else:
-                    for e in errors: st.error(e)
-                    st.session_state.last_processed_files = "error"
-        except Exception as e:
-            st.error(f"Processing error: {e}")
-            st.code(traceback.format_exc())
-            st.session_state.last_processed_files = "error"
+                    std_dfs = []
+                    for raw_data in all_dfs:
+                        std_data = standardize_input_data(raw_data)
+                        if 'PRODUCT_SET_SID' in std_data.columns:
+                            std_data['PRODUCT_SET_SID'] = std_data['PRODUCT_SET_SID'].astype(str).str.strip()
+                            file_sids_sets.append(set(std_data['PRODUCT_SET_SID'].unique()))
+                        std_dfs.append(std_data)
+                    merged_data = pd.concat(std_dfs, ignore_index=True)
+                    if len(file_sids_sets) > 1: st.session_state.intersection_sids = set.intersection(*file_sids_sets)
+                    else: st.session_state.intersection_sids = set()
+                    st.session_state.intersection_count = len(st.session_state.intersection_sids)
+                    data_prop = propagate_metadata(merged_data)
+                    is_valid, errors = validate_input_schema(data_prop)
+                    if is_valid:
+                        data_filtered, det_names = filter_by_country(data_prop, country_validator)
+                        if data_filtered.empty:
+                            st.error(f"No {country_validator.country} products found. Detected countries: {', '.join(det_names) if det_names else 'None'}", icon=":material/error:")
+                            st.stop()
+                        actual_counts = data_filtered.groupby('PRODUCT_SET_SID')['PRODUCT_SET_SID'].transform('count')
+                        if 'COUNT_VARIATIONS' in data_filtered.columns:
+                            file_counts = pd.to_numeric(data_filtered['COUNT_VARIATIONS'], errors='coerce').fillna(1)
+                            data_filtered['COUNT_VARIATIONS'] = actual_counts.combine(file_counts, max)
+                        else: data_filtered['COUNT_VARIATIONS'] = actual_counts
+                        data = data_filtered.drop_duplicates(subset=['PRODUCT_SET_SID'], keep='first')
+                        if '_IS_MULTI_COUNTRY' not in data.columns: data['_IS_MULTI_COUNTRY'] = False
+                        data_has_warranty = all(c in data.columns for c in ['PRODUCT_WARRANTY', 'WARRANTY_DURATION'])
+                        for c in ['NAME', 'BRAND', 'COLOR', 'SELLER_NAME', 'CATEGORY_CODE', 'LIST_VARIATIONS']:
+                            if c in data.columns: data[c] = data[c].astype(str).fillna('')
+                        if 'COLOR_FAMILY' not in data.columns: data['COLOR_FAMILY'] = ""
 
+                        data_hash = df_hash(data) + country_validator.code
+                        final_report, _ = cached_validate_products(data_hash, data, support_files, country_validator.code, data_has_warranty)
+
+                        st.session_state.final_report = final_report
+                        st.session_state.all_data_map = data
+                        st.session_state.last_processed_files = process_signature
+                        
+                        save_df_parquet(data, f"{sig_hash}_data.parquet")
+                        save_df_parquet(final_report, f"{sig_hash}_report.parquet")
+                    else:
+                        for e in errors: st.error(e)
+                        st.session_state.last_processed_files = "error"
+            except Exception as e:
+                st.error(f"Processing error: {e}")
+                st.code(traceback.format_exc())
+                st.session_state.last_processed_files = "error"
 
 _bridge_val = st.text_input(
     "jtbridge", value="",
@@ -2112,19 +2157,6 @@ def render_image_grid():
         left_on="ProductSetSid", right_on="PRODUCT_SET_SID", how="left",
     )
     
-    # --- SEARCH STATE RESTORATION ---
-    is_searching = bool(search_n or search_sc)
-    if 'search_active' not in st.session_state: st.session_state.search_active = False
-    if 'pre_search_page' not in st.session_state: st.session_state.pre_search_page = 0
-
-    if is_searching and not st.session_state.search_active:
-        st.session_state.pre_search_page = st.session_state.grid_page
-        st.session_state.grid_page = 0
-        st.session_state.search_active = True
-    elif not is_searching and st.session_state.search_active:
-        st.session_state.grid_page = st.session_state.pre_search_page
-        st.session_state.search_active = False
-
     if search_n:
         review_data = review_data[
             review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)
@@ -2141,7 +2173,6 @@ def render_image_grid():
     if st.session_state.grid_page >= total_pages:
         st.session_state.grid_page = 0
 
-    # --- ADVANCED PAGINATION WITH JUMP ---
     pg_cols = st.columns([1, 2, 1], vertical_alignment="center")
     with pg_cols[0]:
         if st.button("◀ Prev Page", use_container_width=True, disabled=st.session_state.grid_page == 0):
@@ -2170,28 +2201,14 @@ def render_image_grid():
 
     page_start = st.session_state.grid_page * ipp
     page_data  = review_data.iloc[page_start : page_start + ipp]
-    
-    # Pre-fetch target for background loader
-    next_page_start = (st.session_state.grid_page + 1) * ipp
-    if next_page_start < len(review_data):
-        next_page_data = review_data.iloc[next_page_start : next_page_start + ipp]
-    else:
-        next_page_data = pd.DataFrame()
 
-    # --- MASSIVELY PARALLEL CACHED IMAGE FETCHING ---
     page_warnings: dict = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-        # Process current page
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
         future_to_sid = {
-            ex.submit(analyze_image_quality_cached, str(r.get("MAIN_IMAGE", "")).strip()): str(r["PRODUCT_SET_SID"])
+            ex.submit(analyze_image_quality_cached,
+                      str(r.get("MAIN_IMAGE", "")).strip()): str(r["PRODUCT_SET_SID"])
             for _, r in page_data.iterrows()
         }
-        
-        # Fire-and-forget pre-fetch for NEXT page so it loads instantly later
-        for _, r in next_page_data.iterrows():
-            ex.submit(analyze_image_quality_cached, str(r.get("MAIN_IMAGE", "")).strip())
-            
-        # Collect current page warnings
         for future in concurrent.futures.as_completed(future_to_sid):
             warns = future.result()
             if warns:
@@ -2214,7 +2231,6 @@ def render_image_grid():
         cols_per_row,
     )
     
-    # --- RENDER IFRAME WITH OPTIMIZED SCROLLING HEIGHT ---
     components.html(grid_html, height=800, scrolling=True)
 
     if st.session_state.get("do_scroll_top", False):
