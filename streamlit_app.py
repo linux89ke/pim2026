@@ -1414,9 +1414,15 @@ def build_fast_grid_html(
   .card.staged-rej{{border-color:{R};box-shadow:0 0 0 3px rgba(231,60,23,.2); background:rgba(231,60,23,.04);}}
   .card.committed-rej{{border-color:#bbb;opacity:.6;}}
   
-  .card-img-wrap{{position:relative;cursor:pointer; overflow:hidden; border-radius:6px; background:#fff; display:flex; align-items:center; justify-content:center; height: 130px;}}
-  .card-img{{width:100%; height:130px; object-fit:contain; border-radius:6px; display:block;}}
+  /* CHANGED TO 180px HERE */
+  .card-img-wrap{{position:relative;cursor:pointer; overflow:hidden; border-radius:6px; background:#fff; display:flex; align-items:center; justify-content:center; height: 180px;}}
+  .card-img{{width:100%; height:180px; object-fit:contain; border-radius:6px; display:block; transition: transform 0.25s ease-in-out;}}
   .card.committed-rej .card-img{{filter:grayscale(80%);}}
+  .card-img-wrap:hover .card-img {{ transform: scale(1.15); }}
+  
+  .tick{{position:absolute;bottom:6px;right:6px;width:22px;height:22px;border-radius:50%;background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;color:transparent;font-size:13px;font-weight:900;pointer-events:none; z-index:10;}}
+  .card.selected .tick{{background:{G};color:#fff;}}
+  .card.staged-rej .tick{{background:{R};color:#fff;}}
   
   /* LENS ZOOM BUTTON */
   .zoom-btn {{
@@ -1437,10 +1443,6 @@ def build_fast_grid_html(
       transition: transform 0.1s, background 0.1s;
   }}
   .zoom-btn:hover {{ transform: scale(1.15); background: #fff; }}
-  
-  .tick{{position:absolute;bottom:6px;right:6px;width:22px;height:22px;border-radius:50%;background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;color:transparent;font-size:13px;font-weight:900;pointer-events:none; z-index:10;}}
-  .card.selected .tick{{background:{G};color:#fff;}}
-  .card.staged-rej .tick{{background:{R};color:#fff;}}
   
   .warn-wrap{{position:absolute;top:6px;right:6px;display:flex;flex-direction:column;gap:3px;z-index:5;pointer-events:none;}}
   .warn-badge{{background:rgba(255,193,7,.95);color:#313133;font-size:9px;font-weight:800;padding:3px 7px;border-radius:10px;}}
@@ -1759,7 +1761,6 @@ renderAll();
 </script>
 </body>
 </html>"""
-
 # -------------------------------------------------
 # UI COMPONENTS
 # -------------------------------------------------
