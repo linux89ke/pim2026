@@ -19,6 +19,10 @@ import hashlib
 import requests
 from PIL import Image
 
+# ── NEW: parquet caching & per-flag hash imports ──────────────────────────────
+import pickle
+import tempfile
+
 try:
     from postqc import detect_file_type, normalize_post_qc, run_checks as run_post_qc_checks, render_post_qc_section
 except ImportError:
@@ -66,6 +70,89 @@ COUNTRY_CURRENCY = {
     "Ghana":   {"code": "GHS", "symbol": "GH₵", "pair": "USD/GHS"},
     "Morocco": {"code": "MAD", "symbol": "MAD", "pair": "USD/MAD"},
 }
+
+# ── PARQUET CACHE DIR ─────────────────────────────────────────────────────────
+PARQUET_CACHE_DIR = os.path.join(tempfile.gettempdir(), "jt_parquet_cache")
+os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
+
+def _parquet_path(key: str) -> str:
+    return os.path.join(PARQUET_CACHE_DIR, f"{key}.parquet")
+
+def _pickle_path(key: str) -> str:
+    return os.path.join(PARQUET_CACHE_DIR, f"{key}.pkl")
+
+def save_df_parquet(df: pd.DataFrame, key: str):
+    """Persist a DataFrame to disk via parquet (fast columnar format)."""
+    try:
+        df.to_parquet(_parquet_path(key), index=False)
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Parquet save failed for {key}: {e}")
+
+def load_df_parquet(key: str) -> Optional[pd.DataFrame]:
+    """Load a cached DataFrame from disk. Returns None on miss."""
+    path = _parquet_path(key)
+    if not os.path.exists(path):
+        return None
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        return None
+
+def save_pickle(obj, key: str):
+    try:
+        with open(_pickle_path(key), "wb") as f:
+            pickle.dump(obj, f)
+    except Exception:
+        pass
+
+def load_pickle(key: str):
+    path = _pickle_path(key)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+# ── PER-FLAG HASH HELPERS ─────────────────────────────────────────────────────
+def compute_flag_input_hash(data: pd.DataFrame, flag_name: str, extra: str = "") -> str:
+    """
+    Hash only the columns that matter for a specific flag check so we can
+    skip re-running it when unrelated data changes.
+    """
+    FLAG_RELEVANT_COLS = {
+        "Wrong Category":              ["PRODUCT_SET_SID", "CATEGORY"],
+        "Restricted brands":           ["PRODUCT_SET_SID", "NAME", "BRAND", "SELLER_NAME", "CATEGORY_CODE"],
+        "Suspected Fake product":      ["PRODUCT_SET_SID", "CATEGORY_CODE", "BRAND", "GLOBAL_SALE_PRICE", "GLOBAL_PRICE"],
+        "Seller Not approved to sell Refurb": ["PRODUCT_SET_SID", "CATEGORY_CODE", "SELLER_NAME", "NAME"],
+        "Product Warranty":            ["PRODUCT_SET_SID", "CATEGORY_CODE", "PRODUCT_WARRANTY", "WARRANTY_DURATION"],
+        "Seller Approve to sell books":["PRODUCT_SET_SID", "CATEGORY_CODE", "SELLER_NAME"],
+        "Seller Approved to Sell Perfume": ["PRODUCT_SET_SID", "CATEGORY_CODE", "SELLER_NAME", "BRAND", "NAME"],
+        "Counterfeit Sneakers":        ["PRODUCT_SET_SID", "CATEGORY_CODE", "NAME", "BRAND"],
+        "Suspected counterfeit Jerseys": ["PRODUCT_SET_SID", "CATEGORY_CODE", "NAME", "SELLER_NAME"],
+        "Prohibited products":         ["PRODUCT_SET_SID", "NAME", "CATEGORY_CODE"],
+        "Unnecessary words in NAME":   ["PRODUCT_SET_SID", "NAME"],
+        "Single-word NAME":            ["PRODUCT_SET_SID", "NAME", "CATEGORY_CODE"],
+        "Generic BRAND Issues":        ["PRODUCT_SET_SID", "CATEGORY_CODE", "BRAND"],
+        "Fashion brand issues":        ["PRODUCT_SET_SID", "CATEGORY_CODE", "BRAND"],
+        "BRAND name repeated in NAME": ["PRODUCT_SET_SID", "BRAND", "NAME"],
+        "Wrong Variation":             ["PRODUCT_SET_SID", "CATEGORY_CODE", "COUNT_VARIATIONS"],
+        "Generic branded products with genuine brands": ["PRODUCT_SET_SID", "NAME", "BRAND", "CATEGORY"],
+        "Missing COLOR":               ["PRODUCT_SET_SID", "CATEGORY_CODE", "NAME", "COLOR"],
+        "Missing Weight/Volume":       ["PRODUCT_SET_SID", "CATEGORY_CODE", "NAME"],
+        "Incomplete Smartphone Name":  ["PRODUCT_SET_SID", "CATEGORY_CODE", "NAME"],
+        "Duplicate product":           ["PRODUCT_SET_SID", "NAME", "BRAND", "SELLER_NAME", "COLOR"],
+    }
+    cols = FLAG_RELEVANT_COLS.get(flag_name, data.columns.tolist())
+    cols_present = [c for c in cols if c in data.columns]
+    try:
+        h = hashlib.md5(
+            pd.util.hash_pandas_object(data[cols_present], index=False).values
+        ).hexdigest()
+        return h + extra
+    except Exception:
+        return hashlib.md5((str(data.shape) + flag_name + extra).encode()).hexdigest()
 
 @st.cache_data(ttl=3600)
 def fetch_exchange_rate(country: str) -> float:
@@ -155,17 +242,17 @@ if 'main_toasts' not in st.session_state: st.session_state.main_toasts = []
 if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
 if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = False
 if 'display_df_cache' not in st.session_state: st.session_state.display_df_cache = {}
-
 if 'main_bridge_counter' not in st.session_state: st.session_state.main_bridge_counter = 0
-
 if 'search_active' not in st.session_state: st.session_state.search_active = False
 if 'pre_search_page' not in st.session_state: st.session_state.pre_search_page = 0
-
 if 'desel_counter' not in st.session_state: st.session_state.desel_counter = 0
-if 'batch_counter' not in st.session_state: st.session_state.batch_counter = 0  
+if 'batch_counter' not in st.session_state: st.session_state.batch_counter = 0
 if 'clear_counter' not in st.session_state: st.session_state.clear_counter = 0
 if 'ls_processed_flag' not in st.session_state: st.session_state.ls_processed_flag = False
 if 'ls_read_trigger' not in st.session_state: st.session_state.ls_read_trigger = 0
+# ── NEW STATE ─────────────────────────────────────────────────────────────────
+if 'flag_hashes' not in st.session_state: st.session_state.flag_hashes = {}
+if 'recategorize_bridge_counter' not in st.session_state: st.session_state.recategorize_bridge_counter = 0
 
 try: st.set_page_config(page_title="Product Tool", layout=st.session_state.layout_mode)
 except: pass
@@ -665,10 +752,8 @@ def standardize_input_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns=renamed)
     for col in ['ACTIVE_STATUS_COUNTRY', 'CATEGORY_CODE', 'BRAND', 'TAX_CLASS', 'NAME', 'SELLER_NAME']:
         if col in df.columns: df[col] = df[col].astype(str)
-        
     if 'MAIN_IMAGE' not in df.columns:
         df['MAIN_IMAGE'] = ''
-        
     return df
 
 def validate_input_schema(df: pd.DataFrame) -> Tuple[bool, List[str]]:
@@ -706,7 +791,7 @@ def propagate_metadata(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # -------------------------------------------------
-# VALIDATION CHECKS
+# VALIDATION CHECKS (unchanged)
 # -------------------------------------------------
 def check_miscellaneous_category(data: pd.DataFrame) -> pd.DataFrame:
     if 'CATEGORY' not in data.columns: return pd.DataFrame(columns=data.columns)
@@ -1060,7 +1145,7 @@ def check_duplicate_products(data: pd.DataFrame, exempt_categories: List[str] = 
     return rdf[base_cols + extra_cols].drop_duplicates(subset=['PRODUCT_SET_SID'])
 
 # -------------------------------------------------
-# MASTER VALIDATION RUNNER
+# MASTER VALIDATION RUNNER  (with per-flag hash cache)
 # -------------------------------------------------
 def validate_products(data: pd.DataFrame, support_files: Dict, country_validator: CountryValidator, data_has_warranty_cols: bool, common_sids: Optional[set] = None, skip_validators: Optional[List[str]] = None):
     data['PRODUCT_SET_SID'] = data['PRODUCT_SET_SID'].astype(str).str.strip()
@@ -1101,17 +1186,36 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
     restricted_keys = {}
     validation_errors = []
 
-    with st.spinner("Validating products... This may take a moment."):
+    # ── PER-FLAG HASH CACHING ─────────────────────────────────────────────────
+    extra_for_hash = country_validator.code
+    current_flag_hashes = st.session_state.get('flag_hashes', {})
+    new_flag_hashes = {}
+
+    with st.spinner("Validating products..."):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             future_to_name = {}
             for i, (name, func, kwargs) in enumerate(validations):
                 if skip_validators and name in skip_validators: continue
                 if country_validator.should_skip_validation(name): continue
+
+                # Compute hash for this flag's relevant columns
+                flag_hash = compute_flag_input_hash(data, name, extra_for_hash)
+                new_flag_hashes[name] = flag_hash
+                cache_key = f"flagcache_{name}_{flag_hash}"
+
+                # Try disk cache first
+                cached_result = load_pickle(cache_key)
+                if cached_result is not None and current_flag_hashes.get(name) == flag_hash:
+                    results[name] = cached_result
+                    continue
+
                 ckwargs = {'data': data, **kwargs}
-                if name in ["Generic BRAND Issues", "Fashion brand issues"]: ckwargs['valid_category_codes_fas'] = support_files.get('category_fas', [])
-                future_to_name[executor.submit(func, **ckwargs)] = name
+                if name in ["Generic BRAND Issues", "Fashion brand issues"]:
+                    ckwargs['valid_category_codes_fas'] = support_files.get('category_fas', [])
+                future_to_name[executor.submit(func, **ckwargs)] = (name, flag_hash, cache_key)
+
             for future in concurrent.futures.as_completed(future_to_name):
-                name = future_to_name[future]
+                name, flag_hash, cache_key = future_to_name[future]
                 try:
                     res = future.result()
                     if not res.empty and 'PRODUCT_SET_SID' in res.columns:
@@ -1128,10 +1232,15 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
                         else: results[name] = final_res
                     else:
                         if name not in results: results[name] = pd.DataFrame(columns=data.columns)
+                    # Save to disk cache
+                    save_pickle(results[name], cache_key)
                 except Exception as e:
                     logger.error(f"Error in {name}: {e}")
                     validation_errors.append((name, str(e)))
                     if name not in results: results[name] = pd.DataFrame(columns=data.columns)
+
+    # Update flag hashes in session state
+    st.session_state.flag_hashes = new_flag_hashes
 
     if validation_errors:
         st.warning(f"{len(validation_errors)} validation checks encountered errors.")
@@ -1264,7 +1373,444 @@ REASON_MAP = {
 }
 
 # -------------------------------------------------
-# HTML GRID BUILDER
+# ██████╗ ██████╗  █████╗  ██████╗     ██████╗  ██████╗  █████╗ ██████╗ ██████╗
+# ██╔══██╗██╔══██╗██╔══██╗██╔════╝     ██╔══██╗██╔═══██╗██╔══██╗██╔══██╗██╔══██╗
+# ██║  ██║██████╔╝███████║██║  ███╗    ██████╔╝██║   ██║███████║██████╔╝██║  ██║
+# ██║  ██║██╔══██╗██╔══██║██║   ██║    ██╔══██╗██║   ██║██╔══██║██╔══██╗██║  ██║
+# ██████╔╝██║  ██║██║  ██║╚██████╔╝    ██████╔╝╚██████╔╝██║  ██║██║  ██║██████╔╝
+# DRAG & DROP RECATEGORIZATION TOOL
+# -------------------------------------------------
+def build_recategorize_html(flags_data: dict, flags_mapping: dict) -> str:
+    """
+    flags_data: {flag_name: [{"sid": ..., "name": ..., "brand": ..., "seller": ...}, ...]}
+    Renders a kanban-style drag & drop board where cards can be moved between flag columns.
+    """
+    O = JUMIA_COLORS["primary_orange"]
+    R = JUMIA_COLORS["jumia_red"]
+    G = JUMIA_COLORS["success_green"]
+
+    # Colour palette for columns
+    col_colors = ["#E3F2FD","#FFF3E0","#F3E5F5","#E8F5E9","#FBE9E7","#E0F7FA","#FFF8E1","#FCE4EC"]
+    col_borders = ["#1565C0","#E65100","#6A1B9A","#2E7D32","#BF360C","#00695C","#F57F17","#880E4F"]
+
+    all_flags = list(flags_data.keys()) + ["✅ Approved"]
+    flags_json = json.dumps(flags_data)
+    flag_reasons_json = json.dumps({k: v[0] for k, v in flags_mapping.items()})
+    all_flags_json = json.dumps(all_flags)
+    col_colors_json = json.dumps(col_colors)
+    col_borders_json = json.dumps(col_borders)
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+* {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }}
+body {{ background: #f0f2f5; padding: 12px; overflow-x: auto; }}
+
+.board-header {{
+  display: flex; align-items: center; gap: 12px; margin-bottom: 14px;
+  padding: 10px 16px;
+  background: linear-gradient(135deg, {O}, #FF9933);
+  border-radius: 10px;
+  box-shadow: 0 3px 10px rgba(246,139,30,0.3);
+  flex-wrap: wrap;
+}}
+.board-title {{ color: #fff; font-size: 16px; font-weight: 800; letter-spacing: 0.3px; }}
+.board-subtitle {{ color: rgba(255,255,255,0.85); font-size: 12px; }}
+.apply-btn {{
+  margin-left: auto;
+  padding: 8px 18px;
+  background: #fff;
+  color: {O};
+  border: none;
+  border-radius: 6px;
+  font-weight: 800;
+  font-size: 13px;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+  transition: transform 0.1s;
+}}
+.apply-btn:hover {{ transform: scale(1.04); }}
+.apply-btn:active {{ transform: scale(0.98); }}
+.changes-count {{
+  background: {R};
+  color: #fff;
+  border-radius: 12px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  min-width: 20px;
+  text-align: center;
+}}
+
+.board {{
+  display: flex;
+  gap: 12px;
+  min-height: 500px;
+  align-items: flex-start;
+}}
+
+.column {{
+  min-width: 230px;
+  max-width: 260px;
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+  flex-shrink: 0;
+  border: 2px solid transparent;
+  transition: border-color 0.15s;
+}}
+.column.drag-over {{
+  border-color: {O} !important;
+  box-shadow: 0 0 0 3px rgba(246,139,30,0.25);
+}}
+
+.col-header {{
+  padding: 10px 12px;
+  font-weight: 800;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  letter-spacing: 0.2px;
+  border-bottom: 2px solid rgba(0,0,0,0.08);
+}}
+.col-count {{
+  background: rgba(0,0,0,0.12);
+  border-radius: 10px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 700;
+}}
+
+.col-body {{
+  min-height: 120px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: rgba(255,255,255,0.6);
+}}
+.col-body.drag-over {{ background: rgba(246,139,30,0.06); }}
+
+.card {{
+  background: #fff;
+  border-radius: 7px;
+  padding: 9px 10px;
+  border-left: 4px solid #ccc;
+  cursor: grab;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  transition: box-shadow 0.15s, transform 0.1s, opacity 0.15s;
+  user-select: none;
+}}
+.card:hover {{ box-shadow: 0 3px 10px rgba(0,0,0,0.14); transform: translateY(-1px); }}
+.card.dragging {{ opacity: 0.45; transform: rotate(2deg) scale(0.97); cursor: grabbing; }}
+.card.moved {{ border-left-color: {O} !important; background: #FFFBF6; }}
+
+.card-sid {{ font-size: 10px; color: #999; margin-bottom: 3px; font-family: monospace; }}
+.card-name {{ font-size: 11px; font-weight: 700; color: #222; line-height: 1.3; margin-bottom: 3px; }}
+.card-brand {{ font-size: 10px; color: {O}; font-weight: 600; }}
+.card-seller {{ font-size: 9px; color: #888; margin-top: 3px; border-top: 1px dashed #eee; padding-top: 3px; }}
+
+.empty-hint {{
+  text-align: center;
+  color: #bbb;
+  font-size: 11px;
+  padding: 20px 8px;
+  font-style: italic;
+}}
+
+.search-wrap {{ margin-bottom: 8px; }}
+.col-search {{
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid #ddd;
+  border-radius: 5px;
+  font-size: 11px;
+  outline: none;
+  background: #fafafa;
+}}
+.col-search:focus {{ border-color: {O}; background: #fff; }}
+
+.toast {{
+  position: fixed; bottom: 20px; right: 20px;
+  background: #313133; color: #fff;
+  padding: 10px 18px; border-radius: 8px;
+  font-size: 13px; font-weight: 600;
+  opacity: 0; transition: opacity 0.3s;
+  pointer-events: none; z-index: 9999;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}}
+.toast.show {{ opacity: 1; }}
+</style>
+</head>
+<body>
+
+<div class="board-header">
+  <div>
+    <div class="board-title">🔀 Bulk Re-categorization Board</div>
+    <div class="board-subtitle">Drag products between flag categories · Drop to "✅ Approved" to clear flag</div>
+  </div>
+  <span class="changes-count" id="changes-count">0 changes</span>
+  <button class="apply-btn" onclick="applyChanges()">✓ Apply All Changes</button>
+</div>
+
+<div class="board" id="board"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+var FLAGS_DATA     = {flags_json};
+var FLAG_REASONS   = {flag_reasons_json};
+var ALL_FLAGS      = {all_flags_json};
+var COL_COLORS     = {col_colors_json};
+var COL_BORDERS    = {col_borders_json};
+
+// State: current position of every card {{sid -> flagName}}
+var cardState = {{}};
+// Original positions for diff
+var originalState = {{}};
+
+(function initState() {{
+  ALL_FLAGS.forEach(function(flag) {{
+    var cards = FLAGS_DATA[flag] || [];
+    cards.forEach(function(card) {{
+      cardState[card.sid] = flag;
+      originalState[card.sid] = flag;
+    }});
+  }});
+  // Approved column starts empty in flags_data, so we don't need to init it
+}})();
+
+var dragSid = null;
+
+function escHtml(s) {{
+  return (s||"").toString()
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}}
+
+function getChangedCount() {{
+  return Object.keys(cardState).filter(sid => cardState[sid] !== originalState[sid]).length;
+}}
+
+function updateChangesCount() {{
+  var n = getChangedCount();
+  document.getElementById('changes-count').textContent = n + ' change' + (n===1?'':'s');
+}}
+
+function showToast(msg) {{
+  var t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(function() {{ t.classList.remove('show'); }}, 2200);
+}}
+
+function makeCard(card, flagName) {{
+  var isMoved = cardState[card.sid] !== originalState[card.sid];
+  var col = getColColor(flagName);
+  var div = document.createElement('div');
+  div.className = 'card' + (isMoved ? ' moved' : '');
+  div.id = 'card-' + card.sid;
+  div.setAttribute('draggable', 'true');
+  div.style.borderLeftColor = col.border;
+  div.innerHTML = `
+    <div class="card-sid">${{escHtml(card.sid)}}</div>
+    <div class="card-name" title="${{escHtml(card.name)}}">${{escHtml((card.name||'').substring(0,50))}}</div>
+    <div class="card-brand">${{escHtml(card.brand||'')}}</div>
+    <div class="card-seller">${{escHtml(card.seller||'')}}</div>
+  `;
+  div.addEventListener('dragstart', function(e) {{
+    dragSid = card.sid;
+    div.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+  }});
+  div.addEventListener('dragend', function() {{
+    dragSid = null;
+    div.classList.remove('dragging');
+    document.querySelectorAll('.column.drag-over').forEach(c => c.classList.remove('drag-over'));
+    document.querySelectorAll('.col-body.drag-over').forEach(c => c.classList.remove('drag-over'));
+  }});
+  return div;
+}}
+
+function getColColor(flag) {{
+  var idx = ALL_FLAGS.indexOf(flag);
+  if (idx < 0) idx = 0;
+  if (flag === '✅ Approved') return {{ bg: '#E8F5E9', border: '#2E7D32', text: '#1B5E20' }};
+  return {{
+    bg:     COL_COLORS[idx % COL_COLORS.length],
+    border: COL_BORDERS[idx % COL_BORDERS.length],
+    text:   COL_BORDERS[idx % COL_BORDERS.length],
+  }};
+}}
+
+function buildBoard() {{
+  var board = document.getElementById('board');
+  board.innerHTML = '';
+
+  ALL_FLAGS.forEach(function(flag, fi) {{
+    var col = getColColor(flag);
+
+    // Gather cards for this column (based on current state)
+    var allCardsInFlag = [];
+    Object.keys(cardState).forEach(function(sid) {{
+      if (cardState[sid] === flag) {{
+        // Find card data from original flags_data
+        var found = null;
+        Object.values(FLAGS_DATA).forEach(function(cards) {{
+          cards.forEach(function(c) {{ if (c.sid === sid) found = c; }});
+        }});
+        if (found) allCardsInFlag.push(found);
+      }}
+    }});
+
+    var colEl = document.createElement('div');
+    colEl.className = 'column';
+    colEl.id = 'col-' + fi;
+    colEl.style.border = '2px solid ' + col.border;
+
+    var shortFlag = flag.replace('✅ ', '').substring(0, 28);
+    colEl.innerHTML = `
+      <div class="col-header" style="background:${{col.bg}};color:${{col.text}};">
+        <span title="${{escHtml(flag)}}">${{escHtml(shortFlag)}}</span>
+        <span class="col-count" id="count-${{fi}}">${{allCardsInFlag.length}}</span>
+      </div>
+      <div class="search-wrap" style="padding:6px 8px 0 8px;background:${{col.bg}};">
+        <input class="col-search" type="text" placeholder="Filter…" oninput="filterCol(${{fi}}, this.value)">
+      </div>
+      <div class="col-body" id="body-${{fi}}"></div>
+    `;
+
+    var body = colEl.querySelector('.col-body');
+    body.addEventListener('dragover', function(e) {{
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      colEl.classList.add('drag-over');
+      body.classList.add('drag-over');
+    }});
+    body.addEventListener('dragleave', function(e) {{
+      if (!colEl.contains(e.relatedTarget)) {{
+        colEl.classList.remove('drag-over');
+        body.classList.remove('drag-over');
+      }}
+    }});
+    body.addEventListener('drop', function(e) {{
+      e.preventDefault();
+      colEl.classList.remove('drag-over');
+      body.classList.remove('drag-over');
+      if (!dragSid) return;
+      var prevFlag = cardState[dragSid];
+      if (prevFlag === flag) return;
+      cardState[dragSid] = flag;
+      updateChangesCount();
+      rebuildAllCols();
+      showToast('Moved to: ' + flag.substring(0, 40));
+    }});
+
+    board.appendChild(colEl);
+
+    // Render cards
+    if (allCardsInFlag.length === 0) {{
+      body.innerHTML = '<div class="empty-hint">Drop here</div>';
+    }} else {{
+      allCardsInFlag.forEach(function(card) {{
+        body.appendChild(makeCard(card, flag));
+      }});
+    }}
+  }});
+}}
+
+function rebuildAllCols() {{
+  // More efficient: just rebuild each column body in place
+  ALL_FLAGS.forEach(function(flag, fi) {{
+    var body = document.getElementById('body-' + fi);
+    var countEl = document.getElementById('count-' + fi);
+    if (!body) return;
+
+    var allCardsInFlag = [];
+    Object.keys(cardState).forEach(function(sid) {{
+      if (cardState[sid] === flag) {{
+        var found = null;
+        Object.values(FLAGS_DATA).forEach(function(cards) {{
+          cards.forEach(function(c) {{ if (c.sid === sid) found = c; }});
+        }});
+        if (found) allCardsInFlag.push(found);
+      }}
+    }});
+
+    body.innerHTML = '';
+    if (allCardsInFlag.length === 0) {{
+      body.innerHTML = '<div class="empty-hint">Drop here</div>';
+    }} else {{
+      allCardsInFlag.forEach(function(card) {{
+        body.appendChild(makeCard(card, flag));
+      }});
+    }}
+    if (countEl) countEl.textContent = allCardsInFlag.length;
+  }});
+}}
+
+function filterCol(fi, query) {{
+  var body = document.getElementById('body-' + fi);
+  if (!body) return;
+  var q = query.toLowerCase();
+  body.querySelectorAll('.card').forEach(function(card) {{
+    var text = card.textContent.toLowerCase();
+    card.style.display = (q === '' || text.includes(q)) ? '' : 'none';
+  }});
+}}
+
+function applyChanges() {{
+  var changes = {{}};
+  Object.keys(cardState).forEach(function(sid) {{
+    if (cardState[sid] !== originalState[sid]) {{
+      changes[sid] = cardState[sid];
+    }}
+  }});
+  if (Object.keys(changes).length === 0) {{
+    showToast('No changes to apply.');
+    return;
+  }}
+  sendMsg('recategorize', changes);
+  // Update originals so we don't re-fire
+  Object.keys(changes).forEach(function(sid) {{
+    originalState[sid] = cardState[sid];
+  }});
+  updateChangesCount();
+  showToast('✓ ' + Object.keys(changes).length + ' change(s) applied!');
+}}
+
+// ── postMessage bridge (same pattern as grid) ─────────────────────────────────
+function sendMsg(type, payload) {{
+  try {{
+    var par = window.parent;
+    var inputs = par.document.querySelectorAll('input[type="text"]');
+    var bridge = null;
+    for (var i = 0; i < inputs.length; i++) {{
+      if (inputs[i].getAttribute('aria-label') === 'rcbridge' || inputs[i].placeholder === 'RCBRIDGE_UNIQUE') {{
+        bridge = inputs[i]; break;
+      }}
+    }}
+    if (!bridge) return;
+    var msg = JSON.stringify({{action: type, payload: payload}});
+    Object.getOwnPropertyDescriptor(par.HTMLInputElement.prototype, 'value').set.call(bridge, msg);
+    bridge.dispatchEvent(new par.Event('input', {{bubbles: true}}));
+    setTimeout(function() {{
+      bridge.blur();
+      bridge.dispatchEvent(new par.KeyboardEvent('keydown', {{bubbles: true, cancelable: true, key: 'Enter', keyCode: 13}}));
+    }}, 150);
+  }} catch(ex) {{ console.error('rcbridge error:', ex); }}
+}}
+
+buildBoard();
+</script>
+</body>
+</html>"""
+
+
+# -------------------------------------------------
+# ENHANCED GRID: virtual scroll + lazy images + debounce
 # -------------------------------------------------
 def build_fast_grid_html(
     page_data,
@@ -1284,12 +1830,10 @@ def build_fast_grid_html(
     for _, row in page_data.iterrows():
         sid = str(row["PRODUCT_SET_SID"])
         img_url = str(row.get("MAIN_IMAGE", "")).strip()
-        
         if img_url.startswith("http://"):
             img_url = img_url.replace("http://", "https://")
         if not img_url.startswith("http"):
-            img_url = "https://via.placeholder.com/150?text=No+Image"
-            
+            img_url = ""   # empty = use placeholder lazy
         cards_data.append({
             "sid":      sid,
             "img":      img_url,
@@ -1309,85 +1853,78 @@ def build_fast_grid_html(
   *{{box-sizing:border-box;margin:0;padding:0;font-family:sans-serif;}}
   body{{background:#f5f5f5;padding:8px;}}
 
-  /* ── UPGRADED STICKY CONTROL BAR ── */
+  /* ── STICKY CONTROL BAR ── */
   .ctrl-bar{{
-    position: -webkit-sticky;
-    position: sticky;
-    top: 8px;
-    z-index: 9999;
+    position:-webkit-sticky;position:sticky;top:8px;z-index:9999;
     display:flex;align-items:center;gap:8px;flex-wrap:wrap;
     padding:8px 12px;
-    background: rgba(255, 255, 255, 0.90);
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
-    border:1px solid rgba(224, 224, 224, 0.8);
-    border-radius:8px;margin-bottom:12px;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+    background:rgba(255,255,255,0.92);
+    backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+    border:1px solid rgba(224,224,224,0.8);border-radius:8px;margin-bottom:12px;
+    box-shadow:0 4px 16px rgba(0,0,0,0.15);
   }}
+  /* ── DEBOUNCED SEARCH (inside control bar) ── */
+  .grid-search{{
+    flex:1;min-width:140px;padding:6px 10px;border:1px solid #ddd;border-radius:5px;
+    font-size:12px;outline:none;background:#fff;
+  }}
+  .grid-search:focus{{border-color:{O};}}
+
   .sel-count{{font-weight:700;color:{O};font-size:13px;min-width:80px;}}
-  .reason-sel{{
-    flex:1;min-width:160px;padding:6px 10px;
-    border:1px solid #ccc;border-radius:4px;font-size:12px;
-    background:#fff;cursor:pointer;outline:none;
-  }}
-  .batch-btn{{
-    padding:7px 14px;background:{O};color:#fff;
-    border:none;border-radius:4px;font-weight:700;font-size:12px;
-    cursor:pointer;white-space:nowrap;
-  }}
+  .reason-sel{{flex:1;min-width:160px;padding:6px 10px;border:1px solid #ccc;border-radius:4px;font-size:12px;background:#fff;cursor:pointer;outline:none;}}
+  .batch-btn{{padding:7px 14px;background:{O};color:#fff;border:none;border-radius:4px;font-weight:700;font-size:12px;cursor:pointer;white-space:nowrap;}}
   .batch-btn:hover{{opacity:.88;}}
-  .desel-btn{{
-    padding:7px 12px;background:#fff;color:#555;
-    border:1px solid #ccc;border-radius:4px;font-size:12px;
-    cursor:pointer;white-space:nowrap;
-  }}
+  .desel-btn{{padding:7px 12px;background:#fff;color:#555;border:1px solid #ccc;border-radius:4px;font-size:12px;cursor:pointer;white-space:nowrap;}}
   .desel-btn:hover{{background:#f5f5f5;}}
 
+  /* ── VIRTUAL SCROLL WRAPPER ── */
+  #vs-viewport{{
+    height:600px;overflow-y:auto;position:relative;
+    background:#f5f5f5;border-radius:6px;
+  }}
+  #vs-spacer{{width:100%;}}
+  #vs-window{{position:absolute;left:0;right:0;}}
+
   /* ── grid & cards ── */
-  .grid{{display:grid;grid-template-columns:repeat({cols_per_row},1fr);gap:12px;}}
+  .grid{{display:grid;grid-template-columns:repeat({cols_per_row},1fr);gap:12px;padding:4px;}}
   .card{{border:2px solid #e0e0e0;border-radius:8px;padding:10px;background:#fff;
          position:relative;transition:border-color .15s,box-shadow .15s;}}
-         
-  /* Selected for general batch (Green) */
-  .card.selected{{border-color:{G};box-shadow:0 0 0 3px rgba(76,175,80,.2); background:rgba(76,175,80,.04);}}
-  
-  /* Selected via individual button (Red/Staged) */
-  .card.staged-rej{{border-color:{R};box-shadow:0 0 0 3px rgba(231,60,23,.2); background:rgba(231,60,23,.04);}}
-  
-  /* Already committed to Python (Grey) */
+  .card.selected{{border-color:{G};box-shadow:0 0 0 3px rgba(76,175,80,.2);background:rgba(76,175,80,.04);}}
+  .card.staged-rej{{border-color:{R};box-shadow:0 0 0 3px rgba(231,60,23,.2);background:rgba(231,60,23,.04);}}
   .card.committed-rej{{border-color:#bbb;opacity:.6;}}
-  
-  .card-img-wrap{{position:relative;cursor:pointer; overflow:hidden; border-radius:6px;}}
-  .card-img{{width:100%;aspect-ratio:1;object-fit:contain;border-radius:6px;display:block; transition: transform 0.25s ease-in-out;}}
+  .card.hidden{{display:none;}}  /* used by debounce search */
+
+  /* ── IMAGE LAZY LOADING ── */
+  .card-img-wrap{{position:relative;cursor:pointer;overflow:hidden;border-radius:6px;}}
+  .card-img{{width:100%;aspect-ratio:1;object-fit:contain;border-radius:6px;display:block;
+             transition:transform 0.25s ease-in-out;background:#f0f0f0;}}
+  /* placeholder shimmer while not yet loaded */
+  .card-img:not([src]),.card-img[src=""]{{
+    background:linear-gradient(90deg,#f0f0f0 25%,#e0e0e0 50%,#f0f0f0 75%);
+    background-size:200% 100%;animation:shimmer 1.4s infinite;
+  }}
+  @keyframes shimmer{{0%{{background-position:200% 0}}100%{{background-position:-200% 0}}}}
   .card.committed-rej .card-img{{filter:grayscale(80%);}}
-  
-  /* HOVER ZOOM */
-  .card-img-wrap:hover .card-img {{ transform: scale(1.15); }}
-  
+  .card-img-wrap:hover .card-img{{transform:scale(1.15);}}
+
   .tick{{position:absolute;bottom:6px;right:6px;width:22px;height:22px;border-radius:50%;
          background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;
          color:transparent;font-size:13px;font-weight:900;pointer-events:none;}}
   .card.selected .tick{{background:{G};color:#fff;}}
   .card.staged-rej .tick{{background:{R};color:#fff;}}
-  
-  .warn-wrap{{position:absolute;top:6px;right:6px;display:flex;flex-direction:column;gap:3px;
-              z-index:5;pointer-events:none;}}
-  .warn-badge{{background:rgba(255,193,7,.95);color:#313133;font-size:9px;font-weight:800;
-               padding:3px 7px;border-radius:10px;}}
-               
+
+  .warn-wrap{{position:absolute;top:6px;right:6px;display:flex;flex-direction:column;gap:3px;z-index:5;pointer-events:none;}}
+  .warn-badge{{background:rgba(255,193,7,.95);color:#313133;font-size:9px;font-weight:800;padding:3px 7px;border-radius:10px;}}
+
   .rej-overlay{{display:none;position:absolute;inset:0;background:rgba(255,255,255,.90);
                 border-radius:6px;flex-direction:column;align-items:center;
                 justify-content:center;z-index:20;gap:5px;padding:8px;text-align:center;}}
   .card.committed-rej .rej-overlay{{display:flex;}}
   .card.staged-rej .rej-overlay.staged{{display:flex;}}
-  
-  .rej-badge{{background:{R};color:#fff;padding:3px 10px;border-radius:10px; font-size:11px;font-weight:700;}}
+  .rej-badge{{background:{R};color:#fff;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:700;}}
   .rej-badge.pending{{background:{O};}}
-  
   .rej-label{{font-size:10px;color:{R};font-weight:600;max-width:120px;}}
-  
-  /* UNDO BUTTON */
-  .undo-btn{{margin-top:8px; padding:6px 12px; background:#313133; color:#fff; border:none; border-radius:4px; font-size:11px; font-weight:bold; cursor:pointer; box-shadow:0 2px 4px rgba(0,0,0,0.2);}}
+  .undo-btn{{margin-top:8px;padding:6px 12px;background:#313133;color:#fff;border:none;border-radius:4px;font-size:11px;font-weight:bold;cursor:pointer;box-shadow:0 2px 4px rgba(0,0,0,0.2);}}
   .undo-btn:hover{{background:#000;}}
 
   .meta{{font-size:11px;margin-top:8px;line-height:1.4;}}
@@ -1395,18 +1932,18 @@ def build_fast_grid_html(
   .meta .br{{color:{O};font-weight:700;margin:2px 0;}}
   .meta .ct{{color:#666;font-size:10px;}}
   .meta .sl{{color:#999;font-size:9px;margin-top:4px;border-top:1px dashed #eee;padding-top:4px;}}
-  
+
   .acts{{display:flex;gap:4px;margin-top:8px;}}
-  .act-btn{{flex:1;padding:6px;font-size:11px;border:none;border-radius:4px;cursor:pointer;
-            font-weight:700;color:#fff;background:{O};}}
-  .act-more{{flex:1;font-size:11px;border:1px solid #ccc;border-radius:4px;outline:none;
-             cursor:pointer;background:#fff;}}
+  .act-btn{{flex:1;padding:6px;font-size:11px;border:none;border-radius:4px;cursor:pointer;font-weight:700;color:#fff;background:{O};}}
+  .act-more{{flex:1;font-size:11px;border:1px solid #ccc;border-radius:4px;outline:none;cursor:pointer;background:#fff;}}
 </style>
 </head>
 <body>
 
 <div class="ctrl-bar">
   <span class="sel-count" id="sel-count-bar">0 selected</span>
+  <!-- DEBOUNCED SEARCH -->
+  <input class="grid-search" type="text" id="grid-search-inp" placeholder="🔍 Filter by name…" oninput="onSearchInput(this.value)">
   <select class="reason-sel" id="batch-reason">
     <option value="REJECT_POOR_IMAGE">Poor Image Quality</option>
     <option value="REJECT_WRONG_CAT">Wrong Category</option>
@@ -1421,88 +1958,191 @@ def build_fast_grid_html(
   <button class="desel-btn" onclick="doDeselAll()">☐ Deselect All</button>
 </div>
 
-<div class="grid" id="card-grid"></div>
+<!-- VIRTUAL SCROLL VIEWPORT -->
+<div id="vs-viewport">
+  <div id="vs-spacer"></div>
+  <div id="vs-window">
+    <div class="grid" id="card-grid"></div>
+  </div>
+</div>
 
 <script>
 function escapeHtml(unsafe) {{
-    return (unsafe || "").toString()
-         .replace(/&/g, "&amp;")
-         .replace(/</g, "&lt;")
-         .replace(/>/g, "&gt;")
-         .replace(/"/g, "&quot;")
-         .replace(/'/g, "&#039;");
+    return (unsafe||"").toString()
+         .replace(/&/g,"&amp;").replace(/</g,"&lt;")
+         .replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");
 }}
 
 var CARDS     = {cards_json};
 var COMMITTED = {committed_json};
 
-// KEEP STATE ALIVE ACROSS RE-RENDERS
-window._gridSelected = window._gridSelected || {{}};
-window._stagedRejections = window._stagedRejections || {{}};
+window._gridSelected    = window._gridSelected    || {{}};
+window._stagedRejections= window._stagedRejections|| {{}};
 var selected = window._gridSelected;
-var staged = window._stagedRejections;
+var staged   = window._stagedRejections;
 
-// ── 1. ANTI-JUMP SCROLL RESTORATION ENGINE ──
-function saveScroll() {{
-    try {{
-        sessionStorage.setItem("jt_iframe_scroll", window.scrollY);
-        if (window.parent && window.parent.document) {{
-            var main = window.parent.document.querySelector('.main');
-            if (main) window.parent.sessionStorage.setItem("jt_parent_scroll", main.scrollTop);
+// ── VIRTUAL SCROLL ENGINE ─────────────────────────────────────────────────────
+var CARD_H         = 310;  // estimated px per row
+var COLS           = {cols_per_row};
+var OVERSCAN_ROWS  = 2;    // extra rows rendered above/below viewport
+var filteredCards  = CARDS.slice();  // current search-filtered set
+var _vsDirty       = false;
+
+var viewport = document.getElementById('vs-viewport');
+var spacer   = document.getElementById('vs-spacer');
+var vsWindow = document.getElementById('vs-window');
+
+function vsUpdate() {{
+  if (!filteredCards.length) {{
+    spacer.style.height = '0px';
+    document.getElementById('card-grid').innerHTML = '<p style="text-align:center;color:#aaa;padding:20px">No results</p>';
+    return;
+  }}
+  var rows       = Math.ceil(filteredCards.length / COLS);
+  var totalH     = rows * CARD_H;
+  spacer.style.height = totalH + 'px';
+
+  var scrollTop  = viewport.scrollTop;
+  var viewH      = viewport.clientHeight || 600;
+
+  var firstRow   = Math.max(0, Math.floor(scrollTop / CARD_H) - OVERSCAN_ROWS);
+  var lastRow    = Math.min(rows - 1, Math.floor((scrollTop + viewH) / CARD_H) + OVERSCAN_ROWS);
+  var firstIdx   = firstRow * COLS;
+  var lastIdx    = Math.min(filteredCards.length - 1, (lastRow + 1) * COLS - 1);
+
+  vsWindow.style.top = (firstRow * CARD_H) + 'px';
+
+  var html = '';
+  for (var i = firstIdx; i <= lastIdx; i++) {{
+    html += renderCard(filteredCards[i]);
+  }}
+  document.getElementById('card-grid').innerHTML = html;
+
+  // Attach lazy observer to new images
+  attachLazyObserver();
+  _vsDirty = false;
+}}
+
+function scheduleVsUpdate() {{
+  if (_vsDirty) return;
+  _vsDirty = true;
+  requestAnimationFrame(vsUpdate);
+}}
+
+viewport.addEventListener('scroll', scheduleVsUpdate, {{passive: true}});
+window.addEventListener('resize', scheduleVsUpdate);
+
+// ── LAZY IMAGE OBSERVER ──────────────────────────────────────────────────────
+var _lazyObserver = null;
+
+function attachLazyObserver() {{
+  if (!('IntersectionObserver' in window)) {{
+    // fallback: just set all srcs directly
+    document.querySelectorAll('img[data-src]').forEach(function(img) {{
+      img.src = img.getAttribute('data-src') || 'https://via.placeholder.com/150?text=No+Image';
+      img.removeAttribute('data-src');
+    }});
+    return;
+  }}
+
+  if (!_lazyObserver) {{
+    _lazyObserver = new IntersectionObserver(function(entries) {{
+      entries.forEach(function(entry) {{
+        if (entry.isIntersecting) {{
+          var img = entry.target;
+          var src = img.getAttribute('data-src');
+          if (src) {{
+            img.src = src;
+            img.removeAttribute('data-src');
+          }}
+          _lazyObserver.unobserve(img);
         }}
-    }} catch(e) {{}}
+      }});
+    }}, {{ root: viewport, rootMargin: '200px', threshold: 0.01 }});
+  }}
+
+  document.querySelectorAll('img[data-src]').forEach(function(img) {{
+    _lazyObserver.observe(img);
+  }});
+}}
+
+// ── DEBOUNCED SEARCH ──────────────────────────────────────────────────────────
+var _searchTimer = null;
+function onSearchInput(val) {{
+  clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(function() {{
+    var q = val.toLowerCase().trim();
+    if (q === '') {{
+      filteredCards = CARDS.slice();
+    }} else {{
+      filteredCards = CARDS.filter(function(c) {{
+        return (c.name||'').toLowerCase().includes(q)
+            || (c.brand||'').toLowerCase().includes(q)
+            || (c.cat||'').toLowerCase().includes(q)
+            || (c.seller||'').toLowerCase().includes(q);
+      }});
+    }}
+    viewport.scrollTop = 0;
+    scheduleVsUpdate();
+  }}, 250);  // 250ms debounce
+}}
+
+// ── SCROLL RESTORATION ──────────────────────────────────────────────────────
+function saveScroll() {{
+  try {{
+    sessionStorage.setItem("jt_iframe_scroll", viewport.scrollTop);
+    if (window.parent && window.parent.document) {{
+      var main = window.parent.document.querySelector('.main');
+      if (main) window.parent.sessionStorage.setItem("jt_parent_scroll", main.scrollTop);
+    }}
+  }} catch(e) {{}}
 }}
 
 function restoreScroll() {{
-    try {{
-        var iScroll = sessionStorage.getItem("jt_iframe_scroll");
-        if (iScroll) {{
-            window.scrollTo(0, parseInt(iScroll));
-            sessionStorage.removeItem("jt_iframe_scroll");
-        }}
-
-        if (window.parent && window.parent.document) {{
-            var main = window.parent.document.querySelector('.main');
-            var pScroll = window.parent.sessionStorage.getItem("jt_parent_scroll");
-            if (main && pScroll) {{
-                setTimeout(() => {{ 
-                    main.scrollTo({{top: parseInt(pScroll), behavior: 'instant'}}); 
-                    window.parent.sessionStorage.removeItem("jt_parent_scroll");
-                }}, 20);
-            }}
-        }}
-    }} catch(e) {{}}
+  try {{
+    var iScroll = sessionStorage.getItem("jt_iframe_scroll");
+    if (iScroll) {{
+      viewport.scrollTop = parseInt(iScroll);
+      sessionStorage.removeItem("jt_iframe_scroll");
+    }}
+    if (window.parent && window.parent.document) {{
+      var main = window.parent.document.querySelector('.main');
+      var pScroll = window.parent.sessionStorage.getItem("jt_parent_scroll");
+      if (main && pScroll) {{
+        setTimeout(function() {{
+          main.scrollTo({{top: parseInt(pScroll), behavior: 'instant'}});
+          window.parent.sessionStorage.removeItem("jt_parent_scroll");
+        }}, 20);
+      }}
+    }}
+  }} catch(e) {{}}
 }}
 restoreScroll();
 
-// ── 2. NAVIGATION / DOWNLOAD INTERCEPTOR ──
+// ── NAVIGATION INTERCEPTOR ───────────────────────────────────────────────────
 if (window.parent) {{
-    window.parent._jtClickListener = function(e) {{
-        let btn = e.target.closest('button');
-        if (!btn) return;
-        let txt = btn.innerText;
-        if (txt.includes('Next') || txt.includes('Prev') || txt.includes('Generate') || txt.includes('Download') || txt.includes('Jump')) {{
-            let selCount = Object.keys(window._gridSelected).length;
-            let stagedCount = Object.keys(window._stagedRejections).length;
-            let total = selCount + stagedCount;
-            
-            if (total > 0) {{
-                let msg = "Wait! You have " + total + " products selected but NOT rejected yet.\\n\\nClick 'Cancel' to stay on this page and hit 'Batch Reject Selected'.\\n\\nClick 'OK' to ignore them and proceed anyway.";
-                if (!confirm(msg)) {{
-                    e.preventDefault();
-                    e.stopPropagation();
-                }} else {{
-                    for(let k in window._gridSelected) delete window._gridSelected[k];
-                    for(let k in window._stagedRejections) delete window._stagedRejections[k];
-                }}
-            }}
+  window.parent._jtClickListener = function(e) {{
+    var btn = e.target.closest('button');
+    if (!btn) return;
+    var txt = btn.innerText;
+    if (txt.includes('Next')||txt.includes('Prev')||txt.includes('Generate')||txt.includes('Download')||txt.includes('Jump')) {{
+      var total = Object.keys(window._gridSelected).length + Object.keys(window._stagedRejections).length;
+      if (total > 0) {{
+        var msg = "Wait! You have " + total + " products selected but NOT rejected yet.\\n\\nClick 'Cancel' to stay and hit 'Batch Reject'.\\nClick 'OK' to ignore them.";
+        if (!confirm(msg)) {{
+          e.preventDefault(); e.stopPropagation();
+        }} else {{
+          for(var k in window._gridSelected) delete window._gridSelected[k];
+          for(var k in window._stagedRejections) delete window._stagedRejections[k];
         }}
-    }};
-    window.parent.document.removeEventListener('click', window.parent._jtClickListener, true);
-    window.parent.document.addEventListener('click', window.parent._jtClickListener, true);
+      }}
+    }}
+  }};
+  window.parent.document.removeEventListener('click', window.parent._jtClickListener, true);
+  window.parent.document.addEventListener('click', window.parent._jtClickListener, true);
 }}
 
-// ── 3. postMessage BRIDGE WITH ANTI-YANK ──
+// ── postMessage BRIDGE ───────────────────────────────────────────────────────
 function sendMsg(type, payload) {{
   try {{
     var par = window.parent;
@@ -1514,191 +2154,145 @@ function sendMsg(type, payload) {{
       }}
     }}
     if (!bridge) return;
-    
-    // CACHE POSITIONS BEFORE DOING ANYTHING
     saveScroll();
     var main = par.document.querySelector('.main');
     var currParentScroll = main ? main.scrollTop : 0;
-    var currIframeScroll = window.scrollY;
-
+    var currIframeScroll = viewport.scrollTop;
     var msg = JSON.stringify({{action: type, payload: payload}});
-    
-    // NEUTRALIZE BROWSER FOCUS JUMP
-    bridge.focus({{ preventScroll: true }});
-    // Double-enforce: instantly snap back if the browser ignored preventScroll
+    bridge.focus({{preventScroll: true}});
     if (main) main.scrollTop = currParentScroll;
-    window.scrollTo(0, currIframeScroll);
-
+    viewport.scrollTop = currIframeScroll;
     Object.getOwnPropertyDescriptor(par.HTMLInputElement.prototype, 'value').set.call(bridge, msg);
     bridge.dispatchEvent(new par.Event('input', {{bubbles: true}}));
-    
     setTimeout(function() {{
-        bridge.blur();
-        if (main) main.scrollTop = currParentScroll; // Fix potential blur jump
-        bridge.dispatchEvent(new par.KeyboardEvent('keydown', {{bubbles: true, cancelable: true, key: 'Enter', keyCode: 13}}));
+      bridge.blur();
+      if (main) main.scrollTop = currParentScroll;
+      bridge.dispatchEvent(new par.KeyboardEvent('keydown', {{bubbles: true, cancelable: true, key: 'Enter', keyCode: 13}}));
     }}, 150);
   }} catch(ex) {{ console.error('jtbridge sendMsg error:', ex); }}
 }}
 
-// ── UI helpers ────────────────────────────────────────────────────────────────
+// ── UI HELPERS ───────────────────────────────────────────────────────────────
 function updateSelCount() {{
-  const n = Object.keys(selected).length + Object.keys(staged).length;
+  var n = Object.keys(selected).length + Object.keys(staged).length;
   document.getElementById('sel-count-bar').textContent = n + ' items pending reject';
 }}
 
-// ── Card rendering ────────────────────────────────────────────────────────────
+// ── CARD RENDERER ────────────────────────────────────────────────────────────
 function renderCard(card) {{
-  const sid = card.sid;
-  const img = escapeHtml(card.img);
-  const isCommitted = sid in COMMITTED;
-  const isStaged = sid in staged;
-  const isSelected = !isCommitted && !isStaged && (sid in selected);
+  var sid = card.sid;
+  var isCommitted = sid in COMMITTED;
+  var isStaged    = sid in staged;
+  var isSelected  = !isCommitted && !isStaged && (sid in selected);
 
-  let cls = 'card';
-  if (isCommitted)     cls += ' committed-rej';
-  else if (isStaged)   cls += ' staged-rej';
-  else if (isSelected) cls += ' selected';
+  var cls = 'card';
+  if (isCommitted)    cls += ' committed-rej';
+  else if (isStaged)  cls += ' staged-rej';
+  else if (isSelected)cls += ' selected';
 
-  const shortName = card.name.length > 38 ? escapeHtml(card.name.slice(0,38))+'…' : escapeHtml(card.name);
-  const warnHtml  = (card.warnings || []).map(w => `<span class="warn-badge">${{escapeHtml(w)}}</span>`).join('');
-  
-  let overlayHtml = '';
-  let actHtml = '';
+  var shortName = card.name.length > 38 ? escapeHtml(card.name.slice(0,38))+'…' : escapeHtml(card.name);
+  var warnHtml  = (card.warnings||[]).map(function(w){{return '<span class="warn-badge">'+escapeHtml(w)+'</span>';}}).join('');
+
+  // Use data-src for lazy loading; src stays empty until IntersectionObserver fires
+  var imgSrc  = card.img || '';
+  var imgAttr = imgSrc
+    ? 'data-src="'+escapeHtml(imgSrc)+'"'
+    : 'src="https://via.placeholder.com/150?text=No+Image"';
+
+  var overlayHtml = '';
+  var actHtml = '';
 
   if (isCommitted) {{
-      const rejLabel = escapeHtml((COMMITTED[sid]||'').replace(/_/g,' '));
-      overlayHtml = `
-        <div class="rej-overlay">
-          <div class="rej-badge">REJECTED</div>
-          <div class="rej-label">${{rejLabel}}</div>
-          <button class="undo-btn" onclick="event.stopPropagation();window.undoReject('${{sid}}')">↺ Undo Reject</button>
-        </div>`;
+    var rejLabel = escapeHtml((COMMITTED[sid]||'').replace(/_/g,' '));
+    overlayHtml = '<div class="rej-overlay"><div class="rej-badge">REJECTED</div><div class="rej-label">'+rejLabel+'</div><button class="undo-btn" onclick="event.stopPropagation();window.undoReject(\''+sid+'\')">↺ Undo</button></div>';
   }} else if (isStaged) {{
-      const stagedLabel = escapeHtml((staged[sid]||'').replace(/_/g,' '));
-      overlayHtml = `
-        <div class="rej-overlay staged">
-          <div class="rej-badge pending">PENDING</div>
-          <div class="rej-label">${{stagedLabel}}</div>
-          <button class="undo-btn" onclick="event.stopPropagation();window.clearStaged('${{sid}}')">✖ Clear Selection</button>
-        </div>`;
+    var stagedLabel = escapeHtml((staged[sid]||'').replace(/_/g,' '));
+    overlayHtml = '<div class="rej-overlay staged"><div class="rej-badge pending">PENDING</div><div class="rej-label">'+stagedLabel+'</div><button class="undo-btn" onclick="event.stopPropagation();window.clearStaged(\''+sid+'\')">✖ Clear</button></div>';
   }} else {{
-      actHtml = `
-        <div class="acts">
-          <button class="act-btn"
-            onclick="event.stopPropagation();window.stageReject('${{sid}}','REJECT_POOR_IMAGE')">
-            Poor Img
-          </button>
-          <select class="act-more"
-            onchange="if(this.value){{event.stopPropagation();window.stageReject('${{sid}}',this.value);this.value=''}}">
-            <option value="">More…</option>
-            <option value="REJECT_WRONG_CAT">Wrong Category</option>
-            <option value="REJECT_FAKE">Fake Product</option>
-            <option value="REJECT_BRAND">Restricted Brand</option>
-            <option value="REJECT_PROHIBITED">Prohibited</option>
-            <option value="REJECT_COLOR">Wrong Color</option>
-            <option value="REJECT_WRONG_BRAND">Wrong Brand</option>
-          </select>
-        </div>`;
+    actHtml = '<div class="acts"><button class="act-btn" onclick="event.stopPropagation();window.stageReject(\''+sid+'\',\'REJECT_POOR_IMAGE\')">Poor Img</button><select class="act-more" onchange="if(this.value){{event.stopPropagation();window.stageReject(\''+sid+'\',this.value);this.value=\'\'}}"><option value="">More…</option><option value="REJECT_WRONG_CAT">Wrong Category</option><option value="REJECT_FAKE">Fake Product</option><option value="REJECT_BRAND">Restricted Brand</option><option value="REJECT_PROHIBITED">Prohibited</option><option value="REJECT_COLOR">Wrong Color</option><option value="REJECT_WRONG_BRAND">Wrong Brand</option></select></div>';
   }}
 
-  return `<div class="${{cls}}" id="card-${{sid}}">
-    <div class="card-img-wrap" onclick="window.toggleSelect('${{sid}}')">
-      <div class="warn-wrap">${{warnHtml}}</div>
-      <img class="card-img" src="${{img}}" loading="lazy" onerror="this.src='https://via.placeholder.com/150?text=No+Image'">
-      ${{overlayHtml}}<div class="tick">✓</div>
-    </div>
-    <div class="meta">
-      <div class="nm" title="${{escapeHtml(card.name)}}">${{shortName}}</div>
-      <div class="br">${{escapeHtml(card.brand)}}</div>
-      <div class="ct">${{escapeHtml(card.cat)}}</div>
-      <div class="sl">${{escapeHtml(card.seller)}}</div>
-    </div>${{actHtml}}</div>`;
+  return '<div class="'+cls+'" id="card-'+sid+'">'
+    +'<div class="card-img-wrap" onclick="window.toggleSelect(\''+sid+'\')">'
+    +'<div class="warn-wrap">'+warnHtml+'</div>'
+    +'<img class="card-img" '+imgAttr+' loading="lazy" onerror="this.src=\'https://via.placeholder.com/150?text=No+Image\'">'
+    +overlayHtml+'<div class="tick">✓</div>'
+    +'</div>'
+    +'<div class="meta"><div class="nm" title="'+escapeHtml(card.name)+'">'+shortName+'</div>'
+    +'<div class="br">'+escapeHtml(card.brand)+'</div>'
+    +'<div class="ct">'+escapeHtml(card.cat)+'</div>'
+    +'<div class="sl">'+escapeHtml(card.seller)+'</div></div>'
+    +actHtml+'</div>';
 }}
 
-function renderAll() {{
-  document.getElementById('card-grid').innerHTML = CARDS.map(renderCard).join('');
-  updateSelCount();
-}}
-
-function replaceCard(sid) {{
-  const el = document.getElementById('card-'+sid);
-  if (!el) return;
-  const card = CARDS.find(c => c.sid === sid);
-  if (card) {{ const t=document.createElement('div'); t.innerHTML=renderCard(card); el.replaceWith(t.firstElementChild); }}
-}}
-
-// ── Actions ───────────────────────────────────────────────────────────────────
+// ── ACTIONS ──────────────────────────────────────────────────────────────────
 window.doSelectAll = function() {{
-  CARDS.forEach(c => {{
-      if (!(c.sid in COMMITTED) && !(c.sid in staged)) {{
-          selected[c.sid] = true;
-      }}
+  filteredCards.forEach(function(c) {{
+    if (!(c.sid in COMMITTED) && !(c.sid in staged)) selected[c.sid] = true;
   }});
-  renderAll();
+  scheduleVsUpdate();
   updateSelCount();
-}}
+}};
 
 window.toggleSelect = function(sid) {{
   if (sid in COMMITTED) return;
-  if (sid in staged) {{ delete staged[sid]; }}
+  if (sid in staged)       {{ delete staged[sid]; }}
   else if (sid in selected) {{ delete selected[sid]; }}
-  else {{ selected[sid] = true; }}
-  replaceCard(sid);
+  else                      {{ selected[sid] = true; }}
   updateSelCount();
-}}
+  scheduleVsUpdate();
+}};
 
 window.stageReject = function(sid, reasonKey) {{
   if (sid in selected) delete selected[sid];
   staged[sid] = reasonKey;
-  replaceCard(sid);
+  scheduleVsUpdate();
   updateSelCount();
-}}
+}};
 
 window.clearStaged = function(sid) {{
   delete staged[sid];
-  replaceCard(sid);
+  scheduleVsUpdate();
   updateSelCount();
-}}
+}};
 
 window.undoReject = function(sid) {{
   sendMsg('undo', {{[sid]: true}});
   delete COMMITTED[sid];
-  replaceCard(sid);
+  scheduleVsUpdate();
   updateSelCount();
-}}
+}};
 
 window.doBatchReject = function() {{
-  const batchReason = document.getElementById('batch-reason').value;
-  const payload   = {{}};
-  let count = 0;
-  
-  for (let sid in staged) {{ payload[sid] = staged[sid]; count++; }}
-  for (let sid in selected) {{ payload[sid] = batchReason; count++; }}
-  
+  var batchReason = document.getElementById('batch-reason').value;
+  var payload = {{}};
+  var count = 0;
+  for (var sid in staged)   {{ payload[sid] = staged[sid];   count++; }}
+  for (var sid in selected) {{ payload[sid] = batchReason;   count++; }}
   if (count === 0) {{ alert('No products selected or staged for rejection.'); return; }}
-  
-  for (let sid in payload) {{
-      COMMITTED[sid] = payload[sid];
-      delete selected[sid];
-      delete staged[sid];
+  for (var sid in payload) {{
+    COMMITTED[sid] = payload[sid];
+    delete selected[sid];
+    delete staged[sid];
   }}
-  
   sendMsg('reject', payload);
-  renderAll();
+  scheduleVsUpdate();
   updateSelCount();
-}}
+}};
 
 window.doDeselAll = function() {{
-  for(let k in selected) delete selected[k];
-  for(let k in staged) delete staged[k];
-  renderAll();
+  for(var k in selected) delete selected[k];
+  for(var k in staged)   delete staged[k];
+  scheduleVsUpdate();
   updateSelCount();
-}}
+}};
 
-renderAll();
+// Initial render
+scheduleVsUpdate();
 </script>
 </body>
 </html>"""
+
 
 # -------------------------------------------------
 # UI COMPONENTS
@@ -1849,7 +2443,12 @@ with st.sidebar:
     st.header("System Status")
     if st.button("🔄 Clear Cache & Reload Data", use_container_width=True, type="secondary", help="Forces a reload of all support rules from local files."):
         st.cache_data.clear()
+        # Also purge disk caches
+        for f in os.listdir(PARQUET_CACHE_DIR):
+            try: os.remove(os.path.join(PARQUET_CACHE_DIR, f))
+            except: pass
         st.session_state.display_df_cache = {}
+        st.session_state.flag_hashes = {}
         st.rerun()
     st.markdown("---")
     st.header("Display Settings")
@@ -1888,9 +2487,7 @@ if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.grid_page = 0
     st.session_state.exports_cache = {}
     st.session_state.display_df_cache = {}
-    
     if 'main_bridge_counter' not in st.session_state: st.session_state.main_bridge_counter = 0
-
     st.session_state.desel_counter = 0
     st.session_state.batch_counter = 0
     st.session_state.clear_counter = 0
@@ -1967,8 +2564,21 @@ if st.session_state.get('last_processed_files') != process_signature:
                         if c in data.columns: data[c] = data[c].astype(str).fillna('')
                     if 'COLOR_FAMILY' not in data.columns: data['COLOR_FAMILY'] = ""
 
-                    data_hash = df_hash(data) + country_validator.code
-                    final_report, _ = cached_validate_products(data_hash, data, support_files, country_validator.code, data_has_warranty)
+                    # ── PARQUET CACHE CHECK ──────────────────────────────────
+                    parquet_key = df_hash(data) + "_" + country_validator.code
+                    cached_data   = load_df_parquet(parquet_key + "_data")
+                    cached_report = load_df_parquet(parquet_key + "_report")
+
+                    if cached_data is not None and cached_report is not None:
+                        st.toast("⚡ Loaded from cache (instant!)", icon="⚡")
+                        final_report = cached_report
+                        data         = cached_data
+                    else:
+                        data_hash = parquet_key
+                        final_report, _ = cached_validate_products(data_hash, data, support_files, country_validator.code, data_has_warranty)
+                        # Persist to disk
+                        save_df_parquet(data, parquet_key + "_data")
+                        save_df_parquet(final_report, parquet_key + "_report")
 
                     st.session_state.final_report = final_report
                     st.session_state.all_data_map = data
@@ -2015,7 +2625,7 @@ if _bridge_val:
                 st.session_state.main_toasts.append((f"Rejected {_total} product(s)", "✅"))
                 st.session_state.main_bridge_counter += 1
                 st.rerun()
-                
+
         elif _msg.get("action") == "undo":
             _payload = _msg.get("payload", {})
             _total_restored = 0
@@ -2026,9 +2636,45 @@ if _bridge_val:
             if _total_restored > 0:
                 st.session_state.main_bridge_counter += 1
                 st.rerun()
-                
+
     except Exception as _e:
         logger.error(f"Bridge parse error: {_e}")
+
+# ── RECATEGORIZE BRIDGE ───────────────────────────────────────────────────────
+_rc_bridge_val = st.text_input(
+    "rcbridge", value="",
+    placeholder="RCBRIDGE_UNIQUE",
+    key=f"rc_bridge_{st.session_state.recategorize_bridge_counter}",
+    label_visibility="collapsed",
+)
+if _rc_bridge_val:
+    try:
+        _rc_msg = json.loads(_rc_bridge_val)
+        if _rc_msg.get("action") == "recategorize":
+            _rc_payload = _rc_msg.get("payload", {})
+            _fm = support_files["flags_mapping"]
+            _total_rc = 0
+            for _sid, _new_flag in _rc_payload.items():
+                if _new_flag == "✅ Approved":
+                    st.session_state.final_report.loc[
+                        st.session_state.final_report["ProductSetSid"] == _sid,
+                        ["Status", "Reason", "Comment", "FLAG"]
+                    ] = ["Approved", "", "", "Approved by User"]
+                else:
+                    _rcode, _rcmt = _fm.get(_new_flag, ("1000007 - Other Reason", _new_flag))
+                    st.session_state.final_report.loc[
+                        st.session_state.final_report["ProductSetSid"] == _sid,
+                        ["Status", "Reason", "Comment", "FLAG"]
+                    ] = ["Rejected", _rcode, _rcmt, _new_flag]
+                _total_rc += 1
+            if _total_rc > 0:
+                st.session_state.exports_cache.clear()
+                st.session_state.display_df_cache.clear()
+                st.session_state.main_toasts.append((f"Re-categorized {_total_rc} product(s)", "🔀"))
+                st.session_state.recategorize_bridge_counter += 1
+                st.rerun()
+    except Exception as _rce:
+        logger.error(f"RC bridge parse error: {_rce}")
 
 # ==========================================
 # POST-QC RESULTS SECTION
@@ -2072,7 +2718,49 @@ if uploaded_files and not st.session_state.final_report.empty and st.session_sta
 
 
 # ==========================================
-# SECTION 2: MANUAL IMAGE REVIEW
+# SECTION 2A: BULK RE-CATEGORIZATION BOARD
+# ==========================================
+@st.fragment
+def render_recategorize_board():
+    if st.session_state.final_report.empty or st.session_state.file_mode == "post_qc":
+        return
+
+    fr   = st.session_state.final_report
+    data = st.session_state.all_data_map
+    rej_df = fr[fr['Status'] == 'Rejected']
+    if rej_df.empty:
+        return
+
+    st.markdown("---")
+    st.header(":material/view_kanban: Bulk Re-categorization Board", anchor=False)
+    st.caption("Drag rejected products between flag buckets to reassign their rejection reason. Drop onto **✅ Approved** to clear the rejection entirely.")
+
+    # Build card data per flag
+    flags_data: dict = {}
+    for flag_name in rej_df['FLAG'].unique():
+        flag_sids = rej_df[rej_df['FLAG'] == flag_name]['ProductSetSid'].astype(str).tolist()
+        flag_rows = data[data['PRODUCT_SET_SID'].astype(str).isin(flag_sids)]
+        cards = []
+        for _, row in flag_rows.iterrows():
+            cards.append({
+                "sid":    str(row['PRODUCT_SET_SID']),
+                "name":   str(row.get('NAME', ''))[:60],
+                "brand":  str(row.get('BRAND', '')),
+                "seller": str(row.get('SELLER_NAME', '')),
+            })
+        if cards:
+            flags_data[flag_name] = cards
+
+    if not flags_data:
+        st.info("No rejected products to re-categorize.")
+        return
+
+    board_html = build_recategorize_html(flags_data, support_files['flags_mapping'])
+    components.html(board_html, height=680, scrolling=True)
+
+
+# ==========================================
+# SECTION 2B: MANUAL IMAGE REVIEW
 # ==========================================
 @st.fragment
 def render_image_grid():
@@ -2090,8 +2778,8 @@ def render_image_grid():
         for k in st.session_state.keys()
         if k.startswith("quick_rej_") and "reason" not in k
     }
-    mask           = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
-    valid_grid_df  = fr[mask]
+    mask          = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
+    valid_grid_df = fr[mask]
 
     c1, c2, c3 = st.columns([1.5, 1.5, 2])
     with c1: search_n  = st.text_input("Search by Name",            placeholder="Product name…")
@@ -2111,17 +2799,14 @@ def render_image_grid():
         data[available_cols],
         left_on="ProductSetSid", right_on="PRODUCT_SET_SID", how="left",
     )
-    
+
     # --- SEARCH STATE RESTORATION ---
     is_searching = bool(search_n or search_sc)
-    if 'search_active' not in st.session_state: st.session_state.search_active = False
-    if 'pre_search_page' not in st.session_state: st.session_state.pre_search_page = 0
-
-    if is_searching and not st.session_state.search_active:
+    if not st.session_state.search_active and is_searching:
         st.session_state.pre_search_page = st.session_state.grid_page
         st.session_state.grid_page = 0
         st.session_state.search_active = True
-    elif not is_searching and st.session_state.search_active:
+    elif st.session_state.search_active and not is_searching:
         st.session_state.grid_page = st.session_state.pre_search_page
         st.session_state.search_active = False
 
@@ -2141,27 +2826,22 @@ def render_image_grid():
     if st.session_state.grid_page >= total_pages:
         st.session_state.grid_page = 0
 
-    # --- ADVANCED PAGINATION WITH JUMP ---
     pg_cols = st.columns([1, 2, 1], vertical_alignment="center")
     with pg_cols[0]:
         if st.button("◀ Prev Page", use_container_width=True, disabled=st.session_state.grid_page == 0):
             st.session_state.grid_page = max(0, st.session_state.grid_page - 1)
             st.session_state.do_scroll_top = True
             st.rerun(scope="fragment")
-            
     with pg_cols[1]:
         new_page = st.number_input(
-            f"Jump to Page (Total: {total_pages} | {len(review_data)} items)", 
-            min_value=1, 
-            max_value=max(1, total_pages), 
-            value=st.session_state.grid_page + 1,
-            step=1
+            f"Jump to Page (Total: {total_pages} | {len(review_data)} items)",
+            min_value=1, max_value=max(1, total_pages),
+            value=st.session_state.grid_page + 1, step=1
         )
         if new_page - 1 != st.session_state.grid_page:
             st.session_state.grid_page = new_page - 1
             st.session_state.do_scroll_top = True
             st.rerun(scope="fragment")
-            
     with pg_cols[2]:
         if st.button("Next Page ▶", use_container_width=True, disabled=st.session_state.grid_page >= total_pages - 1):
             st.session_state.grid_page += 1
@@ -2170,28 +2850,20 @@ def render_image_grid():
 
     page_start = st.session_state.grid_page * ipp
     page_data  = review_data.iloc[page_start : page_start + ipp]
-    
-    # Pre-fetch target for background loader
-    next_page_start = (st.session_state.grid_page + 1) * ipp
-    if next_page_start < len(review_data):
-        next_page_data = review_data.iloc[next_page_start : next_page_start + ipp]
-    else:
-        next_page_data = pd.DataFrame()
 
-    # --- MASSIVELY PARALLEL CACHED IMAGE FETCHING ---
+    # Pre-fetch next page in background (fire-and-forget)
+    next_page_start = (st.session_state.grid_page + 1) * ipp
+    next_page_data = review_data.iloc[next_page_start : next_page_start + ipp] if next_page_start < len(review_data) else pd.DataFrame()
+
+    # Only analyze images for warning badges — actual loading is lazy in JS
     page_warnings: dict = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-        # Process current page
         future_to_sid = {
             ex.submit(analyze_image_quality_cached, str(r.get("MAIN_IMAGE", "")).strip()): str(r["PRODUCT_SET_SID"])
             for _, r in page_data.iterrows()
         }
-        
-        # Fire-and-forget pre-fetch for NEXT page so it loads instantly later
         for _, r in next_page_data.iterrows():
             ex.submit(analyze_image_quality_cached, str(r.get("MAIN_IMAGE", "")).strip())
-            
-        # Collect current page warnings
         for future in concurrent.futures.as_completed(future_to_sid):
             warns = future.result()
             if warns:
@@ -2213,9 +2885,8 @@ def render_image_grid():
         rejected_state,
         cols_per_row,
     )
-    
-    # --- RENDER IFRAME WITH OPTIMIZED SCROLLING HEIGHT ---
-    components.html(grid_html, height=800, scrolling=True)
+
+    components.html(grid_html, height=750, scrolling=False)
 
     if st.session_state.get("do_scroll_top", False):
         components.html(
@@ -2277,5 +2948,6 @@ def render_exports_section():
 # ==========================================
 # CALL FRAGMENTS
 # ==========================================
+render_recategorize_board()
 render_image_grid()
 render_exports_section()
