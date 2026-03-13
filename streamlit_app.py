@@ -176,7 +176,6 @@ if 'main_toasts' not in st.session_state: st.session_state.main_toasts = []
 if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
 if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = False
 if 'display_df_cache' not in st.session_state: st.session_state.display_df_cache = {}
-
 if 'main_bridge_counter' not in st.session_state: st.session_state.main_bridge_counter = 0
 
 if 'search_active' not in st.session_state: st.session_state.search_active = False
@@ -196,6 +195,21 @@ st_yled.init()
 # --- GLOBAL CSS ---
 st.markdown(f"""
     <style>
+        /* ── HIDE THE BRIDGE INPUT COMPLETELY ── */
+        div[data-testid="stTextInput"]:has(input[placeholder="JTBRIDGE_UNIQUE_DO_NOT_USE"]) {{
+            position: absolute !important;
+            width: 1px !important;
+            height: 1px !important;
+            padding: 0 !important;
+            margin: -1px !important;
+            overflow: hidden !important;
+            clip: rect(0, 0, 0, 0) !important;
+            white-space: nowrap !important;
+            border: 0 !important;
+            opacity: 0 !important;
+            z-index: -9999 !important;
+        }}
+
         @import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined');
 
         :root {{
@@ -1173,8 +1187,10 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             future_to_name = {}
             for i, (name, func, kwargs) in enumerate(validations):
+                # Honor the skip_validators list passed from the expander approval
                 if skip_validators and name in skip_validators: continue
                 if country_validator.should_skip_validation(name): continue
+                
                 ckwargs = {'data': data, **kwargs}
                 if name in ["Generic BRAND Issues", "Fashion brand issues"]: ckwargs['valid_category_codes_fas'] = support_files.get('category_fas', [])
                 
@@ -1243,10 +1259,10 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
     return country_validator.ensure_status_column(final_df), results
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def cached_validate_products(data_hash: str, _data: pd.DataFrame, _support_files: Dict, country_code: str, data_has_warranty_cols: bool):
+def cached_validate_products(data_hash: str, _data: pd.DataFrame, _support_files: Dict, country_code: str, data_has_warranty_cols: bool, skip_validators: Optional[List[str]] = None):
     country_name = next((k for k, v in CountryValidator.COUNTRY_CONFIG.items() if v['code'] == country_code), "Kenya")
     cv = CountryValidator(country_name)
-    return validate_products(_data, _support_files, cv, data_has_warranty_cols)
+    return validate_products(_data, _support_files, cv, data_has_warranty_cols, skip_validators=skip_validators)
 
 # -------------------------------------------------
 # EXPORTS UTILITIES
@@ -1616,6 +1632,7 @@ window.toggleZoom = function(sid) {{
         img.classList.remove('locally-zoomed');
         if(img.closest('.card')) img.closest('.card').style.zIndex = '1';
     }} else {{
+        // Reset others
         document.querySelectorAll('.locally-zoomed').forEach(el => {{
             el.classList.remove('locally-zoomed');
             if (el.closest('.card')) el.closest('.card').style.zIndex = '1';
@@ -1720,6 +1737,7 @@ window.doSelectAll = function() {{
 }}
 
 window.toggleSelect = function(sid, e) {{
+  // Automatically shrink zoomed image if clicking the card body
   const img = document.querySelector('#card-' + sid + ' .card-img');
   if (img && img.classList.contains('locally-zoomed')) {{
       img.classList.remove('locally-zoomed');
@@ -1813,7 +1831,7 @@ def bulk_approve_dialog(sids_to_process, title, subset_data, data_has_warranty_c
     if st.button("Confirm Approval", type="primary", use_container_width=True):
         with st.spinner("Processing..."):
             data_hash = df_hash(subset_data) + country_validator.code + "_skip_" + title
-            new_report, _ = cached_validate_products(data_hash, subset_data, support_files, country_validator.code, data_has_warranty_cols_check)
+            new_report, _ = cached_validate_products(data_hash, subset_data, support_files, country_validator.code, data_has_warranty_cols_check, skip_validators=[title])
             msg_moved, msg_approved = {}, 0
             for sid in sids_to_process:
                 new_row = new_report[new_report['ProductSetSid'] == sid]
@@ -1859,6 +1877,19 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
         def strip_html(text): return re.sub('<[^<]+?>', '', text) if isinstance(text, str) else text
         df_view['NAME'] = df_view['NAME'].apply(strip_html)
 
+    # --- INJECT LOCAL PRICE INTO EXPANDER GRID ---
+    if 'GLOBAL_PRICE' in df_view.columns and 'GLOBAL_SALE_PRICE' in df_view.columns:
+        def _get_local_p(row):
+            sp = row.get('GLOBAL_SALE_PRICE')
+            rp = row.get('GLOBAL_PRICE')
+            val = sp if pd.notna(sp) and str(sp).strip() != "" else rp
+            return format_local_price(val, country_validator.country)
+        try:
+            loc_idx = df_view.columns.get_loc('GLOBAL_PRICE') + 1
+            df_view.insert(loc_idx, 'Local Price', df_view.apply(_get_local_p, axis=1))
+        except Exception:
+            df_view['Local Price'] = df_view.apply(_get_local_p, axis=1)
+
     event = st.dataframe(
         df_view, hide_index=True, use_container_width=True, selection_mode="multi-row", on_select="rerun",
         column_config={
@@ -1866,6 +1897,7 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
             "NAME": st.column_config.TextColumn(pinned=True),
             "GLOBAL_SALE_PRICE": st.column_config.NumberColumn("Sale Price (USD)", format="$%.2f"),
             "GLOBAL_PRICE": st.column_config.NumberColumn("Price (USD)", format="$%.2f"),
+            "Local Price": st.column_config.TextColumn(f"Local Price ({country_validator.country})"),
         }, key=f"df_{title}"
     )
     raw_selected_indices = list(event.selection.rows)
@@ -1990,6 +2022,8 @@ if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.clear_counter = 0
     st.session_state.ls_processed_flag = False
     st.session_state.ls_read_trigger = 0
+    st.session_state.search_active = False
+    st.session_state.pre_search_page = 0
 
     keys_to_delete = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_"))]
     for k in keys_to_delete: del st.session_state[k]
