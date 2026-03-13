@@ -1397,7 +1397,7 @@ def build_fast_grid_html(
         if img_url.startswith("http://"):
             img_url = img_url.replace("http://", "https://")
         if not img_url.startswith("http"):
-            img_url = ""   # empty = use placeholder lazy
+            img_url = "https://via.placeholder.com/150?text=No+Image"
         cards_data.append({
             "sid":      sid,
             "img":      img_url,
@@ -1458,16 +1458,10 @@ def build_fast_grid_html(
   .card.committed-rej{{border-color:#bbb;opacity:.6;}}
   .card.hidden{{display:none;}}  /* used by debounce search */
 
-  /* ── IMAGE LAZY LOADING ── */
+  /* ── IMAGE ── */
   .card-img-wrap{{position:relative;cursor:pointer;overflow:hidden;border-radius:6px;}}
   .card-img{{width:100%;aspect-ratio:1;object-fit:contain;border-radius:6px;display:block;
-             transition:transform 0.25s ease-in-out;background:#f0f0f0;}}
-  /* placeholder shimmer while not yet loaded */
-  .card-img:not([src]),.card-img[src=""]{{
-    background:linear-gradient(90deg,#f0f0f0 25%,#e0e0e0 50%,#f0f0f0 75%);
-    background-size:200% 100%;animation:shimmer 1.4s infinite;
-  }}
-  @keyframes shimmer{{0%{{background-position:200% 0}}100%{{background-position:-200% 0}}}}
+             transition:transform 0.25s ease-in-out;}}
   .card.committed-rej .card-img{{filter:grayscale(80%);}}
   .card-img-wrap:hover .card-img{{transform:scale(1.15);}}
 
@@ -1582,8 +1576,6 @@ function vsUpdate() {{
   }}
   document.getElementById('card-grid').innerHTML = html;
 
-  // Attach lazy observer to new images
-  attachLazyObserver();
   _vsDirty = false;
 }}
 
@@ -1596,39 +1588,6 @@ function scheduleVsUpdate() {{
 viewport.addEventListener('scroll', scheduleVsUpdate, {{passive: true}});
 window.addEventListener('resize', scheduleVsUpdate);
 
-// ── LAZY IMAGE OBSERVER ──────────────────────────────────────────────────────
-var _lazyObserver = null;
-
-function attachLazyObserver() {{
-  if (!('IntersectionObserver' in window)) {{
-    // fallback: just set all srcs directly
-    document.querySelectorAll('img[data-src]').forEach(function(img) {{
-      img.src = img.getAttribute('data-src') || 'https://via.placeholder.com/150?text=No+Image';
-      img.removeAttribute('data-src');
-    }});
-    return;
-  }}
-
-  if (!_lazyObserver) {{
-    _lazyObserver = new IntersectionObserver(function(entries) {{
-      entries.forEach(function(entry) {{
-        if (entry.isIntersecting) {{
-          var img = entry.target;
-          var src = img.getAttribute('data-src');
-          if (src) {{
-            img.src = src;
-            img.removeAttribute('data-src');
-          }}
-          _lazyObserver.unobserve(img);
-        }}
-      }});
-    }}, {{ root: viewport, rootMargin: '200px', threshold: 0.01 }});
-  }}
-
-  document.querySelectorAll('img[data-src]').forEach(function(img) {{
-    _lazyObserver.observe(img);
-  }});
-}}
 
 // ── DEBOUNCED SEARCH ──────────────────────────────────────────────────────────
 var _searchTimer = null;
@@ -1757,11 +1716,8 @@ function renderCard(card) {{
   var shortName = card.name.length > 38 ? escapeHtml(card.name.slice(0,38))+'…' : escapeHtml(card.name);
   var warnHtml  = (card.warnings||[]).map(function(w){{return '<span class="warn-badge">'+escapeHtml(w)+'</span>';}}).join('');
 
-  // Use data-src for lazy loading; src stays empty until IntersectionObserver fires
-  var imgSrc  = card.img || '';
-  var imgAttr = imgSrc
-    ? 'data-src="'+escapeHtml(imgSrc)+'"'
-    : 'src="https://via.placeholder.com/150?text=No+Image"';
+  // Direct src — virtual scroll keeps DOM small so no need for lazy loading
+  var imgSrc = card.img || 'https://via.placeholder.com/150?text=No+Image';
 
   var overlayHtml = '';
   var actHtml = '';
@@ -1779,7 +1735,7 @@ function renderCard(card) {{
   return '<div class="'+cls+'" id="card-'+sid+'">'
     +'<div class="card-img-wrap" onclick="window.toggleSelect(\''+sid+'\')">'
     +'<div class="warn-wrap">'+warnHtml+'</div>'
-    +'<img class="card-img" '+imgAttr+' loading="lazy" onerror="this.src=\'https://via.placeholder.com/150?text=No+Image\'">'
+    +'<img class="card-img" src="'+escapeHtml(imgSrc)+'" loading="lazy" onerror="this.src=\'https://via.placeholder.com/150?text=No+Image\'">'
     +overlayHtml+'<div class="tick">✓</div>'
     +'</div>'
     +'<div class="meta"><div class="nm" title="'+escapeHtml(card.name)+'">'+shortName+'</div>'
