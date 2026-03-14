@@ -33,6 +33,12 @@ try:
 except ImportError:
     _reg = None
 
+try:
+    from jumia_scraper import enrich_post_qc_df, COUNTRY_BASE_URLS as _SCRAPER_URLS
+    _SCRAPER_AVAILABLE = True
+except ImportError:
+    _SCRAPER_AVAILABLE = False
+
 # Fallback stub so load_all_support_files never crashes if postqc isn't importable
 if 'load_category_map' not in dir():
     def load_category_map(filename: str = "category_map.xlsx") -> dict:
@@ -2026,6 +2032,17 @@ with st.sidebar:
     new_mode = "wide" if "Wide" in st.radio("Layout Mode", ["Centered", "Wide"], index=1 if st.session_state.layout_mode == "wide" else 0) else "centered"
     if new_mode != st.session_state.layout_mode: st.session_state.layout_mode = new_mode; st.rerun()
 
+    if _SCRAPER_AVAILABLE:
+        st.markdown("---")
+        st.header(":material/travel_explore: Post-QC Enrichment")
+        st.session_state.scraper_enabled = st.toggle(
+            "Auto-fill missing fields from Jumia",
+            value=st.session_state.get("scraper_enabled", False),
+            help="Scrapes Color, Warranty, Variation count from Jumia product pages for any columns absent in your upload. Only runs when a Post-QC file is detected."
+        )
+        if st.session_state.get("scraper_enabled", False):
+            st.caption(":material/info: Runs after upload. May take 1–3 s per product.")
+
 # ==========================================
 # SECTION 1: UPLOAD & VALIDATION
 # ==========================================
@@ -2168,6 +2185,41 @@ if st.session_state.get('last_processed_files') != process_signature:
                             norm_dfs.append(ndf)
                     merged = pd.concat(norm_dfs, ignore_index=True)
                     merged_dedup = merged.drop_duplicates(subset=['PRODUCT_SET_SID'], keep='first')
+
+                    # ── Jumia scraper enrichment ───────────────────────────
+                    if _SCRAPER_AVAILABLE and st.session_state.get('scraper_enabled', False):
+                        _scrape_missing = [
+                            c for c in ['COLOR', 'PRODUCT_WARRANTY', 'WARRANTY_DURATION',
+                                        'COUNT_VARIATIONS', 'MAIN_IMAGE']
+                            if c not in merged_dedup.columns
+                            or merged_dedup[c].astype(str).str.strip().replace('nan','').eq('').all()
+                        ]
+                        if _scrape_missing:
+                            _n = len(merged_dedup)
+                            _prog_bar  = st.progress(0, text=f"Enriching {_n} products from Jumia…")
+                            _prog_text = st.empty()
+                            def _prog_cb(done, total, sku):
+                                pct = done / max(total, 1)
+                                _prog_bar.progress(pct, text=f"Scraped {done}/{total} — {sku}")
+                                _prog_text.caption(f"Last: {sku}")
+                            merged_dedup = enrich_post_qc_df(
+                                merged_dedup,
+                                country_code=country_validator.code,
+                                progress_callback=_prog_cb,
+                            )
+                            _prog_bar.empty()
+                            _prog_text.empty()
+                            _filled = sum(
+                                1 for c in _scrape_missing
+                                if c in merged_dedup.columns
+                                and not merged_dedup[c].astype(str).str.strip().replace('nan','').eq('').all()
+                            )
+                            if _filled:
+                                st.toast(f":material/check_circle: Enriched {_filled} column(s) from Jumia", icon=":material/travel_explore:")
+                        else:
+                            st.toast("All columns already present — no scraping needed.", icon=":material/info:")
+                    # ─────────────────────────────────────────────────────
+
                     with st.spinner("Running Post-QC checks..."):
                         summary_df, results = run_post_qc_checks(merged_dedup, support_files_pq)
                     st.session_state.post_qc_summary = summary_df
