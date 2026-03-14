@@ -1790,6 +1790,8 @@ def bulk_approve_dialog(sids_to_process, title, subset_data, data_has_warranty_c
             for flag, count in msg_moved.items(): st.session_state.main_toasts.append(f"{count} items re-flagged as: {flag}")
             st.session_state.exports_cache.clear()
             st.session_state.display_df_cache.clear()
+            # Keep the expander open after rerun
+            st.session_state[f"exp_{title}"] = True
         st.rerun()
 
 def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_check, support_files, country_validator):
@@ -1877,6 +1879,7 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
                     st.session_state.main_toasts.append(f"{len(to_reject)} items rejected with custom reason.")
                     st.session_state.exports_cache.clear()
                     st.session_state.display_df_cache.clear()
+                    st.session_state[f"exp_{title}"] = True
                     st.rerun()
             else:
                 _rinfo = _fm.get(chosen_reason, {'reason': '1000007 - Other Reason', 'en': chosen_reason})
@@ -1890,6 +1893,7 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
                     st.session_state.main_toasts.append(f"{len(to_reject)} items rejected as '{chosen_reason}'.")
                     st.session_state.exports_cache.clear()
                     st.session_state.display_df_cache.clear()
+                    st.session_state[f"exp_{title}"] = True
                     st.rerun()
 
 # ==========================================
