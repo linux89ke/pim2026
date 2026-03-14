@@ -710,7 +710,7 @@ with tab_sku:
             ra.metric("Items searched",  total_n)
             rb.metric("Found on Jumia",  int(found_n))
             rc.metric("Not found",       int(total_n - found_n))
-            rd.metric("URLs provided",   int((res_df.get("Type","") == "URL").sum()))
+            rd.metric("URLs provided",   int((res_df["Type"] == "URL").sum()) if "Type" in res_df.columns else 0)
 
             # ── Card view ─────────────────────────────────────────
             with st.expander("🃏 Card view — one card per item", expanded=True):
