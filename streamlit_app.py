@@ -6,6 +6,7 @@ from io import BytesIO
 from datetime import datetime
 import re
 import logging
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set
 import traceback
 import json
@@ -16,18 +17,19 @@ import pickle
 import concurrent.futures
 from dataclasses import dataclass
 import base64
-import time
 import hashlib
 import requests
 from PIL import Image
 
-# IMPORT OUR NEW TRANSLATIONS FILE
 from translations import LANGUAGES, get_translation
 
 try:
     from postqc import detect_file_type, normalize_post_qc, run_checks as run_post_qc_checks, render_post_qc_section
 except ImportError:
     pass
+
+# CHANGE 12: Logger defined early so every function can use it
+logger = logging.getLogger(__name__)
 
 # -------------------------------------------------
 # CACHE DIRECTORIES & HELPERS
@@ -37,15 +39,33 @@ FLAG_CACHE_DIR = "app_cache_flags"
 os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
 os.makedirs(FLAG_CACHE_DIR, exist_ok=True)
 
+# CHANGE 10: Prune old pkl files so the cache dir never grows unbounded
+def prune_cache_dir(directory: str, max_files: int = 500):
+    try:
+        files = sorted(Path(directory).glob("*.pkl"), key=os.path.getmtime)
+        stale = files[:-max_files]
+        for f in stale:
+            f.unlink(missing_ok=True)
+        if stale:
+            logger.info(f"Pruned {len(stale)} stale cache files from {directory}")
+    except Exception as e:
+        logger.warning(f"Cache pruning failed for {directory}: {e}")
+
+prune_cache_dir(FLAG_CACHE_DIR)
+
 def save_df_parquet(df, filename):
-    try: df.to_parquet(os.path.join(PARQUET_CACHE_DIR, filename))
-    except Exception as e: logger.warning(f"Failed to save parquet: {e}")
+    try:
+        df.to_parquet(os.path.join(PARQUET_CACHE_DIR, filename))
+    except Exception as e:
+        logger.warning(f"Failed to save parquet {filename}: {e}")
 
 def load_df_parquet(filename):
     path = os.path.join(PARQUET_CACHE_DIR, filename)
     if os.path.exists(path):
-        try: return pd.read_parquet(path)
-        except Exception: pass
+        try:
+            return pd.read_parquet(path)
+        except Exception as e:
+            logger.warning(f"Failed to load parquet {filename}: {e}")
     return None
 
 # -------------------------------------------------
@@ -96,12 +116,12 @@ def fetch_exchange_rate(country: str) -> float:
     cfg = COUNTRY_CURRENCY.get(country)
     if not cfg: return 1.0
     try:
-        import urllib.request, json
-        url = f"https://open.er-api.com/v6/latest/USD"
-        with urllib.request.urlopen(url, timeout=3) as r: data = json.loads(r.read())
-        rate = data["rates"].get(cfg["code"], 1.0)
-        return float(rate)
-    except Exception:
+        import urllib.request, json as _json
+        with urllib.request.urlopen("https://open.er-api.com/v6/latest/USD", timeout=3) as r:
+            data = _json.loads(r.read())
+        return float(data["rates"].get(cfg["code"], 1.0))
+    except Exception as e:
+        logger.warning(f"Exchange rate fetch failed for {country}: {e}")
         fallbacks = {"Kenya": 128.0, "Uganda": 3750.0, "Nigeria": 1550.0, "Ghana": 15.5, "Morocco": 10.1}
         return fallbacks.get(country, 1.0)
 
@@ -159,8 +179,6 @@ NEW_FILE_MAPPING = {
     'list variations': 'LIST_VARIATIONS'
 }
 
-logger = logging.getLogger(__name__)
-
 # -------------------------------------------------
 # INITIALIZATION & CONTEXT
 # -------------------------------------------------
@@ -181,17 +199,15 @@ if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
 if 'do_scroll_top' not in st.session_state: st.session_state.do_scroll_top = False
 if 'display_df_cache' not in st.session_state: st.session_state.display_df_cache = {}
 if 'main_bridge_counter' not in st.session_state: st.session_state.main_bridge_counter = 0
-
 if 'search_active' not in st.session_state: st.session_state.search_active = False
 if 'pre_search_page' not in st.session_state: st.session_state.pre_search_page = 0
-
 if 'desel_counter' not in st.session_state: st.session_state.desel_counter = 0
-if 'batch_counter' not in st.session_state: st.session_state.batch_counter = 0  
+if 'batch_counter' not in st.session_state: st.session_state.batch_counter = 0
 if 'clear_counter' not in st.session_state: st.session_state.clear_counter = 0
 if 'ls_processed_flag' not in st.session_state: st.session_state.ls_processed_flag = False
 if 'ls_read_trigger' not in st.session_state: st.session_state.ls_read_trigger = 0
+if 'flags_expanded_initialized' not in st.session_state: st.session_state.flags_expanded_initialized = False
 
-# TRANSLATION HELPER FUNCTION
 def _t(key):
     return get_translation(st.session_state.ui_lang, key)
 
@@ -200,8 +216,6 @@ except: pass
 
 st_yled.init()
 
-# --- GLOBAL CSS ---
-# Dynamic CSS Injection for Arabic (RTL support in text areas)
 rtl_css = """
         div[data-testid="stTextArea"] textarea, div[data-testid="stTextInput"] input {
             direction: rtl !important;
@@ -212,8 +226,7 @@ rtl_css = """
 st.markdown(f"""
     <style>
         {rtl_css}
-        
-        /* ── HIDE THE BRIDGE INPUT COMPLETELY ── */
+
         div[data-testid="stTextInput"]:has(input[placeholder="JTBRIDGE_UNIQUE_DO_NOT_USE"]) {{
             position: absolute !important;
             width: 1px !important;
@@ -242,8 +255,16 @@ st.markdown(f"""
         .stButton > button[kind="primary"]:hover {{ background-color: {JUMIA_COLORS['secondary_orange']} !important; box-shadow: 0 4px 8px rgba(246, 139, 30, 0.3); transform: translateY(-1px); }}
         .stButton > button[kind="secondary"] {{ background-color: white !important; border: 2px solid {JUMIA_COLORS['primary_orange']} !important; color: {JUMIA_COLORS['primary_orange']} !important; }}
         .stButton > button[kind="secondary"]:hover {{ background-color: {JUMIA_COLORS['light_gray']} !important; }}
-        div[data-testid="stMetricValue"] {{ color: {JUMIA_COLORS['dark_gray']}; font-weight: 700; }}
-        div[data-testid="stMetricLabel"] {{ color: {JUMIA_COLORS['medium_gray']}; }}
+
+        /* CHANGE 1: Style native st.metric to match the design */
+        div[data-testid="stMetric"] {{
+            background: {JUMIA_COLORS['light_gray']};
+            border-radius: 0 0 8px 8px;
+            padding: 12px 16px 16px 16px;
+            text-align: center;
+        }}
+        div[data-testid="stMetricValue"] {{ color: {JUMIA_COLORS['dark_gray']}; font-weight: 700; font-size: 26px !important; }}
+        div[data-testid="stMetricLabel"] {{ color: {JUMIA_COLORS['medium_gray']}; font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600; }}
 
         ::-webkit-scrollbar {{ width: 18px !important; height: 18px !important; }}
         ::-webkit-scrollbar-track {{ background: {JUMIA_COLORS['light_gray']}; border-radius: 8px; }}
@@ -257,14 +278,12 @@ st.markdown(f"""
         @media (prefers-color-scheme: dark) {{
             div[data-testid="stMetricValue"] {{ color: #F5F5F5 !important; }}
             div[data-testid="stMetricLabel"] {{ color: #B0B0B0 !important; }}
+            div[data-testid="stMetric"] {{ background: #2a2a2e !important; }}
             h1, h2, h3 {{ color: #F5F5F5 !important; }}
             div[data-testid="stExpander"] summary {{ background-color: #2a2a2e !important; color: #F5F5F5 !important; }}
             div[data-testid="stExpander"] summary p, div[data-testid="stExpander"] summary span, div[data-testid="stExpander"] summary div {{ color: #F5F5F5 !important; }}
             div[data-testid="stDataFrame"] * {{ color: #F5F5F5 !important; }}
             .stDataFrame th {{ background-color: #2a2a2e !important; color: #F5F5F5 !important; }}
-            .metric-card-inner {{ background: #2a2a2e !important; }}
-            .metric-card-value {{ color: inherit !important; }}
-            .metric-card-label {{ color: #B0B0B0 !important; }}
             .color-badge {{ background: #3a3a3e !important; border-color: #555 !important; color: #E0E0E0 !important; }}
             div[style*="position: sticky"], div[style*="position:sticky"] {{ background-color: #0e1117 !important; border-bottom-color: #2a2a2e !important; }}
             .stCaption, div[data-testid="stCaptionContainer"] p {{ color: #B0B0B0 !important; }}
@@ -330,11 +349,15 @@ def create_match_key(row: pd.Series) -> str:
     color = normalize_text(row.get('COLOR', ''))
     return f"{brand}|{name}|{color}"
 
+# CHANGE 13: Fix weak fallback — same shape + same columns should not collide
 def df_hash(df: pd.DataFrame) -> str:
     try:
         return hashlib.md5(pd.util.hash_pandas_object(df, index=True).values).hexdigest()
-    except Exception:
-        return hashlib.md5(str(df.shape).encode()).hexdigest()
+    except Exception as e:
+        logger.warning(f"df_hash primary failed, using fallback: {e}")
+        # Include column names to prevent same-shape collisions
+        fallback_str = str(df.shape) + str(df.columns.tolist())
+        return hashlib.md5(fallback_str.encode()).hexdigest()
 
 COLOR_PATTERNS = {
     'red': ['red', 'crimson', 'scarlet', 'maroon', 'burgundy', 'wine', 'ruby'],
@@ -396,7 +419,10 @@ def load_txt_file(filename: str) -> List[str]:
     try:
         if not os.path.exists(os.path.abspath(filename)): return []
         with open(filename, 'r', encoding='utf-8') as f: return [line.strip() for line in f if line.strip()]
-    except Exception: return []
+    except Exception as e:
+        # CHANGE 12: Log instead of silently swallowing
+        logger.warning(f"load_txt_file({filename}): {e}")
+        return []
 
 @st.cache_data(ttl=3600)
 def load_excel_file(filename: str, column: Optional[str] = None):
@@ -406,7 +432,9 @@ def load_excel_file(filename: str, column: Optional[str] = None):
         df.columns = df.columns.str.strip()
         if column and column in df.columns: return df[column].apply(clean_category_code).tolist()
         return df
-    except Exception: return [] if column else pd.DataFrame()
+    except Exception as e:
+        logger.warning(f"load_excel_file({filename}, col={column}): {e}")
+        return [] if column else pd.DataFrame()
 
 def safe_excel_read(filename: str, sheet_name, usecols=None) -> pd.DataFrame:
     if not os.path.exists(filename): return pd.DataFrame()
@@ -414,7 +442,7 @@ def safe_excel_read(filename: str, sheet_name, usecols=None) -> pd.DataFrame:
         df = pd.read_excel(filename, sheet_name=sheet_name, usecols=usecols, engine='openpyxl', dtype=str)
         return df.dropna(how='all')
     except Exception as e:
-        logger.error(f"Error reading tab '{sheet_name}' from {filename}: {e}")
+        logger.error(f"safe_excel_read: tab='{sheet_name}' file={filename}: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
@@ -443,7 +471,8 @@ def load_prohibited_from_local() -> Dict[str, List[Dict]]:
                         categories.update([clean_category_code(c.strip()) for c in split_cats if c.strip()])
                 country_rules.append({'keyword': keyword, 'categories': categories})
             prohibited_by_country[tab] = country_rules
-        except Exception:
+        except Exception as e:
+            logger.warning(f"load_prohibited_from_local tab={tab}: {e}")
             prohibited_by_country[tab] = []
     return prohibited_by_country
 
@@ -479,11 +508,11 @@ def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
                     brand_dict[b_lower]['variations'].update([v.strip() for v in vars_raw.split(',') if v.strip()])
             country_rules = []
             for b_lower, data in brand_dict.items():
-                if data['has_blank_category']:
-                    data['categories'] = set()
+                if data['has_blank_category']: data['categories'] = set()
                 country_rules.append({'brand': b_lower, 'brand_raw': data['brand_raw'], 'sellers': data['sellers'], 'categories': data['categories'], 'variations': list(data['variations'])})
             config_by_country[country_name] = country_rules
-        except Exception:
+        except Exception as e:
+            logger.warning(f"load_restricted_brands tab={tab_name}: {e}")
             config_by_country[country_name] = []
     return config_by_country
 
@@ -500,7 +529,8 @@ def load_refurb_data_from_local() -> dict:
                 phones_set = set(df.iloc[:, 0].dropna().astype(str).str.strip().str.lower()) - {"", "nan", "phones"}
                 laptops_set = set(df.iloc[:, 1].dropna().astype(str).str.strip().str.lower()) - {"", "nan", "laptops"}
                 result["sellers"][tab] = {"Phones": phones_set, "Laptops": laptops_set}
-        except Exception:
+        except Exception as e:
+            logger.warning(f"load_refurb_data tab={tab}: {e}")
             result["sellers"][tab] = {"Phones": set(), "Laptops": set()}
     try:
         df_cats = safe_excel_read(FILE_NAME, sheet_name="Categories", usecols=[0, 1])
@@ -509,13 +539,16 @@ def load_refurb_data_from_local() -> dict:
             df_cats.columns = [str(c).strip() for c in df_cats.columns]
             result["categories"]["Phones"] = {clean_category_code(c) for c in df_cats.iloc[:, 0].dropna().astype(str) if c.strip() and c.strip().lower() not in ("phones", "phone", "nan")}
             result["categories"]["Laptops"] = {clean_category_code(c) for c in df_cats.iloc[:, 1].dropna().astype(str) if c.strip() and c.strip().lower() not in ("laptops", "laptop", "nan")}
-    except Exception: pass
+    except Exception as e:
+        logger.warning(f"load_refurb_data categories: {e}")
     try:
         df_names = safe_excel_read(FILE_NAME, sheet_name="Name", usecols=[0])
         if not df_names.empty:
             first_col = df_names.columns[0]
             result["keywords"] = {k for k in df_names[first_col].dropna().astype(str).str.strip().str.lower() if k and k not in ("name", "keyword", "keywords", "words", "nan")}
-    except Exception: result["keywords"] = {"refurb", "refurbished", "renewed"}
+    except Exception as e:
+        logger.warning(f"load_refurb_data keywords: {e}")
+        result["keywords"] = {"refurb", "refurbished", "renewed"}
     return result
 
 @st.cache_data(ttl=3600)
@@ -531,21 +564,25 @@ def load_perfume_data_from_local() -> Dict:
                 seller_col = next((c for c in df.columns if 'seller' in c.lower()), df.columns[0])
                 sellers = set(df[seller_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "sellername", "seller name", "seller"])]))
                 result["sellers"][tab] = sellers
-        except Exception: result["sellers"][tab] = set()
+        except Exception as e:
+            logger.warning(f"load_perfume_data tab={tab}: {e}")
+            result["sellers"][tab] = set()
     try:
         df_kw = safe_excel_read(FILE_NAME, sheet_name="Keywords")
         if not df_kw.empty:
             df_kw.columns = [str(c).strip() for c in df_kw.columns]
             kw_col = next((c for c in df_kw.columns if 'brand' in c.lower() or 'keyword' in c.lower()), df_kw.columns[0])
             result["keywords"] = set(df_kw[kw_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "brand", "keyword", "keywords"])]))
-    except Exception: result["keywords"] = set()
+    except Exception as e:
+        logger.warning(f"load_perfume_data keywords: {e}")
     try:
         df_cats = safe_excel_read(FILE_NAME, sheet_name="Categories")
         if not df_cats.empty:
             df_cats.columns = [str(c).strip() for c in df_cats.columns]
             cat_col = next((c for c in df_cats.columns if 'cat' in c.lower()), df_cats.columns[0])
             result["category_codes"] = set(df_cats[cat_col].dropna().astype(str).apply(clean_category_code).pipe(lambda s: s[~s.isin(["", "nan", "categories", "category"])]))
-    except Exception: result["category_codes"] = set()
+    except Exception as e:
+        logger.warning(f"load_perfume_data categories: {e}")
     return result
 
 @st.cache_data(ttl=3600)
@@ -560,14 +597,17 @@ def load_books_data_from_local() -> Dict:
                 df.columns = [str(c).strip() for c in df.columns]
                 seller_col = next((c for c in df.columns if 'seller' in c.lower()), df.columns[0])
                 result["sellers"][tab] = set(df[seller_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "sellername", "seller name", "seller"])]))
-        except Exception: result["sellers"][tab] = set()
+        except Exception as e:
+            logger.warning(f"load_books_data tab={tab}: {e}")
+            result["sellers"][tab] = set()
     try:
         df_cats = safe_excel_read(FILE_NAME, sheet_name="Categories")
         if not df_cats.empty:
             df_cats.columns = [str(c).strip() for c in df_cats.columns]
             cat_col = next((c for c in df_cats.columns if 'cat' in c.lower()), df_cats.columns[0])
             result["category_codes"] = set(df_cats[cat_col].dropna().astype(str).apply(clean_category_code).pipe(lambda s: s[~s.isin(["", "nan", "categories", "category"])]))
-    except Exception: result["category_codes"] = set()
+    except Exception as e:
+        logger.warning(f"load_books_data categories: {e}")
     return result
 
 @st.cache_data(ttl=3600)
@@ -585,21 +625,25 @@ def load_jerseys_from_local() -> Dict:
                 ex_col = next((c for c in df.columns if "exempt" in c.lower() or "seller" in c.lower()), None)
                 if ex_col:
                     result["exempted"][tab] = set(df[ex_col].dropna().astype(str).str.strip().str.lower().pipe(lambda s: s[~s.isin(["", "nan", "exempted sellers", "seller"])]))
-        except Exception: pass
+        except Exception as e:
+            logger.warning(f"load_jerseys tab={tab}: {e}")
     try:
         df_cats = safe_excel_read(FILE_NAME, sheet_name="categories")
         if not df_cats.empty:
             df_cats.columns = [str(c).strip().lower() for c in df_cats.columns]
             cat_col = next((c for c in df_cats.columns if "cat" in c), df_cats.columns[0])
             result["categories"] = set(df_cats[cat_col].dropna().astype(str).apply(clean_category_code).pipe(lambda s: s[~s.isin(["", "nan", "categories", "category"])]))
-    except Exception: pass
+    except Exception as e:
+        logger.warning(f"load_jerseys categories: {e}")
     return result
 
 @st.cache_data(ttl=3600)
 def load_suspected_fake_from_local() -> pd.DataFrame:
     try:
-        if os.path.exists('suspected_fake.xlsx'): return pd.read_excel('suspected_fake.xlsx', sheet_name=0, engine='openpyxl', dtype=str)
-    except Exception: pass
+        if os.path.exists('suspected_fake.xlsx'):
+            return pd.read_excel('suspected_fake.xlsx', sheet_name=0, engine='openpyxl', dtype=str)
+    except Exception as e:
+        logger.warning(f"load_suspected_fake: {e}")
     return pd.DataFrame()
 
 # -------------------------------------------------
@@ -631,11 +675,11 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
         'Wrong Category': ('1000004 - Wrong Category', "Assigned to Wrong Category. Please use correct category."),
         'Poor images': ('1000042 - Kindly follow our product image upload guideline.', "Poor Image Quality")
     }
-    
+
     default_mapping = {}
     for k, v in raw_default.items():
         default_mapping[k] = {'reason': v[0], 'en': v[1], 'fr': v[1], 'ar': v[1]}
-        
+
     try:
         if os.path.exists(filename):
             df = pd.read_excel(filename, engine='openpyxl', dtype=str)
@@ -646,26 +690,17 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
                     flag = str(row['flag']).strip()
                     reason = str(row['reason']).strip()
                     comment_en = str(row['comment']).strip()
-                    
-                    # Fetch French/Arabic from Excel, fallback to English if blank
                     comment_fr = str(row['french']).strip() if 'french' in df.columns else comment_en
                     comment_ar = str(row['arabic']).strip() if 'arabic' in df.columns else comment_en
-                    
                     if comment_fr.lower() == 'nan' or not comment_fr: comment_fr = comment_en
                     if comment_ar.lower() == 'nan' or not comment_ar: comment_ar = comment_en
-                    
                     if flag and flag.lower() != 'nan':
-                        custom_mapping[flag] = {
-                            'reason': reason,
-                            'en': comment_en,
-                            'fr': comment_fr,
-                            'ar': comment_ar
-                        }
-                if custom_mapping: 
+                        custom_mapping[flag] = {'reason': reason, 'en': comment_en, 'fr': comment_fr, 'ar': comment_ar}
+                if custom_mapping:
                     return custom_mapping
-    except Exception: 
-        pass
-        
+    except Exception as e:
+        logger.warning(f"load_flags_mapping({filename}): {e}")
+
     return default_mapping
 
 @st.cache_data(ttl=3600)
@@ -743,10 +778,7 @@ def standardize_input_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns=renamed)
     for col in ['ACTIVE_STATUS_COUNTRY', 'CATEGORY_CODE', 'BRAND', 'TAX_CLASS', 'NAME', 'SELLER_NAME']:
         if col in df.columns: df[col] = df[col].astype(str)
-        
-    if 'MAIN_IMAGE' not in df.columns:
-        df['MAIN_IMAGE'] = ''
-        
+    if 'MAIN_IMAGE' not in df.columns: df['MAIN_IMAGE'] = ''
     return df
 
 def validate_input_schema(df: pd.DataFrame) -> Tuple[bool, List[str]]:
@@ -759,7 +791,6 @@ def filter_by_country(df: pd.DataFrame, country_validator: CountryValidator) -> 
     if 'ACTIVE_STATUS_COUNTRY' not in df.columns: return df, []
     s = df['ACTIVE_STATUS_COUNTRY'].astype(str).str.strip().str.upper().str.replace(r'^JUMIA-', '', regex=True)
     df['ACTIVE_STATUS_COUNTRY'] = s
-
     if country_validator.code == 'NG':
         is_ng = df['ACTIVE_STATUS_COUNTRY'] == 'NG'
         is_multi = df['ACTIVE_STATUS_COUNTRY'].isin(MULTI_COUNTRY_VALUES)
@@ -768,7 +799,6 @@ def filter_by_country(df: pd.DataFrame, country_validator: CountryValidator) -> 
     else:
         filtered = df[df['ACTIVE_STATUS_COUNTRY'] == country_validator.code].copy()
         filtered['_IS_MULTI_COUNTRY'] = False
-
     detected_names = []
     if filtered.empty:
         detected_codes = [c for c in df['ACTIVE_STATUS_COUNTRY'].unique() if str(c).strip() and str(c).strip().lower() != 'nan']
@@ -826,11 +856,13 @@ def run_cached_check(func, cache_path, ckwargs):
     if os.path.exists(cache_path):
         try:
             with open(cache_path, 'rb') as f: return pickle.load(f)
-        except Exception: pass
+        except Exception as e:
+            logger.warning(f"run_cached_check load failed {cache_path}: {e}")
     res = func(**ckwargs)
     try:
         with open(cache_path, 'wb') as f: pickle.dump(res, f)
-    except Exception: pass
+    except Exception as e:
+        logger.warning(f"run_cached_check save failed {cache_path}: {e}")
     return res
 
 def check_miscellaneous_category(data: pd.DataFrame) -> pd.DataFrame:
@@ -918,7 +950,8 @@ def check_prohibited_products(data: pd.DataFrame, prohibited_rules: List[Dict]) 
     return result.drop_duplicates(subset=['PRODUCT_SET_SID'])
 
 def check_suspected_fake_products(data: pd.DataFrame, suspected_fake_df: pd.DataFrame, fx_rate: float) -> pd.DataFrame:
-    if not all(c in data.columns for c in ['CATEGORY_CODE', 'BRAND', 'GLOBAL_SALE_PRICE', 'GLOBAL_PRICE']) or suspected_fake_df.empty: return pd.DataFrame(columns=data.columns)
+    if not all(c in data.columns for c in ['CATEGORY_CODE', 'BRAND', 'GLOBAL_SALE_PRICE', 'GLOBAL_PRICE']) or suspected_fake_df.empty:
+        return pd.DataFrame(columns=data.columns)
     try:
         ref_data = suspected_fake_df.copy()
         brand_cat_price = {}
@@ -940,7 +973,9 @@ def check_suspected_fake_products(data: pd.DataFrame, suspected_fake_df: pd.Data
         cats = d['CAT_BASE'].values
         d['is_fake'] = [p < brand_cat_price.get((b, c), -1) for p, b, c in zip(prices, brands, cats)]
         return d[d['is_fake'] == True][data.columns].drop_duplicates(subset=['PRODUCT_SET_SID'])
-    except: return pd.DataFrame(columns=data.columns)
+    except Exception as e:
+        logger.warning(f"check_suspected_fake_products: {e}")
+        return pd.DataFrame(columns=data.columns)
 
 def check_refurb_seller_approval(data: pd.DataFrame, refurb_data: dict, country_code: str) -> pd.DataFrame:
     required = {'PRODUCT_SET_SID', 'CATEGORY_CODE', 'SELLER_NAME', 'NAME'}
@@ -1157,30 +1192,32 @@ def check_incomplete_smartphone_name(data: pd.DataFrame, smartphone_category_cod
     if not flagged.empty: flagged['Comment_Detail'] = "Name missing Storage/Memory spec (e.g., 64GB)"
     return flagged.drop_duplicates(subset=['PRODUCT_SET_SID'])
 
+# CHANGE 9: Vectorized duplicate detection — replaces slow iterrows loop
 def check_duplicate_products(data: pd.DataFrame, exempt_categories: List[str] = None, similarity_threshold: float = 0.70, known_colors: List[str] = None, **kwargs) -> pd.DataFrame:
     if not {'NAME', 'SELLER_NAME', 'BRAND'}.issubset(data.columns): return pd.DataFrame(columns=data.columns)
     d = data.copy()
     if exempt_categories and 'CATEGORY_CODE' in d.columns:
         d = d[~d['CATEGORY_CODE'].apply(clean_category_code).isin(set(clean_category_code(c) for c in exempt_categories))]
     if d.empty: return pd.DataFrame(columns=data.columns)
-    d['_norm_name'] = d['NAME'].astype(str).apply(lambda x: re.sub(r'\s+', '', normalize_text(x)))
-    d['_norm_brand'] = d['BRAND'].astype(str).str.lower().str.strip()
+
+    d['_norm_name']   = d['NAME'].astype(str).apply(lambda x: re.sub(r'\s+', '', normalize_text(x)))
+    d['_norm_brand']  = d['BRAND'].astype(str).str.lower().str.strip()
     d['_norm_seller'] = d['SELLER_NAME'].astype(str).str.lower().str.strip()
-    d['_dedup_key'] = d['_norm_seller'] + '|' + d['_norm_brand'] + '|' + d['_norm_name']
-    seen_keys: dict = {}
-    rej: set = set()
-    details: dict = {}
-    for _, row in d.iterrows():
-        key = row['_dedup_key']
-        sid = str(row['PRODUCT_SET_SID'])
-        if key in seen_keys:
-            rej.add(sid)
-            details[sid] = {'base': str(row['NAME'])[:40]}
-        else: seen_keys[key] = sid
-    if not rej: return pd.DataFrame(columns=data.columns)
-    rdf = d[d['PRODUCT_SET_SID'].astype(str).isin(rej)].copy()
-    rdf['Comment_Detail'] = rdf['PRODUCT_SET_SID'].apply(lambda sid: f"Duplicate: '{details[str(sid)]['base']}'" if str(sid) in details else "Duplicate detected")
-    base_cols = data.columns.tolist()
+    d['_dedup_key']   = d['_norm_seller'] + '|' + d['_norm_brand'] + '|' + d['_norm_name']
+
+    # Vectorized: keep first occurrence per key, flag all subsequent ones
+    first_seen_mask = ~d.duplicated(subset=['_dedup_key'], keep='first')
+    dup_mask        = d.duplicated(subset=['_dedup_key'], keep='first')
+
+    if not dup_mask.any(): return pd.DataFrame(columns=data.columns)
+
+    # Build name lookup from first occurrence for comments
+    first_occurrence = d[first_seen_mask].set_index('_dedup_key')['NAME']
+    rdf = d[dup_mask].copy()
+    rdf['Comment_Detail'] = rdf['_dedup_key'].map(
+        lambda k: f"Duplicate: '{str(first_occurrence.get(k, ''))[:40]}'"
+    )
+    base_cols  = data.columns.tolist()
     extra_cols = [c for c in ['Comment_Detail'] if c not in base_cols]
     return rdf[base_cols + extra_cols].drop_duplicates(subset=['PRODUCT_SET_SID'])
 
@@ -1230,17 +1267,14 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             future_to_name = {}
             for i, (name, func, kwargs) in enumerate(validations):
-                # Honor the skip_validators list passed from the expander approval
                 if skip_validators and name in skip_validators: continue
                 if country_validator.should_skip_validation(name): continue
-                
                 ckwargs = {'data': data, **kwargs}
                 if name in ["Generic BRAND Issues", "Fashion brand issues"]: ckwargs['valid_category_codes_fas'] = support_files.get('category_fas', [])
-                
                 flag_hash = compute_flag_input_hash(data, name, ckwargs)
                 cache_path = os.path.join(FLAG_CACHE_DIR, f"{flag_hash}.pkl")
                 future_to_name[executor.submit(run_cached_check, func, cache_path, ckwargs)] = name
-                
+
             for future in concurrent.futures.as_completed(future_to_name):
                 name = future_to_name[future]
                 try:
@@ -1260,7 +1294,7 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
                     else:
                         if name not in results: results[name] = pd.DataFrame(columns=data.columns)
                 except Exception as e:
-                    logger.error(f"Error in {name}: {e}")
+                    logger.error(f"Validation error in '{name}': {e}")
                     validation_errors.append((name, str(e)))
                     if name not in results: results[name] = pd.DataFrame(columns=data.columns)
 
@@ -1273,27 +1307,21 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
         for fname, keys in restricted_keys.items():
             extra = data[data['match_key'].isin(keys)].copy()
             results[fname] = pd.concat([results.get(fname, pd.DataFrame()), extra]).drop_duplicates(subset=['PRODUCT_SET_SID'])
-    
-    # DETERMINE TARGET LANGUAGE FOR FINAL EXPORT COMMENT
+
     target_lang = 'fr' if country_validator.country == "Morocco" else 'en'
-    
+
     rows = []
     processed = set()
     for name, _, _ in validations:
         if name not in results or results[name].empty or 'PRODUCT_SET_SID' not in results[name].columns: continue
         res = results[name]
-        
-        # Pull correct translation dictionary
         rinfo = flags_mapping.get(name, {'reason': "1000007 - Other Reason", 'en': f"Flagged by {name}", 'fr': f"Flagged by {name}", 'ar': f"Flagged by {name}"})
         base_comment = rinfo.get(target_lang, rinfo.get('en'))
-        
         res['PRODUCT_SET_SID'] = res['PRODUCT_SET_SID'].astype(str).str.strip()
         flagged = pd.merge(res[['PRODUCT_SET_SID', 'Comment_Detail']] if 'Comment_Detail' in res.columns else res[['PRODUCT_SET_SID']], data, on='PRODUCT_SET_SID', how='left')
-        
         if 'Comment_Detail' not in flagged.columns and 'Comment_Detail' in res.columns:
             if isinstance(res['Comment_Detail'], pd.DataFrame): flagged['Comment_Detail'] = res['Comment_Detail'].iloc[:, 0]
             else: flagged['Comment_Detail'] = res['Comment_Detail']
-            
         for _, r in flagged.iterrows():
             sid = str(r['PRODUCT_SET_SID']).strip()
             if sid in processed: continue
@@ -1301,7 +1329,7 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
             det = r.get('Comment_Detail', '')
             comment_str = f"{base_comment} ({det})" if pd.notna(det) and det else base_comment
             rows.append({'ProductSetSid': sid, 'ParentSKU': r.get('PARENTSKU', ''), 'Status': 'Rejected', 'Reason': rinfo['reason'], 'Comment': comment_str, 'FLAG': name, 'SellerName': r.get('SELLER_NAME', '')})
-            
+
     for _, r in data[~data['PRODUCT_SET_SID'].astype(str).str.strip().isin(processed)].iterrows():
         sid = str(r['PRODUCT_SET_SID']).strip()
         if sid not in processed:
@@ -1376,7 +1404,9 @@ def prepare_full_data_merged(data_df, final_report_df):
         merged = pd.merge(d_cp, r_cp[["ProductSetSid", "Status", "Reason", "Comment", "FLAG", "SellerName"]], left_on="PRODUCT_SET_SID", right_on="ProductSetSid", how='left')
         if 'ProductSetSid' in merged.columns: merged.drop(columns=['ProductSetSid'], inplace=True)
         return merged
-    except Exception: return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"prepare_full_data_merged: {e}")
+        return pd.DataFrame()
 
 # -------------------------------------------------
 # UTILITIES FOR BRIDGE & DATA MUTATION
@@ -1408,14 +1438,7 @@ REASON_MAP = {
 # -------------------------------------------------
 # HTML GRID BUILDER
 # -------------------------------------------------
-def build_fast_grid_html(
-    page_data,
-    flags_mapping,
-    country,
-    page_warnings,
-    rejected_state,
-    cols_per_row,
-):
+def build_fast_grid_html(page_data, flags_mapping, country, page_warnings, rejected_state, cols_per_row):
     O = JUMIA_COLORS["primary_orange"]
     G = JUMIA_COLORS["success_green"]
     R = JUMIA_COLORS["jumia_red"]
@@ -1427,28 +1450,25 @@ def build_fast_grid_html(
     for _, row in page_data.iterrows():
         sid = str(row["PRODUCT_SET_SID"])
         img_url = str(row.get("MAIN_IMAGE", "")).strip()
-        
-        if img_url.startswith("http://"):
-            img_url = img_url.replace("http://", "https://")
-        if not img_url.startswith("http"):
-            img_url = "https://via.placeholder.com/150?text=No+Image"
-            
+        if img_url.startswith("http://"): img_url = img_url.replace("http://", "https://")
+        if not img_url.startswith("http"): img_url = "https://via.placeholder.com/150?text=No+Image"
         sale_p = row.get("GLOBAL_SALE_PRICE")
         reg_p = row.get("GLOBAL_PRICE")
         usd_val = sale_p if pd.notna(sale_p) and str(sale_p).strip() != "" else reg_p
         price_str = format_local_price(usd_val, st.session_state.selected_country) if pd.notna(usd_val) else ""
-            
         cards_data.append({
-            "sid":      sid,
-            "img":      img_url,
-            "name":     str(row.get("NAME", "")),
-            "brand":    str(row.get("BRAND", "Unknown Brand")),
-            "cat":      str(row.get("CATEGORY", "Unknown Category")),
-            "seller":   str(row.get("SELLER_NAME", "Unknown Seller")),
+            "sid": sid, "img": img_url,
+            "name": str(row.get("NAME", "")),
+            "brand": str(row.get("BRAND", "Unknown Brand")),
+            "cat": str(row.get("CATEGORY", "Unknown Category")),
+            "seller": str(row.get("SELLER_NAME", "Unknown Seller")),
             "warnings": page_warnings.get(sid, []),
-            "price":    price_str
+            "price": price_str
         })
     cards_json = json.dumps(cards_data)
+
+    # CHANGE 6: Safe upper() — guard against None translation value
+    rejected_label = str(_t('rejected') or 'REJECTED').upper()
 
     return f"""<!DOCTYPE html>
 <html dir="{html_dir}">
@@ -1457,21 +1477,14 @@ def build_fast_grid_html(
 <style>
   *{{box-sizing:border-box;margin:0;padding:0;font-family:sans-serif;}}
   body{{background:#f5f5f5;padding:8px;}}
-
   .ctrl-bar{{
-    position: -webkit-sticky;
-    position: sticky;
-    top: 0;
-    z-index: 99999; 
+    position:-webkit-sticky;position:sticky;top:0;z-index:99999;
     display:flex;align-items:center;gap:8px;flex-wrap:wrap;
     padding:8px 12px;
-    background: rgba(255, 255, 255, 0.95);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
-    border-bottom: 2px solid {O};
-    border-radius: 4px;
-    margin-bottom:12px;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+    background:rgba(255,255,255,0.95);
+    backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
+    border-bottom:2px solid {O};border-radius:4px;margin-bottom:12px;
+    box-shadow:0 4px 16px rgba(0,0,0,0.15);
   }}
   .sel-count{{font-weight:700;color:{O};font-size:13px;min-width:80px;}}
   .reason-sel{{flex:1;min-width:160px;padding:6px 10px;border:1px solid #ccc;border-radius:4px;font-size:12px;background:#fff;cursor:pointer;outline:none;}}
@@ -1479,80 +1492,42 @@ def build_fast_grid_html(
   .batch-btn:hover{{opacity:.88;}}
   .desel-btn{{padding:7px 12px;background:#fff;color:#555;border:1px solid #ccc;border-radius:4px;font-size:12px;cursor:pointer;white-space:nowrap;}}
   .desel-btn:hover{{background:#f5f5f5;}}
-
   .grid{{display:grid;grid-template-columns:repeat({cols_per_row},1fr);gap:12px;}}
-  .card{{border:2px solid #e0e0e0;border-radius:8px;padding:10px;background:#fff;position:relative;transition:border-color .15s,box-shadow .15s; z-index:1;}}
-  .card.selected{{border-color:{G};box-shadow:0 0 0 3px rgba(76,175,80,.2); background:rgba(76,175,80,.04);}}
-  .card.staged-rej{{border-color:{R};box-shadow:0 0 0 3px rgba(231,60,23,.2); background:rgba(231,60,23,.04);}}
+  .card{{border:2px solid #e0e0e0;border-radius:8px;padding:10px;background:#fff;position:relative;transition:border-color .15s,box-shadow .15s;z-index:1;}}
+  .card.selected{{border-color:{G};box-shadow:0 0 0 3px rgba(76,175,80,.2);background:rgba(76,175,80,.04);}}
+  .card.staged-rej{{border-color:{R};box-shadow:0 0 0 3px rgba(231,60,23,.2);background:rgba(231,60,23,.04);}}
   .card.committed-rej{{border-color:#bbb;opacity:.6;}}
-  
-  .card-img-wrap{{position:relative;cursor:pointer; border-radius:6px; background:#fff; display:flex; align-items:center; justify-content:center; height: 180px;}}
-  .card-img{{width:100%; height:180px; object-fit:contain; border-radius:6px; display:block; transition: transform 0.2s ease-out, box-shadow 0.2s ease-out;}}
+  .card-img-wrap{{position:relative;cursor:pointer;border-radius:6px;background:#fff;display:flex;align-items:center;justify-content:center;height:180px;}}
+  .card-img{{width:100%;height:180px;object-fit:contain;border-radius:6px;display:block;transition:transform 0.2s ease-out,box-shadow 0.2s ease-out;}}
   .card.committed-rej .card-img{{filter:grayscale(80%);}}
-  
-  /* LOCAL ZOOM CLASSES */
-  .card-img.locally-zoomed {{
-      transform: scale(2.3);
-      box-shadow: 0 15px 50px rgba(0,0,0,0.6);
-      border: 2px solid {O};
-      background: #fff;
-      position: relative;
-      z-index: 9999;
-      border-radius: 8px;
-  }}
-
-  /* LENS ZOOM BUTTON */
-  .zoom-btn {{
-      position: absolute;
-      bottom: 6px;
-      left: 6px;
-      width: 28px;
-      height: 28px;
-      background: rgba(255, 255, 255, 0.95);
-      border-radius: 50%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      cursor: pointer;
-      box-shadow: 0 2px 6px rgba(0,0,0,0.3);
-      z-index: 10000;
-      font-size: 14px;
-      transition: background 0.1s, transform 0.1s;
-  }}
-  .zoom-btn:hover {{ background: #fff; transform: scale(1.1); }}
-  
-  .tick{{position:absolute;bottom:6px;right:6px;width:22px;height:22px;border-radius:50%;background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;color:transparent;font-size:13px;font-weight:900;pointer-events:none; z-index:10;}}
+  .card-img.locally-zoomed{{transform:scale(2.3);box-shadow:0 15px 50px rgba(0,0,0,0.6);border:2px solid {O};background:#fff;position:relative;z-index:9999;border-radius:8px;}}
+  .zoom-btn{{position:absolute;bottom:6px;left:6px;width:28px;height:28px;background:rgba(255,255,255,0.95);border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,0.3);z-index:10000;font-size:14px;transition:background 0.1s,transform 0.1s;}}
+  .zoom-btn:hover{{background:#fff;transform:scale(1.1);}}
+  .tick{{position:absolute;bottom:6px;right:6px;width:22px;height:22px;border-radius:50%;background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;color:transparent;font-size:13px;font-weight:900;pointer-events:none;z-index:10;}}
   .card.selected .tick{{background:{G};color:#fff;}}
   .card.staged-rej .tick{{background:{R};color:#fff;}}
-  
   .warn-wrap{{position:absolute;top:6px;right:6px;display:flex;flex-direction:column;gap:3px;z-index:5;pointer-events:none;}}
   .warn-badge{{background:rgba(255,193,7,.95);color:#313133;font-size:9px;font-weight:800;padding:3px 7px;border-radius:10px;}}
-               
   .price-badge{{position:absolute;top:6px;left:6px;background:rgba(76,175,80,.95);color:#fff;font-size:10px;font-weight:800;padding:3px 7px;border-radius:10px;z-index:5;pointer-events:none;box-shadow:0 2px 4px rgba(0,0,0,0.2);}}
-
   .rej-overlay{{display:none;position:absolute;inset:0;background:rgba(255,255,255,.90);border-radius:6px;flex-direction:column;align-items:center;justify-content:center;z-index:20;gap:5px;padding:8px;text-align:center;}}
   .card.committed-rej .rej-overlay{{display:flex;}}
   .card.staged-rej .rej-overlay.staged{{display:flex;}}
-  
-  .rej-badge{{background:{R};color:#fff;padding:3px 10px;border-radius:10px; font-size:11px;font-weight:700;}}
+  .rej-badge{{background:{R};color:#fff;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:700;}}
   .rej-badge.pending{{background:{O};}}
   .rej-label{{font-size:10px;color:{R};font-weight:600;max-width:120px;}}
-  .undo-btn{{margin-top:8px; padding:6px 12px; background:#313133; color:#fff; border:none; border-radius:4px; font-size:11px; font-weight:bold; cursor:pointer; box-shadow:0 2px 4px rgba(0,0,0,0.2);}}
+  .undo-btn{{margin-top:8px;padding:6px 12px;background:#313133;color:#fff;border:none;border-radius:4px;font-size:11px;font-weight:bold;cursor:pointer;box-shadow:0 2px 4px rgba(0,0,0,0.2);}}
   .undo-btn:hover{{background:#000;}}
-
   .meta{{font-size:11px;margin-top:8px;line-height:1.4;}}
   .meta .nm{{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
   .meta .br{{color:{O};font-weight:700;margin:2px 0;}}
   .meta .ct{{color:#666;font-size:10px;}}
   .meta .sl{{color:#999;font-size:9px;margin-top:4px;border-top:1px dashed #eee;padding-top:4px;}}
-  
   .acts{{display:flex;gap:4px;margin-top:8px;}}
   .act-btn{{flex:1;padding:6px;font-size:11px;border:none;border-radius:4px;cursor:pointer;font-weight:700;color:#fff;background:{O};}}
   .act-more{{flex:1;font-size:11px;border:1px solid #ccc;border-radius:4px;outline:none;cursor:pointer;background:#fff;}}
 </style>
 </head>
 <body>
-
 <div class="ctrl-bar">
   <span class="sel-count" id="sel-count-bar">0 {_t("items_pending")}</span>
   <select class="reason-sel" id="batch-reason">
@@ -1568,28 +1543,19 @@ def build_fast_grid_html(
   <button class="desel-btn" onclick="window.doSelectAll()">{_t("select_all")}</button>
   <button class="desel-btn" onclick="doDeselAll()">{_t("deselect_all")}</button>
 </div>
-
 <div class="grid" id="card-grid"></div>
-
 <script>
 function escapeHtml(unsafe) {{
     return (unsafe || "").toString()
-         .replace(/&/g, "&amp;")
-         .replace(/</g, "&lt;")
-         .replace(/>/g, "&gt;")
-         .replace(/"/g, "&quot;")
-         .replace(/'/g, "&#039;");
+         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+         .replace(/"/g, "&quot;").replace(/'/g, "&#039;");
 }}
-
-var CARDS     = {cards_json};
+var CARDS = {cards_json};
 var COMMITTED = {committed_json};
-
 window._gridSelected = window._gridSelected || {{}};
 window._stagedRejections = window._stagedRejections || {{}};
 var selected = window._gridSelected;
 var staged = window._stagedRejections;
-
-// ── SAFE SCROLL CACHE ──
 try {{
     window.addEventListener("beforeunload", function() {{
         sessionStorage.setItem("jt_iframe_scroll", window.scrollY);
@@ -1601,20 +1567,15 @@ try {{
     window.addEventListener("load", function() {{
         var iScroll = sessionStorage.getItem("jt_iframe_scroll");
         if (iScroll) {{ setTimeout(function() {{ window.scrollTo(0, parseInt(iScroll)); }}, 20); }}
-
         if (window.parent && window.parent.document) {{
             var pScroll = window.parent.sessionStorage.getItem("jt_parent_scroll");
             if (pScroll) {{
                 var main = window.parent.document.querySelector('.main');
-                if (main) {{
-                    setTimeout(function() {{ main.scrollTo({{top: parseInt(pScroll), behavior: 'instant'}}); }}, 30);
-                }}
+                if (main) {{ setTimeout(function() {{ main.scrollTo({{top: parseInt(pScroll), behavior: 'instant'}}); }}, 30); }}
             }}
         }}
     }});
 }} catch(e) {{}}
-
-// ── SAFE PAGE NAVIGATION INTERCEPTOR ──
 try {{
     if (window.parent && window.parent.document) {{
         window.parent._jtClickListener = function(e) {{
@@ -1636,11 +1597,7 @@ try {{
         window.parent.document.removeEventListener('click', window.parent._jtClickListener, true);
         window.parent.document.addEventListener('click', window.parent._jtClickListener, true);
     }}
-}} catch(e) {{
-    console.warn("Interceptor blocked");
-}}
-
-// ── postMessage BRIDGE ──
+}} catch(e) {{ console.warn("Interceptor blocked"); }}
 function sendMsg(type, payload) {{
   try {{
     var par = window.parent;
@@ -1652,19 +1609,14 @@ function sendMsg(type, payload) {{
       }}
     }}
     if (!bridge) return;
-
     var currIframeScroll = window.scrollY;
     var main = par.document.querySelector('.main');
     var currParentScroll = main ? main.scrollTop : 0;
-
     var msg = JSON.stringify({{action: type, payload: payload}});
-
     bridge.focus({{ preventScroll: true }});
     window.scrollTo(0, currIframeScroll);
-
     Object.getOwnPropertyDescriptor(par.HTMLInputElement.prototype, 'value').set.call(bridge, msg);
     bridge.dispatchEvent(new par.Event('input', {{bubbles: true}}));
-
     setTimeout(function() {{
         bridge.blur();
         if (main) main.scrollTop = currParentScroll;
@@ -1672,17 +1624,13 @@ function sendMsg(type, payload) {{
     }}, 150);
   }} catch(ex) {{ console.error('jtbridge error:', ex); }}
 }}
-
 function updateSelCount() {{
   const n = Object.keys(selected).length + Object.keys(staged).length;
   document.getElementById('sel-count-bar').textContent = n + ' {_t("items_pending")}';
 }}
-
-// ── LOCAL ZOOM LOGIC ──
 window.toggleZoom = function(sid) {{
     const img = document.querySelector('#card-' + sid + ' .card-img');
     if (!img) return;
-    
     if (img.classList.contains('locally-zoomed')) {{
         img.classList.remove('locally-zoomed');
         if(img.closest('.card')) img.closest('.card').style.zIndex = '1';
@@ -1695,165 +1643,94 @@ window.toggleZoom = function(sid) {{
         img.closest('.card').style.zIndex = '999';
     }}
 }}
-
 function renderCard(card) {{
   const sid = card.sid;
   const img = escapeHtml(card.img);
   const isCommitted = sid in COMMITTED;
   const isStaged = sid in staged;
   const isSelected = !isCommitted && !isStaged && (sid in selected);
-
   let cls = 'card';
-  if (isCommitted)     cls += ' committed-rej';
-  else if (isStaged)   cls += ' staged-rej';
+  if (isCommitted) cls += ' committed-rej';
+  else if (isStaged) cls += ' staged-rej';
   else if (isSelected) cls += ' selected';
-
   const shortName = card.name.length > 38 ? escapeHtml(card.name.slice(0,38))+'…' : escapeHtml(card.name);
-  const warnHtml  = (card.warnings || []).map(w => `<span class="warn-badge">${{escapeHtml(w)}}</span>`).join('');
+  const warnHtml = (card.warnings || []).map(w => `<span class="warn-badge">${{escapeHtml(w)}}</span>`).join('');
   const priceHtml = card.price ? `<div class="price-badge">${{escapeHtml(card.price)}}</div>` : '';
-  const zoomHtml  = `<div class="zoom-btn" onclick="event.stopPropagation(); window.toggleZoom('${{sid}}')">🔍</div>`;
-  
+  const zoomHtml = `<div class="zoom-btn" onclick="event.stopPropagation();window.toggleZoom('${{sid}}')">🔍</div>`;
   let overlayHtml = '';
   let actHtml = '';
-
   if (isCommitted) {{
       const rejLabel = escapeHtml((COMMITTED[sid]||'').replace(/_/g,' '));
-      overlayHtml = `
-        <div class="rej-overlay">
-          <div class="rej-badge">{_t('rejected').upper()}</div>
-          <div class="rej-label">${{rejLabel}}</div>
-          <button class="undo-btn" onclick="event.stopPropagation();window.undoReject('${{sid}}')">{_t('undo')}</button>
-        </div>`;
+      overlayHtml = `<div class="rej-overlay"><div class="rej-badge">{rejected_label}</div><div class="rej-label">${{rejLabel}}</div><button class="undo-btn" onclick="event.stopPropagation();window.undoReject('${{sid}}')">{_t('undo')}</button></div>`;
   }} else if (isStaged) {{
       const stagedLabel = escapeHtml((staged[sid]||'').replace(/_/g,' '));
-      overlayHtml = `
-        <div class="rej-overlay staged">
-          <div class="rej-badge pending">PENDING</div>
-          <div class="rej-label">${{stagedLabel}}</div>
-          <button class="undo-btn" onclick="event.stopPropagation();window.clearStaged('${{sid}}')">{_t('clear_sel')}</button>
-        </div>`;
+      overlayHtml = `<div class="rej-overlay staged"><div class="rej-badge pending">PENDING</div><div class="rej-label">${{stagedLabel}}</div><button class="undo-btn" onclick="event.stopPropagation();window.clearStaged('${{sid}}')">{_t('clear_sel')}</button></div>`;
   }} else {{
-      actHtml = `
-        <div class="acts">
-          <button class="act-btn"
-            onclick="event.stopPropagation();window.stageReject('${{sid}}','REJECT_POOR_IMAGE')">
-            {_t('poor_img')}
-          </button>
-          <select class="act-more"
-            onchange="if(this.value){{event.stopPropagation();window.stageReject('${{sid}}',this.value);this.value=''}}">
-            <option value="">{_t('more_options')}</option>
-            <option value="REJECT_WRONG_CAT">{_t('wrong_cat')}</option>
-            <option value="REJECT_FAKE">{_t('fake_prod')}</option>
-            <option value="REJECT_BRAND">{_t('restr_brand')}</option>
-            <option value="REJECT_PROHIBITED">{_t('prohibited')}</option>
-            <option value="REJECT_COLOR">{_t('missing_color')}</option>
-            <option value="REJECT_WRONG_BRAND">{_t('wrong_brand')}</option>
-          </select>
-        </div>`;
+      actHtml = `<div class="acts"><button class="act-btn" onclick="event.stopPropagation();window.stageReject('${{sid}}','REJECT_POOR_IMAGE')">{_t('poor_img')}</button><select class="act-more" onchange="if(this.value){{event.stopPropagation();window.stageReject('${{sid}}',this.value);this.value=''}}"><option value="">{_t('more_options')}</option><option value="REJECT_WRONG_CAT">{_t('wrong_cat')}</option><option value="REJECT_FAKE">{_t('fake_prod')}</option><option value="REJECT_BRAND">{_t('restr_brand')}</option><option value="REJECT_PROHIBITED">{_t('prohibited')}</option><option value="REJECT_COLOR">{_t('missing_color')}</option><option value="REJECT_WRONG_BRAND">{_t('wrong_brand')}</option></select></div>`;
   }}
-
-  return `<div class="${{cls}}" id="card-${{sid}}">
-    <div class="card-img-wrap" onclick="window.toggleSelect('${{sid}}', event)">
-      ${{priceHtml}}
-      <div class="warn-wrap">${{warnHtml}}</div>
-      <img class="card-img" src="${{img}}" onerror="this.src='https://via.placeholder.com/150?text=No+Image'">
-      ${{zoomHtml}}
-      ${{overlayHtml}}<div class="tick">✓</div>
-    </div>
-    <div class="meta">
-      <div class="nm" title="${{escapeHtml(card.name)}}">${{shortName}}</div>
-      <div class="br">${{escapeHtml(card.brand)}}</div>
-      <div class="ct">${{escapeHtml(card.cat)}}</div>
-      <div class="sl">${{escapeHtml(card.seller)}}</div>
-    </div>${{actHtml}}</div>`;
+  return `<div class="${{cls}}" id="card-${{sid}}"><div class="card-img-wrap" onclick="window.toggleSelect('${{sid}}', event)">${{priceHtml}}<div class="warn-wrap">${{warnHtml}}</div><img class="card-img" src="${{img}}" onerror="this.src='https://via.placeholder.com/150?text=No+Image'">${{zoomHtml}}${{overlayHtml}}<div class="tick">✓</div></div><div class="meta"><div class="nm" title="${{escapeHtml(card.name)}}">${{shortName}}</div><div class="br">${{escapeHtml(card.brand)}}</div><div class="ct">${{escapeHtml(card.cat)}}</div><div class="sl">${{escapeHtml(card.seller)}}</div></div>${{actHtml}}</div>`;
 }}
-
 function renderAll() {{
   document.getElementById('card-grid').innerHTML = CARDS.map(renderCard).join('');
   updateSelCount();
 }}
-
 function replaceCard(sid) {{
   const el = document.getElementById('card-'+sid);
   if (!el) return;
   const card = CARDS.find(c => c.sid === sid);
   if (card) {{ const t=document.createElement('div'); t.innerHTML=renderCard(card); el.replaceWith(t.firstElementChild); }}
 }}
-
 window.doSelectAll = function() {{
-  CARDS.forEach(c => {{
-      if (!(c.sid in COMMITTED) && !(c.sid in staged)) {{
-          selected[c.sid] = true;
-      }}
-  }});
-  renderAll();
-  updateSelCount();
+  CARDS.forEach(c => {{ if (!(c.sid in COMMITTED) && !(c.sid in staged)) selected[c.sid] = true; }});
+  renderAll(); updateSelCount();
 }}
-
 window.toggleSelect = function(sid, e) {{
   const img = document.querySelector('#card-' + sid + ' .card-img');
   if (img && img.classList.contains('locally-zoomed')) {{
       img.classList.remove('locally-zoomed');
       img.closest('.card').style.zIndex = '1';
-      return; 
+      return;
   }}
-
   if (sid in COMMITTED) return;
   if (sid in staged) {{ delete staged[sid]; }}
   else if (sid in selected) {{ delete selected[sid]; }}
   else {{ selected[sid] = true; }}
-  replaceCard(sid);
-  updateSelCount();
+  replaceCard(sid); updateSelCount();
 }}
-
 window.stageReject = function(sid, reasonKey) {{
   if (sid in selected) delete selected[sid];
   staged[sid] = reasonKey;
-  replaceCard(sid);
-  updateSelCount();
+  replaceCard(sid); updateSelCount();
 }}
-
 window.clearStaged = function(sid) {{
   delete staged[sid];
-  replaceCard(sid);
-  updateSelCount();
+  replaceCard(sid); updateSelCount();
 }}
-
 window.undoReject = function(sid) {{
   sendMsg('undo', {{[sid]: true}});
   delete COMMITTED[sid];
-  replaceCard(sid);
-  updateSelCount();
+  replaceCard(sid); updateSelCount();
 }}
-
 window.doBatchReject = function() {{
   const batchReason = document.getElementById('batch-reason').value;
-  const payload   = {{}};
+  const payload = {{}};
   let count = 0;
-
   for (let sid in staged) {{ payload[sid] = staged[sid]; count++; }}
   for (let sid in selected) {{ payload[sid] = batchReason; count++; }}
-
-  if (count === 0) {{ return; }}
-
+  if (count === 0) return;
   for (let sid in payload) {{
       COMMITTED[sid] = payload[sid];
       delete selected[sid];
       delete staged[sid];
   }}
-
   sendMsg('reject', payload);
-  renderAll();
-  updateSelCount();
+  renderAll(); updateSelCount();
 }}
-
 window.doDeselAll = function() {{
   for(let k in selected) delete selected[k];
   for(let k in staged) delete staged[k];
-  renderAll();
-  updateSelCount();
+  renderAll(); updateSelCount();
 }}
-
 renderAll();
 </script>
 </body>
@@ -1862,12 +1739,13 @@ renderAll();
 # -------------------------------------------------
 # UI COMPONENTS
 # -------------------------------------------------
+# CHANGE 8: Reduced timeout from 2s to 1s to prevent page blocking on slow CDNs
 @st.cache_data(ttl=86400, show_spinner=False)
 def analyze_image_quality_cached(url: str) -> List[str]:
     if not url or not str(url).startswith("http"): return []
     warnings = []
     try:
-        resp = requests.get(url, timeout=2, stream=True)
+        resp = requests.get(url, timeout=1, stream=True)
         if resp.status_code == 200:
             img = Image.open(resp.raw)
             w, h = img.size
@@ -1875,7 +1753,8 @@ def analyze_image_quality_cached(url: str) -> List[str]:
             ratio = h / w if w > 0 else 1
             if ratio > 1.5: warnings.append("Tall (Screenshot?)")
             elif ratio < 0.6: warnings.append("Wide Aspect")
-    except Exception: pass
+    except Exception:
+        pass
     return warnings
 
 @st.dialog("Confirm Bulk Approval")
@@ -1916,7 +1795,8 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
             left_on='ProductSetSid', right_on='PRODUCT_SET_SID', how='left'
         )[[c for c in current_display_cols if c in data.columns]]
         st.session_state.display_df_cache[cache_key] = df_display
-    else: df_display = st.session_state.display_df_cache[cache_key]
+    else:
+        df_display = st.session_state.display_df_cache[cache_key]
 
     c1, c2 = st.columns([1, 1])
     with c1: search_term = st.text_input(_t("search_grid"), placeholder="Name, Brand...", key=f"s_{title}")
@@ -1989,10 +1869,8 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
             else:
                 _rinfo = _fm.get(chosen_reason, {'reason': '1000007 - Other Reason', 'en': chosen_reason})
                 _rcode = _rinfo['reason']
-                
                 _cmt_lang = 'fr' if st.session_state.selected_country == "Morocco" else 'en'
                 _rcmt = _rinfo.get(_cmt_lang, _rinfo.get('en'))
-                
                 st.caption(f"Code: {_rcode[:40]}...")
                 if st.button("Apply", key=f"apply_dd_{title}", type="primary", use_container_width=True, disabled=not has_selection):
                     to_reject = df_view.iloc[selected_indices]['PRODUCT_SET_SID'].tolist()
@@ -2012,7 +1890,8 @@ def get_image_base64(path):
     if os.path.exists(path):
         try:
             with open(path, "rb") as img_file: return base64.b64encode(img_file.read()).decode('utf-8')
-        except Exception: return ""
+        except Exception as e:
+            logger.warning(f"get_image_base64({path}): {e}")
     return ""
 
 logo_base64 = get_image_base64("jumia logo.png") or get_image_base64("jumia_logo.png")
@@ -2022,20 +1901,15 @@ st.markdown(f"""<div class="back-to-top" onclick="window.parent.document.querySe
 st.markdown(f"""<div style='background: linear-gradient(135deg, {JUMIA_COLORS['primary_orange']}, {JUMIA_COLORS['secondary_orange']}); padding: 25px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(246, 139, 30, 0.3);'><h1 style='color: white; margin: 0; font-size: 36px; display: flex; align-items: center;'>{logo_html}Product Validation Tool</h1></div>""", unsafe_allow_html=True)
 
 with st.sidebar:
-    # 1. THE LANGUAGE SWITCHER
     lang_names = list(LANGUAGES.keys())
     current_lang_code = st.session_state.get('ui_lang', 'en')
     current_lang_name = next((k for k, v in LANGUAGES.items() if v == current_lang_code), "English")
-    
     selected_lang_name = st.selectbox("🌐 Language / Langue / اللغة", lang_names, index=lang_names.index(current_lang_name))
     new_lang_code = LANGUAGES[selected_lang_name]
-    
     if new_lang_code != current_lang_code:
         st.session_state.ui_lang = new_lang_code
         st.rerun()
-
     st.markdown("---")
-    
     st.header(_t("system_status"))
     if st.button(_t("clear_cache"), use_container_width=True, type="secondary"):
         st.cache_data.clear()
@@ -2043,7 +1917,6 @@ with st.sidebar:
         if os.path.exists(PARQUET_CACHE_DIR): shutil.rmtree(PARQUET_CACHE_DIR)
         if os.path.exists(FLAG_CACHE_DIR): shutil.rmtree(FLAG_CACHE_DIR)
         st.rerun()
-        
     st.markdown("---")
     st.header(_t("display_settings"))
     new_mode = "wide" if "Wide" in st.radio("Layout Mode", ["Centered", "Wide"], index=1 if st.session_state.layout_mode == "wide" else 0) else "centered"
@@ -2055,14 +1928,26 @@ with st.sidebar:
 st.header(f":material/upload_file: {_t('upload_files')}", anchor=False)
 
 current_country = st.session_state.get('selected_country', get_default_country())
-country_choice = st.segmented_control("Country", ["Kenya", "Uganda", "Nigeria", "Ghana", "Morocco"], default=current_country)
+
+# CHANGE 3: bind="country" syncs selection with URL query param (?country=Kenya)
+# Requires Streamlit >= 1.55.0
+country_choice = st.segmented_control(
+    "Country",
+    ["Kenya", "Uganda", "Nigeria", "Ghana", "Morocco"],
+    default=current_country,
+    key="country_selector",
+    bind="country",
+)
 
 if country_choice and country_choice != current_country:
     st.session_state.selected_country = country_choice
+    # CHANGE 14: Visible feedback before the rerun so the switch feels instant
+    st.toast(f"Switching to {country_choice}…", icon="🌍")
     if country_choice == "Morocco":
         st.session_state.ui_lang = "fr"
     else:
         st.session_state.ui_lang = "en"
+    st.session_state.flags_expanded_initialized = False
     st.rerun()
 
 country_validator = CountryValidator(st.session_state.selected_country)
@@ -2072,7 +1957,8 @@ uploaded_files = st.file_uploader("", type=['csv', 'xlsx'], accept_multiple_file
 if uploaded_files:
     current_file_signature = sorted([f.name + str(f.size) for f in uploaded_files])
     process_signature = str(current_file_signature) + f"_{country_validator.code}"
-else: process_signature = "empty"
+else:
+    process_signature = "empty"
 
 if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.final_report = pd.DataFrame()
@@ -2086,9 +1972,8 @@ if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.grid_page = 0
     st.session_state.exports_cache = {}
     st.session_state.display_df_cache = {}
-    
+    st.session_state.flags_expanded_initialized = False
     if 'main_bridge_counter' not in st.session_state: st.session_state.main_bridge_counter = 0
-
     st.session_state.desel_counter = 0
     st.session_state.batch_counter = 0
     st.session_state.clear_counter = 0
@@ -2096,17 +1981,16 @@ if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.ls_read_trigger = 0
     st.session_state.search_active = False
     st.session_state.pre_search_page = 0
-
     keys_to_delete = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_"))]
     for k in keys_to_delete: del st.session_state[k]
 
-    if process_signature == "empty": 
+    if process_signature == "empty":
         st.session_state.last_processed_files = "empty"
     else:
         sig_hash = hashlib.md5(process_signature.encode()).hexdigest()
         cached_data = load_df_parquet(f"{sig_hash}_data.parquet")
         cached_report = load_df_parquet(f"{sig_hash}_report.parquet")
-        
+
         if cached_data is not None and cached_report is not None:
             st.session_state.final_report = cached_report
             st.session_state.all_data_map = cached_data
@@ -2119,14 +2003,15 @@ if st.session_state.get('last_processed_files') != process_signature:
                 detected_modes = []
                 for uf in uploaded_files:
                     uf.seek(0)
-                    if uf.name.endswith('.xlsx'): raw_data = pd.read_excel(uf, engine='openpyxl', dtype=str)
+                    if uf.name.endswith('.xlsx'):
+                        raw_data = pd.read_excel(uf, engine='openpyxl', dtype=str)
                     else:
                         try:
                             raw_data = pd.read_csv(uf, dtype=str)
                             if len(raw_data.columns) <= 1:
                                 uf.seek(0)
                                 raw_data = pd.read_csv(uf, sep=';', encoding='ISO-8859-1', dtype=str)
-                        except:
+                        except Exception:
                             uf.seek(0)
                             raw_data = pd.read_csv(uf, sep=';', encoding='ISO-8859-1', dtype=str)
                     detected_modes.append(detect_file_type(raw_data))
@@ -2168,7 +2053,8 @@ if st.session_state.get('last_processed_files') != process_signature:
                         if 'COUNT_VARIATIONS' in data_filtered.columns:
                             file_counts = pd.to_numeric(data_filtered['COUNT_VARIATIONS'], errors='coerce').fillna(1)
                             data_filtered['COUNT_VARIATIONS'] = actual_counts.combine(file_counts, max)
-                        else: data_filtered['COUNT_VARIATIONS'] = actual_counts
+                        else:
+                            data_filtered['COUNT_VARIATIONS'] = actual_counts
                         data = data_filtered.drop_duplicates(subset=['PRODUCT_SET_SID'], keep='first')
                         if '_IS_MULTI_COUNTRY' not in data.columns: data['_IS_MULTI_COUNTRY'] = False
                         data_has_warranty = all(c in data.columns for c in ['PRODUCT_WARRANTY', 'WARRANTY_DURATION'])
@@ -2182,7 +2068,7 @@ if st.session_state.get('last_processed_files') != process_signature:
                         st.session_state.final_report = final_report
                         st.session_state.all_data_map = data
                         st.session_state.last_processed_files = process_signature
-                        
+
                         save_df_parquet(data, f"{sig_hash}_data.parquet")
                         save_df_parquet(final_report, f"{sig_hash}_report.parquet")
                     else:
@@ -2212,26 +2098,26 @@ if _bridge_val:
                 for _rkey, _sids in _rgroups.items():
                     _flag = REASON_MAP.get(_rkey, "Other Reason (Custom)")
                     _rinfo = support_files["flags_mapping"].get(_flag, {'reason': "1000007 - Other Reason", 'en': "Manual rejection"})
-                    
                     _code = _rinfo['reason']
                     _cmt_lang = 'fr' if st.session_state.selected_country == "Morocco" else 'en'
                     _cmt = _rinfo.get(_cmt_lang, _rinfo.get('en'))
-                    
                     st.session_state.final_report.loc[
                         st.session_state.final_report["ProductSetSid"].isin(_sids),
                         ["Status", "Reason", "Comment", "FLAG"]
                     ] = ["Rejected", _code, _cmt, _flag]
-                    
                     for _s in _sids:
-                        st.session_state[f"quick_rej_{_s}"]        = True
+                        st.session_state[f"quick_rej_{_s}"] = True
                         st.session_state[f"quick_rej_reason_{_s}"] = _flag
                     _total += len(_sids)
                 st.session_state.exports_cache.clear()
                 st.session_state.display_df_cache.clear()
                 st.session_state.main_toasts.append((f"Rejected {_total} product(s)", "✅"))
                 st.session_state.main_bridge_counter += 1
+                # CHANGE 16: Reset scroll flag on bridge-triggered reruns to prevent
+                # accidental scroll-to-top after a rejection from the image grid
+                st.session_state.do_scroll_top = False
                 st.rerun()
-                
+
         elif _msg.get("action") == "undo":
             _payload = _msg.get("payload", {})
             _total_restored = 0
@@ -2241,8 +2127,9 @@ if _bridge_val:
                     _total_restored += 1
             if _total_restored > 0:
                 st.session_state.main_bridge_counter += 1
+                st.session_state.do_scroll_top = False  # CHANGE 16
                 st.rerun()
-                
+
     except Exception as _e:
         logger.error(f"Bridge parse error: {_e}")
 
@@ -2262,29 +2149,44 @@ if uploaded_files and not st.session_state.final_report.empty and st.session_sta
     rej_df = fr[fr['Status'] == 'Rejected']
 
     st.header(f":material/bar_chart: {_t('val_results')}", anchor=False)
+
+    # CHANGE 1: Native st.metric with colored top-bar accent instead of raw HTML divs
     with st.container(border=True):
         cols = st.columns(5 if st.session_state.layout_mode == "wide" else 3)
         is_nigeria = st.session_state.get('selected_country') == 'Nigeria'
         multi_count = int(data['_IS_MULTI_COUNTRY'].sum()) if '_IS_MULTI_COUNTRY' in data.columns else 0
 
         metrics_config = [
-            (_t("total_prod"), len(data), JUMIA_COLORS['dark_gray']),
-            (_t("approved"), len(app_df), JUMIA_COLORS['success_green']),
-            (_t("rejected"), len(rej_df), JUMIA_COLORS['jumia_red']),
-            (_t("rej_rate"), f"{(len(rej_df)/len(data)*100) if len(data)>0 else 0:.1f}%", JUMIA_COLORS['primary_orange']),
+            (_t("total_prod"),  len(data),                                                                                             JUMIA_COLORS['dark_gray']),
+            (_t("approved"),    len(app_df),                                                                                           JUMIA_COLORS['success_green']),
+            (_t("rejected"),    len(rej_df),                                                                                           JUMIA_COLORS['jumia_red']),
+            (_t("rej_rate"),    f"{(len(rej_df)/len(data)*100) if len(data)>0 else 0:.1f}%",                                           JUMIA_COLORS['primary_orange']),
             (_t("multi_skus") if is_nigeria else _t("common_skus"), multi_count if is_nigeria else st.session_state.intersection_count, JUMIA_COLORS['warning_yellow'] if is_nigeria else JUMIA_COLORS['medium_gray']),
         ]
         for i, (label, value, color) in enumerate(metrics_config):
             with cols[i % len(cols)]:
-                st.markdown(f"""<div class="metric-card-inner" style='text-align: center; padding: 18px 12px; background: {JUMIA_COLORS['light_gray']}; border-radius: 8px; border-left: 4px solid {color};'><div class="metric-card-value" style='font-size: 28px; font-weight: 700; color: {color}; margin-bottom: 4px;'>{value}</div><div class="metric-card-label" style='font-size: 11px; color: {JUMIA_COLORS['medium_gray']}; text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600;'>{label}</div></div>""", unsafe_allow_html=True)
+                # Colored top bar + native st.metric
+                st.markdown(
+                    f"<div style='height:5px;background:{color};border-radius:6px 6px 0 0;'></div>",
+                    unsafe_allow_html=True
+                )
+                st.metric(label=label, value=value)
 
+    # CHANGE 2: Expanders use key= for programmatic control (Streamlit 1.55.0+)
+    # Auto-open the largest flag group on first load
     st.subheader(f":material/flag: {_t('flags_breakdown')}", anchor=False)
     if not rej_df.empty:
+        if not st.session_state.flags_expanded_initialized and not rej_df.empty:
+            top_flag = rej_df['FLAG'].value_counts().index[0]
+            st.session_state[f"exp_{top_flag}"] = True
+            st.session_state.flags_expanded_initialized = True
+
         for title in rej_df['FLAG'].unique():
             df_flagged = rej_df[rej_df['FLAG'] == title]
-            with st.expander(f"{title} ({len(df_flagged)})"):
+            with st.expander(f"{title} ({len(df_flagged)})", key=f"exp_{title}"):
                 render_flag_expander(title, df_flagged, data, all(c in data.columns for c in ['PRODUCT_WARRANTY', 'WARRANTY_DURATION']), support_files, country_validator)
-    else: st.success("All products passed validation — no rejections found.")
+    else:
+        st.success("All products passed validation — no rejections found.")
 
 
 # ==========================================
@@ -2306,8 +2208,8 @@ def render_image_grid():
         for k in st.session_state.keys()
         if k.startswith("quick_rej_") and "reason" not in k
     }
-    mask           = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
-    valid_grid_df  = fr[mask]
+    mask          = (fr["Status"] == "Approved") | (fr["ProductSetSid"].isin(committed_rej_sids))
+    valid_grid_df = fr[mask]
 
     c1, c2, c3 = st.columns([1.5, 1.5, 2])
     with c1: search_n  = st.text_input("Search by Name", placeholder="Product name…")
@@ -2318,31 +2220,24 @@ def render_image_grid():
             value=st.session_state.grid_items_per_page,
         )
 
-    if 'MAIN_IMAGE' not in data.columns:
-        data['MAIN_IMAGE'] = ''
-
+    if 'MAIN_IMAGE' not in data.columns: data['MAIN_IMAGE'] = ''
     available_cols = [c for c in GRID_COLS if c in data.columns]
     review_data = pd.merge(
         valid_grid_df[["ProductSetSid"]],
         data[available_cols],
         left_on="ProductSetSid", right_on="PRODUCT_SET_SID", how="left",
     )
-    
+
     if search_n:
-        review_data = review_data[
-            review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)
-        ]
+        review_data = review_data[review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)]
     if search_sc:
-        mc = (review_data["CATEGORY"].astype(str).str.contains(search_sc, case=False, na=False)
-              if "CATEGORY" in review_data.columns
-              else pd.Series(False, index=review_data.index))
+        mc = (review_data["CATEGORY"].astype(str).str.contains(search_sc, case=False, na=False) if "CATEGORY" in review_data.columns else pd.Series(False, index=review_data.index))
         ms = review_data["SELLER_NAME"].astype(str).str.contains(search_sc, case=False, na=False)
         review_data = review_data[mc | ms]
 
     ipp         = st.session_state.grid_items_per_page
     total_pages = max(1, (len(review_data) + ipp - 1) // ipp)
-    if st.session_state.grid_page >= total_pages:
-        st.session_state.grid_page = 0
+    if st.session_state.grid_page >= total_pages: st.session_state.grid_page = 0
 
     pg_cols = st.columns([1, 2, 1], vertical_alignment="center")
     with pg_cols[0]:
@@ -2350,20 +2245,16 @@ def render_image_grid():
             st.session_state.grid_page = max(0, st.session_state.grid_page - 1)
             st.session_state.do_scroll_top = True
             st.rerun(scope="fragment")
-            
     with pg_cols[1]:
         new_page = st.number_input(
-            f"Jump to Page (Total: {total_pages} | {len(review_data)} items)", 
-            min_value=1, 
-            max_value=max(1, total_pages), 
-            value=st.session_state.grid_page + 1,
-            step=1
+            f"Jump to Page (Total: {total_pages} | {len(review_data)} items)",
+            min_value=1, max_value=max(1, total_pages),
+            value=st.session_state.grid_page + 1, step=1
         )
         if new_page - 1 != st.session_state.grid_page:
             st.session_state.grid_page = new_page - 1
             st.session_state.do_scroll_top = True
             st.rerun(scope="fragment")
-            
     with pg_cols[2]:
         if st.button("Next Page ▶", use_container_width=True, disabled=st.session_state.grid_page >= total_pages - 1):
             st.session_state.grid_page += 1
@@ -2376,14 +2267,12 @@ def render_image_grid():
     page_warnings: dict = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
         future_to_sid = {
-            ex.submit(analyze_image_quality_cached,
-                      str(r.get("MAIN_IMAGE", "")).strip()): str(r["PRODUCT_SET_SID"])
+            ex.submit(analyze_image_quality_cached, str(r.get("MAIN_IMAGE", "")).strip()): str(r["PRODUCT_SET_SID"])
             for _, r in page_data.iterrows()
         }
         for future in concurrent.futures.as_completed(future_to_sid):
             warns = future.result()
-            if warns:
-                page_warnings[future_to_sid[future]] = warns
+            if warns: page_warnings[future_to_sid[future]] = warns
 
     rejected_state = {
         sid: st.session_state[f"quick_rej_reason_{sid}"]
@@ -2394,16 +2283,12 @@ def render_image_grid():
     cols_per_row = 3 if st.session_state.layout_mode == "centered" else 4
 
     grid_html = build_fast_grid_html(
-        page_data,
-        support_files["flags_mapping"],
-        st.session_state.selected_country,
-        page_warnings,
-        rejected_state,
-        cols_per_row,
+        page_data, support_files["flags_mapping"],
+        st.session_state.selected_country, page_warnings, rejected_state, cols_per_row,
     )
-    
     components.html(grid_html, height=800, scrolling=True)
 
+    # CHANGE 16: Only scroll on explicit page navigation — never on bridge-triggered reruns
     if st.session_state.get("do_scroll_top", False):
         components.html(
             "<script>window.parent.document.querySelector('.main').scrollTo({top:0,behavior:'smooth'});</script>",
@@ -2420,30 +2305,33 @@ def render_exports_section():
     if st.session_state.final_report.empty or st.session_state.file_mode == 'post_qc':
         return
 
-    fr = st.session_state.final_report
-    data = st.session_state.all_data_map
-    app_df = fr[fr['Status'] == 'Approved']
-    rej_df = fr[fr['Status'] == 'Rejected']
-    c_code = st.session_state.selected_country[:2].upper()
+    # Read fresh from session_state every time the fragment runs
+    fr      = st.session_state.final_report
+    data    = st.session_state.all_data_map
+    app_df  = fr[fr['Status'] == 'Approved']
+    rej_df  = fr[fr['Status'] == 'Rejected']
+    c_code  = st.session_state.selected_country[:2].upper()
     date_str = datetime.now().strftime('%Y-%m-%d')
     reasons_df = support_files.get('reasons', pd.DataFrame())
 
     st.markdown("---")
     st.markdown(f"""<div style='background: linear-gradient(135deg, {JUMIA_COLORS['primary_orange']}, {JUMIA_COLORS['secondary_orange']}); padding: 20px 24px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(246, 139, 30, 0.25);'><h2 style='color: white; margin: 0; font-size: 24px; font-weight: 700;'>{_t('download_reports')}</h2><p style='color: rgba(255,255,255,0.9); margin: 6px 0 0 0; font-size: 13px;'>Export validation results in Excel or ZIP format</p></div>""", unsafe_allow_html=True)
 
-    # 1. Icons removed from the config
     exports_config = [
         ("Final Report",  fr,     'Complete validation report with all statuses', lambda df: generate_smart_export(df, f"{c_code}_Final_{date_str}", 'simple', reasons_df)),
-        ("Rejected Only", rej_df, 'Products that failed validation', lambda df: generate_smart_export(df, f"{c_code}_Rejected_{date_str}", 'simple', reasons_df)),
-        ("Approved Only", app_df, 'Products that passed validation', lambda df: generate_smart_export(df, f"{c_code}_Approved_{date_str}", 'simple', reasons_df)),
-        ("Full Data",     data,   'Complete dataset with validation flags', lambda df: generate_smart_export(prepare_full_data_merged(df, fr), f"{c_code}_Full_{date_str}", 'full')),
+        ("Rejected Only", rej_df, 'Products that failed validation',              lambda df: generate_smart_export(df, f"{c_code}_Rejected_{date_str}", 'simple', reasons_df)),
+        ("Approved Only", app_df, 'Products that passed validation',              lambda df: generate_smart_export(df, f"{c_code}_Approved_{date_str}", 'simple', reasons_df)),
+        ("Full Data",     data,   'Complete dataset with validation flags',       lambda df: generate_smart_export(prepare_full_data_merged(df, fr), f"{c_code}_Full_{date_str}", 'full')),
     ]
 
-    # Added top-level Generate All button for convenience
     all_cached = all(title in st.session_state.exports_cache for title, _, _, _ in exports_config)
-    if not all_cached:
+
+    # CHANGE 15: Success banner when all reports are ready
+    if all_cached:
+        st.success("✅ All reports generated and ready to download.", icon=":material/check_circle:")
+    else:
         if st.button("Generate All Reports", type="primary", icon=":material/download:", use_container_width=True):
-            with st.spinner("Generating all reports..."):
+            with st.spinner("Generating all reports…"):
                 for t2, d2, _desc2, f2 in exports_config:
                     if t2 not in st.session_state.exports_cache:
                         res, fname, mime = f2(d2)
@@ -2458,25 +2346,24 @@ def render_exports_section():
                 title, df, desc, func = exports_config[i + j]
                 with col:
                     with st.container(border=True):
-                        # 2. Material icon div removed from the HTML
-                        st.markdown(f"""<div style='text-align: center; margin-bottom: 15px;'><div style='font-size: 18px; font-weight: 700;'>{title}</div><div style='font-size: 11px; margin-top: 4px; opacity: 0.7;'>{desc}</div><div style='background: {JUMIA_COLORS['light_gray']}; color: {JUMIA_COLORS['primary_orange']}; padding: 8px; border-radius: 6px; margin-top: 12px; font-weight: 600;'>{len(df):,} rows</div></div>""", unsafe_allow_html=True)
-                        
-                        export_key = title
-                        if export_key not in st.session_state.exports_cache:
+                        st.markdown(f"""<div style='text-align:center;margin-bottom:15px;'><div style='font-size:18px;font-weight:700;'>{title}</div><div style='font-size:11px;margin-top:4px;opacity:0.7;'>{desc}</div><div style='background:{JUMIA_COLORS['light_gray']};color:{JUMIA_COLORS['primary_orange']};padding:8px;border-radius:6px;margin-top:12px;font-weight:600;'>{len(df):,} rows</div></div>""", unsafe_allow_html=True)
+
+                        if title not in st.session_state.exports_cache:
                             if st.button("Generate", key=f"gen_{title}", type="primary", use_container_width=True, icon=":material/download:"):
-                                with st.spinner("Generating all reports..."):
-                                    # 3. Loop over all configs so clicking any 'Generate' generates all 4
+                                with st.spinner("Generating all reports…"):
+                                    # Any single Generate click builds all four
                                     for t2, d2, _desc2, f2 in exports_config:
                                         if t2 not in st.session_state.exports_cache:
                                             res, fname, mime = f2(d2)
                                             st.session_state.exports_cache[t2] = {"data": res.getvalue(), "fname": fname, "mime": mime}
                                 st.rerun()
                         else:
-                            cache = st.session_state.exports_cache[export_key]
+                            cache = st.session_state.exports_cache[title]
                             st.download_button("Download", data=cache["data"], file_name=cache["fname"], mime=cache["mime"], use_container_width=True, type="primary", icon=":material/file_download:", key=f"dl_{title}")
                             if st.button("Clear", key=f"clr_{title}", use_container_width=True):
-                                del st.session_state.exports_cache[export_key]
+                                del st.session_state.exports_cache[title]
                                 st.rerun()
+
 # ==========================================
 # CALL FRAGMENTS
 # ==========================================
