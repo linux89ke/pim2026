@@ -25,17 +25,38 @@ JUMIA_COLORS = {
     'warning_yellow':  '#FFC107',
 }
 
-# Order that check expanders are shown in the UI
+# Display order — post-QC-only first, then all shared pre-QC checks
 CHECK_ORDER = [
     "Duplicate SKU",
-    "Brand Repeated in Name",
-    "Fashion Brand",
     "Fake Discount",
     "Low Rating (< 3.0)",
     "No Ratings",
-    "Single-word Name",
-    "Unnecessary Words in Name",
+    "Restricted brands",
+    "Suspected Fake product",
+    "Seller Not approved to sell Refurb",
+    "Product Warranty",
+    "Seller Approve to sell books",
+    "Seller Approved to Sell Perfume",
+    "Perfume Tester",
+    "Counterfeit Sneakers",
+    "Suspected counterfeit Jerseys",
+    "Prohibited products",
+    "Unnecessary words in NAME",
+    "Single-word NAME",
+    "Brand Repeated in Name",
+    "Generic BRAND Issues",
+    "Fashion Brand",
+    "BRAND name repeated in NAME",
+    "Wrong Variation",
+    "Generic branded products with genuine brands",
+    "Missing COLOR",
+    "Missing Weight/Volume",
+    "Incomplete Smartphone Name",
+    "Duplicate product",
+    "Wrong Category",
 ]
+
+POST_QC_ONLY_CHECKS = {"Duplicate SKU", "Fake Discount", "Low Rating (< 3.0)", "No Ratings"}
 
 # -------------------------------------------------
 # FILE DETECTION
@@ -52,15 +73,8 @@ def detect_file_type(df: pd.DataFrame) -> str:
 # -------------------------------------------------
 
 def load_category_map(filename: str = "category_map.xlsx") -> Dict[str, str]:
-    """
-    Load the category name → code mapping file.
-    Expected columns: category_name, category_code, Category Path
-    Returns a dict keyed by lowercased category_name → category_code string.
-    Also indexes by the last segment of Category Path for fuzzy matching.
-    """
     import os
     if not os.path.exists(filename):
-        # try csv variant
         csv_path = filename.replace('.xlsx', '.csv')
         if os.path.exists(csv_path):
             filename = csv_path
@@ -68,14 +82,10 @@ def load_category_map(filename: str = "category_map.xlsx") -> Dict[str, str]:
             logger.warning(f"load_category_map: file '{filename}' not found")
             return {}
     try:
-        if filename.endswith('.csv'):
-            df = pd.read_csv(filename, dtype=str)
-        else:
-            df = pd.read_excel(filename, engine='openpyxl', dtype=str)
-
+        df = pd.read_csv(filename, dtype=str) if filename.endswith('.csv') \
+             else pd.read_excel(filename, engine='openpyxl', dtype=str)
         df.columns = df.columns.str.strip()
 
-        # Flexible column detection
         name_col = next((c for c in df.columns if 'name' in c.lower()), None)
         code_col = next((c for c in df.columns if 'code' in c.lower()), None)
         path_col = next((c for c in df.columns if 'path' in c.lower()), None)
@@ -85,28 +95,22 @@ def load_category_map(filename: str = "category_map.xlsx") -> Dict[str, str]:
             return {}
 
         mapping: Dict[str, str] = {}
-
         for _, row in df.iterrows():
             name = str(row[name_col]).strip()
             code = str(row[code_col]).strip()
             if not name or not code or name.lower() == 'nan' or code.lower() == 'nan':
                 continue
-            code_clean = code.split('.')[0]  # strip any decimal
-
-            # Index by exact category name (lowercased)
+            code_clean = code.split('.')[0]
             mapping[name.lower()] = code_clean
-
-            # Also index by last segment of Category Path if available
             if path_col:
                 path = str(row[path_col]).strip()
                 if path and path.lower() != 'nan':
-                    last_segment = path.split('/')[-1].strip().lower()
-                    if last_segment and last_segment not in mapping:
-                        mapping[last_segment] = code_clean
+                    last = path.split('/')[-1].strip().lower()
+                    if last and last not in mapping:
+                        mapping[last] = code_clean
 
         logger.info(f"load_category_map: loaded {len(mapping)} entries from '{filename}'")
         return mapping
-
     except Exception as e:
         logger.warning(f"load_category_map({filename}): {e}")
         return {}
@@ -117,11 +121,6 @@ def load_category_map(filename: str = "category_map.xlsx") -> Dict[str, str]:
 # -------------------------------------------------
 
 def normalize_post_qc(df: pd.DataFrame, category_map: Dict[str, str] = None) -> pd.DataFrame:
-    """
-    Normalise a post-QC export into the standard column schema.
-    If category_map is provided (name → code), CATEGORY_CODE will be
-    the real Jumia numeric code instead of a slugified placeholder.
-    """
     df = df.copy()
     df.columns = df.columns.str.strip()
 
@@ -151,38 +150,34 @@ def normalize_post_qc(df: pd.DataFrame, category_map: Dict[str, str] = None) -> 
         def resolve_code(raw: str) -> str:
             if not raw or raw == 'nan':
                 return ''
-            # The category field may be a full path like "Automobile / Car Care / Cleaning Kits"
-            # Try progressively shorter suffixes from the right for best match
             segments = [s.strip() for s in re.split(r'[>/]', raw) if s.strip()]
-            # Try from most-specific (last) to least-specific (first)
             for seg in reversed(segments):
                 code = cmap.get(seg.lower())
                 if code:
                     return code
-            # Fallback: slugify the last segment so nothing breaks
             last = segments[-1] if segments else raw
             return re.sub(r'[^a-z0-9]', '_', last.lower())
 
         df['CATEGORY_CODE'] = df['CATEGORY'].astype(str).apply(resolve_code)
-
-        # Surface how many were resolved vs fell back to slug
         resolved = df['CATEGORY_CODE'].str.match(r'^\d+$').sum()
-        total    = len(df)
-        logger.info(f"normalize_post_qc: {resolved}/{total} rows resolved to numeric category codes")
+        logger.info(f"normalize_post_qc: {resolved}/{len(df)} rows resolved to numeric category codes")
 
     if 'ACTIVE_STATUS_COUNTRY' not in df.columns:
         df['ACTIVE_STATUS_COUNTRY'] = 'UNKNOWN'
 
     df['_IS_MULTI_COUNTRY'] = False
     df['PARENTSKU']         = df.get('PRODUCT_SET_SID', pd.Series(dtype=str))
-    df['COLOR']             = ''
+    df['COLOR']             = df['COLOR'] if 'COLOR' in df.columns else ''
     df['COLOR_FAMILY']      = ''
     df['GLOBAL_SALE_PRICE'] = ''
+    if 'COUNT_VARIATIONS' not in df.columns:
+        df['COUNT_VARIATIONS'] = '1'
 
     return df
 
+
 # -------------------------------------------------
-# INDIVIDUAL CHECKS
+# POST-QC-ONLY CHECKS
 # -------------------------------------------------
 
 def _empty(df: pd.DataFrame) -> pd.DataFrame:
@@ -194,92 +189,38 @@ def check_duplicate_sku(df: pd.DataFrame) -> pd.DataFrame:
     if not flagged.empty: flagged['Comment_Detail'] = "Duplicate SKU in file"
     return flagged
 
-def check_brand_in_name(df: pd.DataFrame) -> pd.DataFrame:
-    if not {'NAME', 'BRAND'}.issubset(df.columns): return _empty(df)
-    mask = df.apply(
-        lambda r: (
-            str(r['BRAND']).strip().lower() not in ['', 'nan', 'fashion', 'generic']
-            and str(r['BRAND']).strip().lower() in str(r['NAME']).strip().lower()
-        ), axis=1
-    )
-    flagged = df[mask].copy()
-    if not flagged.empty: flagged['Comment_Detail'] = "Brand '" + flagged['BRAND'].astype(str) + "' repeated in name"
-    return flagged.drop_duplicates(subset=['PRODUCT_SET_SID'])
-
-def check_fashion_brand(df: pd.DataFrame, fashion_categories: list) -> pd.DataFrame:
-    if 'BRAND' not in df.columns or 'CATEGORY' not in df.columns:
-        return _empty(df)
-
-    d = df.copy()
-    d['_brand_lower'] = d['BRAND'].astype(str).str.strip().str.lower()
-    d['_cat_clean'] = d['CATEGORY'].astype(str).str.lower().str.replace('>', '/').str.replace(r'\s+', '', regex=True)
-
-    if fashion_categories:
-        valid_cats = [str(c).lower().replace('>', '/').replace(' ', '') for c in fashion_categories if str(c).strip()]
-        pattern = '|'.join([re.escape(cat) for cat in valid_cats if cat])
-        if pattern:
-            is_valid_category = d['_cat_clean'].str.contains(pattern, regex=True, na=False)
-        else:
-            is_valid_category = pd.Series(False, index=d.index)
-    else:
-        is_valid_category = pd.Series(False, index=d.index)
-
-    mask = (d['_brand_lower'] == 'fashion') & (~is_valid_category)
-    flagged = d[mask].copy()
-    if not flagged.empty:
-        flagged['Comment_Detail'] = "Brand is 'Fashion' but category is not an approved Fashion category"
-
-    return flagged.drop(columns=['_brand_lower', '_cat_clean']).drop_duplicates(subset=['PRODUCT_SET_SID'])
-
 def check_fake_discount(df: pd.DataFrame, multiplier_threshold: float = 10.0) -> pd.DataFrame:
     if not {'GLOBAL_PRICE', 'OLD_PRICE'}.issubset(df.columns): return _empty(df)
     d = df.copy()
-    d['_price']     = pd.to_numeric(d['GLOBAL_PRICE'], errors='coerce')
-    d['_old_price'] = pd.to_numeric(d['OLD_PRICE'],    errors='coerce')
-    mask = (d['_price'].notna() & d['_old_price'].notna() & (d['_price'] > 0) & (d['_old_price'] > d['_price'] * multiplier_threshold))
+    d['_p'] = pd.to_numeric(d['GLOBAL_PRICE'], errors='coerce')
+    d['_o'] = pd.to_numeric(d['OLD_PRICE'],    errors='coerce')
+    mask = d['_p'].notna() & d['_o'].notna() & (d['_p'] > 0) & (d['_o'] > d['_p'] * multiplier_threshold)
     flagged = d[mask].copy()
     if not flagged.empty:
         flagged['Comment_Detail'] = flagged.apply(
-            lambda r: f"Old price {float(r['_old_price']):,.0f} is {float(r['_old_price']) / float(r['_price']):,.0f}x current price {float(r['_price']):,.0f}",
-            axis=1
-        )
-    return flagged.drop(columns=['_price', '_old_price'], errors='ignore').drop_duplicates(subset=['PRODUCT_SET_SID'])
+            lambda r: f"Old price {float(r['_o']):,.0f} is {float(r['_o'])/float(r['_p']):,.0f}x current price {float(r['_p']):,.0f}", axis=1)
+    return flagged.drop(columns=['_p', '_o'], errors='ignore').drop_duplicates(subset=['PRODUCT_SET_SID'])
 
 def check_low_rating(df: pd.DataFrame, threshold: float = 3.0) -> pd.DataFrame:
     if 'RATING' not in df.columns: return _empty(df)
     d = df.copy()
-    d['_rating'] = pd.to_numeric(d['RATING'], errors='coerce')
-    flagged = d[d['_rating'].notna() & (d['_rating'] < threshold)].copy()
-    if not flagged.empty: flagged['Comment_Detail'] = "Rating " + flagged['_rating'].round(1).astype(str) + " is below " + str(threshold)
-    return flagged.drop(columns=['_rating'], errors='ignore').drop_duplicates(subset=['PRODUCT_SET_SID'])
+    d['_r'] = pd.to_numeric(d['RATING'], errors='coerce')
+    flagged = d[d['_r'].notna() & (d['_r'] < threshold)].copy()
+    if not flagged.empty:
+        flagged['Comment_Detail'] = "Rating " + flagged['_r'].round(1).astype(str) + " below " + str(threshold)
+    return flagged.drop(columns=['_r'], errors='ignore').drop_duplicates(subset=['PRODUCT_SET_SID'])
 
 def check_no_ratings(df: pd.DataFrame) -> pd.DataFrame:
     if 'RATING' not in df.columns: return _empty(df)
     d = df.copy()
-    d['_rating'] = pd.to_numeric(d['RATING'], errors='coerce')
-    flagged = d[d['_rating'].isna()].copy()
-    if not flagged.empty: flagged['Comment_Detail'] = "Product has no customer ratings"
-    return flagged.drop(columns=['_rating'], errors='ignore').drop_duplicates(subset=['PRODUCT_SET_SID'])
+    d['_r'] = pd.to_numeric(d['RATING'], errors='coerce')
+    flagged = d[d['_r'].isna()].copy()
+    if not flagged.empty: flagged['Comment_Detail'] = "No customer ratings"
+    return flagged.drop(columns=['_r'], errors='ignore').drop_duplicates(subset=['PRODUCT_SET_SID'])
 
-def check_single_word_name(df: pd.DataFrame) -> pd.DataFrame:
-    if 'NAME' not in df.columns: return _empty(df)
-    flagged = df[df['NAME'].astype(str).str.split().str.len() == 1].copy()
-    if not flagged.empty: flagged['Comment_Detail'] = "Product name is a single word"
-    return flagged.drop_duplicates(subset=['PRODUCT_SET_SID'])
-
-def check_unnecessary_words(df: pd.DataFrame, pattern: re.Pattern) -> pd.DataFrame:
-    if pattern is None or 'NAME' not in df.columns: return _empty(df)
-    mask = df['NAME'].astype(str).str.lower().str.contains(pattern, na=False)
-    flagged = df[mask].copy()
-    if not flagged.empty:
-        def _get_matches(text):
-            matches = pattern.findall(str(text))
-            return ", ".join(set(m.lower() for m in matches if isinstance(m, str)))
-        flagged['Comment_Detail'] = "Unnecessary words: " + flagged['NAME'].apply(_get_matches)
-    return flagged.drop_duplicates(subset=['PRODUCT_SET_SID'])
 
 # -------------------------------------------------
-# CHECK RUNNER
+# HELPERS
 # -------------------------------------------------
 
 def _compile_pattern(words: List[str]):
@@ -287,34 +228,214 @@ def _compile_pattern(words: List[str]):
     pat = '|'.join(r'\b' + re.escape(w) + r'\b' for w in sorted(words, key=len, reverse=True))
     return re.compile(pat, re.IGNORECASE)
 
+
+# -------------------------------------------------
+# CHECK RUNNER
+# -------------------------------------------------
+
 def run_checks(df: pd.DataFrame, support_files: Dict) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
-    unnecessary_pattern = _compile_pattern(support_files.get('unnecessary_words', []))
-    fashion_cats = support_files.get('postqc_fashion_cats', [])
-
-    check_registry = [
-        ("Duplicate SKU",             check_duplicate_sku,      {}),
-        ("Brand Repeated in Name",    check_brand_in_name,      {}),
-        ("Fashion Brand",             check_fashion_brand,      {'fashion_categories': fashion_cats}),
-        ("Fake Discount",             check_fake_discount,      {'multiplier_threshold': 10.0}),
-        ("Low Rating (< 3.0)",        check_low_rating,         {'threshold': 3.0}),
-        ("No Ratings",                check_no_ratings,         {}),
-        ("Single-word Name",          check_single_word_name,   {}),
-        ("Unnecessary Words in Name", check_unnecessary_words,  {'pattern': unnecessary_pattern}),
-    ]
-
     results: Dict[str, pd.DataFrame] = {}
-    for name, func, kwargs in check_registry:
+
+    # ── POST-QC-ONLY ────────────────────────────────────────────────────────
+    for name, func, kwargs in [
+        ("Duplicate SKU",      check_duplicate_sku,  {}),
+        ("Fake Discount",      check_fake_discount,  {'multiplier_threshold': 10.0}),
+        ("Low Rating (< 3.0)", check_low_rating,     {'threshold': 3.0}),
+        ("No Ratings",         check_no_ratings,     {}),
+    ]:
         try:
             res = func(df, **kwargs)
             results[name] = res if (not res.empty and 'PRODUCT_SET_SID' in res.columns) else _empty(df)
         except Exception as exc:
-            logger.error(f"Post-QC check '{name}' failed: {exc}")
+            logger.error(f"Post-QC check '{name}': {exc}")
             results[name] = _empty(df)
 
+    # ── SHARED PRE-QC CHECKS ────────────────────────────────────────────────
+    try:
+        from streamlit_app import (
+            check_restricted_brands, check_suspected_fake_products,
+            check_refurb_seller_approval, check_product_warranty,
+            check_seller_approved_for_books, check_seller_approved_for_perfume,
+            check_perfume_tester, check_counterfeit_sneakers,
+            check_counterfeit_jerseys, check_prohibited_products,
+            check_unnecessary_words, check_single_word_name,
+            check_generic_brand_issues, check_fashion_brand_issues,
+            check_brand_in_name, check_wrong_variation,
+            check_generic_with_brand_in_name, check_missing_color,
+            check_weight_volume_in_name, check_incomplete_smartphone_name,
+            check_duplicate_products, check_miscellaneous_category,
+            compile_regex_patterns, FX_RATE,
+        )
+        _have_preqc = True
+    except ImportError:
+        _have_preqc = False
+        logger.warning("run_checks: pre-QC validators not importable — running basic checks only")
+
+    if _have_preqc:
+        country_code = support_files.get('country_code', 'KE')
+        country_name = support_files.get('country_name', 'Kenya')
+
+        shared_checks = [
+            ("Restricted brands",
+             check_restricted_brands,
+             {'country_rules': support_files.get('restricted_brands_all', {}).get(country_name, [])}),
+
+            ("Suspected Fake product",
+             check_suspected_fake_products,
+             {'suspected_fake_df': support_files.get('suspected_fake', pd.DataFrame()), 'fx_rate': FX_RATE}),
+
+            ("Seller Not approved to sell Refurb",
+             check_refurb_seller_approval,
+             {'refurb_data': support_files.get('refurb_data', {}), 'country_code': country_code}),
+
+            ("Product Warranty",
+             check_product_warranty,
+             {'warranty_category_codes': support_files.get('warranty_category_codes', [])}),
+
+            ("Seller Approve to sell books",
+             check_seller_approved_for_books,
+             {'books_data': support_files.get('books_data', {}),
+              'country_code': country_code,
+              'book_category_codes': support_files.get('book_category_codes', [])}),
+
+            ("Seller Approved to Sell Perfume",
+             check_seller_approved_for_perfume,
+             {'perfume_category_codes': support_files.get('perfume_category_codes', []),
+              'perfume_data': support_files.get('perfume_data', {}),
+              'country_code': country_code}),
+
+            ("Perfume Tester",
+             check_perfume_tester,
+             {'perfume_category_codes': support_files.get('perfume_category_codes', []),
+              'perfume_data': support_files.get('perfume_data', {})}),
+
+            ("Counterfeit Sneakers",
+             check_counterfeit_sneakers,
+             {'sneaker_category_codes': support_files.get('sneaker_category_codes', []),
+              'sneaker_sensitive_brands': support_files.get('sneaker_sensitive_brands', [])}),
+
+            ("Suspected counterfeit Jerseys",
+             check_counterfeit_jerseys,
+             {'jerseys_data': support_files.get('jerseys_data', {}), 'country_code': country_code}),
+
+            ("Prohibited products",
+             check_prohibited_products,
+             {'prohibited_rules': support_files.get('prohibited_words_all', {}).get(country_code, [])}),
+
+            ("Unnecessary words in NAME",
+             check_unnecessary_words,
+             {'pattern': compile_regex_patterns(support_files.get('unnecessary_words', []))}),
+
+            ("Single-word NAME",
+             check_single_word_name,
+             {'book_category_codes': support_files.get('book_category_codes', []),
+              'books_data': support_files.get('books_data', {})}),
+
+            ("Generic BRAND Issues",
+             check_generic_brand_issues,
+             {'valid_category_codes_fas': support_files.get('category_fas', [])}),
+
+            ("Fashion Brand",
+             check_fashion_brand_issues,
+             {'valid_category_codes_fas': support_files.get('category_fas', [])}),
+
+            ("Brand Repeated in Name",
+             check_brand_in_name,
+             {}),
+
+            ("BRAND name repeated in NAME",
+             check_brand_in_name,
+             {}),
+
+            ("Wrong Variation",
+             check_wrong_variation,
+             {'allowed_variation_codes': list(set(
+                 support_files.get('variation_allowed_codes', []) +
+                 support_files.get('category_fas', [])))}),
+
+            ("Generic branded products with genuine brands",
+             check_generic_with_brand_in_name,
+             {'brands_list': support_files.get('known_brands', [])}),
+
+            ("Missing COLOR",
+             check_missing_color,
+             {'pattern': compile_regex_patterns(support_files.get('colors', [])),
+              'color_categories': support_files.get('color_categories', []),
+              'country_code': country_code}),
+
+            ("Missing Weight/Volume",
+             check_weight_volume_in_name,
+             {'weight_category_codes': support_files.get('weight_category_codes', [])}),
+
+            ("Incomplete Smartphone Name",
+             check_incomplete_smartphone_name,
+             {'smartphone_category_codes': support_files.get('smartphone_category_codes', [])}),
+
+            ("Duplicate product",
+             check_duplicate_products,
+             {'exempt_categories': support_files.get('duplicate_exempt_codes', []),
+              'known_colors': support_files.get('colors', [])}),
+
+            ("Wrong Category",
+             check_miscellaneous_category,
+             {}),
+        ]
+
+        # Deduplicate — "Brand Repeated in Name" and "BRAND name repeated in NAME" are same function
+        seen_funcs = set()
+        for name, func, kwargs in shared_checks:
+            # Skip true duplicates (same flag name already processed)
+            if name in results:
+                continue
+            try:
+                res = func(df, **kwargs)
+                results[name] = res if (not res.empty and 'PRODUCT_SET_SID' in res.columns) else _empty(df)
+            except Exception as exc:
+                logger.error(f"Post-QC shared check '{name}': {exc}")
+                results[name] = _empty(df)
+
+    else:
+        # Minimal fallback when pre-QC import fails
+        unnecessary_pattern = _compile_pattern(support_files.get('unnecessary_words', []))
+
+        # Brand in name
+        try:
+            mask = df.apply(lambda r: (
+                str(r.get('BRAND', '')).strip().lower() not in ['', 'nan', 'fashion', 'generic']
+                and str(r.get('BRAND', '')).strip().lower() in str(r.get('NAME', '')).strip().lower()
+            ), axis=1)
+            flagged = df[mask].copy()
+            if not flagged.empty:
+                flagged['Comment_Detail'] = "Brand repeated in name"
+            results["Brand Repeated in Name"] = flagged.drop_duplicates(subset=['PRODUCT_SET_SID']) if not flagged.empty else _empty(df)
+        except Exception as e:
+            results["Brand Repeated in Name"] = _empty(df)
+
+        # Single word name
+        try:
+            flagged = df[df['NAME'].astype(str).str.split().str.len() == 1].copy()
+            if not flagged.empty: flagged['Comment_Detail'] = "Single word name"
+            results["Single-word NAME"] = flagged.drop_duplicates(subset=['PRODUCT_SET_SID']) if not flagged.empty else _empty(df)
+        except Exception:
+            results["Single-word NAME"] = _empty(df)
+
+        # Unnecessary words
+        try:
+            if unnecessary_pattern and 'NAME' in df.columns:
+                mask = df['NAME'].astype(str).str.lower().str.contains(unnecessary_pattern, na=False)
+                flagged = df[mask].copy()
+                if not flagged.empty: flagged['Comment_Detail'] = "Unnecessary words in name"
+                results["Unnecessary words in NAME"] = flagged.drop_duplicates(subset=['PRODUCT_SET_SID']) if not flagged.empty else _empty(df)
+        except Exception:
+            results["Unnecessary words in NAME"] = _empty(df)
+
+    # ── BUILD SUMMARY ────────────────────────────────────────────────────────
     rows = []
     processed: set = set()
-    for name, _, _ in check_registry:
-        res = results.get(name, pd.DataFrame())
+    all_checks = CHECK_ORDER + [k for k in results if k not in CHECK_ORDER]
+
+    for check_name in all_checks:
+        res = results.get(check_name, pd.DataFrame())
         if res.empty or 'PRODUCT_SET_SID' not in res.columns: continue
         for _, r in res.iterrows():
             sid = str(r['PRODUCT_SET_SID']).strip()
@@ -322,7 +443,8 @@ def run_checks(df: pd.DataFrame, support_files: Dict) -> Tuple[pd.DataFrame, Dic
             processed.add(sid)
             rows.append({
                 'SKU': sid, 'Name': r.get('NAME', ''), 'Brand': r.get('BRAND', ''),
-                'Seller': r.get('SELLER_NAME', ''), 'Flag': name, 'Comment': r.get('Comment_Detail', ''),
+                'Category': r.get('CATEGORY', ''), 'Seller': r.get('SELLER_NAME', ''),
+                'Flag': check_name, 'Comment': r.get('Comment_Detail', ''),
                 'Price': r.get('GLOBAL_PRICE', ''), 'Old Price': r.get('OLD_PRICE', ''),
                 'Rating': r.get('RATING', ''), 'Image URL': r.get('MAIN_IMAGE', ''),
             })
@@ -332,13 +454,15 @@ def run_checks(df: pd.DataFrame, support_files: Dict) -> Tuple[pd.DataFrame, Dic
         if sid not in processed:
             rows.append({
                 'SKU': sid, 'Name': r.get('NAME', ''), 'Brand': r.get('BRAND', ''),
-                'Seller': r.get('SELLER_NAME', ''), 'Flag': '', 'Comment': '',
+                'Category': r.get('CATEGORY', ''), 'Seller': r.get('SELLER_NAME', ''),
+                'Flag': '', 'Comment': '',
                 'Price': r.get('GLOBAL_PRICE', ''), 'Old Price': r.get('OLD_PRICE', ''),
                 'Rating': r.get('RATING', ''), 'Image URL': r.get('MAIN_IMAGE', ''),
             })
             processed.add(sid)
 
     return pd.DataFrame(rows), results
+
 
 # -------------------------------------------------
 # EXPORT HELPER
@@ -348,90 +472,123 @@ def build_export(summary: pd.DataFrame, results: Dict[str, pd.DataFrame]) -> byt
     out = BytesIO()
     with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
         summary.to_excel(writer, sheet_name='Summary', index=False)
-        wb  = writer.book
-        ws  = writer.sheets['Summary']
+        wb = writer.book
+        ws = writer.sheets['Summary']
         red_fmt   = wb.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
         green_fmt = wb.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100'})
         if 'Flag' in summary.columns:
             flag_col = summary.columns.get_loc('Flag')
-            ws.conditional_format(1, flag_col, len(summary), flag_col, {'type': 'cell', 'criteria': '!=', 'value': '""', 'format': red_fmt})
-            ws.conditional_format(1, flag_col, len(summary), flag_col, {'type': 'cell', 'criteria': '==', 'value': '""', 'format': green_fmt})
-
+            ws.conditional_format(1, flag_col, len(summary), flag_col,
+                {'type': 'cell', 'criteria': '!=', 'value': '""', 'format': red_fmt})
+            ws.conditional_format(1, flag_col, len(summary), flag_col,
+                {'type': 'cell', 'criteria': '==', 'value': '""', 'format': green_fmt})
         for check_name, res in results.items():
             if res.empty or 'PRODUCT_SET_SID' not in res.columns: continue
-            sheet_name = check_name[:31]
-            res.to_excel(writer, sheet_name=sheet_name, index=False)
-
+            res.to_excel(writer, sheet_name=check_name[:31], index=False)
     out.seek(0)
     return out.getvalue()
+
 
 # -------------------------------------------------
 # STREAMLIT UI
 # -------------------------------------------------
 
 def render_post_qc_section(support_files: Dict) -> None:
-    summary  = st.session_state.post_qc_summary
-    results  = st.session_state.post_qc_results
-    data_pq  = st.session_state.post_qc_data
+    summary = st.session_state.post_qc_summary
+    results = st.session_state.post_qc_results
+    data_pq = st.session_state.post_qc_data
 
     flagged_df = summary[summary['Flag'] != '']
     clean_df   = summary[summary['Flag'] == '']
     flag_rate  = len(flagged_df) / len(summary) * 100 if len(summary) > 0 else 0
 
+    # Category code resolution banner
+    total_count = len(data_pq)
+    resolved_count = int(data_pq['CATEGORY_CODE'].str.match(r'^\d+$').sum()) \
+        if 'CATEGORY_CODE' in data_pq.columns else 0
+
     st.header(":material/bar_chart: Post-QC Results", anchor=False)
+
+    if total_count > 0:
+        pct = resolved_count / total_count * 100
+        if pct == 100:
+            st.success(f"All {total_count} products matched to real category codes — full validation active.", icon=":material/check_circle:")
+        elif pct > 0:
+            st.warning(f"{resolved_count}/{total_count} products matched to category codes ({pct:.0f}%). "
+                       f"Category-dependent checks may miss unresolved rows.", icon=":material/warning:")
+        else:
+            st.error("No products matched to category codes. Check that `category_map.xlsx` is in your app root.",
+                     icon=":material/error:")
+
     with st.container(border=True):
-        n_cols  = 5 if st.session_state.get('layout_mode') == 'wide' else 3
-        p_cols  = st.columns(n_cols)
+        n_cols = 5 if st.session_state.get('layout_mode') == 'wide' else 3
+        p_cols = st.columns(n_cols)
+        active_checks = len([k for k, v in results.items() if not v.empty and 'PRODUCT_SET_SID' in v.columns])
         metrics = [
             ("Total Products", data_pq['PRODUCT_SET_SID'].nunique(), JUMIA_COLORS['dark_gray']),
             ("Issues Found",   len(flagged_df),                       JUMIA_COLORS['jumia_red']),
             ("Clean",          len(clean_df),                         JUMIA_COLORS['success_green']),
             ("Issue Rate",     f"{flag_rate:.1f}%",                   JUMIA_COLORS['primary_orange']),
-            ("Checks Run",     len(results),                          JUMIA_COLORS['medium_gray']),
+            ("Checks Run",     active_checks,                         JUMIA_COLORS['medium_gray']),
         ]
         for i, (label, value, color) in enumerate(metrics):
             with p_cols[i % n_cols]:
-                st.markdown(f"""<div class="metric-card-inner" style='text-align:center;padding:18px 12px;background:{JUMIA_COLORS['light_gray']};border-radius:8px;border-left:4px solid {color};'><div class="metric-card-value" style='font-size:28px;font-weight:700;color:{color};margin-bottom:4px;'>{value}</div><div class="metric-card-label" style='font-size:11px;color:{JUMIA_COLORS['medium_gray']};text-transform:uppercase;letter-spacing:0.6px;font-weight:600;'>{label}</div></div>""", unsafe_allow_html=True)
+                st.markdown(f"<div style='height:4px;background:{color};border-radius:4px 4px 0 0;'></div>",
+                            unsafe_allow_html=True)
+                st.metric(label=label, value=value)
 
     st.subheader(":material/flag: Issues Breakdown", anchor=False)
     any_issues = False
 
-    for check_name in CHECK_ORDER:
+    all_checks_ordered = CHECK_ORDER + [k for k in results if k not in CHECK_ORDER]
+
+    for check_name in all_checks_ordered:
         res = results.get(check_name, pd.DataFrame())
         if res.empty or 'PRODUCT_SET_SID' not in res.columns: continue
         any_issues = True
         count = res['PRODUCT_SET_SID'].nunique()
+        tag = "" if check_name in POST_QC_ONLY_CHECKS else " 🔍"
 
-        if check_name == "Fake Discount": disp_cols = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'GLOBAL_PRICE', 'OLD_PRICE', 'DISCOUNT', 'SELLER_NAME', 'Comment_Detail']
-        elif check_name in ("Low Rating (< 3.0)", "No Ratings"): disp_cols = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'RATING', 'TOTAL_RATINGS', 'SELLER_NAME', 'Comment_Detail']
-        else: disp_cols = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'SELLER_NAME', 'Comment_Detail']
+        if check_name == "Fake Discount":
+            disp_cols = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'CATEGORY', 'GLOBAL_PRICE', 'OLD_PRICE', 'DISCOUNT', 'SELLER_NAME', 'Comment_Detail']
+        elif check_name in ("Low Rating (< 3.0)", "No Ratings"):
+            disp_cols = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'CATEGORY', 'RATING', 'TOTAL_RATINGS', 'SELLER_NAME', 'Comment_Detail']
+        else:
+            disp_cols = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'CATEGORY', 'SELLER_NAME', 'Comment_Detail']
 
         display_df = res[[c for c in disp_cols if c in res.columns]].copy()
         if 'Comment_Detail' not in display_df.columns: display_df['Comment_Detail'] = ''
 
-        with st.expander(f"{check_name} ({count})"):
+        with st.expander(f"{check_name}{tag} ({count})"):
             s1, s2 = st.columns([1, 1])
-            with s1: search = st.text_input("Search", placeholder="Name, Brand...", key=f"pqs_{check_name}")
+            with s1:
+                search = st.text_input("Search", placeholder="Name, Brand, Category...", key=f"pqs_{check_name}")
             with s2:
                 seller_opts = sorted(display_df['SELLER_NAME'].astype(str).unique()) if 'SELLER_NAME' in display_df.columns else []
                 seller_filter = st.multiselect("Filter by Seller", seller_opts, key=f"pqf_{check_name}")
 
-            if search: display_df = display_df[display_df.apply(lambda x: x.astype(str).str.contains(search, case=False).any(), axis=1)]
-            if seller_filter: display_df = display_df[display_df['SELLER_NAME'].isin(seller_filter)]
+            if search:
+                display_df = display_df[display_df.apply(
+                    lambda x: x.astype(str).str.contains(search, case=False).any(), axis=1)]
+            if seller_filter:
+                display_df = display_df[display_df['SELLER_NAME'].isin(seller_filter)]
 
             col_cfg = {
                 "PRODUCT_SET_SID": st.column_config.TextColumn("SKU", pinned=True),
-                "NAME": st.column_config.TextColumn("Name", pinned=True),
-                "GLOBAL_PRICE": st.column_config.NumberColumn("Price", format="₦%.0f"),
-                "OLD_PRICE": st.column_config.NumberColumn("Old Price", format="₦%.0f"),
-                "RATING": st.column_config.NumberColumn("Rating", format="%.1f"),
-                "TOTAL_RATINGS": st.column_config.NumberColumn("# Ratings", format="%d"),
-                "Comment_Detail": st.column_config.TextColumn("Detail"),
+                "NAME":            st.column_config.TextColumn("Name", pinned=True),
+                "CATEGORY":        st.column_config.TextColumn("Category"),
+                "GLOBAL_PRICE":    st.column_config.NumberColumn("Price", format="%.2f"),
+                "OLD_PRICE":       st.column_config.NumberColumn("Old Price", format="%.2f"),
+                "RATING":          st.column_config.NumberColumn("Rating", format="%.1f"),
+                "TOTAL_RATINGS":   st.column_config.NumberColumn("# Ratings", format="%d"),
+                "Comment_Detail":  st.column_config.TextColumn("Detail"),
             }
-            st.dataframe(display_df.reset_index(drop=True), hide_index=True, use_container_width=True, column_config=col_cfg)
+            st.dataframe(display_df.reset_index(drop=True), hide_index=True,
+                         use_container_width=True, column_config=col_cfg)
             st.caption(f"{len(display_df)} rows shown")
 
-    if not any_issues: st.success("No issues found — all post-QC checks passed.")
+    if not any_issues:
+        st.success("No issues found — all post-QC checks passed.")
 
     st.markdown("---")
     st.subheader(":material/download: Export Post-QC Report", anchor=False)
@@ -441,16 +598,18 @@ def render_post_qc_section(support_files: Dict) -> None:
         if st.button("Generate Post-QC Report", type="primary", icon=":material/download:"):
             with st.spinner("Building report..."):
                 xlsx_bytes = build_export(summary, results)
-                if 'exports_cache' not in st.session_state: st.session_state.exports_cache = {}
+                if 'exports_cache' not in st.session_state:
+                    st.session_state.exports_cache = {}
                 st.session_state.exports_cache[export_key] = xlsx_bytes
             st.rerun()
     else:
         date_str = datetime.now().strftime('%Y-%m-%d')
         st.download_button(
-            "Download Post-QC Report", data=st.session_state.exports_cache[export_key],
+            "Download Post-QC Report",
+            data=st.session_state.exports_cache[export_key],
             file_name=f"PostQC_Report_{date_str}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary", icon=":material/file_download:"
+            type="primary", icon=":material/file_download:",
         )
         if st.button("Clear", key="clr_post_qc_export"):
             del st.session_state.exports_cache[export_key]
