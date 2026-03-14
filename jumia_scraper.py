@@ -318,17 +318,23 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
     # ── Price (HTML fallback) ──────────────────────────────────────────────────
     if not result.get("PRICE"):
         for sel in [
-            "span.-b.-ltr.-tal.-fs24",
-            "span.prc",
-            "[class*='price'] span",
-            "span[data-price]",
+            "span.-b.-ltr.-tal.-fs24",   # Jumia current price span
+            "span.prc",                   # alternate class
+            "span[data-price]",           # data attribute variant
         ]:
             el = soup.select_one(sel)
             if el:
                 raw_p = re.sub(r"[^\d.,]", "", el.get_text())
                 if raw_p:
-                    result["PRICE"] = raw_p.replace(",", "")
-                    break
+                    try:
+                        price_val = float(raw_p.replace(",", ""))
+                        # Minimum 50 KES — avoids matching ratings, percentages,
+                        # delivery fees written in the wrong element
+                        if price_val >= 50:
+                            result["PRICE"] = str(int(price_val)) if price_val == int(price_val) else str(price_val)
+                            break
+                    except ValueError:
+                        pass
 
     # ── Discount ──────────────────────────────────────────────────────────────
     for sel in ["span.bdg._dsct._sm", "span._dsct", "[class*='discount']"]:
@@ -406,7 +412,14 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
         return bool(_SIZE_RE.match(val.strip()))
 
     def _collect_pills(selector: str) -> list[str]:
-        """Return text values of all non-empty pill/option elements."""
+        """Return text values of all non-empty pill/option elements.
+        Rejects spec-table rows — they contain ': ' like 'SKU: XYZ123'.
+        """
+        _SPEC_ROW = re.compile(
+            r"^(sku|weight|model|gtin|size|material|dimension|barcode"
+            r"|main\s+material|color\s*:|colour\s*:)\s*[:\(]",
+            re.IGNORECASE,
+        )
         vals: list[str] = []
         for el in soup.select(selector):
             # Prefer hidden input value (radio buttons inside li)
@@ -416,8 +429,12 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
             else:
                 v = el.get_text(strip=True)
             v = v.strip()
-            if v and len(v) < 50:
-                vals.append(v)
+            if not v or len(v) >= 50:
+                continue
+            # Reject anything that looks like a spec row "Label: Value"
+            if ": " in v or _SPEC_ROW.match(v):
+                continue
+            vals.append(v)
         return vals
 
     # Strategy A: variation list <li> items (most common Jumia pattern)
@@ -689,17 +706,26 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
 
     # ── IS_OFFICIAL_STORE ─────────────────────────────────────────────────────
     # Jumia marks official stores with a "JMALL" tag badge and/or an
-    # "Official Store" label near the seller info.
+    # "Official Store" (singular) label near the product title.
+    # IMPORTANT: every Jumia page has an "Official Stores" (plural) nav link —
+    # we must NOT match that. Use \b word-boundary so "store\b" never matches
+    # inside "stores", and scope the text search to exclude the <header>/<nav>.
     if not result.get("IS_OFFICIAL_STORE"):
-        official_signals = [
-            # Tag badge with JMALL href
-            soup.select_one("a[href*='JMALL'], a[tag*='JMALL']"),
-            # Text badge
-            soup.find(string=re.compile(r"official\s+store", re.IGNORECASE)),
-            # Image alt text
-            soup.find("img", alt=re.compile(r"official\s+store", re.IGNORECASE)),
-        ]
-        result["IS_OFFICIAL_STORE"] = "Yes" if any(official_signals) else "No"
+        # Word-boundary regex: matches "Official Store" but NOT "Official Stores"
+        _official_re = re.compile(r"\bofficial\s+store\b", re.IGNORECASE)
+
+        # Remove header/nav from search scope to avoid the nav-bar link
+        body_copy = soup.find("body")
+        for nav_el in (body_copy.find_all(["header", "nav"]) if body_copy else []):
+            nav_el.decompose()
+
+        jmall_badge   = soup.select_one("a[href*='JMALL'], a[tag*='JMALL']")
+        official_text = body_copy.find(string=_official_re) if body_copy else None
+        official_img  = soup.find("img", alt=_official_re)
+
+        result["IS_OFFICIAL_STORE"] = (
+            "Yes" if any([jmall_badge, official_text, official_img]) else "No"
+        )
 
 
     warranty_pattern = re.compile(
@@ -976,17 +1002,21 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
                         in_box.append(txt)
                 break
 
-    # Regex fallback on plain text
+    # Regex fallback on plain text — stop at the next heading keyword
     if not in_box:
         m_box = re.search(
-            r"what.{0,5}s?\s+in\s+the\s+box[:\s]+(.*?)(?:\n\n|\Z)",
+            r"what.{0,5}s?\s+in\s+the\s+box[:\s]+"
+            r"(.*?)"
+            r"(?=\n\s*\n|##|\bSpecifications?\b|\bCustomer\b|\bRelated\b|\Z)",
             full_text,
             re.IGNORECASE | re.DOTALL,
         )
         if m_box:
             raw_box = m_box.group(1).strip()
-            items = re.split(r"[•\n,;]+", raw_box)
-            in_box = [i.strip() for i in items if i.strip() and len(i.strip()) > 2]
+            # Sanity cap — box content shouldn't be a whole paragraph
+            if len(raw_box) < 300:
+                items = re.split(r"[•\n,;]+", raw_box)
+                in_box = [i.strip() for i in items if i.strip() and len(i.strip()) > 2]
 
     if in_box:
         result["WHATS_IN_BOX"] = " | ".join(in_box)
