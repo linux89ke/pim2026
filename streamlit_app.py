@@ -2105,10 +2105,13 @@ if st.session_state.get('last_processed_files') != process_signature:
 
                 if file_mode == 'post_qc':
                     cat_map = support_files.get('category_map', {})
+                    # Inject country context so post-QC validators use correct rules
+                    support_files_pq = dict(support_files)
+                    support_files_pq['country_code'] = country_validator.code
+                    support_files_pq['country_name'] = country_validator.country
                     try:
                         norm_dfs = [normalize_post_qc(df, category_map=cat_map) for df in all_dfs]
                     except TypeError:
-                        # Old postqc.py deployed — patch category codes after normalisation
                         norm_dfs = []
                         for df in all_dfs:
                             ndf = normalize_post_qc(df)
@@ -2127,7 +2130,7 @@ if st.session_state.get('last_processed_files') != process_signature:
                     merged = pd.concat(norm_dfs, ignore_index=True)
                     merged_dedup = merged.drop_duplicates(subset=['PRODUCT_SET_SID'], keep='first')
                     with st.spinner("Running Post-QC checks..."):
-                        summary_df, results = run_post_qc_checks(merged_dedup, support_files)
+                        summary_df, results = run_post_qc_checks(merged_dedup, support_files_pq)
                     st.session_state.post_qc_summary = summary_df
                     st.session_state.post_qc_results = results
                     st.session_state.post_qc_data = merged_dedup
