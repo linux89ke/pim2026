@@ -1937,11 +1937,6 @@ country_choice = st.segmented_control(
 )
 
 if country_choice and country_choice != current_country:
-    # Update country in session state — do NOT call st.rerun() here.
-    # A second rerun causes the file_uploader to lose its widget state (returns None),
-    # making process_signature = "empty" so nothing gets processed.
-    # Instead, let the script continue: process_signature already includes the country
-    # code so it will differ from last_processed_files and trigger reprocessing below.
     st.session_state.selected_country = country_choice
     st.session_state.last_processed_files = None   # force reprocess
     st.session_state.final_report = pd.DataFrame()
@@ -1954,7 +1949,10 @@ if country_choice and country_choice != current_country:
     else:
         st.session_state.ui_lang = "en"
     st.toast(f"Switching to {country_choice}…", icon="🌍")
-    # Fall through — no st.rerun()
+    # st.rerun() is safe here — st.file_uploader preserves its state across reruns
+    # via Streamlit's widget state manager (key="daily_files"). The earlier bug was
+    # caused by bind="query-params" resetting the widget, not by the rerun itself.
+    st.rerun()
 
 country_validator = CountryValidator(st.session_state.selected_country)
 
