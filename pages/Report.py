@@ -165,9 +165,9 @@ if not master_df.empty:
             insights_container = st.container(border=True)
             
             with insights_container:
-                # 1. Health Insight
+                # 1. Health Insight (Updated)
                 if rejection_rate > 20:
-                    st.error(f"**Action Required:** The overall rejection rate is high at **{rejection_rate:.1f}%**. Consider reviewing general seller submission guidelines.", icon=":material/report:")
+                    st.error(f"**Action Required:** The overall rejection rate is high at **{rejection_rate:.1f}%**.", icon=":material/report:")
                 elif rejection_rate > 0:
                     st.success(f"**Healthy Quality:** The approval rate is strong at **{100-rejection_rate:.1f}%**.", icon=":material/health_and_safety:")
                 
@@ -178,17 +178,17 @@ if not master_df.empty:
                     reason_pct = (top_reason_count / weekly_rejected) * 100
                     st.warning(f"**Primary Bottleneck:** **'{top_reason}'** is the leading cause of rejections, accounting for **{reason_pct:.1f}%** of all rejected products.", icon=":material/warning:")
                 
-                # 3. Seller Focus Insight
+                # 3. Seller Focus Insight (Updated)
                 if not seller_stats.empty and not rejected_df.empty:
                     worst_seller = seller_stats.sort_values(by='Rejected', ascending=False).index[0]
                     worst_seller_rejections = seller_stats.loc[worst_seller, 'Rejected']
                     if worst_seller_rejections > 0:
-                        st.info(f"**Seller Focus:** **{worst_seller}** generated the highest number of rejections ({int(worst_seller_rejections)} items). Targeted training for this seller may improve next week's numbers.", icon=":material/person_search:")
+                        st.info(f"**Seller Focus:** **{worst_seller}** generated the highest number of rejections ({int(worst_seller_rejections)} items).", icon=":material/person_search:")
                 
-                # 4. Activity Insight
+                # 4. Activity Insight (Updated)
                 if weekly_total > 0:
                     busiest_day = daily_summary['Daily Total'].drop('Weekly Total').idxmax()
-                    st.info(f"**Peak Activity:** **{busiest_day}** saw the highest volume of product processing this week.", icon=":material/trending_up:")
+                    st.info(f"**Peak Activity:** **{busiest_day}** saw the highest volume of SKUs.", icon=":material/trending_up:")
 
             st.divider()
 
