@@ -436,10 +436,32 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
         )
 
     # Strategy C: <select> dropdown options (some Jumia sellers use a dropdown)
+    # IMPORTANT: Jumia pages also contain location/delivery area dropdowns with
+    # 100+ options. We must scope to the product form only and cap results to
+    # avoid counting those as product variations.
     if not pill_vals:
-        pill_vals = _collect_pills(
-            "select option:not([value='']):not([disabled])"
+        # Only look inside the product add-to-cart form
+        product_form = (
+            soup.select_one("form#product_addtocart_form")
+            or soup.select_one("form[action*='checkout']")
+            or soup.select_one("section.-pvs")  # Jumia variation section
         )
+        if product_form:
+            raw_opts = _collect_pills(
+                "select option:not([value='']):not([disabled])"
+            )
+            # Apply within-form filter manually
+            scoped_opts: list[str] = []
+            for sel_el in product_form.select(
+                "select option:not([value='']):not([disabled])"
+            ):
+                v = sel_el.get_text(strip=True)
+                if v and len(v) < 50:
+                    scoped_opts.append(v)
+            # Sanity cap: location dropdowns have 50+ options; real variation
+            # selects almost never exceed 30
+            if 0 < len(scoped_opts) <= 30:
+                pill_vals = scoped_opts
 
     # Strategy D: div/button variation pills (newer Jumia layout)
     if not pill_vals:
