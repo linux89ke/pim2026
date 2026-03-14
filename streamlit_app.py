@@ -1937,20 +1937,24 @@ country_choice = st.segmented_control(
 )
 
 if country_choice and country_choice != current_country:
+    # Update country in session state — do NOT call st.rerun() here.
+    # A second rerun causes the file_uploader to lose its widget state (returns None),
+    # making process_signature = "empty" so nothing gets processed.
+    # Instead, let the script continue: process_signature already includes the country
+    # code so it will differ from last_processed_files and trigger reprocessing below.
     st.session_state.selected_country = country_choice
-    # Force the processing block to re-run with the new country even if files are already loaded
-    st.session_state.last_processed_files = None
+    st.session_state.last_processed_files = None   # force reprocess
     st.session_state.final_report = pd.DataFrame()
     st.session_state.all_data_map = pd.DataFrame()
     st.session_state.exports_cache = {}
     st.session_state.display_df_cache = {}
     st.session_state.flags_expanded_initialized = False
-    st.toast(f"Switching to {country_choice}…", icon="🌍")
     if country_choice == "Morocco":
         st.session_state.ui_lang = "fr"
     else:
         st.session_state.ui_lang = "en"
-    st.rerun()
+    st.toast(f"Switching to {country_choice}…", icon="🌍")
+    # Fall through — no st.rerun()
 
 country_validator = CountryValidator(st.session_state.selected_country)
 
