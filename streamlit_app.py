@@ -1993,7 +1993,7 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
 # ==========================================
 # APP INITIALIZATION
 # ==========================================
-try: support_files = load_support_files_lazy()
+try: support_files = load_support_files_lazy(); st.session_state.support_files = support_files
 except Exception as e: st.error(f"Failed to load configs: {e}"); st.stop()
 
 def get_image_base64(path):
@@ -2032,16 +2032,6 @@ with st.sidebar:
     new_mode = "wide" if "Wide" in st.radio("Layout Mode", ["Centered", "Wide"], index=1 if st.session_state.layout_mode == "wide" else 0) else "centered"
     if new_mode != st.session_state.layout_mode: st.session_state.layout_mode = new_mode; st.rerun()
 
-    if _SCRAPER_AVAILABLE:
-        st.markdown("---")
-        st.header(":material/travel_explore: Post-QC Enrichment")
-        st.session_state.scraper_enabled = st.toggle(
-            "Auto-fill missing fields from Jumia",
-            value=st.session_state.get("scraper_enabled", False),
-            help="Scrapes Color, Warranty, Variation count from Jumia product pages for any columns absent in your upload. Only runs when a Post-QC file is detected."
-        )
-        if st.session_state.get("scraper_enabled", False):
-            st.caption(":material/info: Runs after upload. May take 1–3 s per product.")
 
 # ==========================================
 # SECTION 1: UPLOAD & VALIDATION
@@ -2160,71 +2150,11 @@ if st.session_state.get('last_processed_files') != process_signature:
                 st.session_state.file_mode = file_mode
 
                 if file_mode == 'post_qc':
-                    cat_map = support_files.get('category_map', {})
-                    # Inject country context so post-QC validators use correct rules
-                    support_files_pq = dict(support_files)
-                    support_files_pq['country_code'] = country_validator.code
-                    support_files_pq['country_name'] = country_validator.country
-                    try:
-                        norm_dfs = [normalize_post_qc(df, category_map=cat_map) for df in all_dfs]
-                    except TypeError:
-                        norm_dfs = []
-                        for df in all_dfs:
-                            ndf = normalize_post_qc(df)
-                            if cat_map and 'CATEGORY' in ndf.columns:
-                                import re as _re
-                                def _resolve(raw, cmap=cat_map):
-                                    if not raw or raw == 'nan': return ''
-                                    segs = [s.strip() for s in _re.split(r'[>/]', str(raw)) if s.strip()]
-                                    for seg in reversed(segs):
-                                        code = cmap.get(seg.lower())
-                                        if code: return code
-                                    last = segs[-1] if segs else raw
-                                    return _re.sub(r'[^a-z0-9]', '_', last.lower())
-                                ndf['CATEGORY_CODE'] = ndf['CATEGORY'].astype(str).apply(_resolve)
-                            norm_dfs.append(ndf)
-                    merged = pd.concat(norm_dfs, ignore_index=True)
-                    merged_dedup = merged.drop_duplicates(subset=['PRODUCT_SET_SID'], keep='first')
-
-                    # ── Jumia scraper enrichment ───────────────────────────
-                    if _SCRAPER_AVAILABLE and st.session_state.get('scraper_enabled', False):
-                        _scrape_missing = [
-                            c for c in ['COLOR', 'PRODUCT_WARRANTY', 'WARRANTY_DURATION',
-                                        'COUNT_VARIATIONS', 'MAIN_IMAGE']
-                            if c not in merged_dedup.columns
-                            or merged_dedup[c].astype(str).str.strip().replace('nan','').eq('').all()
-                        ]
-                        if _scrape_missing:
-                            _n = len(merged_dedup)
-                            _prog_bar  = st.progress(0, text=f"Enriching {_n} products from Jumia…")
-                            _prog_text = st.empty()
-                            def _prog_cb(done, total, sku):
-                                pct = done / max(total, 1)
-                                _prog_bar.progress(pct, text=f"Scraped {done}/{total} — {sku}")
-                                _prog_text.caption(f"Last: {sku}")
-                            merged_dedup = enrich_post_qc_df(
-                                merged_dedup,
-                                country_code=country_validator.code,
-                                progress_callback=_prog_cb,
-                            )
-                            _prog_bar.empty()
-                            _prog_text.empty()
-                            _filled = sum(
-                                1 for c in _scrape_missing
-                                if c in merged_dedup.columns
-                                and not merged_dedup[c].astype(str).str.strip().replace('nan','').eq('').all()
-                            )
-                            if _filled:
-                                st.toast(f":material/check_circle: Enriched {_filled} column(s) from Jumia", icon=":material/travel_explore:")
-                        else:
-                            st.toast("All columns already present — no scraping needed.", icon=":material/info:")
-                    # ─────────────────────────────────────────────────────
-
-                    with st.spinner("Running Post-QC checks..."):
-                        summary_df, results = run_post_qc_checks(merged_dedup, support_files_pq)
-                    st.session_state.post_qc_summary = summary_df
-                    st.session_state.post_qc_results = results
-                    st.session_state.post_qc_data = merged_dedup
+                    st.info(
+                        "Post-QC file detected. "
+                        "Please use the **Post-QC** page in the sidebar to process this file.",
+                        icon=":material/fact_check:",
+                    )
                     st.session_state.last_processed_files = process_signature
                 else:
                     std_dfs = []
@@ -2327,12 +2257,6 @@ if _bridge_val:
 
     except Exception as _e:
         logger.error(f"Bridge parse error: {_e}")
-
-# ==========================================
-# POST-QC RESULTS SECTION
-# ==========================================
-if _files_for_processing and st.session_state.file_mode == 'post_qc' and not st.session_state.post_qc_summary.empty:
-    render_post_qc_section(support_files)
 
 # ==========================================
 # RESULTS SECTION
