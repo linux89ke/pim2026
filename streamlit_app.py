@@ -1668,7 +1668,7 @@ function renderCard(card) {{
   const shortName = card.name.length > 38 ? escapeHtml(card.name.slice(0,38))+'…' : escapeHtml(card.name);
   const warnHtml = (card.warnings || []).map(w => `<span class="warn-badge">${{escapeHtml(w)}}</span>`).join('');
   const priceHtml = card.price ? `<div class="price-badge">${{escapeHtml(card.price)}}</div>` : '';
-  const zoomHtml = `<div class="zoom-btn" onclick="event.stopPropagation();window.toggleZoom('${{sid}}')">🔍</div>`;
+  const zoomHtml = `<div class="zoom-btn" onclick="event.stopPropagation();window.toggleZoom('${{sid}}')"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div>`;
   let overlayHtml = '';
   let actHtml = '';
   if (isCommitted) {{
@@ -1680,7 +1680,7 @@ function renderCard(card) {{
   }} else {{
       actHtml = `<div class="acts"><button class="act-btn" onclick="event.stopPropagation();window.stageReject('${{sid}}','REJECT_POOR_IMAGE')">{_t('poor_img')}</button><select class="act-more" onchange="if(this.value){{event.stopPropagation();window.stageReject('${{sid}}',this.value);this.value=''}}"><option value="">{_t('more_options')}</option><option value="REJECT_WRONG_CAT">{_t('wrong_cat')}</option><option value="REJECT_FAKE">{_t('fake_prod')}</option><option value="REJECT_BRAND">{_t('restr_brand')}</option><option value="REJECT_PROHIBITED">{_t('prohibited')}</option><option value="REJECT_COLOR">{_t('missing_color')}</option><option value="REJECT_WRONG_BRAND">{_t('wrong_brand')}</option></select></div>`;
   }}
-  return `<div class="${{cls}}" id="card-${{sid}}"><div class="card-img-wrap" onclick="window.toggleSelect('${{sid}}', event)">${{priceHtml}}<div class="warn-wrap">${{warnHtml}}</div><img class="card-img" src="${{img}}" onerror="this.src='https://via.placeholder.com/150?text=No+Image'">${{zoomHtml}}${{overlayHtml}}<div class="tick">✓</div></div><div class="meta"><div class="nm" title="${{escapeHtml(card.name)}}">${{shortName}}</div><div class="br">${{escapeHtml(card.brand)}}</div><div class="ct">${{escapeHtml(card.cat)}}</div><div class="sl">${{escapeHtml(card.seller)}}</div></div>${{actHtml}}</div>`;
+  return `<div class="${{cls}}" id="card-${{sid}}"><div class="card-img-wrap" onclick="window.toggleSelect('${{sid}}', event)">${{priceHtml}}<div class="warn-wrap">${{warnHtml}}</div><img class="card-img" src="${{img}}" onerror="this.src='https://via.placeholder.com/150?text=No+Image'">${{zoomHtml}}${{overlayHtml}}<div class="tick">&#10003;</div></div><div class="meta"><div class="nm" title="${{escapeHtml(card.name)}}">${{shortName}}</div><div class="br">${{escapeHtml(card.brand)}}</div><div class="ct">${{escapeHtml(card.cat)}}</div><div class="sl">${{escapeHtml(card.seller)}}</div></div>${{actHtml}}</div>`;
 }}
 function renderAll() {{
   document.getElementById('card-grid').innerHTML = CARDS.map(renderCard).join('');
@@ -1916,7 +1916,7 @@ with st.sidebar:
     lang_names = list(LANGUAGES.keys())
     current_lang_code = st.session_state.get('ui_lang', 'en')
     current_lang_name = next((k for k, v in LANGUAGES.items() if v == current_lang_code), "English")
-    selected_lang_name = st.selectbox("🌐 Language / Langue / اللغة", lang_names, index=lang_names.index(current_lang_name))
+    selected_lang_name = st.selectbox("Language / Langue / اللغة", lang_names, index=lang_names.index(current_lang_name))
     new_lang_code = LANGUAGES[selected_lang_name]
     if new_lang_code != current_lang_code:
         st.session_state.ui_lang = new_lang_code
@@ -1963,7 +1963,7 @@ if country_choice and country_choice != current_country:
         st.session_state.ui_lang = "fr"
     else:
         st.session_state.ui_lang = "en"
-    st.toast(f"Switching to {country_choice}…", icon="🌍")
+    st.toast(f"Switching to {country_choice}…", icon=":material/public:")
 country_validator = CountryValidator(st.session_state.selected_country)
 
 uploaded_files = st.file_uploader("", type=['csv', 'xlsx'], accept_multiple_files=True, key="daily_files")
@@ -2031,7 +2031,7 @@ if st.session_state.get('last_processed_files') != process_signature:
             st.session_state.final_report = cached_report
             st.session_state.all_data_map = cached_data
             st.session_state.last_processed_files = process_signature
-            st.toast("⚡ Loaded from cache", icon="⚡")
+            st.toast("Loaded from cache", icon=":material/bolt:")
         else:
             try:
                 all_dfs = []
@@ -2148,7 +2148,7 @@ if _bridge_val:
                     _total += len(_sids)
                 st.session_state.exports_cache.clear()
                 st.session_state.display_df_cache.clear()
-                st.session_state.main_toasts.append((f"Rejected {_total} product(s)", "✅"))
+                st.session_state.main_toasts.append((f"Rejected {_total} product(s)", ":material/block:"))
                 st.session_state.main_bridge_counter += 1
                 # CHANGE 16: Reset scroll flag on bridge-triggered reruns to prevent
                 # accidental scroll-to-top after a rejection from the image grid
@@ -2365,7 +2365,7 @@ def render_exports_section():
 
     # CHANGE 15: Success banner when all reports are ready
     if all_cached:
-        st.success("✅ All reports generated and ready to download.", icon=":material/check_circle:")
+        st.success("All reports generated and ready to download.", icon=":material/check_circle:")
     else:
         if st.button("Generate All Reports", type="primary", icon=":material/download:", use_container_width=True):
             with st.spinner("Generating all reports…"):
