@@ -1964,6 +1964,18 @@ if uploaded_files:
     st.session_state.cached_uploaded_files = [
         {"name": uf.name, "bytes": uf.read()} for uf in uploaded_files
     ]
+elif uploaded_files is not None and len(uploaded_files) == 0:
+    # User clicked X to clear — wipe the cache so results disappear too
+    st.session_state.cached_uploaded_files = []
+    st.session_state.final_report = pd.DataFrame()
+    st.session_state.all_data_map = pd.DataFrame()
+    st.session_state.post_qc_summary = pd.DataFrame()
+    st.session_state.post_qc_results = {}
+    st.session_state.post_qc_data = pd.DataFrame()
+    st.session_state.file_mode = None
+    st.session_state.exports_cache = {}
+    st.session_state.display_df_cache = {}
+    st.session_state.last_processed_files = "empty"
 
 # Always use the cached bytes for processing — falls back to empty if nothing uploaded yet
 _files_for_processing = st.session_state.get("cached_uploaded_files", [])
