@@ -93,22 +93,27 @@ if uploaded_files:
             daily_summary = master_df.groupby(['Day', status_col]).size().unstack(fill_value=0)
             
             days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+            
             # Only keep days that exist in the data, but ordered correctly
-            available_days = [d for d in days_order if d in daily_summary.index]
             daily_summary = daily_summary.reindex(days_order).fillna(0).astype(int)
             
-            daily_summary['Total'] = daily_summary.sum(axis=1)
+            # Add a Daily Total column (Totals horizontally)
+            daily_summary['Daily Total'] = daily_summary.sum(axis=1)
             
-            weekly_approved = daily_summary['Approved'].sum() if 'Approved' in daily_summary.columns else 0
-            weekly_rejected = daily_summary['Rejected'].sum() if 'Rejected' in daily_summary.columns else 0
-            weekly_total = daily_summary['Total'].sum()
+            # Add a Weekly Total row (Totals vertically)
+            daily_summary.loc['Weekly Total'] = daily_summary.sum()
+            
+            # Extract numbers for the top metrics cards
+            weekly_approved = daily_summary.loc['Weekly Total', 'Approved'] if 'Approved' in daily_summary.columns else 0
+            weekly_rejected = daily_summary.loc['Weekly Total', 'Rejected'] if 'Rejected' in daily_summary.columns else 0
+            weekly_total = daily_summary.loc['Weekly Total', 'Daily Total']
 
             col1, col2, col3 = st.columns(3)
-            col1.metric("Weekly Approved", weekly_approved)
-            col2.metric("Weekly Rejected", weekly_rejected, delta=f"{(weekly_rejected/weekly_total)*100:.1f}% Rate" if weekly_total > 0 else "0%", delta_color="inverse")
-            col3.metric("Total Processed", weekly_total)
+            col1.metric("Weekly Approved", int(weekly_approved))
+            col2.metric("Weekly Rejected", int(weekly_rejected), delta=f"{(weekly_rejected/weekly_total)*100:.1f}% Rate" if weekly_total > 0 else "0%", delta_color="inverse")
+            col3.metric("Total Processed", int(weekly_total))
 
-            st.subheader("📅 Daily Breakdown")
+            st.subheader("📅 Daily & Weekly Breakdown")
             st.table(daily_summary)
 
             # Filter rejected products
