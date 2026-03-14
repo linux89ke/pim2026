@@ -45,6 +45,28 @@ try:
 except ImportError:
     pass
 
+# Import the full validation pipeline and support helpers from the main app.
+# These live in streamlit_app.py (the app root module). We import defensively
+# so Post_QC still works if run in isolation.
+try:
+    import importlib, sys as _sys
+    _main_mod = (
+        _sys.modules.get("streamlit_app")
+        or _sys.modules.get("__main__")
+        or importlib.import_module("streamlit_app")
+    )
+    validate_products      = _main_mod.validate_products
+    load_all_support_files = _main_mod.load_all_support_files
+    render_flag_expander   = _main_mod.render_flag_expander
+    CountryValidator       = _main_mod.CountryValidator
+    generate_smart_export  = _main_mod.generate_smart_export
+    PRODUCTSETS_COLS       = _main_mod.PRODUCTSETS_COLS
+    REJECTION_REASONS_COLS = _main_mod.REJECTION_REASONS_COLS
+    _FULL_VALIDATION_OK    = True
+except Exception as _fv_err:
+    _FULL_VALIDATION_OK = False
+    _fv_err_msg = str(_fv_err)
+
 try:
     from jumia_scraper import (
         enrich_post_qc_df,
@@ -165,6 +187,11 @@ _SS_DEFAULTS = {
     "sku_results_df":     pd.DataFrame(),
     "sku_search_done":    False,
     "sku_lookup_country": "Kenya",
+    # full validation results (runs after post-QC normalisation)
+    "pq_val_report":      pd.DataFrame(),
+    "pq_val_results":     {},
+    "pq_val_exports":     {},
+    "pq_flags_init":      False,
 }
 for _k, _v in _SS_DEFAULTS.items():
     if _k not in st.session_state:
@@ -229,6 +256,10 @@ def _reset_results():
     st.session_state.enriched_df        = None
     st.session_state.enrichment_summary = {}
     st.session_state.enrichment_done    = False
+    st.session_state.pq_val_report    = pd.DataFrame()
+    st.session_state.pq_val_results   = {}
+    st.session_state.pq_val_exports   = {}
+    st.session_state.pq_flags_init    = False
 
 
 def _count_filled(series: pd.Series) -> int:
@@ -932,7 +963,31 @@ with tab_upload:
                             icon="ℹ️",
                         )
 
-                # ── Run QC checks ──────────────────────────────────────
+                # ── Run full validation pipeline (same as main app) ────
+                if _FULL_VALIDATION_OK:
+                    with st.spinner("Running validations…"):
+                        # Build a CountryValidator for the selected country
+                        _cv = CountryValidator(pq_country)
+                        # Reload support files with full set
+                        try:
+                            _sf_full = load_all_support_files()
+                        except Exception:
+                            _sf_full = support_files_pq
+                        data_has_warranty = all(
+                            c in merged_dedup.columns
+                            for c in ["PRODUCT_WARRANTY", "WARRANTY_DURATION"]
+                        )
+                        _val_report, _val_results = validate_products(
+                            merged_dedup.copy(),
+                            _sf_full,
+                            _cv,
+                            data_has_warranty,
+                        )
+                    st.session_state.pq_val_report  = _val_report
+                    st.session_state.pq_val_results = _val_results
+                    st.session_state.pq_flags_init  = False
+
+                # ── Also run legacy post-QC checks ────────────────────
                 with st.spinner("Running Post-QC checks…"):
                     summary_df, results = run_post_qc_checks(
                         merged_dedup, support_files_pq
@@ -1048,8 +1103,121 @@ with tab_upload:
         st.markdown("---")
 
     # ------------------------------------------------------------------
-    # QC RESULTS
+    # FULL VALIDATION RESULTS
     # ------------------------------------------------------------------
+    _val_report = st.session_state.get("pq_val_report", pd.DataFrame())
+    _pq_data    = st.session_state.pq_data
+
+    if _FULL_VALIDATION_OK and not _val_report.empty and not _pq_data.empty:
+        _app_df = _val_report[_val_report["Status"] == "Approved"]
+        _rej_df = _val_report[_val_report["Status"] == "Rejected"]
+        _sf     = _load_support_files()
+        _cv     = CountryValidator(pq_country)
+
+        st.markdown("---")
+        st.markdown(
+            f"""<div style='background:linear-gradient(135deg,{ORANGE},{ORANGE2});
+            padding:18px 24px;border-radius:10px;margin-bottom:16px;
+            box-shadow:0 4px 12px rgba(246,139,30,0.25);'>
+            <h3 style='color:white;margin:0;font-size:20px;font-weight:700;'>
+            🛡️ Validation Results</h3></div>""",
+            unsafe_allow_html=True,
+        )
+
+        # ── Metrics ────────────────────────────────────────────────
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        for _col, _lbl, _val, _color in [
+            (mc1, "Total Products", len(_pq_data),   DARK),
+            (mc2, "Approved",       len(_app_df),    GREEN),
+            (mc3, "Rejected",       len(_rej_df),    RED),
+            (mc4, "Rejection Rate",
+             f"{(len(_rej_df)/len(_pq_data)*100) if len(_pq_data)>0 else 0:.1f}%",
+             ORANGE),
+        ]:
+            with _col:
+                st.markdown(
+                    f"<div style='height:4px;background:{_color};"
+                    f"border-radius:4px 4px 0 0;'></div>",
+                    unsafe_allow_html=True,
+                )
+                st.metric(_lbl, _val)
+
+        # ── Flag expanders ─────────────────────────────────────────
+        if not _rej_df.empty:
+            st.subheader("🚩 Flags Breakdown", anchor=False)
+
+            # Auto-expand the top flag once per load
+            if not st.session_state.pq_flags_init:
+                _top = _rej_df["FLAG"].value_counts().index[0]
+                st.session_state[f"pqexp_{_top}"] = True
+                st.session_state.pq_flags_init = True
+
+            _data_has_w = all(
+                c in _pq_data.columns
+                for c in ["PRODUCT_WARRANTY", "WARRANTY_DURATION"]
+            )
+            for _flag_title in _rej_df["FLAG"].unique():
+                _flag_df = _rej_df[_rej_df["FLAG"] == _flag_title]
+                with st.expander(
+                    f"{_flag_title} ({len(_flag_df)})",
+                    key=f"pqexp_{_flag_title}",
+                ):
+                    render_flag_expander(
+                        _flag_title, _flag_df, _pq_data,
+                        _data_has_w, _sf, _cv,
+                    )
+        else:
+            st.success("✅ All products passed validation — no rejections found.")
+
+        # ── Exports ────────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("#### ⬇️ Download Validation Reports")
+        _date_str = __import__("datetime").datetime.now().strftime("%Y-%m-%d")
+        _fname_base = f"PostQC_{pq_country}_{country_code}_{_date_str}"
+        _reasons_df = _sf.get("reasons", pd.DataFrame())
+
+        _export_cfg = [
+            ("PIM Export",    _val_report, "All products with status"),
+            ("Rejected Only", _rej_df,     "Only rejected products"),
+            ("Approved Only", _app_df,     "Only approved products"),
+        ]
+        _ecols = st.columns(3)
+        for _ei, (_etitle, _edf, _edesc) in enumerate(_export_cfg):
+            with _ecols[_ei]:
+                _ekey = f"pq_exp_{_etitle}"
+                with st.container(border=True):
+                    st.markdown(
+                        f"<div style='text-align:center;'>"
+                        f"<div style='font-weight:700;font-size:15px;'>{_etitle}</div>"
+                        f"<div style='font-size:11px;opacity:.7;margin-top:4px;'>{_edesc}</div>"
+                        f"<div style='background:{LIGHT};color:{ORANGE};padding:6px;"
+                        f"border-radius:6px;margin-top:10px;font-weight:600;'>"
+                        f"{len(_edf):,} rows</div></div>",
+                        unsafe_allow_html=True,
+                    )
+                    if _ekey not in st.session_state.pq_val_exports:
+                        if st.button(
+                            "Generate", key=f"gen_{_ekey}",
+                            type="primary", use_container_width=True,
+                        ):
+                            _res, _fn, _mime = generate_smart_export(
+                                _edf, f"{_fname_base}_{_etitle.replace(' ','_')}",
+                                "simple", _reasons_df,
+                            )
+                            st.session_state.pq_val_exports[_ekey] = {
+                                "data": _res.getvalue(), "fname": _fn, "mime": _mime,
+                            }
+                            st.rerun()
+                    else:
+                        _ec = st.session_state.pq_val_exports[_ekey]
+                        st.download_button(
+                            "📥 Download", data=_ec["data"],
+                            file_name=_ec["fname"], mime=_ec["mime"],
+                            use_container_width=True, type="primary",
+                            key=f"dl_{_ekey}",
+                        )
+
+    # ── Legacy post-QC section (postqc.py checks) ─────────────────────────
     if not st.session_state.pq_summary.empty:
         _save = {
             k: st.session_state.get(k)
@@ -1062,8 +1230,10 @@ with tab_upload:
         st.session_state.post_qc_data    = st.session_state.pq_data
         st.session_state.exports_cache   = st.session_state.pq_exports_cache
 
-        support_files = _load_support_files()
-        render_post_qc_section(support_files)
+        _sf_legacy = _load_support_files()
+        st.markdown("---")
+        st.markdown("### 📋 Post-QC Specific Checks")
+        render_post_qc_section(_sf_legacy)
 
         st.session_state.pq_exports_cache = st.session_state.exports_cache
 
