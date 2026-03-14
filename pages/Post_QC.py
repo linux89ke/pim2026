@@ -8,8 +8,6 @@ from io import BytesIO
 
 # ------------------------------------------------------------------
 # PATH FIX — must be first, before any local imports.
-# On Streamlit Cloud the CWD is not always the repo root, so all
-# relative file loads (xlsx, txt) and local module imports fail.
 # ------------------------------------------------------------------
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
@@ -20,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 # ------------------------------------------------------------------
-# LOCAL IMPORTS  (all modules live in ROOT)
+# LOCAL IMPORTS
 # ------------------------------------------------------------------
 try:
     from translations import LANGUAGES, get_translation
@@ -43,12 +41,17 @@ except Exception as _postqc_err:
     _postqc_err_msg = str(_postqc_err)
 
 try:
-    import _preqc_registry  # noqa: F401 — just ensures it's importable
+    import _preqc_registry  # noqa: F401
 except ImportError:
     pass
 
 try:
-    from jumia_scraper import enrich_post_qc_df
+    from jumia_scraper import (
+        enrich_post_qc_df,
+        SCRAPABLE_FIELDS,
+        scrape_single_sku,
+        COUNTRY_URLS,
+    )
     _SCRAPER_OK = True
 except ImportError:
     _SCRAPER_OK = False
@@ -70,14 +73,15 @@ except Exception:
 # ------------------------------------------------------------------
 # THEME
 # ------------------------------------------------------------------
-ORANGE      = "#F68B1E"
-ORANGE2     = "#FF9933"
-RED         = "#E73C17"
-DARK        = "#313133"
-MED         = "#5A5A5C"
-LIGHT       = "#F5F5F5"
-BORDER      = "#E0E0E0"
-GREEN       = "#4CAF50"
+ORANGE  = "#F68B1E"
+ORANGE2 = "#FF9933"
+RED     = "#E73C17"
+DARK    = "#313133"
+MED     = "#5A5A5C"
+LIGHT   = "#F5F5F5"
+BORDER  = "#E0E0E0"
+GREEN   = "#4CAF50"
+BLUE    = "#1976D2"
 
 st.markdown(f"""
 <style>
@@ -86,9 +90,7 @@ st.markdown(f"""
     background-color: {ORANGE} !important;
     border: none !important; color: white !important;
 }}
-.stButton > button[kind="primary"]:hover {{
-    background-color: {ORANGE2} !important;
-}}
+.stButton > button[kind="primary"]:hover {{ background-color: {ORANGE2} !important; }}
 div[data-testid="stMetric"] {{
     background: {LIGHT}; border-radius: 0 0 8px 8px;
     padding: 12px 16px 16px; text-align: center;
@@ -106,6 +108,32 @@ div[data-testid="stExpander"] summary {{
     background-color: {LIGHT}; padding: 12px; border-radius: 8px 8px 0 0;
 }}
 h1, h2, h3 {{ color: {DARK} !important; }}
+.enrich-badge {{
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    background: {GREEN};
+    color: white;
+    margin-left: 6px;
+}}
+.field-chip {{
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 14px;
+    font-size: 12px;
+    font-weight: 500;
+    background: #E8F5E9;
+    color: #2E7D32;
+    border: 1px solid #A5D6A7;
+    margin: 2px 3px 2px 0;
+}}
+.field-chip.missing {{
+    background: #FFF3E0;
+    color: #E65100;
+    border-color: #FFCC80;
+}}
 @media (prefers-color-scheme: dark) {{
     div[data-testid="stMetricValue"] {{ color: #F5F5F5 !important; }}
     div[data-testid="stMetric"]      {{ background: #2a2a2e !important; }}
@@ -118,17 +146,21 @@ h1, h2, h3 {{ color: {DARK} !important; }}
 # SESSION STATE DEFAULTS
 # ------------------------------------------------------------------
 _SS_DEFAULTS = {
-    "ui_lang":          "en",
-    "selected_country": "Kenya",
-    "layout_mode":      "wide",
-    "pq_country":       "Kenya",
-    "pq_summary":       pd.DataFrame(),
-    "pq_results":       {},
-    "pq_data":          pd.DataFrame(),
-    "pq_last_sig":      None,
-    "pq_exports_cache": {},
-    "pq_cached_files":  [],
-    "scraper_enabled":  False,
+    "ui_lang":            "en",
+    "selected_country":   "Kenya",
+    "layout_mode":        "wide",
+    "pq_country":         "Kenya",
+    "pq_summary":         pd.DataFrame(),
+    "pq_results":         {},
+    "pq_data":            pd.DataFrame(),
+    "pq_last_sig":        None,
+    "pq_exports_cache":   {},
+    "pq_cached_files":    [],
+    "scraper_enabled":    False,
+    # enrichment state
+    "enriched_df":        None,
+    "enrichment_summary": {},   # col -> {before, after, filled}
+    "enrichment_done":    False,
 }
 for _k, _v in _SS_DEFAULTS.items():
     if _k not in st.session_state:
@@ -138,8 +170,11 @@ for _k, _v in _SS_DEFAULTS.items():
 # HELPERS
 # ------------------------------------------------------------------
 COUNTRY_CODES = {
-    "Kenya": "KE", "Uganda": "UG", "Nigeria": "NG",
-    "Ghana": "GH", "Morocco": "MA",
+    "Kenya":   "KE",
+    "Uganda":  "UG",
+    "Nigeria": "NG",
+    "Ghana":   "GH",
+    "Morocco": "MA",
 }
 COUNTRIES = list(COUNTRY_CODES.keys())
 
@@ -153,14 +188,8 @@ def _code(name: str) -> str:
 
 
 def _load_support_files() -> dict:
-    """
-    Re-use support files cached by the main page when available.
-    Falls back to loading them fresh from disk if not.
-    """
     if "support_files" in st.session_state:
         return st.session_state.support_files
-
-    # Try to call load_all_support_files from the already-loaded main module
     mod = sys.modules.get("streamlit_app") or sys.modules.get("__main__")
     if mod and hasattr(mod, "load_all_support_files"):
         try:
@@ -169,8 +198,6 @@ def _load_support_files() -> dict:
             return sf
         except Exception:
             pass
-
-    # Minimal fallback — only category_map (enough for post-QC normalisation)
     cat_map = load_category_map() if _POSTQC_OK else {}
     return {"category_map": cat_map}
 
@@ -181,6 +208,43 @@ def _reset_results():
     st.session_state.pq_data          = pd.DataFrame()
     st.session_state.pq_last_sig      = None
     st.session_state.pq_exports_cache = {}
+    st.session_state.enriched_df        = None
+    st.session_state.enrichment_summary = {}
+    st.session_state.enrichment_done    = False
+
+
+def _count_filled(series: pd.Series) -> int:
+    return int(
+        series.astype(str).str.strip()
+        .replace({"nan": "", "None": "", "NaN": ""})
+        .ne("")
+        .sum()
+    )
+
+
+def _build_enrichment_summary(before: pd.DataFrame, after: pd.DataFrame) -> dict:
+    """Compare before/after to record how many cells each field gained."""
+    summary = {}
+    for col in SCRAPABLE_FIELDS:
+        b_count = _count_filled(before[col]) if col in before.columns else 0
+        a_count = _count_filled(after[col])  if col in after.columns  else 0
+        summary[col] = {
+            "before": b_count,
+            "after":  a_count,
+            "filled": max(0, a_count - b_count),
+        }
+    return summary
+
+
+def _to_excel_bytes(df: pd.DataFrame) -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Enriched Data")
+    return buf.getvalue()
+
+
+def _to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8-sig")
 
 
 # ------------------------------------------------------------------
@@ -204,22 +268,30 @@ with st.sidebar:
     st.markdown("---")
 
     if _SCRAPER_OK:
-        st.subheader("🌐 Enrichment")
+        st.subheader("🌐 Jumia Enrichment")
         st.session_state.scraper_enabled = st.toggle(
             "Auto-fill missing fields from Jumia",
             value=st.session_state.scraper_enabled,
             help=(
-                "Scrapes Color, Warranty and Variation count from Jumia "
-                "product pages for any columns absent in your upload. "
+                "Uses product SKUs to scrape Color, Warranty, Variations, "
+                "Price, Discount, Rating, Image and Stock status from Jumia. "
                 "Runs once per file upload."
             ),
         )
         if st.session_state.scraper_enabled:
-            st.caption("⏱ ~1–3 s per product. Runs once on upload.")
+            st.caption("⏱ ~1–3 s per product row. Runs once on upload.")
+            jumia_site_label = {
+                "KE": "jumia.co.ke",
+                "UG": "jumia.ug",
+                "NG": "jumia.com.ng",
+                "GH": "jumia.com.gh",
+                "MA": "jumia.ma",
+            }.get(country_code, "jumia.co.ke")
+            st.caption(f"🔗 Target: **{jumia_site_label}**")
     else:
         st.caption(
-            "Add `beautifulsoup4` and `requests` to requirements.txt "
-            "to enable auto-enrichment."
+            "⚠️ `jumia_scraper.py` not found. Place it in the repo root to "
+            "enable auto-enrichment."
         )
 
     st.markdown("---")
@@ -239,7 +311,7 @@ box-shadow:0 4px 12px rgba(246,139,30,0.25);">
 <h2 style="color:white;margin:0;font-size:26px;font-weight:700;">
 🔍 Post-QC Validation</h2>
 <p style="color:rgba(255,255,255,0.9);margin:6px 0 0;font-size:13px;">
-Upload a Jumia post-QC export to run quality checks</p>
+Upload a Jumia post-QC export · missing fields auto-filled from Jumia</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -260,7 +332,7 @@ if not _POSTQC_OK:
 st.header("📁 Upload Post-QC File", anchor=False)
 st.caption(
     "Expected columns: **SKU, Name, Brand, Category, Price, Seller** "
-    "— plus any extras your export includes (Rating, Discount, Stock, etc.)"
+    "— plus any extras your export includes."
 )
 
 uploaded = st.file_uploader(
@@ -288,6 +360,7 @@ if files:
         (
             str(sorted(f["name"] + str(len(f["bytes"])) for f in files))
             + country_code
+            + str(st.session_state.scraper_enabled)
         ).encode()
     ).hexdigest()
 
@@ -324,8 +397,8 @@ if files:
                 all_dfs.append(raw)
 
             # ── Support files ──────────────────────────────────────
-            support_files = _load_support_files()
-            cat_map = support_files.get("category_map", {})
+            support_files    = _load_support_files()
+            cat_map          = support_files.get("category_map", {})
             support_files_pq = dict(support_files)
             support_files_pq["country_code"] = country_code
             support_files_pq["country_name"] = pq_country
@@ -334,7 +407,6 @@ if files:
             norm_dfs = []
             for df in all_dfs:
                 ndf = normalize_post_qc(df, category_map=cat_map)
-                # If category_map was empty, try to resolve codes inline
                 if cat_map and "CATEGORY" in ndf.columns:
                     resolved = ndf["CATEGORY_CODE"].str.match(r"^\d+$").sum()
                     if resolved == 0:
@@ -364,29 +436,31 @@ if files:
 
             # ── Scraper enrichment ─────────────────────────────────
             if _SCRAPER_OK and st.session_state.scraper_enabled:
-                _missing = [
-                    c for c in [
-                        "COLOR", "PRODUCT_WARRANTY", "WARRANTY_DURATION",
-                        "COUNT_VARIATIONS", "MAIN_IMAGE",
-                    ]
+                _missing_cols = [
+                    c for c in SCRAPABLE_FIELDS
                     if c not in merged_dedup.columns
                     or merged_dedup[c]
                         .astype(str).str.strip()
-                        .replace("nan", "").eq("").all()
+                        .replace({"nan": "", "None": ""})
+                        .eq("")
+                        .mean() > 0.5
                 ]
-                if _missing:
-                    _bar = st.progress(
-                        0, text=f"Enriching {len(merged_dedup)} products…"
+                if _missing_cols:
+                    st.info(
+                        f"🌐 Enriching **{len(merged_dedup)}** products from Jumia "
+                        f"({', '.join(_missing_cols)})…"
                     )
-                    _txt = st.empty()
+                    _bar  = st.progress(0, text="Starting enrichment…")
+                    _txt  = st.empty()
 
-                    def _cb(done, total, sku,
-                            bar=_bar, txt=_txt):
+                    _before_df = merged_dedup.copy()
+
+                    def _cb(done, total, sku, bar=_bar, txt=_txt):
                         bar.progress(
                             done / max(total, 1),
                             text=f"Scraped {done}/{total} — {sku}",
                         )
-                        txt.caption(f"Last scraped: {sku}")
+                        txt.caption(f"⏱ Last scraped: **{sku}**")
 
                     merged_dedup = enrich_post_qc_df(
                         merged_dedup,
@@ -396,25 +470,30 @@ if files:
                     _bar.empty()
                     _txt.empty()
 
-                    filled = sum(
-                        1 for c in _missing
-                        if c in merged_dedup.columns
-                        and not merged_dedup[c]
-                            .astype(str).str.strip()
-                            .replace("nan", "").eq("").all()
+                    # Build enrichment summary
+                    enrich_summary = _build_enrichment_summary(
+                        _before_df, merged_dedup
                     )
-                    if filled:
+                    total_filled = sum(v["filled"] for v in enrich_summary.values())
+
+                    st.session_state.enriched_df        = merged_dedup.copy()
+                    st.session_state.enrichment_summary = enrich_summary
+                    st.session_state.enrichment_done    = True
+
+                    if total_filled:
                         st.toast(
-                            f"✅ Enriched {filled} column(s) from Jumia",
+                            f"✅ {total_filled} cell(s) filled from Jumia",
                             icon="🌐",
                         )
+                    else:
+                        st.toast("No new data found on Jumia.", icon="ℹ️")
                 else:
                     st.toast(
-                        "All columns already present — no scraping needed.",
+                        "All enrichable columns already populated — no scraping needed.",
                         icon="ℹ️",
                     )
 
-            # ── Run checks ─────────────────────────────────────────
+            # ── Run QC checks ──────────────────────────────────────
             with st.spinner("Running Post-QC checks…"):
                 summary_df, results = run_post_qc_checks(
                     merged_dedup, support_files_pq
@@ -425,16 +504,120 @@ if files:
             st.session_state.pq_data     = merged_dedup
             st.session_state.pq_last_sig = sig
 
+            # Store enriched data if scraper wasn't used
+            if not st.session_state.enrichment_done:
+                st.session_state.enriched_df = merged_dedup.copy()
+
         except Exception as exc:
             st.error(f"Processing error: {exc}")
             st.code(traceback.format_exc())
 
 # ------------------------------------------------------------------
-# RESULTS
+# ENRICHMENT PANEL
+# (shown immediately below the upload, before QC results)
+# ------------------------------------------------------------------
+if st.session_state.enrichment_done and st.session_state.enriched_df is not None:
+    edf     = st.session_state.enriched_df
+    esummary = st.session_state.enrichment_summary
+
+    total_cells_filled = sum(v["filled"] for v in esummary.values())
+    cols_with_data     = [c for c, v in esummary.items() if v["after"] > 0]
+    cols_filled        = [c for c, v in esummary.items() if v["filled"] > 0]
+
+    st.markdown("---")
+    st.markdown(
+        f"### 🌐 Jumia Enrichment Results "
+        f'<span class="enrich-badge">+{total_cells_filled} cells filled</span>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Metrics row ───────────────────────────────────────────────
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Products processed", len(edf))
+    m2.metric("Fields attempted",   len(SCRAPABLE_FIELDS))
+    m3.metric("Fields enriched",    len(cols_filled))
+    m4.metric("Total cells filled", total_cells_filled)
+
+    # ── Per-field breakdown ───────────────────────────────────────
+    with st.expander("📊 Field-by-field breakdown", expanded=True):
+        chip_html = ""
+        for col in SCRAPABLE_FIELDS:
+            info = esummary.get(col, {"before": 0, "after": 0, "filled": 0})
+            label = col.replace("_", " ").title()
+            if info["filled"] > 0:
+                chip_html += (
+                    f'<span class="field-chip">✅ {label} '
+                    f'(+{info["filled"]})</span>'
+                )
+            else:
+                status = "—" if info["after"] == 0 else f'{info["after"]} rows'
+                chip_html += (
+                    f'<span class="field-chip missing">'
+                    f'⬜ {label} ({status})</span>'
+                )
+        st.markdown(chip_html, unsafe_allow_html=True)
+
+        # Detailed table
+        detail_rows = []
+        for col in SCRAPABLE_FIELDS:
+            info = esummary.get(col, {"before": 0, "after": 0, "filled": 0})
+            detail_rows.append({
+                "Field":           col,
+                "Before (filled)": info["before"],
+                "After (filled)":  info["after"],
+                "Newly filled":    info["filled"],
+                "Total rows":      len(edf),
+            })
+        detail_df = pd.DataFrame(detail_rows)
+        st.dataframe(detail_df, use_container_width=True, hide_index=True)
+
+    # ── Inline preview of enriched data ───────────────────────────
+    with st.expander(f"📋 Inline preview — enriched data ({len(edf)} rows)", expanded=False):
+        # Show only columns that have any data
+        preview_cols = [c for c in edf.columns if edf[c].astype(str).str.strip()
+                        .replace({"nan": "", "None": ""}).ne("").any()]
+        # Put enriched columns first for easy review
+        enriched_first = cols_with_data + [
+            c for c in preview_cols if c not in cols_with_data
+        ]
+        st.dataframe(
+            edf[enriched_first].fillna("").replace("nan", ""),
+            use_container_width=True,
+            height=400,
+        )
+
+    # ── Download enriched data ────────────────────────────────────
+    st.markdown("#### ⬇️ Download Enriched Dataset")
+    dl_col1, dl_col2 = st.columns(2)
+
+    with dl_col1:
+        st.download_button(
+            label="📥 Download as Excel (.xlsx)",
+            data=_to_excel_bytes(edf),
+            file_name=f"enriched_postqc_{pq_country.lower()}_{country_code}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            type="primary",
+        )
+    with dl_col2:
+        st.download_button(
+            label="📄 Download as CSV (.csv)",
+            data=_to_csv_bytes(edf),
+            file_name=f"enriched_postqc_{pq_country.lower()}_{country_code}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    st.caption(
+        f"File contains all original columns plus enriched Jumia data · "
+        f"{len(edf)} rows · {len(edf.columns)} columns"
+    )
+    st.markdown("---")
+
+# ------------------------------------------------------------------
+# QC RESULTS
 # ------------------------------------------------------------------
 if not st.session_state.pq_summary.empty:
-    # render_post_qc_section reads from post_qc_* session state keys.
-    # Temporarily point them at our pq_* keys, render, then restore.
     _save = {
         k: st.session_state.get(k)
         for k in ("post_qc_summary", "post_qc_results",
@@ -449,10 +632,8 @@ if not st.session_state.pq_summary.empty:
     support_files = _load_support_files()
     render_post_qc_section(support_files)
 
-    # Persist export cache entries back to pq_ namespace
     st.session_state.pq_exports_cache = st.session_state.exports_cache
 
-    # Restore original keys
     for k, v in _save.items():
         if v is None:
             st.session_state.pop(k, None)
