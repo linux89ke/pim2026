@@ -2151,13 +2151,13 @@ if _bridge_val:
 # ==========================================
 # POST-QC RESULTS SECTION
 # ==========================================
-if uploaded_files and st.session_state.file_mode == 'post_qc' and not st.session_state.post_qc_summary.empty:
+if _files_for_processing and st.session_state.file_mode == 'post_qc' and not st.session_state.post_qc_summary.empty:
     render_post_qc_section(support_files)
 
 # ==========================================
 # RESULTS SECTION
 # ==========================================
-if uploaded_files and not st.session_state.final_report.empty and st.session_state.file_mode != 'post_qc':
+if _files_for_processing and not st.session_state.final_report.empty and st.session_state.file_mode != 'post_qc':
     fr = st.session_state.final_report
     data = st.session_state.all_data_map
     app_df = fr[fr['Status'] == 'Approved']
