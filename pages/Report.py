@@ -13,7 +13,7 @@ COUNTRY_MAP = {
     "NG": "Nigeria",
     "GH": "Ghana",
     "MA": "Morocco",
-    "MO": "Morocco",  # Included since your uploaded file uses 'MO'
+    "MO": "Morocco", 
     "EG": "Egypt",
     "CI": "Ivory Coast",
     "SN": "Senegal",
@@ -48,9 +48,10 @@ def generate_excel_report(daily_summary, top_sellers, top_reasons, top_categorie
     return output.getvalue()
 
 st.title("📊 PIM Weekly Export Analyzer")
-st.markdown("Upload your `ProductSets` CSV files to generate a weekly performance report.")
+st.markdown("Upload your `ProductSets` **Excel (.xlsx)** files to generate a weekly performance report.")
 
-uploaded_files = st.file_uploader("Upload ProductSets CSV files", type="csv", accept_multiple_files=True)
+# CHANGED: Accept .xlsx files instead of .csv
+uploaded_files = st.file_uploader("Upload ProductSets Excel files", type=["xlsx", "xls"], accept_multiple_files=True)
 
 if uploaded_files:
     all_data = []
@@ -59,7 +60,9 @@ if uploaded_files:
     primary_country, _, primary_week = parse_file_metadata(uploaded_files[0].name)
     
     for file in uploaded_files:
-        df = pd.read_csv(file)
+        # CHANGED: Use read_excel instead of read_csv
+        # Note: If your data is on a specific sheet, you can add sheet_name='Sheet1'
+        df = pd.read_excel(file) 
         country, file_date, week_num = parse_file_metadata(file.name)
         
         if file_date:
