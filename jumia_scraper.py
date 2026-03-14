@@ -230,14 +230,16 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
         if isinstance(offers, list):
             offers = offers[0] if offers else {}
         if isinstance(offers, dict):
+            # JSON-LD price is a raw number (often USD/base currency), NOT the
+            # localised display price. Store tentatively; HTML selector wins.
             price = offers.get("price") or offers.get("lowPrice", "")
             if price:
-                result["PRICE"] = str(price).replace(",", "")
+                result["_ld_price_raw"] = str(price).replace(",", "")
             avail = offers.get("availability", "")
             if "InStock" in avail:
-                result["STOCK_STATUS"] = "In Stock"
+                result["_ld_stock"] = "In Stock"
             elif "OutOfStock" in avail:
-                result["STOCK_STATUS"] = "Out of Stock"
+                result["_ld_stock"] = "Out of Stock"
 
         # Rating
         agg = ld_data.get("aggregateRating", {})
@@ -315,26 +317,32 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
                     result["MAIN_IMAGE"] = src if src.startswith("http") else base_url + src
                     break
 
-    # ── Price (HTML fallback) ──────────────────────────────────────────────────
-    if not result.get("PRICE"):
-        for sel in [
-            "span.-b.-ltr.-tal.-fs24",   # Jumia current price span
-            "span.prc",                   # alternate class
-            "span[data-price]",           # data attribute variant
-        ]:
-            el = soup.select_one(sel)
-            if el:
-                raw_p = re.sub(r"[^\d.,]", "", el.get_text())
-                if raw_p:
-                    try:
-                        price_val = float(raw_p.replace(",", ""))
-                        # Minimum 50 KES — avoids matching ratings, percentages,
-                        # delivery fees written in the wrong element
-                        if price_val >= 50:
-                            result["PRICE"] = str(int(price_val)) if price_val == int(price_val) else str(price_val)
-                            break
-                    except ValueError:
-                        pass
+    # ── Price (HTML — primary source for local-currency display price) ─────────
+    # Always run; overwrites any tentative JSON-LD raw number.
+    _html_price_found = False
+    for sel in [
+        "span.-b.-ltr.-tal.-fs24",   # Jumia current price span
+        "span.prc",                   # alternate class
+        "span[data-price]",           # data attribute variant
+        "span.-b.-ltr.-tal",          # another Jumia variant
+        "div.-prc-w span",            # price wrapper div
+    ]:
+        el = soup.select_one(sel)
+        if el:
+            raw_p = re.sub(r"[^\d,.]", "", el.get_text())
+            if raw_p:
+                try:
+                    price_val = float(raw_p.replace(",", ""))
+                    # Must be at least 100 to avoid matching ratings/fees
+                    if price_val >= 100:
+                        result["PRICE"] = f"KSh {int(price_val):,}" if price_val == int(price_val) else f"KSh {price_val:,.2f}"
+                        _html_price_found = True
+                        break
+                except ValueError:
+                    pass
+    # Fallback to JSON-LD raw price only if HTML gave nothing
+    if not _html_price_found and result.pop("_ld_price_raw", None):
+        result["PRICE"] = result.get("PRICE", "")  # already cleared above
 
     # ── Discount ──────────────────────────────────────────────────────────────
     for sel in ["span.bdg._dsct._sm", "span._dsct", "[class*='discount']"]:
@@ -355,6 +363,10 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
                 if m:
                     result["RATING"] = m.group(1)
                     break
+    # Explicit "no ratings" state — set 0 so the field is populated, not blank
+    if not result.get("RATING"):
+        if re.search(r"no\s+ratings?\s+(?:yet|available)", full_text, re.IGNORECASE):
+            result["RATING"] = "0"
 
     # ── Review count (HTML fallback) ──────────────────────────────────────────
     if not result.get("REVIEW_COUNT"):
@@ -370,18 +382,52 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
             m = re.search(r"(\d+)\s+verified\s+ratings?", full_text, re.IGNORECASE)
             if m:
                 result["REVIEW_COUNT"] = m.group(1)
+    # Explicit 0 when page says no ratings
+    if not result.get("REVIEW_COUNT"):
+        if re.search(r"no\s+ratings?\s+(?:yet|available)", full_text, re.IGNORECASE):
+            result["REVIEW_COUNT"] = "0"
 
     # ── Stock status ──────────────────────────────────────────────────────────
-    if not result.get("STOCK_STATUS"):
+    # Always scrape actual displayed text first (captures nuanced messages like
+    # "Some variations with low stock"), then fall back to structural indicators.
+    _stock_text = ""
+    for sel in [
+        "span[class*='stock']", "div[class*='stock']",
+        "span[class*='avail']", "div[class*='avail']",
+        "p[class*='stock']",
+    ]:
+        el = soup.select_one(sel)
+        if el:
+            _t = el.get_text(strip=True)
+            if _t and len(_t) < 80:
+                _stock_text = _t
+                break
+    # Also check page text for Jumia's specific low-stock message
+    if not _stock_text:
+        _low_m = re.search(
+            r"((?:some\s+)?variations?\s+with\s+low\s+stock"
+            r"|low\s+stock|only\s+\d+\s+left"
+            r"|hurry[,!]?\s+(?:only\s+)?\d+"
+            r"|in\s+stock|out\s+of\s+stock|sold\s+out)",
+            full_text, re.IGNORECASE,
+        )
+        if _low_m:
+            _stock_text = _low_m.group(1).strip()
+    if _stock_text:
+        result["STOCK_STATUS"] = _stock_text.capitalize()
+    else:
+        # Structural fallback
         out_indicators = [
             "div.out-of-stock", "[class*='sold-out']",
             "[class*='out-of-stock']", "button[disabled]",
         ]
-        result["STOCK_STATUS"] = "In Stock"
+        result["STOCK_STATUS"] = result.pop("_ld_stock", "In Stock")
         for sel in out_indicators:
             if soup.select_one(sel):
                 result["STOCK_STATUS"] = "Out of Stock"
                 break
+    # Clear the tentative LD stock flag if still present
+    result.pop("_ld_stock", None)
 
     # ── Colors / Sizes / Variations ──────────────────────────────────────────
     # Jumia uses the same variation pill UI for both colours (electronics) and
@@ -495,6 +541,20 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
                 sizes.append(v)
             else:
                 colors.append(v)
+
+    # Strategy E2: split concatenated colour strings like "PinkPurple" or
+    # "BlackRedBlue" — Jumia sometimes renders colour pills without separators.
+    if colors and len(colors) == 1:
+        single = colors[0]
+        KNOWN_COLORS_RE = re.compile(
+            r"(Black|White|Silver|Gold|Blue|Red|Green|Purple|Pink|Grey|Gray|"
+            r"Titanium|Midnight|Starlight|Ivory|Champagne|Rose|Copper|Yellow|"
+            r"Orange|Violet|Navy|Cream|Brown|Coral|Aqua|Cyan|Teal|Lilac|"
+            r"Maroon|Beige|Olive|Turquoise)"
+        )
+        split_parts = KNOWN_COLORS_RE.findall(single)
+        if len(split_parts) >= 2:
+            colors = list(dict.fromkeys(split_parts))
 
     # Strategy E: title-word colour extraction — only when pills gave nothing
     if not colors and not sizes:
@@ -906,13 +966,29 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
                     seen_keys.add(key)
                     unique_parts.append(part)
 
-            # Wrap in a container div with basic responsive styles
-            result["DESCRIPTION"] = (
-                '<div class="jm-desc" style="font-family:sans-serif;'
-                'line-height:1.6;color:#313133;">\n'
-                + "\n".join(unique_parts)
-                + "\n</div>"
-            )
+            # FIX: if ALL parts are <img> tags with no text content, the
+            # description is image-only (Jumia infographic layout). In this case
+            # store only the image URLs as a newline-separated list, not a
+            # wall of HTML that clutters the table/Excel cell.
+            text_parts = [p for p in unique_parts if not re.match(r"^<img", p.strip())]
+            if not text_parts:
+                # Extract unique image URLs and store as plain URL list
+                img_urls = []
+                for part in unique_parts:
+                    m_src = re.search(r'src="([^"]+)"', part)
+                    if m_src:
+                        url = m_src.group(1)
+                        if url not in img_urls:
+                            img_urls.append(url)
+                result["DESCRIPTION"] = "\n".join(img_urls) if img_urls else ""
+            else:
+                # Wrap in a container div with basic responsive styles
+                result["DESCRIPTION"] = (
+                    '<div class="jm-desc" style="font-family:sans-serif;'
+                    'line-height:1.6;color:#313133;">\n'
+                    + "\n".join(text_parts)
+                    + "\n</div>"
+                )
 
     # ── Key Features ──────────────────────────────────────────────────────────
     # Always a <ul> immediately following an h2/h3 "Key Features" heading.
