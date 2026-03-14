@@ -1204,7 +1204,15 @@ def check_weight_volume_in_name(data: pd.DataFrame, weight_category_codes: List[
     if not {'CATEGORY_CODE', 'NAME'}.issubset(data.columns) or not weight_category_codes: return pd.DataFrame(columns=data.columns)
     target = data[data['CATEGORY_CODE'].apply(clean_category_code).isin(set(clean_category_code(c) for c in weight_category_codes))].copy()
     if target.empty: return pd.DataFrame(columns=data.columns)
-    pat = re.compile(r'\b\d+(?:\.\d+)?\s*(?:kg|kgs|g|gm|gms|grams|mg|mcg|ml|l|ltr|liter|litres|litre|cl|oz|ounces|lb|lbs|tablets|capsules|sachets|count|ct|sticks|iu|teabags|pieces|pcs|pack|packs)\b', re.IGNORECASE)
+    pat = re.compile(
+        r'\b\d+(?:\.\d+)?\s*'
+        r'(?:kg|kgs|g|gm|gms|grams|mg|mcg|ml|l|ltr|liter|litres|litre|cl|oz|ounces|lb|lbs'
+        r'|tablets?|tabs?|capsules?|caps?|sachets?|count|ct|sticks?|iu'
+        r'|tea\s*bags?|teabags?|bags?'
+        r'|pieces?|pcs|pack|packs)'
+        r'|\b\d+s\b',
+        re.IGNORECASE
+    )
     return target[~target['NAME'].apply(lambda n: bool(pat.search(str(n))))].drop_duplicates(subset=['PRODUCT_SET_SID'])
 
 def check_incomplete_smartphone_name(data: pd.DataFrame, smartphone_category_codes: List[str]) -> pd.DataFrame:
