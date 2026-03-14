@@ -1216,7 +1216,11 @@ def check_weight_volume_in_name(data: pd.DataFrame, weight_category_codes: List[
         # standalone "dozen / a dozen"
         r"|\b(?:a\s+)?dozen\b"
         # reversed: "pack of 24", "box of 10", "set of 6"
-        r"|\b(?:pack|box|set|bundle|lot)\s+of\s+\d+\b",
+        r"|\b(?:pack|box|set|bundle|lot)\s+of\s+\d+\b"
+        # "per kg", "per g", "per ml" etc — e.g. "Chickpeas per Kg"
+        r"|\bper\s+(?:kg|kgs?|g|gm|grams?|mg|mcg|ml|l|ltr|oz|lb)\b"
+        # broken UTF-8 µg/μg encoding variants: Âµg, Î¼g, µg, μg
+        r"|\d+\s*(?:\xc2\xb5g|\xce\xbcg|\xb5g|\u00b5g|\u03bcg|mcg|µg|μg)",
         re.IGNORECASE
     )
     return target[~target['NAME'].apply(lambda n: bool(pat.search(str(n))))].drop_duplicates(subset=['PRODUCT_SET_SID'])
