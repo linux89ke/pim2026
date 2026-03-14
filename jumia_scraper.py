@@ -50,7 +50,9 @@ SCRAPABLE_FIELDS: list[str] = [
     "WEIGHT",
     # Variations
     "COLOR",
+    "COLOR_IN_TITLE",
     "COUNT_VARIATIONS",
+    "SIZES_AVAILABLE",
     # Warranty
     "PRODUCT_WARRANTY",
     "WARRANTY_DURATION",
@@ -375,57 +377,149 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
                 result["STOCK_STATUS"] = "Out of Stock"
                 break
 
-    # ── Colors / Variations ───────────────────────────────────────────────────
-    # Strategy A: hidden inputs inside the variation list (most reliable)
+    # ── Colors / Sizes / Variations ──────────────────────────────────────────
+    # Jumia uses the same variation pill UI for both colours (electronics) and
+    # sizes (fashion).  We detect which type we're dealing with and populate
+    # the right fields:
+    #   COLOR + COUNT_VARIATIONS  — when pills are colour names
+    #   SIZES_AVAILABLE + COUNT_VARIATIONS — when pills are sizes (EU/UK/US/numeric)
+    #   COUNT_VARIATIONS alone    — when we can count but not label the type
+
     colors: list[str] = []
-    for li in soup.select("ul.-pvs.-mvs li, ul[class*='var'] li"):
-        inp = li.select_one("input")
-        if inp:
-            val = inp.get("value") or inp.get("data-value", "")
-            if val:
-                colors.append(val.strip())
+    sizes:  list[str] = []
 
-    # Strategy B: visible colour swatch labels / selectors
-    if not colors:
-        for el in soup.select(
+    # ── Helper: classify a value as a size or a colour ────────────────────────
+    _SIZE_RE = re.compile(
+        r"""
+        ^(
+            (EU|UK|US|EU/UK)\s*\d{1,3}(\.\d)?   # EU 40, UK 9, US 10.5
+          | \d{1,3}(\.\d)?                        # bare number: 40, 42, 9
+          | (XS|S|M|L|XL|XXL|XXXL|3XL|4XL|5XL)  # letter sizes
+          | (ONE\s*SIZE|FREE\s*SIZE)               # universal sizes
+          | \d{1,3}\s*(cm|mm|in|inch|inches)      # measurement
+        )$
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    )
+
+    def _is_size(val: str) -> bool:
+        return bool(_SIZE_RE.match(val.strip()))
+
+    def _collect_pills(selector: str) -> list[str]:
+        """Return text values of all non-empty pill/option elements."""
+        vals: list[str] = []
+        for el in soup.select(selector):
+            # Prefer hidden input value (radio buttons inside li)
+            inp = el.select_one("input")
+            if inp:
+                v = inp.get("value") or inp.get("data-value", "")
+            else:
+                v = el.get_text(strip=True)
+            v = v.strip()
+            if v and len(v) < 50:
+                vals.append(v)
+        return vals
+
+    # Strategy A: variation list <li> items (most common Jumia pattern)
+    #   Covers both  ul.-pvs.-mvs li  (electronics colours)
+    #   and          ul.-pvs li       (fashion sizes shown as pills)
+    pill_vals = _collect_pills(
+        "ul.-pvs.-mvs li, ul.-pvs li, ul[class*='var'] li"
+    )
+
+    # Strategy B: explicit colour/size selectors
+    if not pill_vals:
+        pill_vals = _collect_pills(
             "[data-type='color'] span, span.color-selector, "
-            "li[class*='color'] span, label[class*='color']"
-        ):
-            txt = el.get_text(strip=True)
-            if txt and len(txt) < 40:
-                colors.append(txt)
-
-    # Strategy C: variation pills / size options — count only, no names
-    variation_count: int = 0
-    if not colors:
-        opts = soup.select(
-            "ul.-pvs li, select option:not([value='']):not([disabled]), "
-            "ul[class*='var'] li, div[class*='var'] button"
+            "li[class*='color'] span, label[class*='color'], "
+            "[data-type='size'] span, li[class*='size'] span"
         )
-        variation_count = len(opts)
 
-    # Strategy D: parse from title — e.g. "Titanium Silver" already in name
-    #   Only fire when we truly found nothing above AND the title contains a
-    #   known colour word, to avoid false positives.
-    if not colors and not variation_count:
+    # Strategy C: <select> dropdown options (some Jumia sellers use a dropdown)
+    if not pill_vals:
+        pill_vals = _collect_pills(
+            "select option:not([value='']):not([disabled])"
+        )
+
+    # Strategy D: div/button variation pills (newer Jumia layout)
+    if not pill_vals:
+        pill_vals = _collect_pills(
+            "div[class*='var'] button, div[class*='size'] button, "
+            "div[class*='color'] button"
+        )
+
+    # Now classify whatever we found
+    if pill_vals:
+        unique_vals = list(dict.fromkeys(v for v in pill_vals if v))
+        for v in unique_vals:
+            if _is_size(v):
+                sizes.append(v)
+            else:
+                colors.append(v)
+
+    # Strategy E: title-word colour extraction — only when pills gave nothing
+    if not colors and not sizes:
         title_el = soup.select_one("h1, title")
         if title_el:
             COLOR_WORDS = re.compile(
-                r"\b(black|white|silver|gold|blue|red|green|purple|pink|grey|gray|"
-                r"titanium|midnight|starlight|ivory|champagne|rose|copper|yellow|"
-                r"orange|violet|navy|cream|brown|coral|aqua|cyan|teal|lilac)\b",
+                r"\b(black|white|silver|gold|blue|red|green|purple|pink|"
+                r"grey|gray|titanium|midnight|starlight|ivory|champagne|"
+                r"rose|copper|yellow|orange|violet|navy|cream|brown|coral|"
+                r"aqua|cyan|teal|lilac|maroon|beige|olive|turquoise)\b",
                 re.IGNORECASE,
             )
             found = COLOR_WORDS.findall(title_el.get_text())
             if found:
                 colors = list(dict.fromkeys(c.title() for c in found))
 
-    if colors:
-        unique_colors = list(dict.fromkeys(c for c in colors if c))
-        result["COLOR"] = ", ".join(unique_colors)
-        result["COUNT_VARIATIONS"] = str(len(unique_colors))
-    elif variation_count:
-        result["COUNT_VARIATIONS"] = str(variation_count)
+    # ── Write results ─────────────────────────────────────────────────────────
+    if sizes and colors:
+        # Both present (rare — e.g. a product with both size and colour options)
+        result["SIZES_AVAILABLE"]  = ", ".join(sizes)
+        result["COLOR"]            = ", ".join(colors)
+        result["COUNT_VARIATIONS"] = str(len(sizes) * len(colors))
+    elif sizes:
+        result["SIZES_AVAILABLE"]  = ", ".join(sizes)
+        result["COUNT_VARIATIONS"] = str(len(sizes))
+    elif colors:
+        result["COLOR"]            = ", ".join(colors)
+        result["COUNT_VARIATIONS"] = str(len(colors))
+
+    # ── COLOR_IN_TITLE — always runs, independent of pill detection ───────────
+    # Extracts colour words directly from the product h1 title.
+    # Useful even when COLOR is already set from pills — confirms/complements it.
+    # Compound phrases (e.g. "Titanium Silver", "Midnight Blue") are matched
+    # before single words so they are captured as one token.
+    _COLOR_WORDS = re.compile(
+        r"\b("
+        # ── Compound phrases first (order matters) ─────────────────────────
+        r"titanium\s+silver|titanium\s+gold|midnight\s+black|midnight\s+blue|"
+        r"space\s+gray|space\s+grey|rose\s+gold|sky\s+blue|navy\s+blue|"
+        r"forest\s+green|hot\s+pink|light\s+blue|dark\s+blue|dark\s+green|"
+        r"light\s+green|deep\s+purple|bright\s+red|pearl\s+white|"
+        r"starlight\s+white|starlight\s+silver|"
+        # ── Single colour words ────────────────────────────────────────────
+        r"black|white|silver|gold|blue|red|green|purple|pink|"
+        r"grey|gray|titanium|midnight|starlight|ivory|champagne|"
+        r"rose|copper|yellow|orange|violet|navy|cream|brown|coral|"
+        r"aqua|cyan|teal|lilac|maroon|beige|olive|turquoise"
+        r")\b",
+        re.IGNORECASE,
+    )
+    h1 = soup.select_one("h1")
+    title_text = h1.get_text(" ", strip=True) if h1 else ""
+    if not title_text:
+        title_tag = soup.find("title")
+        title_text = title_tag.get_text(" ", strip=True) if title_tag else ""
+
+    if title_text:
+        found_title_colors = _COLOR_WORDS.findall(title_text)
+        if found_title_colors:
+            unique_title_colors = list(dict.fromkeys(
+                c.title() for c in found_title_colors
+            ))
+            result["COLOR_IN_TITLE"] = ", ".join(unique_title_colors)
+
 
     # ── Specifications table helper ───────────────────────────────────────────
     # Jumia renders specs as a flat list: "Label Value" lines inside a section.
