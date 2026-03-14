@@ -50,7 +50,6 @@ def generate_excel_report(daily_summary, top_sellers, top_reasons, top_categorie
 st.title("📊 PIM Weekly Export Analyzer")
 st.markdown("Upload your `ProductSets` **Excel (.xlsx)** files to generate a weekly performance report.")
 
-# CHANGED: Accept .xlsx files instead of .csv
 uploaded_files = st.file_uploader("Upload ProductSets Excel files", type=["xlsx", "xls"], accept_multiple_files=True)
 
 if uploaded_files:
@@ -60,8 +59,6 @@ if uploaded_files:
     primary_country, _, primary_week = parse_file_metadata(uploaded_files[0].name)
     
     for file in uploaded_files:
-        # CHANGED: Use read_excel instead of read_csv
-        # Note: If your data is on a specific sheet, you can add sheet_name='Sheet1'
         df = pd.read_excel(file) 
         country, file_date, week_num = parse_file_metadata(file.name)
         
@@ -112,17 +109,23 @@ if uploaded_files:
             top_sellers = rejected_df['SellerName'].value_counts().head(5)
             st.dataframe(top_sellers, use_container_width=True)
 
-        # 3. Top 5 Rejection Reasons
+        # 3. Top 5 Rejection Reasons (Now using the 'FLAG' column)
         with colB:
             st.subheader("🔍 Top 5 Rejection Reasons")
-            # Extract just the code and short reason if it's too long
-            top_reasons = rejected_df['Reason'].str.split('-').str[0:2].str.join('-').value_counts().head(5)
+            if 'FLAG' in rejected_df.columns:
+                top_reasons = rejected_df['FLAG'].value_counts().head(5)
+            else:
+                top_reasons = pd.Series(["FLAG column missing"], index=["N/A"])
             st.dataframe(top_reasons, use_container_width=True)
 
-        # 4. Top 5 Rejected Categories (Based on FLAG)
+        # 4. Top 5 Rejected Categories (Now using the 'Category' column)
         with colC:
             st.subheader("📁 Top 5 Rejected Categories")
-            top_categories = rejected_df['FLAG'].value_counts().head(5)
+            # Safety check to ensure the Category column exists in the uploaded files
+            if 'Category' in rejected_df.columns:
+                top_categories = rejected_df['Category'].value_counts().head(5)
+            else:
+                top_categories = pd.Series(["Category column missing in file"], index=["N/A"])
             st.dataframe(top_categories, use_container_width=True)
 
         # 5. Downloadable Report
