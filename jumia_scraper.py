@@ -6,7 +6,8 @@ Scrapes missing product data from Jumia for post-QC enrichment.
 Supported countries : KE · UG · NG · GH · MA
 Scraped fields      : COLOR, COUNT_VARIATIONS, PRODUCT_WARRANTY,
                       WARRANTY_DURATION, MAIN_IMAGE, PRICE, DISCOUNT,
-                      RATING, REVIEW_COUNT, STOCK_STATUS
+                      RATING, REVIEW_COUNT, STOCK_STATUS,
+                      DESCRIPTION, KEY_FEATURES, WHATS_IN_BOX
 """
 
 from __future__ import annotations
@@ -42,6 +43,9 @@ SCRAPABLE_FIELDS: list[str] = [
     "RATING",
     "REVIEW_COUNT",
     "STOCK_STATUS",
+    "DESCRIPTION",
+    "KEY_FEATURES",
+    "WHATS_IN_BOX",
 ]
 
 _HEADERS = {
@@ -143,7 +147,14 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
     """
     Download a Jumia product page and return a dict of all fields
     we could extract.  Missing fields are simply absent from the dict.
+
+    Extraction order:
+      1. JSON-LD <script type="application/ld+json"> — fastest, most reliable
+      2. Embedded JSON in <script> window variables (__STORES__, dataLayer, etc.)
+      3. HTML / CSS selector parsing — fallback for anything not in JSON
     """
+    import json as _json
+
     result: dict[str, str] = {}
     try:
         resp = _SESSION.get(url, timeout=15)
@@ -155,30 +166,152 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
     soup = BeautifulSoup(resp.text, "html.parser")
     full_text = soup.get_text(" ", strip=True)
 
-    # ── Main Image ────────────────────────────────────────────────────────────
-    og = soup.find("meta", property="og:image")
-    if og and og.get("content"):
-        result["MAIN_IMAGE"] = og["content"]
-    else:
-        for img in soup.select("img.-fw.-fh, img[data-src*='jumia']"):
-            src = img.get("data-src") or img.get("src", "")
-            if src and ("product" in src or "unsafe" in src or "jumia.is" in src):
-                result["MAIN_IMAGE"] = src if src.startswith("http") else base_url + src
+    # =========================================================================
+    # STRATEGY 1 — JSON-LD
+    # Jumia injects a Product schema block with price, image, name, description,
+    # brand, and sometimes offers/availability.
+    # =========================================================================
+    ld_data: dict = {}
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            blob = _json.loads(script.string or "")
+            # Could be a list of schemas
+            if isinstance(blob, list):
+                for item in blob:
+                    if isinstance(item, dict) and item.get("@type") == "Product":
+                        ld_data = item
+                        break
+            elif isinstance(blob, dict) and blob.get("@type") == "Product":
+                ld_data = blob
+            if ld_data:
                 break
+        except Exception:
+            continue
 
-    # ── Price ─────────────────────────────────────────────────────────────────
-    for sel in [
-        "span.-b.-ltr.-tal.-fs24",
-        "span.prc",
-        "[class*='price'] span",
-        "span[data-price]",
-    ]:
-        el = soup.select_one(sel)
-        if el:
-            raw = re.sub(r"[^\d.,]", "", el.get_text())
-            if raw:
-                result["PRICE"] = raw.replace(",", "")
-                break
+    if ld_data:
+        # Image
+        img = ld_data.get("image")
+        if isinstance(img, list):
+            img = img[0]
+        if img:
+            result["MAIN_IMAGE"] = str(img)
+
+        # Description — JSON-LD often has a clean plain-text description
+        desc = ld_data.get("description", "")
+        if desc and len(desc) > 20:
+            result["DESCRIPTION"] = desc.strip()
+
+        # Brand
+        brand = ld_data.get("brand", {})
+        if isinstance(brand, dict):
+            brand = brand.get("name", "")
+        if brand:
+            result["BRAND"] = str(brand).strip()
+
+        # Price / offers
+        offers = ld_data.get("offers", {})
+        if isinstance(offers, list):
+            offers = offers[0] if offers else {}
+        if isinstance(offers, dict):
+            price = offers.get("price") or offers.get("lowPrice", "")
+            if price:
+                result["PRICE"] = str(price).replace(",", "")
+            avail = offers.get("availability", "")
+            if "InStock" in avail:
+                result["STOCK_STATUS"] = "In Stock"
+            elif "OutOfStock" in avail:
+                result["STOCK_STATUS"] = "Out of Stock"
+
+        # Rating
+        agg = ld_data.get("aggregateRating", {})
+        if isinstance(agg, dict):
+            rv = agg.get("ratingValue", "")
+            rc = agg.get("reviewCount", "") or agg.get("ratingCount", "")
+            if rv:
+                result["RATING"] = str(rv)
+            if rc:
+                result["REVIEW_COUNT"] = str(rc)
+
+    # =========================================================================
+    # STRATEGY 2 — embedded window JSON (dataLayer / __STORES__ / APP_DATA)
+    # Jumia injects product attributes as a JS object that we can regex-parse.
+    # =========================================================================
+    for script in soup.find_all("script"):
+        raw = script.string or ""
+        if not raw or len(raw) < 50:
+            continue
+
+        # dataLayer push — common on Jumia
+        if "dataLayer" in raw and "price" in raw.lower():
+            m = re.search(r"dataLayer\s*=\s*(\[.*?\])\s*;", raw, re.DOTALL)
+            if not m:
+                m = re.search(r"dataLayer\.push\s*\((\{.*?\})\s*\)", raw, re.DOTALL)
+            if m:
+                try:
+                    dl = _json.loads(m.group(1))
+                    if isinstance(dl, list):
+                        dl = dl[0] if dl else {}
+                    # Flatten one level of ecommerce wrapping
+                    dl = dl.get("ecommerce", dl)
+                    dl = dl.get("detail", dl)
+                    products = dl.get("products", [dl])
+                    p = products[0] if products else dl
+                    if not result.get("PRICE") and p.get("price"):
+                        result["PRICE"] = str(p["price"]).replace(",", "")
+                    if not result.get("BRAND") and p.get("brand"):
+                        result["BRAND"] = str(p["brand"])
+                    if not result.get("CATEGORY_PATH") and p.get("category"):
+                        result["CATEGORY_PATH"] = str(p["category"])
+                except Exception:
+                    pass
+
+        # __STORES__ — Jumia SPA state blob (older layout)
+        if "__STORES__" in raw or "window.store" in raw.lower():
+            m = re.search(r"__STORES__\s*=\s*(\{.+?\})\s*;", raw, re.DOTALL)
+            if m:
+                try:
+                    store = _json.loads(m.group(1))
+                    pdp = store.get("pdp", store)
+                    prod = pdp.get("product", pdp)
+                    if not result.get("PRICE") and prod.get("price"):
+                        result["PRICE"] = str(prod["price"]).replace(",", "")
+                    if not result.get("MAIN_IMAGE") and prod.get("image"):
+                        result["MAIN_IMAGE"] = str(prod["image"])
+                except Exception:
+                    pass
+
+    # =========================================================================
+    # STRATEGY 3 — HTML / CSS parsing
+    # Used for anything not captured above, and for KEY_FEATURES / WHATS_IN_BOX
+    # which are always rendered as HTML lists.
+    # =========================================================================
+
+    # ── Main Image (HTML fallback) ────────────────────────────────────────────
+    if not result.get("MAIN_IMAGE"):
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content"):
+            result["MAIN_IMAGE"] = og["content"]
+        else:
+            for img in soup.select("img.-fw.-fh, img[data-src*='jumia']"):
+                src = img.get("data-src") or img.get("src", "")
+                if src and ("product" in src or "unsafe" in src or "jumia.is" in src):
+                    result["MAIN_IMAGE"] = src if src.startswith("http") else base_url + src
+                    break
+
+    # ── Price (HTML fallback) ──────────────────────────────────────────────────
+    if not result.get("PRICE"):
+        for sel in [
+            "span.-b.-ltr.-tal.-fs24",
+            "span.prc",
+            "[class*='price'] span",
+            "span[data-price]",
+        ]:
+            el = soup.select_one(sel)
+            if el:
+                raw_p = re.sub(r"[^\d.,]", "", el.get_text())
+                if raw_p:
+                    result["PRICE"] = raw_p.replace(",", "")
+                    break
 
     # ── Discount ──────────────────────────────────────────────────────────────
     for sel in ["span.bdg._dsct._sm", "span._dsct", "[class*='discount']"]:
@@ -189,69 +322,69 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
                 result["DISCOUNT"] = txt
                 break
 
-    # ── Rating ────────────────────────────────────────────────────────────────
-    for sel in ["div.stars._s", "[class*='stars'] span", "div[data-rating]"]:
-        el = soup.select_one(sel)
-        if el:
-            rating_text = el.get("data-rating") or el.get_text(strip=True)
-            m = re.search(r"(\d+\.?\d*)", rating_text)
-            if m:
-                result["RATING"] = m.group(1)
-                break
+    # ── Rating (HTML fallback) ────────────────────────────────────────────────
+    if not result.get("RATING"):
+        for sel in ["div.stars._s", "[class*='stars'] span", "div[data-rating]"]:
+            el = soup.select_one(sel)
+            if el:
+                rating_text = el.get("data-rating") or el.get_text(strip=True)
+                m = re.search(r"(\d+\.?\d*)", rating_text)
+                if m:
+                    result["RATING"] = m.group(1)
+                    break
 
-    # ── Review count ──────────────────────────────────────────────────────────
-    for sel in ["a[href*='#reviews']", "span[class*='revw']", "[class*='review'] span"]:
-        el = soup.select_one(sel)
-        if el:
-            m = re.search(r"(\d+)", el.get_text())
+    # ── Review count (HTML fallback) ──────────────────────────────────────────
+    if not result.get("REVIEW_COUNT"):
+        for sel in ["a[href*='#reviews']", "span[class*='revw']", "[class*='review'] span"]:
+            el = soup.select_one(sel)
+            if el:
+                m = re.search(r"(\d+)", el.get_text())
+                if m:
+                    result["REVIEW_COUNT"] = m.group(1)
+                    break
+        # Also check text like "13 verified ratings"
+        if not result.get("REVIEW_COUNT"):
+            m = re.search(r"(\d+)\s+verified\s+ratings?", full_text, re.IGNORECASE)
             if m:
                 result["REVIEW_COUNT"] = m.group(1)
-                break
 
     # ── Stock status ──────────────────────────────────────────────────────────
-    out_indicators = [
-        "div.out-of-stock", "[class*='sold-out']",
-        "[class*='out-of-stock']", "button[disabled]",
-    ]
-    result["STOCK_STATUS"] = "In Stock"
-    for sel in out_indicators:
-        if soup.select_one(sel):
-            result["STOCK_STATUS"] = "Out of Stock"
-            break
+    if not result.get("STOCK_STATUS"):
+        out_indicators = [
+            "div.out-of-stock", "[class*='sold-out']",
+            "[class*='out-of-stock']", "button[disabled]",
+        ]
+        result["STOCK_STATUS"] = "In Stock"
+        for sel in out_indicators:
+            if soup.select_one(sel):
+                result["STOCK_STATUS"] = "Out of Stock"
+                break
 
     # ── Colors / Variations ───────────────────────────────────────────────────
     colors: list[str] = []
-
-    # Method A: variation list items (common Jumia pattern)
     for li in soup.select("ul.-pvs.-mvs li"):
         inp = li.select_one("input")
         if inp:
             val = inp.get("value") or inp.get("data-value", "")
             if val:
                 colors.append(val.strip())
-
-    # Method B: colour swatches / selectors
     if not colors:
         for el in soup.select("[data-type='color'] span, span.color-selector"):
             txt = el.get_text(strip=True)
             if txt:
                 colors.append(txt)
-
-    # Method C: size options (count as variations even if not colours)
     variation_count: int = 0
     if not colors:
         opts = soup.select("ul.-pvs li, select option:not([value=''])")
         variation_count = len(opts)
-
     if colors:
-        unique_colors = list(dict.fromkeys(colors))  # deduplicate, preserve order
+        unique_colors = list(dict.fromkeys(colors))
         result["COLOR"] = ", ".join(unique_colors)
         result["COUNT_VARIATIONS"] = str(len(unique_colors))
     elif variation_count:
         result["COUNT_VARIATIONS"] = str(variation_count)
 
     # ── Warranty ──────────────────────────────────────────────────────────────
-    # Look for explicit warranty text in the description / spec table
     warranty_pattern = re.compile(
         r"(\d+[\s\-]?(?:year|month|yr|mo)[s]?\s+(?:warranty|guarantee))",
         re.IGNORECASE,
@@ -261,7 +394,6 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
         result["PRODUCT_WARRANTY"] = "Yes"
         result["WARRANTY_DURATION"] = m.group(1).strip()
     else:
-        # Check spec rows for the word "warranty"
         for row in soup.select("ul li, table tr, div.-fs14"):
             txt = row.get_text(" ", strip=True)
             if re.search(r"warranty", txt, re.IGNORECASE):
@@ -270,6 +402,164 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
                     result["PRODUCT_WARRANTY"] = "Yes"
                     result.setdefault("WARRANTY_DURATION", val)
                     break
+        # Also parse "Warranty Address" spec row on Jumia
+        m2 = re.search(r"Warranty\s+Address\s*[:\-]?\s*(.+?)(?:\n|$)", full_text, re.IGNORECASE)
+        if m2:
+            result["PRODUCT_WARRANTY"] = "Yes"
+            result.setdefault("WARRANTY_DURATION", m2.group(1).strip())
+
+    # ── Description (HTML) ────────────────────────────────────────────────────
+    # Jumia wraps the long product description in a section that sits between
+    # the "Product details" heading and the "Specifications" heading.
+    # The section contains alternating h2/h3 headings and paragraphs.
+    if not result.get("DESCRIPTION"):
+        desc_parts: list[str] = []
+
+        # Walk every h2/h3 and the block of text that follows it,
+        # stopping when we hit "Specifications" or "Customer Feedback".
+        STOP_HEADS = re.compile(
+            r"^(specifications?|customer\s+feedback|related\s+results|seller\s+info)",
+            re.IGNORECASE,
+        )
+        collecting = False
+        for tag in soup.find_all(
+            ["h1", "h2", "h3", "h4", "p", "li"], limit=300
+        ):
+            txt = tag.get_text(" ", strip=True)
+            if not txt:
+                continue
+            # Start collecting after "Product details" heading
+            if tag.name in ("h2", "h3") and re.search(r"product\s+details?", txt, re.IGNORECASE):
+                collecting = True
+                continue
+            # Stop at known boundary headings
+            if collecting and tag.name in ("h2", "h3") and STOP_HEADS.search(txt):
+                break
+            if collecting and len(txt) > 15:
+                desc_parts.append(txt)
+
+        # If "Product details" heading wasn't found, grab all substantial
+        # paragraphs that are NOT inside the spec table or rating block.
+        if not desc_parts:
+            for p in soup.find_all("p"):
+                txt = p.get_text(" ", strip=True)
+                if len(txt) > 40 and not re.search(
+                    r"cookie|privacy|subscribe|newsletter|download", txt, re.IGNORECASE
+                ):
+                    desc_parts.append(txt)
+
+        if desc_parts:
+            seen: set[str] = set()
+            unique: list[str] = []
+            for part in desc_parts:
+                key = part[:80]
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(part)
+            result["DESCRIPTION"] = "\n\n".join(unique)
+
+    # ── Key Features ──────────────────────────────────────────────────────────
+    # Always a <ul> immediately following an h2/h3 "Key Features" heading.
+    key_features: list[str] = []
+    kf_pattern = re.compile(r"key\s+features?", re.IGNORECASE)
+
+    for heading in soup.find_all(["h2", "h3", "h4", "b", "strong"]):
+        if not kf_pattern.search(heading.get_text()):
+            continue
+        # Scan forward siblings for the first <ul>
+        node = heading.find_next_sibling()
+        while node:
+            if node.name in ("h2", "h3", "h4"):
+                break
+            if node.name == "ul":
+                for li in node.find_all("li", recursive=False):
+                    txt = li.get_text(" ", strip=True)
+                    if txt:
+                        key_features.append(txt)
+                break
+            # Some Jumia pages wrap the list in a div first
+            if node.name == "div":
+                inner_ul = node.find("ul")
+                if inner_ul:
+                    for li in inner_ul.find_all("li", recursive=False):
+                        txt = li.get_text(" ", strip=True)
+                        if txt:
+                            key_features.append(txt)
+                    if key_features:
+                        break
+            node = node.find_next_sibling()
+        if key_features:
+            break
+
+    # Fallback: any <ul> whose nearest preceding heading matches
+    if not key_features:
+        for ul in soup.find_all("ul"):
+            prev_h = ul.find_previous(["h2", "h3", "h4", "b", "strong"])
+            if prev_h and kf_pattern.search(prev_h.get_text()):
+                for li in ul.find_all("li"):
+                    txt = li.get_text(" ", strip=True)
+                    if txt:
+                        key_features.append(txt)
+                break
+
+    if key_features:
+        result["KEY_FEATURES"] = " | ".join(key_features)
+
+    # ── What's in the box ─────────────────────────────────────────────────────
+    in_box: list[str] = []
+    box_pattern = re.compile(r"what.{0,5}s?\s+in\s+the\s+box", re.IGNORECASE)
+
+    for heading in soup.find_all(["h2", "h3", "h4", "b", "strong"]):
+        if not box_pattern.search(heading.get_text()):
+            continue
+        node = heading.find_next_sibling()
+        while node:
+            if node.name in ("h2", "h3", "h4"):
+                break
+            if node.name == "ul":
+                for li in node.find_all("li", recursive=False):
+                    txt = li.get_text(" ", strip=True)
+                    if txt:
+                        in_box.append(txt)
+                break
+            if node.name == "div":
+                inner_ul = node.find("ul")
+                if inner_ul:
+                    for li in inner_ul.find_all("li", recursive=False):
+                        txt = li.get_text(" ", strip=True)
+                        if txt:
+                            in_box.append(txt)
+                    if in_box:
+                        break
+            node = node.find_next_sibling()
+        if in_box:
+            break
+
+    # Fallback: nearest preceding heading approach
+    if not in_box:
+        for ul in soup.find_all("ul"):
+            prev_h = ul.find_previous(["h2", "h3", "h4", "b", "strong"])
+            if prev_h and box_pattern.search(prev_h.get_text()):
+                for li in ul.find_all("li"):
+                    txt = li.get_text(" ", strip=True)
+                    if txt:
+                        in_box.append(txt)
+                break
+
+    # Regex fallback on plain text
+    if not in_box:
+        m_box = re.search(
+            r"what.{0,5}s?\s+in\s+the\s+box[:\s]+(.*?)(?:\n\n|\Z)",
+            full_text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if m_box:
+            raw_box = m_box.group(1).strip()
+            items = re.split(r"[•\n,;]+", raw_box)
+            in_box = [i.strip() for i in items if i.strip() and len(i.strip()) > 2]
+
+    if in_box:
+        result["WHATS_IN_BOX"] = " | ".join(in_box)
 
     return result
 
