@@ -609,55 +609,168 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
             result["PRODUCT_WARRANTY"] = "Yes"
             result.setdefault("WARRANTY_DURATION", m2.group(1).strip())
 
-    # ── Description (HTML) ────────────────────────────────────────────────────
-    # Jumia wraps the long product description in a section that sits between
-    # the "Product details" heading and the "Specifications" heading.
-    # The section contains alternating h2/h3 headings and paragraphs.
+    # ── Description (HTML — preserves infographic <img> tags) ────────────────
+    # Jumia's description section sits between the "Product details" heading
+    # and the "Specifications" heading.  We capture it as *HTML*, not plain
+    # text, so that infographic images are preserved for downstream rendering.
+    #
+    # Image handling
+    # --------------
+    # Jumia lazy-loads images: the real URL lives in data-src / data-original /
+    # data-lazy while src holds a tiny SVG placeholder.  We resolve all img
+    # src attributes to the real URL before serialising, and make relative
+    # URLs absolute.  We also strip empty placeholder <img> tags entirely.
     if not result.get("DESCRIPTION"):
-        desc_parts: list[str] = []
 
-        # Walk every h2/h3 and the block of text that follows it,
-        # stopping when we hit "Specifications" or "Customer Feedback".
         STOP_HEADS = re.compile(
-            r"^(specifications?|customer\s+feedback|related\s+results|seller\s+info)",
+            r"^(specifications?|customer\s+feedback|related\s+results|seller\s+info|"
+            r"promotions?|delivery|return\s+policy|seller\s+information)",
             re.IGNORECASE,
         )
+
+        def _resolve_imgs(container) -> None:
+            """Replace lazy-src placeholders with real URLs in-place."""
+            for img in container.find_all("img"):
+                real_src = (
+                    img.get("data-src")
+                    or img.get("data-original")
+                    or img.get("data-lazy")
+                    or img.get("src", "")
+                )
+                # Skip SVG placeholders and data URIs
+                if not real_src or real_src.startswith("data:"):
+                    img.decompose()
+                    continue
+                # Make relative URLs absolute
+                if real_src.startswith("//"):
+                    real_src = "https:" + real_src
+                elif real_src.startswith("/"):
+                    real_src = base_url + real_src
+                img["src"] = real_src
+                # Clean up lazy-load attributes so output HTML is tidy
+                for attr in ("data-src", "data-original", "data-lazy",
+                             "data-srcset", "srcset", "loading"):
+                    if img.has_attr(attr):
+                        del img[attr]
+                # Ensure alt is present
+                if not img.get("alt"):
+                    img["alt"] = ""
+
+        def _html(tag) -> str:
+            """Return the outer HTML of a tag as a clean string."""
+            return str(tag)
+
+        desc_html_parts: list[str] = []
+
+        # ── Strategy A: collect nodes between "Product details" and the
+        #    next boundary heading, walking all siblings in document order.
+        #    This captures both text blocks AND infographic images.
         collecting = False
         for tag in soup.find_all(
-            ["h1", "h2", "h3", "h4", "p", "li"], limit=300
+            ["h2", "h3", "h4", "p", "ul", "ol", "div", "img", "figure"],
+            limit=500,
         ):
             txt = tag.get_text(" ", strip=True)
-            if not txt:
-                continue
-            # Start collecting after "Product details" heading
-            if tag.name in ("h2", "h3") and re.search(r"product\s+details?", txt, re.IGNORECASE):
+
+            # Trigger: "Product details" heading
+            if tag.name in ("h2", "h3", "h4") and re.search(
+                r"product\s+details?", txt, re.IGNORECASE
+            ):
                 collecting = True
                 continue
-            # Stop at known boundary headings
-            if collecting and tag.name in ("h2", "h3") and STOP_HEADS.search(txt):
+
+            if not collecting:
+                continue
+
+            # Stop trigger: boundary headings
+            if tag.name in ("h2", "h3", "h4") and STOP_HEADS.search(txt):
                 break
-            if collecting and len(txt) > 15:
-                desc_parts.append(txt)
 
-        # If "Product details" heading wasn't found, grab all substantial
-        # paragraphs that are NOT inside the spec table or rating block.
-        if not desc_parts:
-            for p in soup.find_all("p"):
-                txt = p.get_text(" ", strip=True)
-                if len(txt) > 40 and not re.search(
-                    r"cookie|privacy|subscribe|newsletter|download", txt, re.IGNORECASE
+            # Skip empty or navigation/boilerplate divs
+            if tag.name == "div":
+                cls = " ".join(tag.get("class", []))
+                if any(
+                    skip in cls.lower()
+                    for skip in ("nav", "bread", "cart", "seller",
+                                 "rate", "review", "footer", "header",
+                                 "sidebar", "related", "promo", "banner")
                 ):
-                    desc_parts.append(txt)
+                    continue
+                # Only include divs that contain either an img OR substantial text
+                has_img = bool(tag.find("img"))
+                has_text = len(txt) > 30
+                if not has_img and not has_text:
+                    continue
 
-        if desc_parts:
-            seen: set[str] = set()
-            unique: list[str] = []
-            for part in desc_parts:
-                key = part[:80]
-                if key not in seen:
-                    seen.add(key)
-                    unique.append(part)
-            result["DESCRIPTION"] = "\n\n".join(unique)
+            # Resolve lazy images before serialising
+            _resolve_imgs(tag)
+
+            serialised = _html(tag).strip()
+            if serialised and serialised not in desc_html_parts:
+                desc_html_parts.append(serialised)
+
+        # ── Strategy B: look for a dedicated description container div
+        if not desc_html_parts:
+            for sel in [
+                "div.-prd-desc",
+                "div[class*='description']",
+                "section[class*='description']",
+                "div[class*='product-desc']",
+                "div.-fs14",
+            ]:
+                container = soup.select_one(sel)
+                if container:
+                    _resolve_imgs(container)
+                    desc_html_parts = [_html(container)]
+                    break
+
+        # ── Strategy C: collect standalone infographic images (data-src on
+        #    product CDN domains) even when no description container is found.
+        if not desc_html_parts:
+            for img in soup.find_all("img"):
+                src = (
+                    img.get("data-src") or img.get("data-original")
+                    or img.get("data-lazy") or img.get("src", "")
+                )
+                if src and not src.startswith("data:") and (
+                    "product" in src or "unsafe" in src or "jumia.is" in src
+                ):
+                    if src.startswith("//"):
+                        src = "https:" + src
+                    elif src.startswith("/"):
+                        src = base_url + src
+                    desc_html_parts.append(
+                        f'<img src="{src}" alt="" '
+                        f'style="max-width:100%;height:auto;display:block;margin:8px 0;">'
+                    )
+
+        # ── Strategy D: JSON-LD plain text (last resort — no images)
+        if not desc_html_parts and result.get("DESCRIPTION"):
+            # Already set by JSON-LD in Strategy 1 — wrap in <p> tags
+            plain = result["DESCRIPTION"]
+            desc_html_parts = [
+                f"<p>{para.strip()}</p>"
+                for para in plain.split("\n\n")
+                if para.strip()
+            ]
+
+        if desc_html_parts:
+            # Deduplicate while preserving order
+            seen_keys: set[str] = set()
+            unique_parts: list[str] = []
+            for part in desc_html_parts:
+                key = re.sub(r"\s+", " ", part)[:120]
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    unique_parts.append(part)
+
+            # Wrap in a container div with basic responsive styles
+            result["DESCRIPTION"] = (
+                '<div class="jm-desc" style="font-family:sans-serif;'
+                'line-height:1.6;color:#313133;">\n'
+                + "\n".join(unique_parts)
+                + "\n</div>"
+            )
 
     # ── Key Features ──────────────────────────────────────────────────────────
     # Always a <ul> immediately following an h2/h3 "Key Features" heading.
