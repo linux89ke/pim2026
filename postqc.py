@@ -1,5 +1,4 @@
 import re
-import sys
 import logging
 from io import BytesIO
 from datetime import datetime
@@ -231,53 +230,50 @@ def _compile_pattern(words: List[str]):
 
 
 # -------------------------------------------------
-# SAFE IMPORT FROM STREAMLIT_APP
-# Resolves the circular-import problem: streamlit_app imports postqc at
-# module load time, so a normal `from streamlit_app import …` inside
-# postqc would fail (the module is only half-initialised).
-# Instead we look it up from sys.modules AFTER it has fully loaded.
+# SAFE LOOKUP FROM SHARED REGISTRY
+# Resolves the circular-import problem without re-executing streamlit_app.
+#
+# streamlit_app.py registers its check functions into _preqc_registry.REGISTRY
+# after they are defined.  postqc.py reads that dict here at call-time.
+# _preqc_registry has NO Streamlit imports and NO side effects.
 # -------------------------------------------------
+
+REQUIRED_SYMBOLS = [
+    'check_restricted_brands', 'check_suspected_fake_products',
+    'check_refurb_seller_approval', 'check_product_warranty',
+    'check_seller_approved_for_books', 'check_seller_approved_for_perfume',
+    'check_perfume_tester', 'check_counterfeit_sneakers',
+    'check_counterfeit_jerseys', 'check_prohibited_products',
+    'check_unnecessary_words', 'check_single_word_name',
+    'check_generic_brand_issues', 'check_fashion_brand_issues',
+    'check_brand_in_name', 'check_wrong_variation',
+    'check_generic_with_brand_in_name', 'check_missing_color',
+    'check_weight_volume_in_name', 'check_incomplete_smartphone_name',
+    'check_duplicate_products', 'check_miscellaneous_category',
+    'compile_regex_patterns', 'FX_RATE',
+]
 
 def _get_preqc_symbols():
     """
-    Return (symbols_dict, True) when streamlit_app is fully loaded,
-    or ({}, False) when it is not yet available.
+    Return (symbols_dict, True) when all required symbols are registered,
+    or ({}, False) when the registry is empty / incomplete.
     """
-    mod = sys.modules.get('streamlit_app')
-    if mod is None:
+    try:
+        from _preqc_registry import REGISTRY
+    except ImportError:
+        logger.warning("_get_preqc_symbols: _preqc_registry module not found")
         return {}, False
 
-    names = [
-        'check_restricted_brands', 'check_suspected_fake_products',
-        'check_refurb_seller_approval', 'check_product_warranty',
-        'check_seller_approved_for_books', 'check_seller_approved_for_perfume',
-        'check_perfume_tester', 'check_counterfeit_sneakers',
-        'check_counterfeit_jerseys', 'check_prohibited_products',
-        'check_unnecessary_words', 'check_single_word_name',
-        'check_generic_brand_issues', 'check_fashion_brand_issues',
-        'check_brand_in_name', 'check_wrong_variation',
-        'check_generic_with_brand_in_name', 'check_missing_color',
-        'check_weight_volume_in_name', 'check_incomplete_smartphone_name',
-        'check_duplicate_products', 'check_miscellaneous_category',
-        'compile_regex_patterns', 'FX_RATE',
-    ]
+    if not REGISTRY:
+        logger.warning("_get_preqc_symbols: registry is empty")
+        return {}, False
 
-    symbols = {}
-    missing = []
-    for name in names:
-        val = getattr(mod, name, None)
-        if val is None:
-            missing.append(name)
-        else:
-            symbols[name] = val
-
+    missing = [n for n in REQUIRED_SYMBOLS if n not in REGISTRY]
     if missing:
-        logger.warning(f"_get_preqc_symbols: missing from streamlit_app: {missing}")
-        return symbols, False
+        logger.warning(f"_get_preqc_symbols: missing from registry: {missing}")
+        return {k: REGISTRY[k] for k in REQUIRED_SYMBOLS if k in REGISTRY}, False
 
-    return symbols, True
-
-
+    return {k: REGISTRY[k] for k in REQUIRED_SYMBOLS}, True
 # -------------------------------------------------
 # CHECK RUNNER
 # -------------------------------------------------
@@ -300,9 +296,7 @@ def run_checks(df: pd.DataFrame, support_files: Dict) -> Tuple[pd.DataFrame, Dic
             results[name] = _empty(df)
 
     # ── SHARED PRE-QC CHECKS ────────────────────────────────────────────────
-    # Use sys.modules lookup to avoid circular import.
-    # streamlit_app imports postqc at startup; by the time run_checks() is
-    # called interactively, streamlit_app is fully initialised in sys.modules.
+    # Uses _preqc_registry to avoid circular import — see _preqc_registry.py
     symbols, _have_preqc = _get_preqc_symbols()
 
     if not _have_preqc:
