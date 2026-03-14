@@ -2431,28 +2431,45 @@ def render_exports_section():
     st.markdown("---")
     st.markdown(f"""<div style='background: linear-gradient(135deg, {JUMIA_COLORS['primary_orange']}, {JUMIA_COLORS['secondary_orange']}); padding: 20px 24px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(246, 139, 30, 0.25);'><h2 style='color: white; margin: 0; font-size: 24px; font-weight: 700;'>{_t('download_reports')}</h2><p style='color: rgba(255,255,255,0.9); margin: 6px 0 0 0; font-size: 13px;'>Export validation results in Excel or ZIP format</p></div>""", unsafe_allow_html=True)
 
+    # 1. Icons removed from the config
     exports_config = [
-        ("Final Report",  fr,     'assignment',   'Complete validation report with all statuses', lambda df: generate_smart_export(df, f"{c_code}_Final_{date_str}", 'simple', reasons_df)),
-        ("Rejected Only", rej_df, 'block',        'Products that failed validation', lambda df: generate_smart_export(df, f"{c_code}_Rejected_{date_str}", 'simple', reasons_df)),
-        ("Approved Only", app_df, 'check_circle', 'Products that passed validation', lambda df: generate_smart_export(df, f"{c_code}_Approved_{date_str}", 'simple', reasons_df)),
-        ("Full Data",     data,   'database',     'Complete dataset with validation flags', lambda df: generate_smart_export(prepare_full_data_merged(df, fr), f"{c_code}_Full_{date_str}", 'full')),
+        ("Final Report",  fr,     'Complete validation report with all statuses', lambda df: generate_smart_export(df, f"{c_code}_Final_{date_str}", 'simple', reasons_df)),
+        ("Rejected Only", rej_df, 'Products that failed validation', lambda df: generate_smart_export(df, f"{c_code}_Rejected_{date_str}", 'simple', reasons_df)),
+        ("Approved Only", app_df, 'Products that passed validation', lambda df: generate_smart_export(df, f"{c_code}_Approved_{date_str}", 'simple', reasons_df)),
+        ("Full Data",     data,   'Complete dataset with validation flags', lambda df: generate_smart_export(prepare_full_data_merged(df, fr), f"{c_code}_Full_{date_str}", 'full')),
     ]
+
+    # Added top-level Generate All button for convenience
+    all_cached = all(title in st.session_state.exports_cache for title, _, _, _ in exports_config)
+    if not all_cached:
+        if st.button("Generate All Reports", type="primary", icon=":material/download:", use_container_width=True):
+            with st.spinner("Generating all reports..."):
+                for t2, d2, _desc2, f2 in exports_config:
+                    if t2 not in st.session_state.exports_cache:
+                        res, fname, mime = f2(d2)
+                        st.session_state.exports_cache[t2] = {"data": res.getvalue(), "fname": fname, "mime": mime}
+            st.rerun()
 
     cols_count = 4 if st.session_state.layout_mode == "wide" else 2
     for i in range(0, len(exports_config), cols_count):
         cols = st.columns(cols_count)
         for j, col in enumerate(cols):
             if i + j < len(exports_config):
-                title, df, icon, desc, func = exports_config[i + j]
+                title, df, desc, func = exports_config[i + j]
                 with col:
                     with st.container(border=True):
-                        st.markdown(f"""<div style='text-align: center; margin-bottom: 15px;'><div style='font-size: 48px; margin-bottom: 8px;' class='material-symbols-outlined'>{icon}</div><div style='font-size: 18px; font-weight: 700;'>{title}</div><div style='font-size: 11px; margin-top: 4px; opacity: 0.7;'>{desc}</div><div style='background: {JUMIA_COLORS['light_gray']}; color: {JUMIA_COLORS['primary_orange']}; padding: 8px; border-radius: 6px; margin-top: 12px; font-weight: 600;'>{len(df):,} rows</div></div>""", unsafe_allow_html=True)
+                        # 2. Material icon div removed from the HTML
+                        st.markdown(f"""<div style='text-align: center; margin-bottom: 15px;'><div style='font-size: 18px; font-weight: 700;'>{title}</div><div style='font-size: 11px; margin-top: 4px; opacity: 0.7;'>{desc}</div><div style='background: {JUMIA_COLORS['light_gray']}; color: {JUMIA_COLORS['primary_orange']}; padding: 8px; border-radius: 6px; margin-top: 12px; font-weight: 600;'>{len(df):,} rows</div></div>""", unsafe_allow_html=True)
+                        
                         export_key = title
                         if export_key not in st.session_state.exports_cache:
                             if st.button("Generate", key=f"gen_{title}", type="primary", use_container_width=True, icon=":material/download:"):
-                                with st.spinner(f"Generating {title}..."):
-                                    res, fname, mime = func(df)
-                                    st.session_state.exports_cache[export_key] = {"data": res.getvalue(), "fname": fname, "mime": mime}
+                                with st.spinner("Generating all reports..."):
+                                    # 3. Loop over all configs so clicking any 'Generate' generates all 4
+                                    for t2, d2, _desc2, f2 in exports_config:
+                                        if t2 not in st.session_state.exports_cache:
+                                            res, fname, mime = f2(d2)
+                                            st.session_state.exports_cache[t2] = {"data": res.getvalue(), "fname": fname, "mime": mime}
                                 st.rerun()
                         else:
                             cache = st.session_state.exports_cache[export_key]
@@ -2460,7 +2477,6 @@ def render_exports_section():
                             if st.button("Clear", key=f"clr_{title}", use_container_width=True):
                                 del st.session_state.exports_cache[export_key]
                                 st.rerun()
-
 # ==========================================
 # CALL FRAGMENTS
 # ==========================================
