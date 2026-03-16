@@ -913,32 +913,52 @@ class CategoryMatcherEngine:
     def apply_learned_correction(self, product_name, category):
         """
         Store a correction: product_name (lower) → category.
-        Also retrains the sklearn SGDClassifier so the model immediately
-        improves — future products similar to this one will route correctly.
+        Also retrains the sklearn SGDClassifier in a background thread so
+        the UI stays responsive — future products similar to this one will
+        route correctly after the retrain completes.
         """
+        import threading
         self.learning_db[product_name.lower().strip()] = category
         self.save_learning_db()
-        # Retrain the sklearn correction classifier in a background thread
-        # so the UI stays responsive
         if SKLEARN_AVAILABLE:
-            try:
-                self._retrain_correction_classifier()
-            except Exception:
-                pass
+            t = threading.Thread(
+                target=self._retrain_correction_classifier,
+                daemon=True,
+            )
+            t.start()
 
     def lookup_learning_db(self, product_name):
         """
         Check the learning DB for an exact or near-exact match.
+
+        Matching order:
+          1. Exact key match (always wins).
+          2. Fuzzy substring match — only fires when the stored key is
+             ≥ 10 characters AND every word in the key appears as a whole
+             word in the product name.  This prevents a short key like
+             "ladies bra" from matching "umbrella bracket ladies".
         Returns category string or None.
         """
         pn = product_name.lower().strip()
+
+        # ── 1. Exact match ────────────────────────────────────────────────
         if pn in self.learning_db:
             return self.learning_db[pn]
+
+        # ── 2. Word-boundary fuzzy match (longer keys only) ───────────────
+        pn_words = set(re.findall(r'[a-z0-9]+', pn))
+        best_cat, best_len = None, 0
         for key, cat in self.learning_db.items():
-            if len(key) >= 6:
-                if key in pn or pn in key:
-                    return cat
-        return None
+            if len(key) < 10:
+                continue  # too short — high false-positive risk
+            key_words = set(re.findall(r'[a-z0-9]+', key))
+            if not key_words:
+                continue
+            # All words in the stored key must appear in the product name
+            if key_words.issubset(pn_words) and len(key) > best_len:
+                best_len = len(key)
+                best_cat = cat
+        return best_cat
 
     def open_learning_panel(self):
         """Not available in engine mode (UI only in the desktop app)."""
@@ -1390,7 +1410,12 @@ class CategoryMatcherEngine:
         rwords  = set(re.findall(r'[a-z]{3,}', rule_result.lower()))  - stopwords
         overlap = pwords & rwords
 
-        if len(overlap) >= 1:
+        # Plausibility check: accept the rule result only when the overlap is
+        # genuinely meaningful — at least one word of 5+ chars, OR two or more
+        # overlapping words.  A single short word like "bag" or "box" is not
+        # strong enough evidence on its own.
+        meaningful_overlap = {w for w in overlap if len(w) >= 5}
+        if meaningful_overlap or len(overlap) >= 2:
             return rule_result  # Rule engine result looks plausible
 
         # Run similarity (sklearn or legacy TF-IDF)
@@ -5196,132 +5221,6 @@ def check_wrong_category(
 
         comment = (
             f"Assigned: {assigned_dom.title()} ({cat_leaf}) | "
-            f"Predicted: {predicted_dom.title()} — "
-            f"{predicted_leaf}{code_str}"
-        )
-
-        row_copy = row.copy()
-        row_copy["Comment_Detail"] = comment
-        flagged_rows.append(row_copy)
-
-    if not flagged_rows:
-        return pd.DataFrame(columns=data.columns)
-
-    result = pd.DataFrame(flagged_rows)
-    if "PRODUCT_SET_SID" in result.columns:
-        result = result.drop_duplicates(subset=["PRODUCT_SET_SID"])
-    return result
-    """
-    Validator for streamlit_app.validate_products().
-
-    Flags products whose assigned CATEGORY top-level domain doesn't match
-    what the engine predicts from the product NAME.
-
-    Uses the 5-priority matching pipeline:
-      1. Learning DB corrections
-      2. Exact product-type map (468 entries)
-      3. Rule-based v2 engine
-      4. sklearn / TF-IDF cosine similarity
-      5. Global cosine similarity fallback
-
-    Only flags when the domain mismatch is unambiguous — e.g. a product
-    clearly identified as "Smartphone" sitting in "Fashion", or a "Dress"
-    sitting in "Electronics".  Short or ambiguous names are skipped.
-
-    Parameters
-    ----------
-    data              : DataFrame with NAME and CATEGORY columns
-    categories_list   : Full list of 'Category Path' strings from category_map.xlsx
-    cat_path_to_code  : Optional dict mapping lowercased Category Path → category_code
-    """
-    if cat_path_to_code is None:
-        cat_path_to_code = {}
-
-    if "NAME" not in data.columns or "CATEGORY" not in data.columns:
-        return pd.DataFrame(columns=data.columns)
-
-    d = data.copy()
-    d = d[
-        d["NAME"].astype(str).str.strip().replace({"nan": "", "None": ""}).ne("")
-        & d["CATEGORY"].astype(str).str.strip().replace({"nan": "", "None": ""}).ne("")
-    ]
-    if d.empty:
-        return pd.DataFrame(columns=data.columns)
-
-    engine = get_engine()
-
-    # Build index and keyword map once (idempotent)
-    if categories_list and not engine._tfidf_built:
-        engine.build_tfidf_index(categories_list)
-    kw_map = engine.build_keyword_to_category_mapping()
-
-    # Build a set of valid top-level domains from the actual category list
-    # so comparisons are against real domain names, not internal engine names
-    valid_domains: set[str] = set()
-    for cp in categories_list:
-        dom = cp.split("/")[0].strip().lower()
-        if dom:
-            valid_domains.add(dom)
-
-    flagged_rows = []
-
-    for _, row in d.iterrows():
-        name     = str(row["NAME"]).strip()
-        assigned = str(row["CATEGORY"]).strip()
-
-        # Skip very short names — too ambiguous to judge
-        if len(name.split()) < 3:
-            continue
-
-        # Get predicted best-match category path
-        if categories_list:
-            predicted = engine.get_category_with_fallback(
-                name, kw_map, categories_list
-            )
-        else:
-            predicted = engine._map_product_type(name)
-            if not predicted:
-                continue
-
-        # Extract top-level domains from both paths
-        # Handle both "Electronics / Televisions / ..." and "Electronics > ..."
-        def _top_dom(path: str) -> str:
-            return re.split(r"\s*/\s*|\s*>\s*", path.strip())[0].strip().lower()
-
-        assigned_dom  = _top_dom(assigned)
-        predicted_dom = _top_dom(predicted)
-
-        if not predicted_dom or predicted_dom == assigned_dom:
-            continue
-
-        # Only flag when both domains are in the real category map
-        if predicted_dom not in valid_domains or assigned_dom not in valid_domains:
-            continue
-
-        # Skip "Miscellaneous" assigned — already caught by legacy check
-        # but keep it if engine confidently predicts something real
-        if assigned_dom == "miscellaneous" and predicted_dom == "miscellaneous":
-            continue
-
-        # Require at least one shared content word between product name
-        # and the predicted category path — guards against low-confidence predictions
-        stopwords = {
-            "and", "the", "for", "with", "new", "set", "pack", "pcs",
-            "best", "top", "pro", "kit", "use", "per", "all", "our",
-            "high", "quality", "inch", "size", "style", "type", "mini",
-            "large", "small", "super", "ultra", "max", "plus", "big",
-        }
-        name_words = set(re.findall(r"[a-z]{3,}", name.lower())) - stopwords
-        pred_words = set(re.findall(r"[a-z]{3,}", predicted.lower())) - stopwords
-        if not (name_words & pred_words):
-            continue
-
-        # Build comment — include predicted code if we have the lookup
-        predicted_leaf = predicted.split("/")[-1].strip()
-        predicted_code = cat_path_to_code.get(predicted.lower(), "")
-        code_str = f" [{predicted_code}]" if predicted_code else ""
-        comment = (
-            f"Assigned: {assigned_dom.title()} | "
             f"Predicted: {predicted_dom.title()} — "
             f"{predicted_leaf}{code_str}"
         )
