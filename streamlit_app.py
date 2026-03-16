@@ -1989,39 +1989,43 @@ def bulk_approve_dialog(sids_to_process, title, subset_data, data_has_warranty_c
                             name = str(row.iloc[0].get('NAME', '')).strip()
                             if not name:
                                 continue
-                            # Resolve full category path via CATEGORY_CODE first
+
                             cat_code = (
                                 str(row.iloc[0].get('CATEGORY_CODE', ''))
                                 .strip()
                                 .split('.')[0]
                             )
-                            category = _code_to_path.get(cat_code.lower(), '')
 
-                            # If code_to_path missed it, search categories_list
-                            # for a path that ends with the leaf category name
+                            # Resolve full category path
+                            category = _code_to_path.get(cat_code.lower(), '')
                             if not category:
                                 leaf = str(row.iloc[0].get('CATEGORY', '')).strip().lower()
                                 if leaf and leaf not in ('nan', 'none', ''):
-                                    # Find the most specific path ending with this leaf
                                     matches = [
                                         c for c in _cats_list
                                         if c.strip().lower().endswith(leaf)
                                     ]
-                                    if matches:
-                                        # Prefer the longest (most specific) match
-                                        category = max(matches, key=len)
-                                    else:
-                                        # Fall back to the raw leaf name
-                                        category = str(row.iloc[0].get('CATEGORY', '')).strip()
+                                    category = max(matches, key=len) if matches else leaf
+                                else:
+                                    category = str(row.iloc[0].get('CATEGORY', '')).strip()
 
                             if category and category.lower() not in ('nan', 'none', ''):
+                                # Save by product name
                                 corrections_to_learn[name] = category
+                                # ALSO save by category code — this means ALL future
+                                # products with this code are auto-approved regardless
+                                # of their name. Most reliable fix for missing code_to_path.
+                                if cat_code:
+                                    corrections_to_learn[f"__code__{cat_code}"] = category
 
                         if corrections_to_learn:
-                            # Single Firestore write for ALL corrections
                             _engine.apply_learned_corrections_bulk(corrections_to_learn)
+                            # Count only real product corrections (not __code__ keys)
+                            real_count = sum(
+                                1 for k in corrections_to_learn if not k.startswith('__code__')
+                            )
                             st.session_state.main_toasts.append(
-                                f"🧠 Engine learned {len(corrections_to_learn)} correction(s) from your approvals."
+                                f"🧠 Engine learned {real_count} correction(s) from your approvals."
                             )
                 except Exception as _le:
                     logger.warning("Wrong Category approval learning failed: %s", _le)
