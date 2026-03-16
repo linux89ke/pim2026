@@ -40,6 +40,7 @@ SCRAPABLE_FIELDS: list[str] = [
     "COLOR", "COLOR_IN_TITLE", "COUNT_VARIATIONS", "SIZES_AVAILABLE",
     "PRODUCT_WARRANTY", "WARRANTY_DURATION",
     "RATING", "REVIEW_COUNT",
+    "SELLER_NAME",
     "DESCRIPTION", "KEY_FEATURES", "KEY_SPECS", "SPECIFICATIONS", "WHATS_IN_BOX",
 ]
 
@@ -81,7 +82,10 @@ _SPEC_LABEL_RE = re.compile(
     r"type|quantity|number\s+of|set\s+includes|net\s+weight|"
     r"unit\s+count|flavor|scent|finish|texture|pattern|fit\s+type|"
     r"closure\s+type|sleeve\s+length|collar\s+type|outer\s+material|"
-    r"sole\s+material|upper\s+material|heel\s+type|toe\s+style)",
+    r"sole\s+material|upper\s+material|heel\s+type|toe\s+style|"
+    r"production|country|manufacturer|origin|made\s+in|from\s+the|"
+    r"item\s+weight|package|box\s+contents|box\s+content|included|"
+    r"features?|specification|certified|certification|standard)",
     re.IGNORECASE,
 )
 
@@ -385,21 +389,17 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
             if inp:
                 v = inp.get("value") or inp.get("data-value", "")
             else:
-                # Read only the first direct child <span> to avoid concatenating
-                # sibling spans like "EU 40" + "Selected" → "EU 40Selected", or
-                # "EU 40" + "Some variations with low stock" etc.
-                first_span = el.find("span", recursive=False)
-                if first_span:
-                    v = first_span.get_text(strip=True)
-                else:
-                    v = el.get_text(strip=True)
+                v = el.get_text(strip=True)
             v = v.strip()
             if not v or len(v) >= 50:
                 continue
             # Filter 1: explicit colon-space separator  e.g. "SKU: XYZ123"
             if ": " in v:
                 continue
-            # Filter 2: starts with a known attribute label (with or without
+            # Filter 2: contains a comma — spec attribute strings, never real pills
+            if "," in v:
+                continue
+            # Filter 3: starts with a known attribute label (with or without
             # a space/value following it)  e.g. "ColourRed", "Size 750ml"
             if _SPEC_LABEL_RE.match(v):
                 continue
@@ -499,15 +499,22 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
                         if _is_size(tok): sizes.append(tok)
                         else: colors.append(tok)
 
-    # NOTE: Strategy E (title colour extraction) has been intentionally removed.
-    # Extracting a colour word from the product title does NOT mean the product
-    # has multiple selectable colour variants — it just describes this one SKU.
-    # Keeping it caused single-SKU products (e.g. "Xiaomi … Black") to get a
-    # spurious COLOR and COUNT_VARIATIONS=1 that is misleading.
+    # Strategy E: title colour extraction (only when all above gave nothing)
+    if not colors and not sizes:
+        title_el = soup.select_one("h1, title")
+        if title_el:
+            COLOR_WORDS = re.compile(
+                r"\b(black|white|silver|gold|blue|red|green|purple|pink|"
+                r"grey|gray|titanium|midnight|starlight|ivory|champagne|"
+                r"rose|copper|yellow|orange|violet|navy|cream|brown|coral|"
+                r"aqua|cyan|teal|lilac|maroon|beige|olive|turquoise)\b",
+                re.IGNORECASE,
+            )
+            found = COLOR_WORDS.findall(title_el.get_text())
+            if found:
+                colors = list(dict.fromkeys(c.title() for c in found))
 
     # Write variation results
-    # COUNT_VARIATIONS always reflects the actual pill count found on the page.
-    # No pills found → no variation data written (seller left it blank; that's fine).
     if sizes and colors:
         result["SIZES_AVAILABLE"]  = ", ".join(sizes)
         result["COLOR"]            = ", ".join(colors)
@@ -518,7 +525,6 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
     elif colors:
         result["COLOR"]            = ", ".join(colors)
         result["COUNT_VARIATIONS"] = str(len(colors))
-    # else: no pills at all → leave COUNT_VARIATIONS blank (1 SKU, seller didn't fill variations)
 
     # COLOR_IN_TITLE
     _COLOR_WORDS = re.compile(
@@ -655,6 +661,66 @@ def _scrape_product_page(url: str, base_url: str) -> dict[str, str]:
         official_text = body_copy.find(string=_official_re) if body_copy else None
         official_img  = soup.find("img", alt=_official_re)
         result["IS_OFFICIAL_STORE"] = "Yes" if any([jmall_badge, official_text, official_img]) else "No"
+
+    # SELLER_NAME
+    # Jumia renders the seller as a linked store name in the seller-info section.
+    # Try multiple selectors in priority order, then fall back to URL slug.
+    if not result.get("SELLER_NAME"):
+        _seller_name = ""
+        # Strategy 1: dedicated seller-info block (most pages)
+        for _sel in [
+            "div.seller-info a",
+            "a[href*='/mlp-'][href*='-store']",
+            "div.-pvs a[href*='-store']",
+            "div[class*='seller'] a[href]",
+            "section[class*='seller'] a[href]",
+            "a[class*='seller']",
+        ]:
+            _el = soup.select_one(_sel)
+            if _el:
+                _txt = _el.get_text(strip=True)
+                if _txt and 2 <= len(_txt) <= 80 and _txt.lower() not in ("seller", "store", "view"):
+                    _seller_name = _txt
+                    break
+
+        # Strategy 2: any <a> whose href is a seller slug (e.g. /botongsw-cod/)
+        # Jumia seller URLs are like /seller-name-cod/ or /seller-name/
+        if not _seller_name:
+            _seller_re = re.compile(r"^/[a-z0-9][a-z0-9\-]{2,50}/$")
+            for _a in soup.find_all("a", href=True):
+                _href = _a["href"]
+                if _seller_re.match(_href):
+                    _txt = _a.get_text(strip=True)
+                    if _txt and 2 <= len(_txt) <= 80:
+                        _lower = _txt.lower()
+                        # skip navigation links that match the pattern
+                        if not any(w in _lower for w in (
+                            "home", "phone", "tablet", "fashion", "compute",
+                            "gaming", "supermarket", "health", "appliance",
+                            "beauty", "office", "baby", "jumia", "sell on",
+                        )):
+                            _seller_name = _txt
+                            break
+
+        # Strategy 3: structured data / JSON-LD seller field
+        if not _seller_name and ld_data:
+            _seller_obj = ld_data.get("seller") or ld_data.get("brand", {})
+            if isinstance(_seller_obj, dict):
+                _seller_name = str(_seller_obj.get("name", "")).strip()
+            elif isinstance(_seller_obj, str):
+                _seller_name = _seller_obj.strip()
+
+        # Strategy 4: full-text regex near "Sold by" / "Seller:"
+        if not _seller_name:
+            _sb = re.search(
+                r"(?:sold\s+by|seller\s*[:\-])\s*([^\n\r,]{2,60})",
+                full_text, re.IGNORECASE,
+            )
+            if _sb:
+                _seller_name = _sb.group(1).strip()
+
+        if _seller_name:
+            result["SELLER_NAME"] = _seller_name
 
     # Warranty
     warranty_pattern = re.compile(
