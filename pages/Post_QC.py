@@ -1175,28 +1175,30 @@ if all_dfs and sig and st.session_state.pq_last_sig != sig:
         # ── NEW: calculate DISCOUNT when missing ───────────────
         ready = _calc_discount_if_missing(ready)
 
-        # ── COLOR_IN_TITLE cross-check ─────────────────────────
-        # When both COLOR and COLOR_IN_TITLE are blank/None, the scraper
-        # found no colour signal at all — this is a strong missing-color
-        # indicator. We synthesise a blank COLOR value so check_missing_color
-        # can fire even if the seller left the COLOR column entirely absent.
+        # ── COLOR: always derive from title (COLOR_IN_TITLE) ───────────
+        # For Post-QC, COLOR is authoritative only when it comes from the
+        # product title.  Pill-scraped colors are unreliable (wrong DOM
+        # elements, spec strings, share buttons, etc.).
+        # Rule:
+        #   • COLOR_IN_TITLE has a real color word → use that as COLOR
+        #   • COLOR_IN_TITLE is "None" or blank     → set COLOR = "None"
+        #   • COLOR_IN_TITLE column absent entirely → leave COLOR as-is
         if "COLOR_IN_TITLE" in ready.columns:
-            _cit_blank = (
-                ready["COLOR_IN_TITLE"].astype(str).str.strip()
-                .replace({"nan": "", "None": "", "none": ""}).eq("")
-                | ready["COLOR_IN_TITLE"].astype(str).str.lower().eq("none")
-            )
-            _color_blank = (
-                ready["COLOR"].astype(str).str.strip()
-                .replace({"nan": "", "None": ""}).eq("")
-            ) if "COLOR" in ready.columns else pd.Series(True, index=ready.index)
-            # Where both signals are absent ensure COLOR column exists and is blank
-            # so the downstream validator sees a missing value rather than KeyError.
             if "COLOR" not in ready.columns:
                 ready["COLOR"] = ""
-            ready.loc[_cit_blank & _color_blank, "COLOR"] = ready.loc[
-                _cit_blank & _color_blank, "COLOR"
-            ].replace({"": ""})   # no-op value; column presence is what matters
+
+            _cit = ready["COLOR_IN_TITLE"].astype(str).str.strip()
+
+            # Rows where COLOR_IN_TITLE has a real value (not blank / "None")
+            _has_title_color = (
+                _cit.str.lower().ne("none")
+                & _cit.replace({"nan": "", "None": "", "none": ""}).ne("")
+            )
+            # Overwrite COLOR from title wherever scraper found a color word
+            ready.loc[_has_title_color, "COLOR"] = _cit[_has_title_color]
+
+            # Where title has no color → set COLOR = "None" explicitly
+            ready.loc[~_has_title_color, "COLOR"] = "None"
 
         # ── NEW: internal quality flags (not pass/fail — advisory) ─
         ready = _flag_corrupted_old_price(ready)
