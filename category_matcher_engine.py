@@ -3554,9 +3554,7 @@ class CategoryMatcherEngine:
             'bread toaster': 'Home & Office / Home &
 
 
-
-            # ── Singleton accessor (Streamlit-safe) ──────────────────────────────────────
-
+# ── Singleton accessor (Streamlit-safe) ──────────────────────────────────────
 _ENGINE_INSTANCE: CategoryMatcherEngine | None = None
 
 def get_engine() -> CategoryMatcherEngine:
