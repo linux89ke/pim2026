@@ -1022,21 +1022,19 @@ class CategoryMatcherEngine:
         except Exception:
             return 0
 
-    def apply_learned_correction(self, product_name, category):
+    def apply_learned_correction(self, product_name, category, auto_save=True):
         """
-        Store a correction: product_name (lower) → category.
-        Also retrains the sklearn SGDClassifier so the model immediately
-        improves — future products similar to this one will route correctly.
+        Store a correction. If auto_save is False, it just holds it in memory
+        until you manually call save_learning_db() later (great for loops!).
         """
         self.learning_db[product_name.lower().strip()] = category
-        self.save_learning_db()
-        # Retrain the sklearn correction classifier in a background thread
-        # so the UI stays responsive
-        if SKLEARN_AVAILABLE:
-            try:
-                self._retrain_correction_classifier()
-            except Exception:
-                pass
+        if auto_save:
+            self.save_learning_db()
+            if SKLEARN_AVAILABLE:
+                try:
+                    self._retrain_correction_classifier()
+                except Exception:
+                    pass
 
     def lookup_learning_db(self, product_name):
         """
