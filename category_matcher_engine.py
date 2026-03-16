@@ -952,16 +952,19 @@ class CategoryMatcherEngine:
     }
 
     def load_learning_db(self):
-        """Load learned product→category corrections from Firestore."""
+        """Load learned product→category corrections from Firestore across multiple chunks."""
         db = {}
         try:
-            # Look for collection 'matcher_data', document 'learning_db'
-            doc_ref = self.db_client.collection('matcher_data').document('learning_db')
-            doc = doc_ref.get()
+            # Stream ALL documents in the matcher_data collection
+            docs = self.db_client.collection('matcher_data').stream()
             
-            if doc.exists:
-                db_data = doc.to_dict()
-                db = {k.lower(): v for k, v in db_data.items()}
+            for doc in docs:
+                # Only grab the ones that are our learning_db chunks
+                if doc.id.startswith('learning_db'):
+                    db_data = doc.to_dict()
+                    if db_data:
+                        db.update({k.lower(): v for k, v in db_data.items()})
+            print(f"✅ Loaded {len(db)} total corrections from Firestore.")
         except Exception as e:
             print(f"🔥 FIREBASE LOAD ERROR: {e}")
 
@@ -972,14 +975,26 @@ class CategoryMatcherEngine:
         return db
 
     def save_learning_db(self):
-        """Persist the learning DB directly to Firestore."""
+        """Persist the learning DB directly to Firestore, chunked to avoid 1MB limits."""
         try:
-            doc_ref = self.db_client.collection('matcher_data').document('learning_db')
-            doc_ref.set(self.learning_db)
-            print("✅ Successfully synced learning_db to Firestore.")
+            CHUNK_SIZE = 400  # Safe number of entries per document to stay under 1MB
+            items = list(self.learning_db.items())
+            
+            # Slice the dictionary into smaller dictionaries of 400 items each
+            chunks = [dict(items[i:i+CHUNK_SIZE]) for i in range(0, len(items), CHUNK_SIZE)]
+            
+            # Use a Firestore Batch to write them all at the exact same time
+            batch = self.db_client.batch()
+            
+            for idx, chunk in enumerate(chunks):
+                doc_ref = self.db_client.collection('matcher_data').document(f'learning_db_{idx}')
+                batch.set(doc_ref, chunk)
+                
+            batch.commit()
+            print(f"✅ Saved {len(self.learning_db)} entries across {len(chunks)} Firestore documents.")
+            
         except Exception as e:
             print(f"🔥 FAILED TO SAVE TO FIREBASE: {e}")
-
     def export_learning_db(self) -> str:
         """
         Return the full learning DB as a pretty-printed JSON string.
