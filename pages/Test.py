@@ -349,6 +349,31 @@ if st.session_state.main_toasts:
 # -------------------------------------------------
 # UTILITIES & EXTRACTION
 # -------------------------------------------------
+@st.cache_data(ttl=3600)
+def load_mojibake_map(filepath="mojibake_map.json") -> dict:
+    """Loads the external Mojibake mapping file."""
+    try:
+        if os.path.exists(filepath):
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning(f"Could not load {filepath}: {e}")
+    return {}
+
+def sanitize_encoding_artifacts(text: str, mojibake_map: dict) -> str:
+    """
+    Replaces common UTF-8 characters that appear as 'funny characters' 
+    using the external mapping dictionary.
+    """
+    if pd.isna(text) or not isinstance(text, str):
+        return text
+    
+    for messy, clean in mojibake_map.items():
+        if messy in text:
+            text = text.replace(messy, clean)
+            
+    return text.strip()
+
 def clean_category_code(code) -> str:
     try:
         if pd.isna(code): return ""
@@ -799,6 +824,16 @@ def standardize_input_data(df: pd.DataFrame) -> pd.DataFrame:
         if col_lower in map_lower: renamed[col] = map_lower[col_lower]
         else: renamed[col] = col.upper()
     df = df.rename(columns=renamed)
+    
+    # --- NEW FIX: Load map and sanitize ParentSKU and Name immediately ---
+    mojibake_map = load_mojibake_map()
+    if mojibake_map:
+        if 'PARENTSKU' in df.columns:
+            df['PARENTSKU'] = df['PARENTSKU'].apply(lambda x: sanitize_encoding_artifacts(x, mojibake_map))
+        if 'NAME' in df.columns:
+            df['NAME'] = df['NAME'].apply(lambda x: sanitize_encoding_artifacts(x, mojibake_map))
+    # ---------------------------------------------------------------------
+
     for col in ['ACTIVE_STATUS_COUNTRY', 'CATEGORY_CODE', 'BRAND', 'TAX_CLASS', 'NAME', 'SELLER_NAME']:
         if col in df.columns: df[col] = df[col].astype(str)
     if 'MAIN_IMAGE' not in df.columns: df['MAIN_IMAGE'] = ''
@@ -1401,6 +1436,7 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
             results[fname] = pd.concat([results.get(fname, pd.DataFrame()), extra]).drop_duplicates(subset=['PRODUCT_SET_SID'])
 
     target_lang = 'fr' if country_validator.country == "Morocco" else 'en'
+    mojibake_map = load_mojibake_map()
 
     rows = []
     processed = set()
@@ -1420,13 +1456,20 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
             processed.add(sid)
             det = r.get('Comment_Detail', '')
             comment_str = f"{base_comment} ({det})" if pd.notna(det) and det else base_comment
-            rows.append({'ProductSetSid': sid, 'ParentSKU': r.get('PARENTSKU', ''), 'Status': 'Rejected', 'Reason': rinfo['reason'], 'Comment': comment_str, 'FLAG': name, 'SellerName': r.get('SELLER_NAME', '')})
+            
+            raw_sku = str(r.get('PARENTSKU', ''))
+            clean_sku = sanitize_encoding_artifacts(raw_sku, mojibake_map) if mojibake_map else raw_sku
+            
+            rows.append({'ProductSetSid': sid, 'ParentSKU': clean_sku, 'Status': 'Rejected', 'Reason': rinfo['reason'], 'Comment': comment_str, 'FLAG': name, 'SellerName': r.get('SELLER_NAME', '')})
 
     for _, r in data[~data['PRODUCT_SET_SID'].astype(str).str.strip().isin(processed)].iterrows():
         sid = str(r['PRODUCT_SET_SID']).strip()
         if sid not in processed:
-            rows.append({'ProductSetSid': sid, 'ParentSKU': r.get('PARENTSKU', ''), 'Status': 'Approved', 'Reason': "", 'Comment': "", 'FLAG': "", 'SellerName': r.get('SELLER_NAME', '')})
+            raw_sku = str(r.get('PARENTSKU', ''))
+            clean_sku = sanitize_encoding_artifacts(raw_sku, mojibake_map) if mojibake_map else raw_sku
+            rows.append({'ProductSetSid': sid, 'ParentSKU': clean_sku, 'Status': 'Approved', 'Reason': "", 'Comment': "", 'FLAG': "", 'SellerName': r.get('SELLER_NAME', '')})
             processed.add(sid)
+            
     final_df = pd.DataFrame(rows)
     for c in ["ProductSetSid", "ParentSKU", "Status", "Reason", "Comment", "FLAG", "SellerName"]:
         if c not in final_df.columns: final_df[c] = ""
@@ -2275,10 +2318,10 @@ if _files_for_processing and not st.session_state.final_report.empty and st.sess
         multi_count = int(data['_IS_MULTI_COUNTRY'].sum()) if '_IS_MULTI_COUNTRY' in data.columns else 0
 
         metrics_config = [
-            (_t("total_prod"),  len(data),                                                                                             JUMIA_COLORS['dark_gray']),
-            (_t("approved"),    len(app_df),                                                                                           JUMIA_COLORS['success_green']),
-            (_t("rejected"),    len(rej_df),                                                                                           JUMIA_COLORS['jumia_red']),
-            (_t("rej_rate"),    f"{(len(rej_df)/len(data)*100) if len(data)>0 else 0:.1f}%",                                           JUMIA_COLORS['primary_orange']),
+            (_t("total_prod"),  len(data),                                                                                                   JUMIA_COLORS['dark_gray']),
+            (_t("approved"),    len(app_df),                                                                                                 JUMIA_COLORS['success_green']),
+            (_t("rejected"),    len(rej_df),                                                                                                 JUMIA_COLORS['jumia_red']),
+            (_t("rej_rate"),    f"{(len(rej_df)/len(data)*100) if len(data)>0 else 0:.1f}%",                                             JUMIA_COLORS['primary_orange']),
             (_t("multi_skus") if is_nigeria else _t("common_skus"), multi_count if is_nigeria else st.session_state.intersection_count, JUMIA_COLORS['warning_yellow'] if is_nigeria else JUMIA_COLORS['medium_gray']),
         ]
         for i, (label, value, color) in enumerate(metrics_config):
