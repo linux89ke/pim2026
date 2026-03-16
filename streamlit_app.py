@@ -97,6 +97,18 @@ def prune_cache_dir(directory: str, max_files: int = 500):
 
 prune_cache_dir(FLAG_CACHE_DIR)
 
+# Evict any cached Wrong Category results — this validator now uses the ML
+# engine and must never serve stale empty results from before the engine was wired up.
+# We identify them by recomputing what their hash prefix would look like, but
+# the safest approach is simply to delete all cache files whose pickled content
+# is an empty DataFrame (size < 500 bytes, which real flag results never are).
+try:
+    for _cf in Path(FLAG_CACHE_DIR).glob("*.pkl"):
+        if _cf.stat().st_size < 500:
+            _cf.unlink(missing_ok=True)
+except Exception:
+    pass
+
 def save_df_parquet(df, filename):
     try:
         df.to_parquet(os.path.join(PARQUET_CACHE_DIR, filename))
@@ -906,7 +918,7 @@ def propagate_metadata(df: pd.DataFrame) -> pd.DataFrame:
 # CACHE-AWARE VALIDATION CHECKS
 # -------------------------------------------------
 FLAG_RELEVANT_COLS = {
-    "Wrong Category": ["CATEGORY"],
+    "Wrong Category": ["NAME", "CATEGORY", "CATEGORY_CODE"],
     "Restricted brands": ["NAME", "BRAND", "SELLER_NAME", "CATEGORY_CODE"],
     "Suspected Fake product": ["CATEGORY_CODE", "BRAND", "GLOBAL_SALE_PRICE", "GLOBAL_PRICE"],
     "Seller Not approved to sell Refurb": ["PRODUCT_SET_SID", "CATEGORY_CODE", "SELLER_NAME", "NAME"],
@@ -915,7 +927,6 @@ FLAG_RELEVANT_COLS = {
     "Seller Approved to Sell Perfume": ["CATEGORY_CODE", "SELLER_NAME", "BRAND", "NAME"],
     "Counterfeit Sneakers": ["CATEGORY_CODE", "NAME", "BRAND"],
     "Suspected counterfeit Jerseys": ["CATEGORY_CODE", "NAME", "SELLER_NAME"],
-    "Wrong Category": ["NAME", "CATEGORY", "CATEGORY_CODE"],
     "Unnecessary words in NAME": ["NAME"],
     "Single-word NAME": ["CATEGORY_CODE", "NAME"],
     "Generic BRAND Issues": ["CATEGORY_CODE", "BRAND"],
@@ -936,13 +947,19 @@ def compute_flag_input_hash(data: pd.DataFrame, flag_name: str, kwargs: dict) ->
     if not available_cols: return "empty"
     df_hash_str = df_hash(data[available_cols])
     kwargs_repr = ""
+    # Skip large category lookup dicts — they don't change between runs and
+    # would make the repr huge, causing unnecessary cache misses or hits on stale data
+    _skip_keys = {'categories_list', 'cat_path_to_code', 'code_to_path'}
     for k, v in kwargs.items():
-        if k == 'data': continue
+        if k == 'data' or k in _skip_keys: continue
         if isinstance(v, pd.DataFrame): kwargs_repr += df_hash(v)
         else: kwargs_repr += repr(v)
     return hashlib.md5((df_hash_str + kwargs_repr).encode()).hexdigest()
 
 def run_cached_check(func, cache_path, ckwargs):
+    # Wrong Category uses the ML engine — always run fresh, never use disk cache
+    if func is check_miscellaneous_category:
+        return func(**ckwargs)
     if os.path.exists(cache_path):
         try:
             with open(cache_path, 'rb') as f: return pickle.load(f)
