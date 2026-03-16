@@ -2614,4 +2614,941 @@ class CategoryMatcherEngine:
             'protein powder': "Health & Beauty / Sports Nutrition",
             'sports supplement': "Health & Beauty / Sports Nutrition",
             'fish oil': "Health & Beauty / Vitamins & Dietary Supplements / Supplements / Fish Oil",
-            '
+            'collagen supplement': "Health & Beauty / Vitamins & Dietary Supplements / Supplements",
+            'skin supplement': "Health & Beauty / Vitamins & Dietary Supplements / Supplements",
+            'baby formula': "Baby Products / Feeding / Formula",
+            'baby food': "Baby Products / Feeding",
+            'baby oil': "Baby Products / Bathing & Skin Care / Baby Lotion & Cream",
+            'baby lotion': "Baby Products / Bathing & Skin Care / Baby Lotion & Cream",
+            'baby powder': "Baby Products / Bathing & Skin Care",
+            'baby soap': "Baby Products / Bathing & Skin Care",
+            'baby shampoo': "Baby Products / Bathing & Skin Care",
+            'baby monitor': "Baby Products / Safety",
+            'baby bouncer': "Baby Products / Gear",
+            'baby swing': "Baby Products / Gear",
+            'high chair': "Baby Products / Feeding / Booster Seats & Highchairs",
+            'baby crib': "Baby Products / Nursery / Cribs",
+            'baby walker': "Baby Products / Gear",
+            'baby rocker': "Baby Products / Gear",
+            'kids scooter': "Baby Products / Gear",
+            'teether': "Baby Products / Baby & Toddler Toys / Teethers",
+            'baby rattle': "Baby Products / Baby & Toddler Toys / Rattles",
+            'baby blanket': "Baby Products / Nursery",
+            'iphone': "Phones & Tablets / Mobile Phones / Smartphones",
+            'phone case': "Phones & Tablets / Accessories / Cases & Sleeves",
+            'tablet case': "Phones & Tablets / Tablet Accessories",
+            'screen protector': "Phones & Tablets / Accessories / Screen Protectors",
+            'wireless charger': "Phones & Tablets / Accessories / Cables",
+            'phone holder': "Phones & Tablets / Accessories / Accessory Combo Packs",
+            'sim card': "Phones & Tablets / Accessories / SIM-related Accessories",
+            'phone strap': "Phones & Tablets / Accessories / Phone Charms",
+            'phone screen': "Phones & Tablets / Tablet Replacement Parts / LCD Displays",
+            'landline phone': "Phones & Tablets / Phone & Fax",
+            'computer monitor': "Computing / Computers & Accessories / Monitors",
+            'keyboard': "Computing / Computer Accessories / Keyboards",
+            'computer mouse': "Computing / Computer Accessories / Mice",
+            'laptop bag': "Computing / Computer Accessories",
+            'external hard drive': "Computing / Computers & Accessories / Data Storage / External Hard Drives",
+            'usb flash drive': "Computing / Computers & Accessories / Data Storage / USB Flash Drives",
+            'memory card': "Computing / Computer Accessories / Memory Cards",
+            'ssd': "Computing / Computers & Accessories / Data Storage / External Solid State Drives",
+            'network switch': "Computing / Computer Accessories / Networking Accessories",
+            'router': "Computing / Computer Accessories / Networking Accessories",
+            'laptop cooling pad': "Computing / Computer Accessories",
+            'hdmi cable': "Computing / Computer Accessories / Cables & Interconnects",
+            'usb hub': "Computing / Computer Accessories",
+            'docking station': "Computing / Computer Accessories",
+            'computer headset': "Computing / Computer Accessories / Audio & Video Accessories / Computer Headsets",
+            'computer speaker': "Computing / Computer Accessories / Audio & Video Accessories / Computer Speakers",
+            'car wash': "Automobile / Car Care / Exterior Care / Car Wash Equipment",
+            'car air freshener': "Automobile / Interior Accessories / Air Fresheners",
+            'tyre': "Automobile / Tyre & Rim",
+            'wheel cap': "Automobile / Exterior Accessories",
+            'brake parts': "Automobile / Replacement Parts",
+            'transmission fluid': "Automobile / Oils & Fluids",
+            'car light': "Automobile / Lights & Lighting Accessories",
+            'parking sensor': "Automobile / Car Electronics & Accessories",
+            'tyre inflator': "Automobile / Tools & Equipment",
+            'car security': "Automobile / Car Electronics & Accessories",
+            'car alarm': "Automobile / Car Electronics & Accessories",
+            'motorcycle': "Automobile / Motorcycle & Powersports / Motorcycle Vehicles",
+            'car sun shade': "Automobile / Interior Accessories",
+            'car organizer': "Automobile / Interior Accessories",
+            'car charger': 'Automobile / Car Electronics & Accessories',
+            'car seat cover': 'Automobile / Interior Accessories',
+            'car floor mat': 'Automobile / Interior Accessories',
+            'motor oil': 'Automobile / Oils & Fluids / Oils / Motor Oils',
+            'car battery': 'Automobile / Power & Battery',
+            'car polish': 'Automobile / Car Care',
+            'car jack': 'Automobile / Tools & Equipment',
+            'car stereo': 'Automobile / Car Electronics & Accessories',
+            'auto part': 'Automobile / Replacement Parts',
+            'honey': 'Grocery',
+            'juice': 'Grocery',
+            'energy drink': 'Grocery',
+            'protein bar': 'Health & Beauty / Sports Nutrition',
+        }
+
+        if product_lower in product_type_routing:
+            target_cat = product_type_routing[product_lower].lower()
+            for cat in categories_list:
+                if cat.lower() == target_cat:
+                    return cat
+            target_parts = [p.strip() for p in target_cat.split('/')]
+            best = None
+            best_score = 0
+            for cat in categories_list:
+                cl = cat.lower()
+                if target_parts[0] not in cl:
+                    continue
+                overlap = sum(1 for part in target_parts if part in cl)
+                if overlap > best_score:
+                    best_score = overlap
+                    best = cat
+            if best:
+                return best
+        
+        category_scores = {}
+        
+        cookware_types = ['pot', 'pots', 'pan', 'pans', 'pot set', 'frying pan', 'saucepan', 'stockpot', 'cooker', 'cookware', 
+                          'non-stick pots', 'nonstick pots', 'non-stick pot', 'nonstick pot', 'cookware pots', 'non-stick frying pan', 'nonstick frying pan']
+        is_cookware_product = product_lower in cookware_types
+        
+        for cat in categories_list:
+            cat_lower = cat.lower()
+            score = 0
+            
+            last_part = last_category_parts.get(cat, self.get_last_category_part(cat))
+            
+            if last_part and (product_lower == last_part or 
+                              product_lower in last_part.replace(' ', '') or 
+                              last_part in product_lower.replace(' ', '')):
+                score += 200
+            
+            if last_part == 'pots & pans' and ('cookware' in cat_lower and ('kitchen' in cat_lower or 'dining' in cat_lower)) and ('pot' in product_lower or 'pots' in product_lower or 'pan' in product_lower or 'cookware' in product_lower):
+                score += 1500
+            
+            if product_lower in cat_lower:
+                score += 100
+            
+            product_words = product_lower.split()
+            for word in product_words:
+                if len(word) > 2:
+                    if word in last_part:
+                        score += 50
+                    elif word in cat_lower:
+                        score += 20
+            
+            for context in context_keywords:
+                if context in cat_lower:
+                    score += 15
+            
+            if is_cookware_product:
+                if '/cookware/' in cat_lower and product_lower in last_part.replace(' ', ''):
+                    score += 500
+                if '/serveware/' in cat_lower or '/beverage serveware/' in cat_lower:
+                    score -= 100
+                if ('pots & pans' in cat_lower or 'cookware sets' in cat_lower or 'steamers, stock & pasta pots' in cat_lower) and ('pots' in product_lower or 'pan' in product_lower or 'cookware' in product_lower):
+                    score += 300
+                if 'steamers, stock & pasta pots' in cat_lower and ('pot' in product_lower or 'pots' in product_lower or 'stockpot' in product_lower):
+                    score += 400
+            
+            is_leaf = leaf_categories.get(cat, True)
+            if is_leaf:
+                score += 50
+            
+            slash_count = cat.count('/')
+            if slash_count < 2:
+                score -= 50
+            elif slash_count < 3:
+                score -= 30
+            
+            score += slash_count * 10
+            
+            cookware_keywords = ['cookware', 'pot', 'pan', 'fry', 'sauce', 'stock', 'steam', 'roast', 'bake', 'casserole']
+            kitchen_keywords = ['kitchen', 'dining', 'home']
+            if any(kw in cat_lower for kw in cookware_keywords):
+                score += 25
+            if any(kw in cat_lower for kw in kitchen_keywords):
+                score += 10
+            
+            if score > 0:
+                category_scores[cat] = score
+        
+        if not category_scores:
+            return None
+        
+        best_category = max(category_scores, key=category_scores.get)
+        return best_category
+    
+    def get_category_for_product_v2(self, product_name, keyword_mapping, categories_list, leaf_categories=None, last_category_parts=None):
+        """Enhanced category matching using product identification approach"""
+        if pd.isna(product_name) or not isinstance(product_name, str):
+            return categories_list[0] if categories_list else "Uncategorized"
+        
+        product_lower = product_name.lower()
+
+        is_ladies_context = any(w in product_lower for w in ['ladies', 'women', 'female', 'girl'])
+        is_child_context = any(w in product_lower for w in ['baby', 'children', 'child', 'kids', 'toddler', 'infant'])
+
+        if re.search(r'\bnightwear\b|\bnight\s*wear\b|\bsleepwear\b|\bsleep\s*wear\b|\bnightie\b|\bpyjama\b|\bpajama\b', product_lower):
+            if is_child_context:
+                for cat in categories_list:
+                    if "Kids Fashion" in cat and 'Sleepwear' in cat and 'Sets' in cat:
+                        return cat
+                for cat in categories_list:
+                    if "Kids Fashion" in cat and 'Sleepwear' in cat:
+                        return cat
+            if re.search(r'\bgown\b', product_lower):
+                for cat in categories_list:
+                    if "Womens Fashion" in cat and 'Nightgowns' in cat and 'Sleepshirts' in cat:
+                        return cat
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Sleep & Lounge' in cat and 'Sets' in cat:
+                    return cat
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Lingerie, Sleep & Lounge' in cat and 'Sleep & Lounge' in cat:
+                    return cat
+
+        if re.search(r'\bnightgown\b|\bnight\s*gown\b', product_lower):
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Nightgowns' in cat:
+                    return cat
+
+        if is_ladies_context and re.search(r'\bpant(ies|ie|y)\b|\bunderwear\b|\bundergarment\b|\bg.?string\b|\bthong\b|\bcondom\s*pant\b|\bboxer\b', product_lower):
+            if re.search(r'\bboxer\b', product_lower) and 'men' in product_lower:
+                for cat in categories_list:
+                    if "Men's Fashion" in cat and 'Boxers' in cat:
+                        return cat
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Panties' in cat and 'Lingerie' in cat:
+                    return cat
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Panties' in cat:
+                    return cat
+
+        if re.search(r'\bboxers?\b', product_lower) and not is_ladies_context:
+            for cat in categories_list:
+                if "Men's Fashion" in cat and 'Boxers' in cat:
+                    return cat
+
+        if is_ladies_context and re.search(r'\bbra\b|\bbras\b|\bbralette\b|\bbratop\b|\bpush.?up\b', product_lower):
+            if re.search(r'\bbreast\s*tape\b|\bbooby\s*tape\b', product_lower):
+                for cat in categories_list:
+                    if "Womens Fashion" in cat and 'Lingerie' in cat and 'Accessories' in cat:
+                        return cat
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Underwear & Sleepwear' in cat and 'Bra' in cat:
+                    return cat
+
+        if re.search(r'\blingerie\b', product_lower):
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Lingerie, Sleep & Lounge' in cat and cat.endswith('Lingerie'):
+                    return cat
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Lingerie' in cat:
+                    return cat
+
+        if re.search(r'\bshapewear\b|\bgirdle\b|\bbody\s*shaper\b|\btummy\s*tight\b|\bslimming\b|\bhips?\s*enhancer\b|\bbum\s*enhancer\b|\bpadded\s*bum\b', product_lower):
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Shapewear' in cat:
+                    return cat
+
+        if re.search(r'\bcamisole\b|\bcami\b', product_lower) and not is_child_context:
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Camisoles' in cat:
+                    return cat
+
+        if re.search(r'\bsinglet\b', product_lower) and is_ladies_context:
+            for cat in categories_list:
+                if "Womens Fashion" in cat and ('Tanks' in cat or 'Camisoles' in cat):
+                    return cat
+
+        if re.search(r'\bsinglet\b', product_lower) and not is_ladies_context:
+            for cat in categories_list:
+                if "Men's Fashion" in cat and 'Tanks' in cat:
+                    return cat
+
+        if is_ladies_context and re.search(r'\bleggings?\b|\btights?\b(?!.*jeans)', product_lower):
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Leggings' in cat and 'Active' not in cat:
+                    return cat
+
+        if re.search(r'\byoga\s*pants?\b|\bsport\s*leggings?\b|\bsport\s*tights?\b|\bpush\s*up\s*leggings?\b', product_lower):
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Active' in cat and 'Leggings' in cat:
+                    return cat
+
+        if is_ladies_context and re.search(r'\bjeans?\b', product_lower):
+            for cat in categories_list:
+                if "Womens Fashion" in cat and cat.endswith('Jeans'):
+                    return cat
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Jeans' in cat:
+                    return cat
+
+        if re.search(r'\bkaftan\b|\bcaftan\b|\babaya\b|\bbubu\b', product_lower):
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Dresses' in cat and 'Casual' in cat:
+                    return cat
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Dresses' in cat:
+                    return cat
+
+        if re.search(r'\bgown\b', product_lower) and is_ladies_context and not re.search(r'\bnight\b|\bsleep\b', product_lower):
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Dresses' in cat and 'Gowns' in cat:
+                    return cat
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Dresses' in cat:
+                    return cat
+
+        if is_ladies_context and re.search(r'\btop\b|\btops\b', product_lower) and not re.search(r'\bnightwear\b|\bnight\s*wear\b|\bsleepwear\b', product_lower):
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Tops & Tees' in cat and 'Tanks' in cat:
+                    return cat
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Tops & Tees' in cat:
+                    return cat
+
+        if is_ladies_context and re.search(r'\bshorts?\b', product_lower) and not re.search(r'\bnightwear\b|\bnight\s*wear\b|\bsleepwear\b', product_lower):
+            for cat in categories_list:
+                if "Womens Fashion" in cat and cat.endswith('Shorts'):
+                    return cat
+
+        if is_ladies_context and re.search(r'\b(top|shirt|blouse)\s+and\s+(pant|trouser|short)\b|\bpant\s+set\b|\btrouser\s+set\b', product_lower):
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Clothing Sets' in cat:
+                    return cat
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Tops & Tees' in cat:
+                    return cat
+
+        if re.search(r'\bbumper\s*tight\b', product_lower) and is_ladies_context:
+            for cat in categories_list:
+                if "Womens Fashion" in cat and 'Leggings' in cat:
+                    return cat
+
+        if is_child_context and re.search(r'\bnightwear\b|\bnight\s*wear\b|\bpyjama\b|\bpajama\b', product_lower):
+            for cat in categories_list:
+                if "Kids Fashion" in cat and 'Sleepwear' in cat:
+                    return cat
+
+        if re.search(r'\bagbada\b|\bdaishiki\b|\bsenator\s*wear\b|\btraditional\s*wear\b|\bafrican\s*wear\b|\bkidagba\b|\bbubou\b|\bkente\b', product_lower):
+            for cat in categories_list:
+                if 'Traditional' in cat and ('African' in cat or 'Cultural' in cat) and 'Fashion' in cat:
+                    return cat
+
+        is_men_context = any(w in product_lower for w in ['men', 'man', 'male', 'gent', 'guy', 'boys'])
+        
+        if is_men_context and not is_ladies_context and not is_child_context:
+            if re.search(r'\bjeans?\b', product_lower):
+                for cat in categories_list:
+                    if "Men's Fashion" in cat and cat.endswith('Jeans'):
+                        return cat
+            if re.search(r'\btrouser\b|\bpants?\b(?!.*yoga)', product_lower):
+                for cat in categories_list:
+                    if "Men's Fashion" in cat and ('Trousers' in cat or 'Pants' in cat) and 'Clothing' in cat:
+                        return cat
+            if re.search(r'\bshort\b|\bshorts\b', product_lower):
+                for cat in categories_list:
+                    if "Men's Fashion" in cat and cat.endswith('Shorts'):
+                        return cat
+            if re.search(r'\bshirt\b|\bpolo\b', product_lower) and not re.search(r'\bshort\b', product_lower):
+                for cat in categories_list:
+                    if "Men's Fashion" in cat and cat.endswith('Polos') and 'polo' in product_lower:
+                        return cat
+                for cat in categories_list:
+                    if "Men's Fashion" in cat and cat.endswith('Shirts') and 'Clothing' in cat:
+                        return cat
+            if re.search(r'\bsuit\b|\bblaz\w+\b', product_lower):
+                for cat in categories_list:
+                    if "Men's Fashion" in cat and ('Suits' in cat or 'Blazers' in cat):
+                        return cat
+            if re.search(r'\bjacket\b|\bcoat\b', product_lower):
+                for cat in categories_list:
+                    if "Men's Fashion" in cat and ('Jackets' in cat or 'Coats' in cat):
+                        return cat
+            if re.search(r'\bhoodie\b|\bsweatshirt\b', product_lower):
+                for cat in categories_list:
+                    if "Men's Fashion" in cat and 'Hoodies' in cat:
+                        return cat
+            if re.search(r'\bboxer\b|\bunderwear\b|\bbrief\b', product_lower):
+                for cat in categories_list:
+                    if "Men's Fashion" in cat and ('Boxers' in cat or 'Underwear' in cat):
+                        return cat
+            if re.search(r'\bsock\b|\bsocks\b', product_lower):
+                for cat in categories_list:
+                    if "Men's Fashion" in cat and 'Socks' in cat:
+                        return cat
+            if re.search(r'\bwatch\b|\bwrist\s*watch\b', product_lower) and not re.search(r'\bsmart\b|\bfitness\b', product_lower):
+                for cat in categories_list:
+                    if "Men's Fashion" in cat and 'Wrist Watch' in cat:
+                        return cat
+                for cat in categories_list:
+                    if "Men's" in cat and 'Watches' in cat and 'Wrist' in cat:
+                        return cat
+                for cat in categories_list:
+                    if "Men's" in cat and 'Watch' in cat and 'Band' not in cat and 'Pocket' not in cat:
+                        return cat
+
+        if is_child_context and not is_ladies_context:
+            if re.search(r'\bdress\b|\bgown\b', product_lower):
+                for cat in categories_list:
+                    if "Kids Fashion" in cat and 'Girl' in cat and 'Clothing' in cat:
+                        return cat
+            if re.search(r'\bshirt\b|\btop\b', product_lower):
+                for cat in categories_list:
+                    if "Kids Fashion" in cat and 'Boy' in cat and 'Clothing' in cat:
+                        return cat
+            if re.search(r'\bschool\s*uniform\b|\bschool\s*wear\b', product_lower):
+                for cat in categories_list:
+                    if "Kids Fashion" in cat and 'School Uniform' in cat:
+                        return cat
+                for cat in categories_list:
+                    if "Kids Fashion" in cat and 'Clothing' in cat:
+                        return cat
+            if re.search(r'\bshoe\b|\bsneaker\b|\bboot\b|\bsandal\b', product_lower):
+                for cat in categories_list:
+                    if "Kids Fashion" in cat and 'Shoes' in cat:
+                        return cat
+
+        if re.search(r'\bsmart\s*tv\b|\bled\s*tv\b|\boled\s*tv\b|\b4k\s*tv\b|\btelevision\b|\bflat\s*screen\b', product_lower):
+            for cat in categories_list:
+                if 'Television & Video' in cat and 'Smart TV' in cat:
+                    return cat
+            for cat in categories_list:
+                if 'Television & Video' in cat and 'Televisions' in cat and 'Projector' not in cat and 'Converter' not in cat:
+                    return cat
+        if re.search(r'\bsound\s*bar\b|\bsoundbar\b', product_lower):
+            for cat in categories_list:
+                if 'Sound Bar' in cat:
+                    return cat
+        if re.search(r'\bhome\s*theater\b|\bhome\s*theatre\b', product_lower):
+            for cat in categories_list:
+                if 'Home Theater System' in cat and 'Complete' in cat:
+                    return cat
+        if re.search(r'\bbluetooth\s*speaker\b|\bportable\s*speaker\b|\bwireless\s*speaker\b', product_lower):
+            for cat in categories_list:
+                if 'Bluetooth Speaker' in cat or ('Speakers' in cat and 'Home Audio' in cat):
+                    return cat
+        if re.search(r'\bsecurity\s*camera\b|\bcctv\b|\bip\s*camera\b|\bsurveillance\s*camera\b', product_lower):
+            for cat in categories_list:
+                if 'Security & Surveillance' in cat and 'Camera' in cat:
+                    return cat
+        if re.search(r'\bprojector\b|\bmini\s*projector\b', product_lower):
+            for cat in categories_list:
+                if 'Projector' in cat and 'Video' in cat:
+                    return cat
+        if re.search(r'\bgps\s*tracker\b|\bgps\s*device\b', product_lower):
+            for cat in categories_list:
+                if 'GPS' in cat and 'Navigation' in cat:
+                    return cat
+        if re.search(r'\bwalkie\s*talkie\b|\btwo.?way\s*radio\b', product_lower):
+            for cat in categories_list:
+                if 'Transceivers' in cat or 'Radios' in cat:
+                    return cat
+        if re.search(r'\bfitness\s*tracker\b|\bsmart\s*band\b|\bfitness\s*watch\b|\bsmartwatch\b|\bsmart\s*watch\b', product_lower):
+            for cat in categories_list:
+                if 'Wearable Technology' in cat:
+                    return cat
+        if re.search(r'\bdrone\b', product_lower):
+            for cat in categories_list:
+                if 'Drone' in cat:
+                    return cat
+
+        if re.search(r'\bsofa\b|\bcouch\b|\bsofa\s*set\b', product_lower):
+            for cat in categories_list:
+                if 'Home & Office' in cat and ('Sofas' in cat or 'Armchair' in cat) and 'Office' not in cat.split('/')[-1]:
+                    return cat
+            for cat in categories_list:
+                if 'Office Products' in cat and ('Sofa' in cat or 'Chair' in cat):
+                    return cat
+        if re.search(r'\bwardrobe\b|\bcloset\b(?!.*organizer)', product_lower):
+            for cat in categories_list:
+                if 'Wardrobe' in cat or 'Armoire' in cat:
+                    return cat
+        if re.search(r'\btv\s*stand\b|\btv\s*console\b|\bentertainment\s*stand\b', product_lower):
+            for cat in categories_list:
+                if 'TV & Media' in cat or ('TV' in cat and 'Furniture' in cat):
+                    return cat
+        if re.search(r'\bcurtain\b|\bwindow\s*blind\b|\bblackout\s*curtain\b', product_lower):
+            for cat in categories_list:
+                if 'Home & Office' in cat and ('Curtain' in cat or 'Drape' in cat):
+                    return cat
+            for cat in categories_list:
+                if 'Window' in cat and ('Curtain' in cat or 'Treatment' in cat):
+                    return cat
+        if re.search(r'\bwall\s*art\b|\bcanvas\s*art\b|\bwall\s*painting\b|\bwall\s*decor\b', product_lower):
+            for cat in categories_list:
+                if 'Wall Art' in cat:
+                    return cat
+        if re.search(r'\bvacuum\s*cleaner\b|\bcordless\s*vacuum\b|\bhoover\b', product_lower):
+            for cat in categories_list:
+                if 'Vacuum' in cat and 'Appliances' in cat:
+                    return cat
+            for cat in categories_list:
+                if 'Vacuum' in cat and 'Home' in cat:
+                    return cat
+        if re.search(r'\blaptop\s*bag\b|\blaptop\s*sleeve\b|\blaptop\s*backpack\b', product_lower):
+            for cat in categories_list:
+                if 'Computing' in cat and ('Accessory' in cat or 'Accessories' in cat):
+                    return cat
+
+        if re.search(r'\bsewing\s*machine\b', product_lower):
+            for cat in categories_list:
+                if 'Sewing' in cat and ('Arts' in cat or 'Crafts' in cat):
+                    return cat
+        if re.search(r'\bled\s*strip\b|\brgb\s*strip\b', product_lower):
+            for cat in categories_list:
+                if 'Lighting' in cat and ('LED' in cat or 'Ceiling' in cat):
+                    return cat
+        if re.search(r'\binverter\b(?!.*solar)', product_lower) and not re.search(r'\bcar\b', product_lower):
+            for cat in categories_list:
+                if 'Inverter' in cat:
+                    return cat
+
+        if re.search(r'\bhair\s*extension\b|\bhair\s*weave\b|\bbundle\s*hair\b|\bclosure\s*hair\b|\bfrontal\b', product_lower):
+            for cat in categories_list:
+                if 'Extensions' in cat and 'Wigs' in cat:
+                    return cat
+        if re.search(r'\bwig\b|\blace\s*front\b|\bhuman\s*hair\s*wig\b', product_lower):
+            for cat in categories_list:
+                if 'Wigs' in cat and ('Hair' in cat or 'Beauty' in cat):
+                    return cat
+        if re.search(r'\bhair\s*dryer\b|\bblow\s*dry\b|\bhair\s*blow\b', product_lower):
+            for cat in categories_list:
+                if 'Hair Cutting' in cat or ('Hair' in cat and 'Styling' in cat):
+                    return cat
+        if re.search(r'\bhair\s*clipper\b|\bbarbering\s*clipper\b|\bhair\s*cutting\s*machine\b|\btrimmer\b(?!.*hedge)', product_lower):
+            for cat in categories_list:
+                if 'Hair Cutting Tool' in cat or ('Hair Care' in cat and 'Cutting' in cat):
+                    return cat
+        if re.search(r'\beyeshadow\b|\beye\s*shadow\b', product_lower):
+            for cat in categories_list:
+                if 'Eyes' in cat and 'Makeup' in cat:
+                    return cat
+        if re.search(r'\blipstick\b|\blip\s*gloss\b|\blip\s*liner\b', product_lower):
+            for cat in categories_list:
+                if 'Lips' in cat and 'Makeup' in cat:
+                    return cat
+        if re.search(r'\bfoundation\b(?!.*underwear|.*bra)|\bbb\s*cream\b|\bconcealer\b', product_lower):
+            for cat in categories_list:
+                if 'Face' in cat and 'Makeup' in cat and 'Beauty' in cat:
+                    return cat
+        if re.search(r'\bblood\s*pressure\s*monitor\b|\bbp\s*monitor\b|\bsphygmo\b', product_lower):
+            for cat in categories_list:
+                if 'Blood Pressure' in cat:
+                    return cat
+            for cat in categories_list:
+                if 'Health Monitor' in cat or ('Diagnostic' in cat and 'Monitor' in cat):
+                    return cat
+        if re.search(r'\bglucometer\b|\bblood\s*glucose\b|\bdiabetes\s*monitor\b', product_lower):
+            for cat in categories_list:
+                if 'Diagnostic' in cat and 'Equipment' in cat:
+                    return cat
+        if re.search(r'\bmassage\s*gun\b|\bpercussion\s*massager\b', product_lower):
+            for cat in categories_list:
+                if 'Massage' in cat and ('Equipment' in cat or 'Relaxation' in cat):
+                    return cat
+        if re.search(r'\bsanitary\s*pad\b|\bmenstrual\s*pad\b|\bpanty\s*liner\b|\bmenstrual\s*cup\b|\bsanitary\s*napkin\b', product_lower):
+            for cat in categories_list:
+                if 'Sanitary Napkin' in cat or 'Feminine Care' in cat:
+                    return cat
+            for cat in categories_list:
+                if 'Health Care' in cat and 'Feminine' in cat:
+                    return cat
+
+        if re.search(r'\bdash\s*cam\b|\bdashboard\s*camera\b', product_lower):
+            for cat in categories_list:
+                if 'Car Electronics' in cat:
+                    return cat
+        if re.search(r'\bcar\s*seat\s*cover\b|\bauto\s*seat\s*cover\b', product_lower):
+            for cat in categories_list:
+                if 'Interior Accessories' in cat and 'Automobile' in cat and 'Freshener' not in cat:
+                    return cat
+        if re.search(r'\bcar\s*wax\b|\bcar\s*polish\b|\bauto\s*polish\b', product_lower):
+            for cat in categories_list:
+                if 'Polish' in cat and ('Car' in cat or 'Automobile' in cat):
+                    return cat
+        if re.search(r'\bengine\s*oil\b|\bmotor\s*oil\b|\bsynth\w+\s*oil\b', product_lower):
+            for cat in categories_list:
+                if 'Motor Oil' in cat:
+                    return cat
+        if re.search(r'\bcar\s*alarm\b|\bauto\s*alarm\b', product_lower):
+            for cat in categories_list:
+                if 'Car Electronics' in cat:
+                    return cat
+        if re.search(r'\bmotorcycle\b|\bmotorbike\b|\bmotor\s*cycle\b', product_lower) and not re.search(r'\bhelmet\b', product_lower):
+            for cat in categories_list:
+                if 'Motorcycle' in cat and 'Vehicles' in cat:
+                    return cat
+        if re.search(r'\bmotorcycle\s*helmet\b|\bbike\s*helmet\b(?!.*cycle)', product_lower):
+            for cat in categories_list:
+                if 'Motorcycle' in cat and 'Powersports' in cat:
+                    return cat
+
+        if re.search(r'\bbaby\s*formula\b|\binfant\s*formula\b', product_lower):
+            for cat in categories_list:
+                if 'Baby Products' in cat and 'Feeding' in cat:
+                    return cat
+        if re.search(r'\bhigh\s*chair\b|\bfeeding\s*chair\b|\bbaby\s*chair\b', product_lower):
+            for cat in categories_list:
+                if 'Highchair' in cat and 'Booster' not in cat:
+                    return cat
+            for cat in categories_list:
+                if 'Highchair' in cat or ('Highchairs' in cat and 'Baby' in cat):
+                    return cat
+        if re.search(r'\bbaby\s*stroller\b|\bpram\b|\bstroller\b', product_lower):
+            for cat in categories_list:
+                if 'Strollers' in cat and 'Baby Products' in cat and 'Accessories' not in cat.split('/')[-1] and 'Toys' not in cat:
+                    return cat
+            for cat in categories_list:
+                if 'Strollers & Accessories' in cat and 'Baby Products' in cat:
+                    return cat
+
+        if re.search(r'\bbaby\s*crib\b|\bbaby\s*cot\b|\bnursery\s*cot\b', product_lower):
+            for cat in categories_list:
+                if 'Baby Products' in cat and ('Crib' in cat or 'Nursery' in cat):
+                    return cat
+        if re.search(r'\bbaby\s*walker\b|\bwalking\s*ring\b', product_lower):
+            for cat in categories_list:
+                if 'Baby Products' in cat and 'Gear' in cat:
+                    return cat
+
+        for keyword, mapped_category in keyword_mapping.items():
+            if len(keyword) > 15:
+                if keyword in product_lower:
+                    mapped_lower = mapped_category.lower()
+                    for cat in categories_list:
+                        if cat.lower() == mapped_lower:
+                            return cat
+                    parts = mapped_lower.split('/')
+                    last_part = parts[-1].strip() if parts else ''
+                    if last_part and len(last_part) > 3:
+                        for cat in categories_list:
+                            if last_part in cat.lower():
+                                return cat
+        
+        def is_word_boundary_match(text, keyword):
+            text_lower = text.lower()
+            keyword_lower = keyword.lower()
+            if keyword_lower not in text_lower:
+                return False
+            idx = text_lower.find(keyword_lower)
+            text_len = len(text_lower)
+            kw_len = len(keyword_lower)
+            if idx > 0:
+                prev_char = text[idx - 1]
+                if prev_char.isalnum() or prev_char == '_':
+                    return False
+            if idx + kw_len < text_len:
+                next_char = text[idx + kw_len]
+                if next_char.isalnum() or next_char == '_':
+                    return False
+            return True
+        
+        def is_phrase_match(text, phrase):
+            if phrase not in text:
+                return False
+            words = phrase.split()
+            if len(words) == 2:
+                word1, word2 = words
+                if word1 in text and word2 in text:
+                    idx1 = text.find(word1)
+                    idx2 = text.find(word2)
+                    if idx2 > idx1:
+                        gap = idx2 - (idx1 + len(word1))
+                        if gap >= 0 and gap <= 1:
+                            return True
+            return False
+        
+        def is_keyword_in_category(category_text, keyword):
+            if is_word_boundary_match(category_text, keyword):
+                return True
+            if len(keyword) <= 5:
+                words = category_text.replace('/', ' ').split()
+                for word in words:
+                    if keyword in word and len(word) > len(keyword):
+                        if word.startswith(keyword):
+                            return True
+            return False
+        
+        product_type_keywords = {'tablet', 'tab', 'yogurt', 'yoghurt', 'drinking yogurt', 'drinking yoghurt', 
+                                 'smart watch', 'power bank', 'headphone', 'earpod', 'earbuds', 'earpods', 'earphone', 'kettle', 'blender', 'toaster', 
+                                 'bread toaster', 'toasting machine', 'edp', 'edt', 'eau de parfum', 'eau de toilette', 
+                                 'perfume', 'chocolate bar', 'watch', 'wrist watch', 'external hard drive', 'hard disk', 
+                                 'ssd', 'mouse', 'wireless mouse', 'computer mouse', 'battery', 'alkaline battery', 'aa battery', 'aaa battery',
+                                 'book', 'led light', 'pendrive', 'usb flash drive'}
+        
+        product_type_keywords_filtered = {k: v for k, v in keyword_mapping.items() if k in product_type_keywords}
+        sorted_product_types = sorted(product_type_keywords_filtered.items(), key=lambda x: len(x[0]), reverse=True)
+        
+        for keyword, mapped_category in sorted_product_types:
+            if ' ' in keyword:
+                keyword_words = keyword.split()
+                keyword_matches = all(is_word_boundary_match(product_lower, word) for word in keyword_words)
+                if not keyword_matches:
+                    keyword_matches = is_phrase_match(product_lower, keyword)
+            else:
+                keyword_matches = is_word_boundary_match(product_lower, keyword)
+            
+            if not keyword_matches:
+                continue
+            
+            mapped_lower = mapped_category.lower()
+            for cat in categories_list:
+                if cat.lower() == mapped_lower:
+                    return cat
+            
+            parts = mapped_lower.split('/')
+            last_part = parts[-1].strip() if parts else ''
+            if last_part and len(last_part) > 2:
+                if last_part in ['perfume', 'fragrance']:
+                    for cat in categories_list:
+                        if 'perfume' in cat.lower() or 'fragrance' in cat.lower():
+                            return cat
+                else:
+                    for cat in categories_list:
+                        if last_part in cat.lower():
+                            return cat
+        
+        other_multi_word_keywords = [(k, v) for k, v in sorted(keyword_mapping.items(), key=lambda x: len(x[0]), reverse=True) 
+                                     if ' ' in k and k not in product_type_keywords]
+        
+        for keyword, mapped_category in other_multi_word_keywords:
+            keyword_words = keyword.split()
+            keyword_matches = all(is_word_boundary_match(product_lower, word) for word in keyword_words)
+            if not keyword_matches:
+                keyword_matches = is_phrase_match(product_lower, keyword)
+            if not keyword_matches:
+                continue
+            mapped_lower = mapped_category.lower()
+            for cat in categories_list:
+                if cat.lower() == mapped_lower:
+                    return cat
+        
+        other_single_word_keywords = [(k, v) for k, v in sorted(keyword_mapping.items(), key=lambda x: len(x[0]), reverse=True) 
+                                      if ' ' not in k and k not in product_type_keywords]
+        
+        for keyword, mapped_category in other_single_word_keywords:
+            if not is_word_boundary_match(product_lower, keyword):
+                continue
+            mapped_lower = mapped_category.lower()
+            for cat in categories_list:
+                if cat.lower() == mapped_lower:
+                    return cat
+        
+        product_type, context_keywords = self.identify_product_type(product_name)
+        
+        if product_type:
+            specific_category = self.get_most_specific_category(
+                product_type, context_keywords, categories_list, leaf_categories, last_category_parts
+            )
+            if specific_category:
+                return specific_category
+        
+        return self.get_category_for_product(product_name, keyword_mapping, categories_list)
+    
+    def build_keyword_to_category_mapping(self):
+        """Build comprehensive keyword to category mappings"""
+        keyword_mapping = {}
+        
+        product_type_mappings = {
+            'nightwear': "Fashion / Womens Fashion / Clothing / Lingerie, Sleep & Lounge / Sleep & Lounge / Sets",
+            'night wear': "Fashion / Womens Fashion / Clothing / Lingerie, Sleep & Lounge / Sleep & Lounge / Sets",
+            'sleepwear': "Fashion / Womens Fashion / Clothing / Lingerie, Sleep & Lounge / Sleep & Lounge / Sets",
+            'sleep wear': "Fashion / Womens Fashion / Clothing / Lingerie, Sleep & Lounge / Sleep & Lounge / Sets",
+            'nightgown': "Fashion / Womens Fashion / Clothing / Lingerie, Sleep & Lounge / Sleep & Lounge / Nightgowns & Sleepshirts",
+            'night gown': "Fashion / Womens Fashion / Clothing / Lingerie, Sleep & Lounge / Sleep & Lounge / Nightgowns & Sleepshirts",
+            'pyjamas': "Fashion / Kids Fashion / Girls / Clothing / Sleepwear & Robes / Pajama Sets",
+            'pajamas': "Fashion / Kids Fashion / Girls / Clothing / Sleepwear & Robes / Pajama Sets",
+            'panties': "Fashion / Womens Fashion / Clothing / Lingerie, Sleep & Lounge / Lingerie / Panties",
+            'underwear': "Fashion / Womens Fashion / Underwear & Sleepwear / Undergarments",
+            'lingerie': "Fashion / Womens Fashion / Clothing / Lingerie, Sleep & Lounge / Lingerie",
+            'bra': "Fashion / Womens Fashion / Underwear & Sleepwear / Bra",
+            'shapewear': "Fashion / Womens Fashion / Underwear & Sleepwear / Shapewear & Leotards",
+            'girdle': "Fashion / Womens Fashion / Underwear & Sleepwear / Shapewear & Leotards",
+            'body shaper': "Fashion / Womens Fashion / Underwear & Sleepwear / Shapewear & Leotards",
+            'camisole': "Fashion / Womens Fashion / Clothing / Lingerie, Sleep & Lounge / Lingerie / Camisoles & Tanks",
+            'leggings': "Fashion / Womens Fashion / Clothing / Leggings",
+            'kaftan': "Fashion / Womens Fashion / Clothing / Dresses",
+            'caftan': "Fashion / Womens Fashion / Clothing / Dresses",
+            'abaya': "Fashion / Womens Fashion / Clothing / Dresses",
+            'bubu': "Fashion / Womens Fashion / Clothing / Dresses",
+            'biotin': 'Health & Beauty / Vitamins & Dietary Supplements / Vitamins / Hair, Skin & Nails Complex',
+            'gummy': 'Health & Beauty / Beauty & Personal Care / Personal Care / Vitamins & Supplements',
+            'vitamin': 'Health & Beauty / Beauty & Personal Care / Personal Care / Vitamins & Supplements',
+            'supplement': 'Health & Beauty / Vitamins & Dietary Supplements / Supplements / Digestive Supplements',
+            'digestive': 'Health & Beauty / Vitamins & Dietary Supplements / Supplements / Digestive Supplements',
+            'digestive health': 'Health & Beauty / Vitamins & Dietary Supplements / Supplements / Digestive Supplements',
+            'herbal supplement': 'Health & Beauty / Vitamins & Dietary Supplements / Herbal Supplements',
+            'herbal tea': 'Health & Beauty / Vitamins & Dietary Supplements / Herbal Supplements / Green Tea',
+            'detox': 'Health & Beauty / Vitamins & Dietary Supplements / Supplements',
+            'ginseng': 'Health & Beauty / Vitamins & Dietary Supplements / Herbal Supplements / Ginseng',
+            'probiotic': 'Health & Beauty / Sports Nutrition / Digestive Health Supplements',
+            'testosterone': 'Health & Beauty / Sports Nutrition / Testosterone Boosters',
+            'calcium': 'Health & Beauty / Sports Nutrition / Multivitamins',
+            'sexual health': 'Health & Beauty / Sexual Wellness / Sexual Remedies & Supplements',
+            'libido': 'Health & Beauty / Sexual Wellness / Sexual Remedies & Supplements',
+            'male enhancement': 'Health & Beauty / Sexual Wellness / Sexual Remedies & Supplements',
+            "men's health": 'Health & Beauty / Sexual Wellness / Sexual Remedies & Supplements',
+            'pot': 'Home & Office / Home & Kitchen / Kitchen & Dining / Cookware / Steamers, Stock & Pasta Pots / Stockpots',
+            'pots': 'Home & Office / Home & Kitchen / Kitchen & Dining / Cookware / Steamers, Stock & Pasta Pots / Stockpots',
+            'pan': 'Home & Office / Home & Kitchen / Kitchen & Dining / Cookware / Steamers, Stock & Pasta Pots / Stockpots',
+            'pans': 'Home & Office / Home & Kitchen / Kitchen & Dining / Cookware / Steamers, Stock & Pasta Pots / Stockpots',
+            'cooking': 'Home & Office / Home & Kitchen / Kitchen & Dining / Cookware / Steamers, Stock & Pasta Pots / Stockpots',
+            'cookware': 'Home & Office / Home & Kitchen / Kitchen & Dining / Cookware / Steamers, Stock & Pasta Pots / Stockpots',
+            'kettle': 'Home & Office / Home & Kitchen / Kitchen & Dining / Small Appliances / Kettles & Hot Pots',
+            'electric kettle': 'Home & Office / Home & Kitchen / Kitchen & Dining / Small Appliances / Kettles & Hot Pots',
+            'cordless kettle': 'Home & Office / Home & Kitchen / Kitchen & Dining / Small Appliances / Kettles & Hot Pots',
+            'blender': 'Home & Office / Home & Kitchen / Kitchen & Dining / Small Appliances / Blenders',
+            'juicer': 'Home & Office / Home & Kitchen / Kitchen & Dining / Small Appliances / Juicers',
+            'chopper': 'Home & Office / Home & Kitchen / Kitchen & Dining / Kitchen Utensils & Gadgets / Seasoning & Spice Tools / Choppers & Mincers',
+            'food chopper': 'Home & Office / Home & Kitchen / Kitchen & Dining / Kitchen Utensils & Gadgets / Seasoning & Spice Tools / Choppers & Mincers',
+            'vegetable chopper': 'Home & Office / Home & Kitchen / Kitchen & Dining / Kitchen Utensils & Gadgets / Seasoning & Spice Tools / Choppers & Mincers',
+            'multi-chopper': 'Home & Office / Home & Kitchen / Kitchen & Dining / Kitchen Utensils & Gadgets / Seasoning & Spice Tools / Choppers & Mincers',
+            'french fry cutter': 'Home & Office / Home & Kitchen / Kitchen & Dining / Kitchen Utensils & Gadgets / Seasoning & Spice Tools / Choppers & Mincers',
+            'chips cutter': 'Home & Office / Home & Kitchen / Kitchen & Dining / Kitchen Utensils & Gadgets / Seasoning & Spice Tools / Choppers & Mincers',
+            'vegetable cutter': 'Home & Office / Home & Kitchen / Kitchen & Dining / Kitchen Utensils & Gadgets / Seasoning & Spice Tools / Choppers & Mincers',
+            'slicer': 'Home & Office / Home & Kitchen / Kitchen & Dining / Kitchen Utensils & Gadgets / Graters, Peelers & Slicers',
+            'dicer': 'Home & Office / Home & Kitchen / Kitchen & Dining / Kitchen Utensils & Gadgets / Seasoning & Spice Tools / Choppers & Mincers',
+            'plate': 'Home & Office / Home & Kitchen / Kitchen & Dining / Dinnerware / Plates',
+            'rack': 'Home & Office / Home & Kitchen / Kitchen & Dining / Storage & Organization / Countertop & Wall Organization / Dish Racks',
+            'tray': 'Home & Office / Home & Kitchen / Kitchen & Dining / Dining & Entertaining / Serveware / Serving Dishes, Trays & Platters / Serving Trays',
+            'container': 'Home & Office / Home & Kitchen / Kitchen & Dining / Storage & Organization / Food Storage / Food Savers & Storage Containers',
+            'teapot': 'Home & Office / Home & Kitchen / Kitchen & Dining / Dining & Entertaining / Serveware / Beverage Serveware / Teapots & Coffee Servers / Tea Sets',
+            'tea set': 'Home & Office / Home & Kitchen / Kitchen & Dining / Dining & Entertaining / Serveware / Beverage Serveware / Teapots & Coffee Servers / Tea Sets',
+            'lunch': 'Home & Office / Home & Kitchen / Kitchen & Dining / Lunch Bags & Boxes',
+            'supporter': 'Baby Products / Diapering / Diaper Changing Kits',
+            'skincare': 'Health & Beauty / Beauty & Personal Care / Personal Care / Skin Care',
+            'skin': 'Health & Beauty / Beauty & Personal Care / Personal Care / Skin Care',
+            'cream': 'Health & Beauty / Beauty & Personal Care / Personal Care / Skin Care / Face / Cleansers / Creams & Lotions / Creams',
+            'lotion': 'Health & Beauty / Beauty & Personal Care / Personal Care / Skin Care / Face / Cleansers / Creams & Lotions / Lotions',
+            'serum': 'Health & Beauty / Beauty & Personal Care / Personal Care / Skin Care / Face / Serums',
+            'treatment': 'Health & Beauty / Beauty & Personal Care / Personal Care / Skin Care / Face / Treatments & Masks',
+            'moistur': 'Health & Beauty / Beauty & Personal Care / Personal Care / Skin Care',
+            'roller': 'Sporting Goods / Exercise & Fitness / Strength Training / Ab Equipment',
+            'derma roller': 'Health & Beauty / Beauty & Personal Care / Personal Care / Skin Care / Face / Tools',
+            'micro needl': 'Health & Beauty / Beauty & Personal Care / Personal Care / Skin Care / Face / Tools',
+            'straightener': 'Health & Beauty / Beauty & Personal Care / Personal Care / Hair Care / Hair Styling Tools',
+            'curler': 'Health & Beauty / Beauty & Personal Care / Personal Care / Hair Care / Hair Styling Tools',
+            'bonnet': 'Health & Beauty / Beauty & Personal Care / Hair Care / Hair Accessories',
+            'sleep cap': 'Health & Beauty / Beauty & Personal Care / Hair Care / Hair Accessories',
+            'headphone': 'Electronics / Wearable Technology / Headphones',
+            'earphone': 'Electronics / Wearable Technology / Headphones',
+            'earpod': 'Electronics / Wearable Technology / Headphones',
+            'earbuds': 'Electronics / Wearable Technology / Headphones',
+            'earpods': 'Electronics / Wearable Technology / Headphones',
+            'freeops': 'Electronics / Wearable Technology / Headphones',
+            'tune 510': 'Electronics / Wearable Technology / Headphones',
+            'light': 'Electronics / Accessories & Supplies / Camera Accessories / Video Recorder Accessories / Video Light',
+            'ring light': 'Phones & Tablets / Accessories / Mobile Flashes & Selfie Lights',
+            'led photography': 'Electronics / Accessories & Supplies / Camera Accessories / Video Recorder Accessories / Video Light',
+            'bi-color led': 'Electronics / Accessories & Supplies / Camera Accessories / Video Recorder Accessories / Video Light',
+            'photography light': 'Electronics / Accessories & Supplies / Camera Accessories / Video Recorder Accessories / Video Light',
+            'video light': 'Electronics / Accessories & Supplies / Camera Accessories / Video Recorder Accessories / Video Light',
+            'led light': 'Electronics / Accessories & Supplies / Camera Accessories / Video Recorder Accessories / Video Light',
+            'tripod': 'Phones & Tablets / Accessories / Selfie Sticks & Tripods / Tripods',
+            'selfie stick': 'Phones & Tablets / Accessories / Selfie Sticks & Tripods / Selfie Sticks',
+            'adapter': 'Electronics / Accessories & Supplies / Power Strips & Surge Protectors',
+            'phone': 'Phones & Tablets / Accessories / Cases & Sleeves',
+            'case': 'Phones & Tablets / Accessories / Cases & Sleeves',
+            'phone case': 'Phones & Tablets / Accessories / Cases & Sleeves',
+            'galaxy z flip': 'Phones & Tablets / Accessories / Cases & Sleeves',
+            'monitor': 'Computing / Computers & Accessories / Monitors',
+            'scale': 'Home & Office / Home & Kitchen / Kitchen & Dining / Kitchen Scales',
+            'pillowcase': 'Home & Office / Home & Kitchen / Bedding / Pillowcases',
+            'carpet': 'Home & Office / Home & Kitchen / Home Decor / Area Rugs, Runners & Pads',
+            'rug': 'Home & Office / Home & Kitchen / Home Decor / Area Rugs, Runners & Pads',
+            'mattress': 'Home & Office / Home & Kitchen / Bedding / Mattress Pads & Protectors',
+            'gripper': 'Home & Office / Home & Kitchen / Bedding / Bed Skirts',
+            'wash': 'Home & Office / Home & Kitchen / Laundry / Detergent',
+            'stain': 'Home & Office / Home & Kitchen / Laundry / Stain Removers',
+            'pad': 'Home & Office / Home & Kitchen / Laundry / Washing Machine Accessories',
+            'anti-vibration': 'Home & Office / Home & Kitchen / Laundry / Washing Machine Accessories',
+            'vibration pad': 'Home & Office / Home & Kitchen / Laundry / Washing Machine Accessories',
+            'washing machine pad': 'Home & Office / Home & Kitchen / Laundry / Washing Machine Accessories',
+            'humidifier': 'Home & Office / Home & Kitchen / Heating, Cooling & Air Quality / Humidifiers',
+            'heater': 'Home & Office / Home & Kitchen / Heating, Cooling & Air Quality / Space Heaters',
+            'shear': 'Home & Office / Tools & Home Improvement / Hand Tools / Cutting Tools',
+            'scales': 'Home & Office / Home & Kitchen / Kitchen & Dining / Kitchen Scales',
+            'blood': 'Health & Beauty / Medical Supplies & Equipment / Diagnostic, Monitoring & Test Equipment',
+            'pressure': 'Health & Beauty / Medical Supplies & Equipment / Diagnostic, Monitoring & Test Equipment',
+            'diaper': 'Baby Products / Diapering / Disposable Diapers',
+            'baby': 'Baby Products / Bathing & Skin Care / Baby Lotion & Cream',
+            'tea': 'Health & Beauty / Vitamins & Dietary Supplements / Herbal Supplements / Green Tea',
+            'coffee': 'Grocery / Beverages / Coffee',
+            'chip': 'Grocery / Snacks / Chips & Crisps',
+            'sauce': 'Grocery / Condiments / Sauces',
+            'sneaker': 'Fashion / Footwear / Athletic / Sneakers',
+            'bag': 'Fashion / Women\'s Fashion / Handbags & Wallets / Handbags / Shopper Bags',
+            'handbag': 'Fashion / Women\'s Fashion / Handbags & Wallets / Handbags / Shopper Bags',
+            'hand bags': 'Fashion / Women\'s Fashion / Handbags & Wallets / Handbags / Shopper Bags',
+            'hand bag': 'Fashion / Women\'s Fashion / Handbags & Wallets / Handbags / Shopper Bags',
+            'mini bag': 'Fashion / Women\'s Fashion / Handbags & Wallets / Handbags / Shopper Bags',
+            'shoulder bag': 'Fashion / Women\'s Fashion / Handbags & Wallets / Shoulder Bags',
+            'bracelet': 'Fashion / Jewelry / Bracelets',
+            'necklace': 'Fashion / Jewelry / Necklaces',
+            'waist': 'Fashion / Luggage & Travel Gear / Waist Packs',
+            'car': 'Automobile / Exterior Accessories / Car Covers',
+            'coating': 'Automobile / Car Care / Exterior Care / Sealants',
+            'ceramic coating': 'Automobile / Car Care / Exterior Care / Sealants',
+            'car coating': 'Automobile / Car Care / Exterior Care / Sealants',
+            'paint protection': 'Automobile / Car Care / Exterior Care / Sealants',
+            'spray': 'Automobile / Exterior Accessories / Car Care / Cleaning Kits',
+            'roof': 'Automobile / Exterior Accessories / Roof Racks & Cargo Boxes',
+            'strap': 'Automobile / Interior Accessories / Cargo Accessories',
+            'tarpaulin': 'Automobile / Interior Accessories / Cargo Covers',
+            'pull': 'Sporting Goods / Exercise & Fitness / Strength Training / Pull-Up Bars',
+            'toy': 'Toys & Games / Toddler & Baby Toys / Learning Toys',
+            'slingshot': 'Toys & Games / Outdoor Play / Slingshots',
+            'domino': 'Toys & Games / Board Games / Dominoes',
+            'coq10': 'Health & Beauty / Vitamins & Dietary Supplements / Supplements / Antioxidants',
+            'antioxidant': 'Health & Beauty / Vitamins & Dietary Supplements / Supplements / Antioxidants',
+            'shampoo': 'Health & Beauty / Beauty & Personal Care / Hair Care / Shampoo',
+            'hair brush': 'Health & Beauty / Beauty & Personal Care / Hair Care / Styling Tools & Appliances / Hair Brushes',
+            'perfume': 'Health & Beauty / Beauty & Personal Care / Fragrance / Solid Perfumes',
+            'oud': 'Health & Beauty / Beauty & Personal Care / Fragrance / Solid Perfumes',
+            'edp': 'Health & Beauty / Beauty & Personal Care / Fragrance / Solid Perfumes',
+            'edt': 'Health & Beauty / Beauty & Personal Care / Fragrance / Solid Perfumes',
+            'eau de parfum': 'Health & Beauty / Beauty & Personal Care / Fragrance / Solid Perfumes',
+            'eau de toilette': 'Health & Beauty / Beauty & Personal Care / Fragrance / Solid Perfumes',
+            'acne': 'Health & Beauty / Dermocosmetics / Skin Care / Acne Prone Skin',
+            'wart removal': 'Health & Beauty / Beauty & Personal Care / Personal Care / Skin Care',
+            'face mask': 'Health & Beauty / Beauty & Personal Care / Personal Care / Skin Care / Face / Treatments & Masks',
+            'mask sheet': 'Health & Beauty / Beauty & Personal Care / Personal Care / Skin Care / Face / Treatments & Masks',
+            'false eyelash': 'Health & Beauty / Beauty & Personal Care / Makeup / Eyes / False Eyelashes',
+            'tablet': 'Phones & Tablets / Tablets / Other Tablets',
+            'tab': 'Phones & Tablets / Tablets / Other Tablets',
+            'smart watch': 'Phones & Tablets / Accessories / Smart Watches',
+            'watch': 'Fashion / Watches / Wrist Watches',
+            'wrist watch': 'Fashion / Watches / Wrist Watches',
+            'power bank': 'Phones & Tablets / Accessories / Batteries & Battery Packs / Portable Power Banks',
+            'external hard drive': 'Computing / Computers & Accessories / Data Storage / External Hard Drives',
+            'hard disk': 'Computing / Computers & Accessories / Data Storage / External Hard Drives',
+            'ssd': 'Computing / Computers & Accessories / Data Storage / External Solid State Drives',
+            'pendrive': 'Computing / Computers & Accessories / Data Storage / USB Flash Drives',
+            'usb flash drive': 'Computing / Computers & Accessories / Data Storage / USB Flash Drives',
+            'lcd display': 'Phones & Tablets / Tablet Replacement Parts / LCD Displays',
+            'computer mouse': 'Computing / Computer Accessories / Mice',
+            'wireless mouse': 'Computing / Computer Accessories / Mice',
+            'mouse': 'Computing / Computer Accessories / Mice',
+            'ring light': 'Phones & Tablets / Accessories / Mobile Flashes & Selfie Lights',
+            'led light': 'Electronics / Accessories & Supplies / Camera Accessories / Video Recorder Accessories / Video Light',
+            'battery': 'Electronics / Accessories & Supplies / Camera Accessories / Batteries, Chargers & Adapters / Batteries',
+            'alkaline battery': 'Electronics / Accessories & Supplies / Camera Accessories / Batteries, Chargers & Adapters / Batteries',
+            'aa battery': 'Electronics / Accessories & Supplies / Camera Accessories / Batteries, Chargers & Adapters / Batteries',
+            'aaa battery': 'Electronics / Accessories & Supplies / Camera Accessories / Batteries, Chargers & Adapters / Batteries',
+            'motor oil': 'Automobile / Oils & Fluids / Oils / Motor Oils',
+            'synthetic oil': 'Automobile / Oils & Fluids / Oils / Motor Oils',
+            'engine oil': 'Automobile / Oils & Fluids / Oils / Motor Oils',
+            'yogurt': 'Grocery',
+            'yoghurt': 'Grocery',
+            'drinking yogurt': 'Grocery',
+            'drinking yoghurt': 'Grocery',
+            'coffee creamer': 'Grocery / Coffee / Coffee Creamers',
+            'full cream': 'Grocery / Coffee / Coffee Creamers',
+            'chocolate bar': 'Grocery / Confectionery / Chocolate / Chocolate Bars',
+            'toaster': 'Home & Office / Home & Kitchen / Kitchen & Dining / Small Appliances / Toasters',
+            'bread toaster': 'Home & Office / Home &
