@@ -1846,6 +1846,47 @@ def check_wrong_category(
     def _top_dom(path):
         return re.split(r"\s*/\s*|\s*>\s*", str(path).strip())[0].strip().lower()
 
+    def _leaf(path):
+        """Return the last segment of a category path, lowercased."""
+        parts = str(path).strip().split("/")
+        return parts[-1].strip().lower()
+
+    def _is_leaf_only(path):
+        """True when path has no '/' — it's just a bare category name like 'Smart Watches'."""
+        return "/" not in str(path).strip()
+
+    def _categories_compatible(assigned_full: str, predicted: str) -> bool:
+        """
+        Return True when assigned and predicted are compatible — i.e. should NOT
+        be flagged as Wrong Category.
+
+        Compatibility rules (any one is sufficient):
+          1. Top-level domains match exactly.
+          2. assigned_full is a bare leaf name (no '/') AND the predicted full
+             path ends with that same leaf — e.g. assigned='Smart Watches',
+             predicted='Phones & Tablets / Wearable Technology / Smart Watches'.
+          3. assigned_full (normalised) appears anywhere inside predicted path —
+             handles cases where the leaf name is a substring of the full path.
+          4. predicted leaf == assigned leaf (both paths point to the same
+             terminal category regardless of the parent hierarchy).
+        """
+        a_norm = assigned_full.strip().lower()
+        p_norm = predicted.strip().lower()
+
+        # Rule 1 — same top domain
+        if _top_dom(assigned_full) == _top_dom(predicted):
+            return True
+
+        # Rule 2 — assigned is a bare leaf and predicted path contains it
+        if _is_leaf_only(assigned_full) and a_norm in p_norm:
+            return True
+
+        # Rule 3 — assigned leaf matches predicted leaf (same terminal node)
+        if _leaf(assigned_full) == _leaf(predicted):
+            return True
+
+        return False
+
     flagged_rows = []
 
     for _, row in d.iterrows():
@@ -1856,34 +1897,42 @@ def check_wrong_category(
         if len(name.split()) < 3:
             continue
 
-        # ── Resolve assigned full path via code_to_path ───────────────────
+        # ── 1. Resolve assigned full path via code_to_path ───────────────
         if cat_code and cat_code in code_to_path:
             assigned_full = code_to_path[cat_code]
         else:
+            # code_to_path missing this code — use whatever CATEGORY column says.
+            # This is often just the leaf name e.g. 'Smart Watches'.
             assigned_full = cat_leaf
 
-        # ── Check learning DB first — if we have a correction for this
-        #    product, honour it and skip re-checking ───────────────────────
+        # ── 2. Learning DB — honour approved corrections ─────────────────
         learned = engine.lookup_learning_db(name)
         if learned:
-            learned_dom   = _top_dom(learned)
-            assigned_dom  = _top_dom(assigned_full)
-            if learned_dom == assigned_dom:
-                continue   # Correction matches assignment → not wrong category
+            # If the learned correction is compatible with the assigned
+            # category, this product was already reviewed → skip it.
+            if _categories_compatible(assigned_full, learned):
+                continue
+            # If the learned correction itself IS the assigned category
+            # (exact or leaf match), also skip.
+            if _categories_compatible(learned, assigned_full):
+                continue
 
-        assigned_dom = _top_dom(assigned_full)
-        predicted    = engine.get_category_with_fallback(name, kw_map, categories_list)
+        # ── 3. Engine prediction ──────────────────────────────────────────
+        predicted = engine.get_category_with_fallback(name, kw_map, categories_list)
 
         if not predicted:
             continue
-        predicted_dom = _top_dom(predicted)
 
-        if not predicted_dom or predicted_dom == assigned_dom:
+        # ── 4. Compatibility check — skip if they agree ───────────────────
+        if _categories_compatible(assigned_full, predicted):
             continue
 
+        # ── 5. Build flag comment ─────────────────────────────────────────
+        assigned_dom   = _top_dom(assigned_full)
+        predicted_dom  = _top_dom(predicted)
         predicted_leaf = predicted.split("/")[-1].strip()
         predicted_code = cat_path_to_code.get(predicted.lower(), "")
-        code_str = f" [{predicted_code}]" if predicted_code else ""
+        code_str       = f" [{predicted_code}]" if predicted_code else ""
 
         comment = (
             f"Assigned: {assigned_dom.title()} | "
