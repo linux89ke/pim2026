@@ -903,27 +903,20 @@ def _detect_and_read_csv(buf) -> pd.DataFrame:
 
 def _repair_mojibake(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Two-stage string sanitisation applied to every object column:
+    Fix the most common mojibake pattern: UTF-8 bytes that were decoded as
+    CP1252 (Windows Western) or ISO-8859-1 (Latin-1).  Applies only to
+    object (string) columns and only when the round-trip actually produces
+    valid UTF-8 with no replacement characters.
 
-    Stage 1 — Mojibake repair
-        Fix UTF-8 bytes that were decoded as CP1252 or Latin-1.
-        Repair order: CP1252 → UTF-8 first, then Latin-1 → UTF-8 fallback.
-        Only applied when the round-trip produces valid UTF-8 with no
-        replacement characters (U+FFFD).
+    Repair order tried per value:
+      1. CP1252 → UTF-8   (covers â€" → – , Ã© → é , etc.)
+      2. Latin-1 → UTF-8  (fallback for strict Latin-1 files)
 
-        Examples fixed:
-            â€"  →  –   (en dash, very common in PARENTSKU)
-            Ã©   →  é   (e-acute in seller/brand names)
-            â€™  →  '   (right single quote)
-            Â£   →  £   (pound sign)
-
-    Stage 2 — XML-illegal character stripping
-        xlsxwriter (and the OOXML spec) forbid control characters in the
-        ranges U+0000–U+0008, U+000B–U+000C, U+000E–U+001F.
-        These cause a hard crash ("IllegalCharacterError") when writing
-        xlsx files.  They are stripped silently after mojibake repair.
-        Tabs (U+0009), newlines (U+000A), and carriage-returns (U+000D)
-        are preserved because Excel renders them.
+    Examples fixed:
+        â€"   →  –   (en dash U+2013, very common in PARENTSKU)
+        Ã©    →  é   (e-acute, common in seller/brand names)
+        â€™   →  '   (right single quote)
+        Â£    →  £   (pound sign)
     """
     import re as _re
     _ILLEGAL_XML = _re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
@@ -940,7 +933,7 @@ def _repair_mojibake(df: pd.DataFrame) -> pd.DataFrame:
                     break
             except (UnicodeDecodeError, UnicodeEncodeError):
                 continue
-        # Stage 2: strip XML-illegal control chars
+        # Stage 2: strip XML-illegal control chars (crash xlsxwriter)
         return _ILLEGAL_XML.sub('', val)
 
     for col in df.select_dtypes(include='object').columns:
@@ -1366,9 +1359,33 @@ def check_generic_brand_issues(data: pd.DataFrame, valid_category_codes_fas: Lis
     if not {'CATEGORY_CODE','BRAND'}.issubset(data.columns): return pd.DataFrame(columns=data.columns)
     return data[data['CATEGORY_CODE'].apply(clean_category_code).isin(set(clean_category_code(c) for c in valid_category_codes_fas)) & (data['BRAND'].astype(str).str.lower() == 'generic')].drop_duplicates(subset=['PRODUCT_SET_SID'])
 
-def check_fashion_brand_issues(data: pd.DataFrame, valid_category_codes_fas: List[str]) -> pd.DataFrame:
-    if not {'CATEGORY_CODE','BRAND'}.issubset(data.columns): return pd.DataFrame(columns=data.columns)
-    return data[(data['BRAND'].astype(str).str.strip().str.lower() == 'fashion') & (~data['CATEGORY_CODE'].apply(clean_category_code).isin(set(clean_category_code(c) for c in valid_category_codes_fas)))].drop_duplicates(subset=['PRODUCT_SET_SID'])
+def check_fashion_brand_issues(data: pd.DataFrame, valid_category_codes_fas: List[str], code_to_path: Dict = None) -> pd.DataFrame:
+    """Flag products with brand='Fashion' that are NOT in the Fashion top-level domain.
+    If the category resolves to a path starting with 'Fashion', it is fine —
+    the brand name is appropriate for those products.
+    """
+    if not {'CATEGORY_CODE', 'BRAND'}.issubset(data.columns): return pd.DataFrame(columns=data.columns)
+    if code_to_path is None:
+        code_to_path = {}
+    # Only look at products whose brand is exactly "Fashion"
+    fashion_brand = data[data['BRAND'].astype(str).str.strip().str.lower() == 'fashion'].copy()
+    if fashion_brand.empty:
+        return pd.DataFrame(columns=data.columns)
+    def _in_fashion_domain(cat_code: str) -> bool:
+        """Return True if the full category path starts with 'Fashion'."""
+        full_path = code_to_path.get(str(cat_code).strip(), '')
+        if full_path:
+            return full_path.strip().lower().startswith('fashion')
+        # Fall back to the fas_codes list when no path is available
+        return clean_category_code(cat_code) in fas_codes
+    fas_codes = set(clean_category_code(c) for c in valid_category_codes_fas)
+    # Flag only those whose category does NOT belong to the Fashion domain
+    flagged = fashion_brand[
+        ~fashion_brand['CATEGORY_CODE'].apply(lambda c: _in_fashion_domain(clean_category_code(c)))
+    ].copy()
+    if not flagged.empty:
+        flagged['Comment_Detail'] = "Brand 'Fashion' used outside Fashion category: " + flagged['CATEGORY_CODE'].astype(str)
+    return flagged.drop_duplicates(subset=['PRODUCT_SET_SID'])
 
 def check_brand_in_name(data: pd.DataFrame) -> pd.DataFrame:
     if not {'BRAND','NAME'}.issubset(data.columns): return pd.DataFrame(columns=data.columns)
@@ -1569,6 +1586,7 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
                 if country_validator.should_skip_validation(name): continue
                 ckwargs = {'data': data, **kwargs}
                 if name in ["Generic BRAND Issues", "Fashion brand issues"]: ckwargs['valid_category_codes_fas'] = support_files.get('category_fas', [])
+                if name == "Fashion brand issues": ckwargs['code_to_path'] = support_files.get('code_to_path', {})
                 flag_hash = compute_flag_input_hash(data, name, ckwargs)
                 cache_path = os.path.join(FLAG_CACHE_DIR, f"{flag_hash}.pkl")
                 future_to_name[executor.submit(run_cached_check, func, cache_path, ckwargs)] = name
@@ -2412,9 +2430,8 @@ if st.session_state.get('last_processed_files') != process_signature:
     if process_signature == "empty":
         st.session_state.last_processed_files = "empty"
     else:
-        # Include the engine's learning DB size in the cache key so that
-        # approving Wrong Category items (which grow the DB) automatically
-        # invalidates the cached report and forces a fresh validation run.
+        # Include the engine's learning DB size in the cache key so approving
+        # Wrong Category items automatically invalidates the cached report.
         _engine_for_cache = _get_cat_matcher_engine() if _CAT_MATCHER_AVAILABLE else None
         _learning_stamp   = str(len(_engine_for_cache.learning_db)) if _engine_for_cache else "0"
         sig_hash = hashlib.md5((process_signature + _learning_stamp).encode()).hexdigest()
