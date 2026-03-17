@@ -2068,6 +2068,8 @@ def bulk_approve_dialog(sids_to_process, title, subset_data, data_has_warranty_c
                     st.session_state.final_report.loc[st.session_state.final_report['ProductSetSid'] == sid, ['Status', 'Reason', 'Comment', 'FLAG']] = ['Rejected', new_row.iloc[0]['Reason'], new_row.iloc[0]['Comment'], new_flag]
                     msg_moved[new_flag] = msg_moved.get(new_flag, 0) + 1
 
+            # If the user approved items in Wrong Category, learn them!
+            # Make SURE 'and msg_approved > 0' is deleted from this next line:
             if title == "Wrong Category" and _CAT_MATCHER_AVAILABLE:
                 try:
                     _engine = _get_cat_matcher_engine()
@@ -2079,16 +2081,16 @@ def bulk_approve_dialog(sids_to_process, title, subset_data, data_has_warranty_c
                                 continue
                             name = str(row.iloc[0].get('NAME', '')).strip()
                             
-                            # NEW: Try to get the FULL hierarchical path using the Category Code
+                            # Get the FULL hierarchical path to save to memory
                             cat_code = str(row.iloc[0].get('CATEGORY_CODE', '')).strip().split('.')[0]
                             full_path = support_files.get('code_to_path', {}).get(cat_code)
                             
-                            # Fallback to the short name only if the full path isn't found
                             category = full_path if full_path else str(row.iloc[0].get('CATEGORY', '')).strip()
                             
                             if name and category and category.lower() not in ('nan', 'none', ''):
                                 _engine.apply_learned_correction(name, category, auto_save=False)
                                 learned_count += 1
+                                
                         if learned_count:
                             # SAVE ONCE AT THE VERY END
                             _engine.save_learning_db()
