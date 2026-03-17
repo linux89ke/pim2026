@@ -2068,7 +2068,7 @@ def bulk_approve_dialog(sids_to_process, title, subset_data, data_has_warranty_c
                                 # ADDED: auto_save=False so we don't hit the Firebase speed limit!
                                 _engine.apply_learned_correction(name, category, auto_save=False)
                                 learned_count += 1
-                else:
+             else:
                     new_flag = str(new_row.iloc[0]['FLAG'])
                     st.session_state.final_report.loc[st.session_state.final_report['ProductSetSid'] == sid, ['Status', 'Reason', 'Comment', 'FLAG']] = ['Rejected', new_row.iloc[0]['Reason'], new_row.iloc[0]['Comment'], new_flag]
                     msg_moved[new_flag] = msg_moved.get(new_flag, 0) + 1
