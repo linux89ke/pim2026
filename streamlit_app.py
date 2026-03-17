@@ -903,32 +903,45 @@ def _detect_and_read_csv(buf) -> pd.DataFrame:
 
 def _repair_mojibake(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fix the most common mojibake pattern: UTF-8 bytes that were decoded as
-    CP1252 (Windows Western) or ISO-8859-1 (Latin-1).  Applies only to
-    object (string) columns and only when the round-trip actually produces
-    valid UTF-8 with no replacement characters.
+    Two-stage string sanitisation applied to every object column:
 
-    Repair order tried per value:
-      1. CP1252 → UTF-8   (covers â€" → – , Ã© → é , etc.)
-      2. Latin-1 → UTF-8  (fallback for strict Latin-1 files)
+    Stage 1 — Mojibake repair
+        Fix UTF-8 bytes that were decoded as CP1252 or Latin-1.
+        Repair order: CP1252 → UTF-8 first, then Latin-1 → UTF-8 fallback.
+        Only applied when the round-trip produces valid UTF-8 with no
+        replacement characters (U+FFFD).
 
-    Examples fixed:
-        â€"   →  –   (en dash U+2013, very common in PARENTSKU)
-        Ã©    →  é   (e-acute, common in seller/brand names)
-        â€™   →  '   (right single quote)
-        Â£    →  £   (pound sign)
+        Examples fixed:
+            â€"  →  –   (en dash, very common in PARENTSKU)
+            Ã©   →  é   (e-acute in seller/brand names)
+            â€™  →  '   (right single quote)
+            Â£   →  £   (pound sign)
+
+    Stage 2 — XML-illegal character stripping
+        xlsxwriter (and the OOXML spec) forbid control characters in the
+        ranges U+0000–U+0008, U+000B–U+000C, U+000E–U+001F.
+        These cause a hard crash ("IllegalCharacterError") when writing
+        xlsx files.  They are stripped silently after mojibake repair.
+        Tabs (U+0009), newlines (U+000A), and carriage-returns (U+000D)
+        are preserved because Excel renders them.
     """
+    import re as _re
+    _ILLEGAL_XML = _re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+
     def _fix(val):
         if not isinstance(val, str):
             return val
+        # Stage 1: mojibake round-trip
         for enc in ('cp1252', 'latin-1'):
             try:
                 fixed = val.encode(enc).decode('utf-8')
                 if fixed != val and '\ufffd' not in fixed:
-                    return fixed
+                    val = fixed
+                    break
             except (UnicodeDecodeError, UnicodeEncodeError):
                 continue
-        return val
+        # Stage 2: strip XML-illegal control chars
+        return _ILLEGAL_XML.sub('', val)
 
     for col in df.select_dtypes(include='object').columns:
         df[col] = df[col].apply(_fix)
@@ -2367,7 +2380,7 @@ elif uploaded_files is not None and len(uploaded_files) == 0:
 _files_for_processing = st.session_state.get("cached_uploaded_files", [])
 
 if _files_for_processing:
-    current_file_signature = sorted([f["name"] + str(len(f["bytes"])) for f in _files_for_processing])
+    current_file_signature = sorted([f["name"] + hashlib.md5(f["bytes"]).hexdigest() for f in _files_for_processing])
     process_signature = str(current_file_signature) + f"_{country_validator.code}"
 else:
     process_signature = "empty"
@@ -2399,7 +2412,12 @@ if st.session_state.get('last_processed_files') != process_signature:
     if process_signature == "empty":
         st.session_state.last_processed_files = "empty"
     else:
-        sig_hash = hashlib.md5(process_signature.encode()).hexdigest()
+        # Include the engine's learning DB size in the cache key so that
+        # approving Wrong Category items (which grow the DB) automatically
+        # invalidates the cached report and forces a fresh validation run.
+        _engine_for_cache = _get_cat_matcher_engine() if _CAT_MATCHER_AVAILABLE else None
+        _learning_stamp   = str(len(_engine_for_cache.learning_db)) if _engine_for_cache else "0"
+        sig_hash = hashlib.md5((process_signature + _learning_stamp).encode()).hexdigest()
         cached_data = load_df_parquet(f"{sig_hash}_data.parquet")
         cached_report = load_df_parquet(f"{sig_hash}_report.parquet")
 
