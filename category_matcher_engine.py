@@ -972,77 +972,44 @@ class CategoryMatcherEngine:
             safe[safe_key] = v
         return safe
 
-    def load_learning_db(self) -> dict[str, str]:
-        """Load learned corrections from Firestore, merging all chunks."""
-        db: dict[str, str] = {}
+    def load_learning_db(self):
+        """Load learned product→category corrections from Firestore across multiple chunks."""
+        db = {}
         try:
             docs = self.db_client.collection('matcher_data').stream()
             for doc in docs:
                 if doc.id.startswith('learning_db'):
-                    data = doc.to_dict()
-                    if data:
-                        db.update({k.lower(): v for k, v in data.items()})
-            print(f"✅ Loaded {len(db)} total corrections from Firestore.")
+                    db_data = doc.to_dict()
+                    # NEW: Unpack the JSON wrapper to bypass character limits
+                    if 'data' in db_data:
+                        chunk = json.loads(db_data['data'])
+                        db.update({k.lower(): v for k, v in chunk.items()})
+                    else:
+                        db.update({k.lower(): v for k, v in db_data.items() if k != 'data'})
         except Exception as e:
             print(f"🔥 FIREBASE LOAD ERROR: {e}")
 
-        # Seed corrections — cloud corrections always win over seeds
+        # Merge seed corrections — user corrections from the cloud always win
         for k, v in self._SEED_CORRECTIONS.items():
             if k not in db:
                 db[k] = v
         return db
 
-    def save_learning_db(self) -> None:
-        """
-        Persist learning_db to Firestore.
-
-        Guarantees:
-          • Keys are sanitized — no periods, slashes or other illegal chars
-            that would cause Firestore to silently drop the entire batch.
-          • Stale chunks are deleted before new ones are written.
-          • 2-second debounce prevents rapid successive writes from racing.
-          • All chunk writes happen in a single atomic batch commit.
-        """
-        now = time.time()
-        if now - self._last_save_time < 2.0:
-            self._pending_save = True
-            print("⏳ Save debounced — will persist on next call.")
-            return
-
-        self._pending_save   = False
-        self._last_save_time = now
-
+    def save_learning_db(self):
+        """Persist the learning DB directly to Firestore, chunked and JSON-wrapped."""
         try:
             CHUNK_SIZE = 400
-            # Sanitize ALL keys before writing — this is the critical fix
-            safe_db = self._safe_learning_db_for_firestore()
-            items   = list(safe_db.items())
-            chunks  = [
-                dict(items[i : i + CHUNK_SIZE])
-                for i in range(0, len(items), CHUNK_SIZE)
-            ]
-
+            items = list(self.learning_db.items())
+            chunks = [dict(items[i:i+CHUNK_SIZE]) for i in range(0, len(items), CHUNK_SIZE)]
+            
             batch = self.db_client.batch()
-
-            # Step 1: delete ALL existing learning_db_* documents
-            existing_docs = self.db_client.collection('matcher_data').stream()
-            for doc in existing_docs:
-                if doc.id.startswith('learning_db'):
-                    batch.delete(doc.reference)
-
-            # Step 2: write fresh sanitized chunks
             for idx, chunk in enumerate(chunks):
-                doc_ref = self.db_client.collection('matcher_data').document(
-                    f'learning_db_{idx}'
-                )
-                batch.set(doc_ref, chunk)
-
+                doc_ref = self.db_client.collection('matcher_data').document(f'learning_db_{idx}')
+                # NEW: Wrap the chunk in a JSON string so Firebase ignores periods and slashes!
+                batch.set(doc_ref, {'data': json.dumps(chunk)})
+                
             batch.commit()
-            print(
-                f"✅ Saved {len(safe_db)} entries "
-                f"across {len(chunks)} Firestore document(s)."
-            )
-
+            print(f"✅ Saved {len(self.learning_db)} entries to Firestore.")
         except Exception as e:
             print(f"🔥 FAILED TO SAVE TO FIREBASE: {e}")
 
