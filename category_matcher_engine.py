@@ -867,12 +867,14 @@ class CategoryMatcherEngine:
             batch = self.db_client.batch()
             for idx, chunk in enumerate(chunks):
                 doc_ref = self.db_client.collection('matcher_data').document(f'learning_db_{idx}')
-                # Wrap the chunk in a JSON string so Firebase ignores periods and slashes!
                 batch.set(doc_ref, {'data': json.dumps(chunk)})
                 
             batch.commit()
             print(f"✅ Saved {len(self.learning_db)} entries to Firestore.")
         except Exception as e:
+            # CHANGED: Show the error directly on the Streamlit screen!
+            import streamlit as st
+            st.error(f"🔥 FAILED TO SAVE TO FIREBASE: {e}")
             print(f"🔥 FAILED TO SAVE TO FIREBASE: {e}")
 
     def export_learning_db(self) -> str:
