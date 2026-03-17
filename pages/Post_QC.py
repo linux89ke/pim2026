@@ -58,14 +58,14 @@ try:
         sys.modules.get("streamlit_app")
         or _importlib.import_module("streamlit_app")
     )
-    validate_products      = _main_mod.validate_products
-    load_all_support_files = _main_mod.load_all_support_files
-    render_flag_expander   = _main_mod.render_flag_expander
-    CountryValidator       = _main_mod.CountryValidator
-    generate_smart_export  = _main_mod.generate_smart_export
-    PRODUCTSETS_COLS       = _main_mod.PRODUCTSETS_COLS
-    REJECTION_REASONS_COLS = _main_mod.REJECTION_REASONS_COLS
-    clean_category_code    = _main_mod.clean_category_code
+    validate_products        = _main_mod.validate_products
+    load_all_support_files   = _main_mod.load_all_support_files
+    CountryValidator         = _main_mod.CountryValidator
+    PRODUCTSETS_COLS         = _main_mod.PRODUCTSETS_COLS
+    REJECTION_REASONS_COLS   = _main_mod.REJECTION_REASONS_COLS
+    clean_category_code      = _main_mod.clean_category_code
+    df_hash                  = _main_mod.df_hash
+    cached_validate_products = _main_mod.cached_validate_products
     # Image grid helpers
     build_fast_grid_html            = _main_mod.build_fast_grid_html
     analyze_image_quality_cached    = _main_mod.analyze_image_quality_cached
@@ -127,6 +127,156 @@ if _FULL_VALIDATION_OK:
 
     _main_mod.check_fashion_brand_issues  = _pq_check_fashion_brand_issues
     _main_mod.check_generic_brand_issues  = _pq_check_generic_brand_issues
+
+
+# ── READ-ONLY Expander logic (No Firebase Learning) ───────────────────────────
+@st.dialog("Confirm Bulk Approval (Post-QC)")
+def pq_bulk_approve_dialog(sids_to_process, title, subset_data, data_has_warranty_cols_check, support_files, country_validator):
+    st.warning(f"You are about to approve **{len(sids_to_process)}** items from `{title}`.")
+    if st.button("Approve", type="primary", use_container_width=True):
+        with st.spinner("Processing..."):
+            data_hash = df_hash(subset_data) + country_validator.code + "_skip_" + title
+            new_report, _ = cached_validate_products(data_hash, subset_data, support_files, country_validator.code, data_has_warranty_cols_check, skip_validators=[title])
+            msg_moved, msg_approved = {}, 0
+            for sid in sids_to_process:
+                new_row = new_report[new_report['ProductSetSid'] == sid]
+                if new_row.empty or not str(new_row.iloc[0]['FLAG']):
+                    st.session_state.final_report.loc[st.session_state.final_report['ProductSetSid'] == sid, ['Status', 'Reason', 'Comment', 'FLAG']] = ['Approved', '', '', 'Approved by User']
+                    msg_approved += 1
+                else:
+                    new_flag = str(new_row.iloc[0]['FLAG'])
+                    st.session_state.final_report.loc[st.session_state.final_report['ProductSetSid'] == sid, ['Status', 'Reason', 'Comment', 'FLAG']] = ['Rejected', new_row.iloc[0]['Reason'], new_row.iloc[0]['Comment'], new_flag]
+                    msg_moved[new_flag] = msg_moved.get(new_flag, 0) + 1
+
+            if msg_approved > 0: st.session_state.main_toasts.append(f"{msg_approved} items successfully Approved!")
+            for flag, count in msg_moved.items(): st.session_state.main_toasts.append(f"{count} items re-flagged as: {flag}")
+            st.session_state.exports_cache.clear()
+            st.session_state.display_df_cache.clear()
+            _key = "pqexp_" + re.sub(r"[^a-zA-Z0-9]", "_", title)
+            st.session_state[_key] = True
+            if f"df_{title}" in st.session_state: del st.session_state[f"df_{title}"]
+        st.rerun()
+
+def pq_render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_check, support_files, country_validator):
+    cache_key = f"display_df_{title}"
+    base_display_cols = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'CATEGORY', 'COLOR', 'GLOBAL_SALE_PRICE', 'GLOBAL_PRICE', 'PARENTSKU', 'SELLER_NAME']
+    current_display_cols = base_display_cols.copy()
+    if title == "Wrong Variation":
+        if 'COUNT_VARIATIONS' in data.columns: current_display_cols.append('COUNT_VARIATIONS')
+        if 'LIST_VARIATIONS' in data.columns: current_display_cols.append('LIST_VARIATIONS')
+
+    if cache_key not in st.session_state.display_df_cache:
+        _extra_cols = [c for c in current_display_cols if c in data.columns]
+        if 'CATEGORY_CODE' in data.columns and 'CATEGORY_CODE' not in _extra_cols:
+            _extra_cols = _extra_cols + ['CATEGORY_CODE']
+        df_display = pd.merge(
+            df_flagged_sids[['ProductSetSid']],
+            data,
+            left_on='ProductSetSid', right_on='PRODUCT_SET_SID', how='left'
+        )[[c for c in _extra_cols if c in data.columns]]
+
+        _code_to_path = support_files.get('code_to_path', {})
+        if _code_to_path and 'CATEGORY_CODE' in df_display.columns:
+            df_display['CATEGORY'] = df_display['CATEGORY_CODE'].apply(
+                lambda c: _code_to_path.get(str(c).strip()) or df_display.get('CATEGORY', pd.Series(dtype=str)).iloc[0] if pd.notna(c) else ''
+            )
+            df_display = df_display.drop(columns=['CATEGORY_CODE'])
+
+        df_display = df_display[[c for c in current_display_cols if c in df_display.columns]]
+        st.session_state.display_df_cache[cache_key] = df_display
+    else:
+        df_display = st.session_state.display_df_cache[cache_key]
+
+    c1, c2 = st.columns([1, 1])
+    with c1: search_term = st.text_input("Search", placeholder="Name, Brand...", key=f"s_{title}")
+    with c2: seller_filter = st.multiselect("Filter by Seller", sorted(df_display['SELLER_NAME'].astype(str).unique()), key=f"f_{title}")
+
+    df_view = df_display.copy()
+    if search_term: df_view = df_view[df_view.apply(lambda x: x.astype(str).str.contains(search_term, case=False).any(), axis=1)]
+    if seller_filter: df_view = df_view[df_view['SELLER_NAME'].isin(seller_filter)]
+    df_view = df_view.reset_index(drop=True)
+    if 'NAME' in df_view.columns:
+        def strip_html(text): return re.sub('<[^<]+?>', '', text) if isinstance(text, str) else text
+        df_view['NAME'] = df_view['NAME'].apply(strip_html)
+
+    if 'GLOBAL_PRICE' in df_view.columns and 'GLOBAL_SALE_PRICE' in df_view.columns:
+        def _get_local_p(row):
+            sp = row.get('GLOBAL_SALE_PRICE')
+            rp = row.get('GLOBAL_PRICE')
+            val = sp if pd.notna(sp) and str(sp).strip() != "" else rp
+            return format_local_price(val, country_validator.country)
+        try:
+            loc_idx = df_view.columns.get_loc('GLOBAL_PRICE') + 1
+            df_view.insert(loc_idx, 'Local Price', df_view.apply(_get_local_p, axis=1))
+        except Exception:
+            df_view['Local Price'] = df_view.apply(_get_local_p, axis=1)
+
+    event = st.dataframe(
+        df_view, hide_index=True, use_container_width=True, selection_mode="multi-row", on_select="rerun",
+        column_config={
+            "PRODUCT_SET_SID": st.column_config.TextColumn(pinned=True),
+            "NAME": st.column_config.TextColumn(pinned=True),
+            "CATEGORY": st.column_config.TextColumn("Full Category", width="large"),
+            "GLOBAL_SALE_PRICE": st.column_config.NumberColumn("Sale Price (USD)", format="$%.2f"),
+            "GLOBAL_PRICE": st.column_config.NumberColumn("Price (USD)", format="$%.2f"),
+            "Local Price": st.column_config.TextColumn(f"Local Price ({country_validator.country})"),
+        }, key=f"df_{title}"
+    )
+    raw_selected_indices = list(event.selection.rows)
+    selected_indices = [i for i in raw_selected_indices if i < len(df_view)]
+    st.caption(f"{len(selected_indices)} / {len(df_view)} selected")
+    has_selection = len(selected_indices) > 0
+
+    _fm = support_files.get('flags_mapping', {})
+    _reason_options = [
+        "Wrong Category", "Restricted brands", "Suspected Fake product", "Seller Not approved to sell Refurb",
+        "Product Warranty", "Seller Approve to sell books", "Seller Approved to Sell Perfume", "Counterfeit Sneakers",
+        "Suspected counterfeit Jerseys", "Prohibited products", "Unnecessary words in NAME", "Single-word NAME",
+        "Generic BRAND Issues", "Fashion brand issues", "BRAND name repeated in NAME", "Wrong Variation",
+        "Generic branded products with genuine brands", "Missing COLOR", "Missing Weight/Volume",
+        "Incomplete Smartphone Name", "Duplicate product", "Poor images", "Perfume Tester", "Other Reason (Custom)",
+    ]
+
+    btn_col1, btn_col2 = st.columns([1, 1])
+    with btn_col1:
+        if st.button("Approve", key=f"approve_sel_{title}", type="primary", use_container_width=True, disabled=not has_selection):
+            sids_to_process = df_view.iloc[selected_indices]['PRODUCT_SET_SID'].tolist()
+            subset = data[data['PRODUCT_SET_SID'].isin(sids_to_process)]
+            if f"df_{title}" in st.session_state: del st.session_state[f"df_{title}"]
+            pq_bulk_approve_dialog(sids_to_process, title, subset, data_has_warranty_cols_check, support_files, country_validator)
+
+    with btn_col2:
+        with st.popover("Reject As", use_container_width=True, disabled=not has_selection):
+            chosen_reason = st.selectbox("Reason", _reason_options, key=f"rej_reason_dd_{title}", label_visibility="collapsed")
+            if chosen_reason == "Other Reason (Custom)":
+                custom_comment = st.text_area("Custom comment", placeholder="Type your rejection reason here...", key=f"custom_comment_{title}", height=80)
+                if st.button("Apply", key=f"apply_custom_{title}", type="primary", use_container_width=True, disabled=not has_selection):
+                    to_reject = df_view.iloc[selected_indices]['PRODUCT_SET_SID'].tolist()
+                    final_comment = custom_comment.strip() if custom_comment.strip() else "Other Reason"
+                    st.session_state.final_report.loc[st.session_state.final_report['ProductSetSid'].isin(to_reject), ['Status', 'Reason', 'Comment', 'FLAG']] = ['Rejected', '1000007 - Other Reason', final_comment, 'Other Reason (Custom)']
+                    st.session_state.main_toasts.append(f"{len(to_reject)} items rejected with custom reason.")
+                    st.session_state.exports_cache.clear()
+                    st.session_state.display_df_cache.clear()
+                    _key = "pqexp_" + re.sub(r"[^a-zA-Z0-9]", "_", title)
+                    st.session_state[_key] = True
+                    if f"df_{title}" in st.session_state: del st.session_state[f"df_{title}"]
+                    st.rerun()
+            else:
+                _rinfo = _fm.get(chosen_reason, {'reason': '1000007 - Other Reason', 'en': chosen_reason})
+                _rcode = _rinfo['reason']
+                _cmt = _rinfo.get('en', chosen_reason)
+                st.caption(f"Code: {_rcode[:40]}...")
+                if st.button("Apply", key=f"apply_dd_{title}", type="primary", use_container_width=True, disabled=not has_selection):
+                    to_reject = df_view.iloc[selected_indices]['PRODUCT_SET_SID'].tolist()
+                    st.session_state.final_report.loc[st.session_state.final_report['ProductSetSid'].isin(to_reject), ['Status', 'Reason', 'Comment', 'FLAG']] = ['Rejected', _rcode, _cmt, chosen_reason]
+                    st.session_state.main_toasts.append(f"{len(to_reject)} items rejected as '{chosen_reason}'.")
+                    st.session_state.exports_cache.clear()
+                    st.session_state.display_df_cache.clear()
+                    _key = "pqexp_" + re.sub(r"[^a-zA-Z0-9]", "_", title)
+                    st.session_state[_key] = True
+                    if f"df_{title}" in st.session_state: del st.session_state[f"df_{title}"]
+                    st.rerun()
+# ─────────────────────────────────────────────────────────────────────────────
 
 try:
     from jumia_scraper import (
@@ -491,7 +641,7 @@ def _build_enrichment_summary(before: pd.DataFrame, after: pd.DataFrame) -> dict
 def _to_excel_bytes(df: pd.DataFrame) -> bytes:
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Enriched Data")
+        df.to_excel(writer, index=False, sheet_name="Post QC Results")
     return buf.getvalue()
 
 def _to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -1324,28 +1474,6 @@ if st.session_state.enrichment_done and st.session_state.enriched_df is not None
             use_container_width=True, height=400,
         )
 
-    st.markdown(
-        f'<div class="pq-section-header">{_ICON["download"]} Download Enriched Dataset</div>',
-        unsafe_allow_html=True,
-    )
-    dl_col1, dl_col2 = st.columns(2)
-    _edf_clean = edf[[c for c in edf.columns if not c.startswith("_")]]
-    with dl_col1:
-        st.download_button(
-            label="Download as Excel (.xlsx)",
-            data=_to_excel_bytes(_edf_clean),
-            file_name=f"enriched_data_{pq_country.lower()}_{country_code}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True, type="primary",
-        )
-    with dl_col2:
-        st.download_button(
-            label="Download as CSV (.csv)",
-            data=_to_csv_bytes(_edf_clean),
-            file_name=f"enriched_data_{pq_country.lower()}_{country_code}.csv",
-            mime="text/csv", use_container_width=True,
-        )
-
 # ------------------------------------------------------------------
 # DATA QUALITY FLAGS (advisory — shown before validation results)
 # ------------------------------------------------------------------
@@ -1389,8 +1517,8 @@ if _FULL_VALIDATION_OK and not _val_report.empty and not _pq_data.empty:
     _total = len(_pq_data[[c for c in _pq_data.columns if not c.startswith("_")]])
     for _col, _lbl, _val, _color in [
         (mc1, "Total Products",  _total,           DARK),
-        (mc2, "Approved",        len(_app_df),      GREEN),
-        (mc3, "Rejected",        len(_rej_df),      RED),
+        (mc2, "Approved",        len(_app_df),     GREEN),
+        (mc3, "Rejected",        len(_rej_df),     RED),
         (mc4, "Rejection Rate",  f"{(len(_rej_df)/_total*100) if _total > 0 else 0:.1f}%", ORANGE),
     ]:
         with _col:
@@ -1419,7 +1547,7 @@ if _FULL_VALIDATION_OK and not _val_report.empty and not _pq_data.empty:
             _flag_df = _rej_df[_rej_df["FLAG"] == _flag_title]
             _flag_key = "pqexp_" + re.sub(r"[^a-zA-Z0-9]", "_", _flag_title)
             with st.expander(f"{_flag_title} ({len(_flag_df)})", key=_flag_key):
-                render_flag_expander(_flag_title, _flag_df, _pq_data, _data_has_w, _sf, _cv)
+                pq_render_flag_expander(_flag_title, _flag_df, _pq_data, _data_has_w, _sf, _cv)
 
         st.session_state.pq_val_report = st.session_state.final_report.copy()
     else:
@@ -1427,49 +1555,44 @@ if _FULL_VALIDATION_OK and not _val_report.empty and not _pq_data.empty:
 
     st.markdown("---")
     st.markdown(
-        f'<div class="pq-section-header">{_ICON["download"]} Download Validation Reports</div>',
+        f'<div class="pq-section-header">{_ICON["download"]} Download Post-QC Results</div>',
         unsafe_allow_html=True,
     )
     _date_str = __import__("datetime").datetime.now().strftime("%Y-%m-%d")
-    _fname_base = f"Validation_Report_{pq_country}_{country_code}_{_date_str}"
-    _reasons_df = _sf.get("reasons", pd.DataFrame())
-
-    _export_cfg = [
-        ("PIM Export",    _val_report, "All products with status"),
-        ("Rejected Only", _rej_df,     "Rejected products only"),
-        ("Approved Only", _app_df,     "Approved products only"),
-    ]
-
-    _ecols = st.columns(3)
-    for _ei, (_etitle, _edf, _edesc) in enumerate(_export_cfg):
-        with _ecols[_ei]:
-            _ekey = f"pq_exp_{_etitle}"
-            with st.container(border=True):
-                st.markdown(
-                    f"<div style='text-align:center;'>"
-                    f"<div style='font-weight:600;font-size:14px;color:{DARK};'>{_etitle}</div>"
-                    f"<div style='font-size:11px;color:{MED};margin-top:4px;'>{_edesc}</div>"
-                    f"<div style='background:{LIGHT};color:{ORANGE};padding:6px;"
-                    f"border-radius:4px;margin-top:10px;font-weight:600;font-size:13px;'>"
-                    f"{len(_edf):,} rows</div></div>",
-                    unsafe_allow_html=True,
-                )
-                if _ekey not in st.session_state.pq_val_exports:
-                    if st.button("Generate", key=f"gen_{_ekey}", type="primary", use_container_width=True):
-                        _res, _fn, _mime = generate_smart_export(
-                            _edf, f"{_fname_base}_{_etitle.replace(' ','_')}", "simple", _reasons_df,
-                        )
-                        st.session_state.pq_val_exports[_ekey] = {
-                            "data": _res.getvalue(), "fname": _fn, "mime": _mime
-                        }
-                        st.rerun()
-                else:
-                    _ec = st.session_state.pq_val_exports[_ekey]
-                    st.download_button(
-                        "Download", data=_ec["data"], file_name=_ec["fname"],
-                        mime=_ec["mime"], use_container_width=True, type="primary",
-                        key=f"dl_{_ekey}",
-                    )
+    
+    # ── CONSOLIDATED SINGLE-FILE EXPORT ──────────────────────────
+    _export_df = _pq_data.copy()
+    
+    _status_map = st.session_state.final_report.set_index("ProductSetSid")["Status"].to_dict()
+    _flag_map = st.session_state.final_report.set_index("ProductSetSid")["FLAG"].to_dict()
+    _comment_map = st.session_state.final_report.set_index("ProductSetSid")["Comment"].to_dict()
+    
+    def _get_final_flag(sku):
+        stat = _status_map.get(sku, "Approved")
+        if stat == "Approved":
+            return "ok"
+        return _flag_map.get(sku, "Rejected")
+        
+    def _get_final_comment(sku):
+        stat = _status_map.get(sku, "Approved")
+        if stat == "Approved":
+            return "ok"
+        return _comment_map.get(sku, "")
+        
+    _export_df["FINAL_FLAG"] = _export_df["PRODUCT_SET_SID"].apply(_get_final_flag)
+    _export_df["FLAG_REASON"] = _export_df["PRODUCT_SET_SID"].apply(_get_final_comment)
+    
+    # Clean up advisory internal flags from export
+    _export_df = _export_df.drop(columns=[c for c in _export_df.columns if c.startswith("_")], errors="ignore")
+    
+    st.download_button(
+        label="Download Final Results (.xlsx)",
+        data=_to_excel_bytes(_export_df),
+        file_name=f"Post_QC_Results_{pq_country}_{country_code}_{_date_str}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        type="primary"
+    )
 
 # ------------------------------------------------------------------
 # JTBRIDGE — receives reject / undo messages from the iframe
@@ -1957,10 +2080,6 @@ renderAll();
 </html>"""
 
 
-# ------------------------------------------------------------------
-# CALL THE IMAGE GRID
-# Only when validation has run and produced data.
-# ------------------------------------------------------------------
 # ------------------------------------------------------------------
 # CALL THE IMAGE GRID
 # Render whenever product data is available — works with or without
