@@ -718,6 +718,8 @@ def load_nigeria_qc_rules() -> Dict:
         "hp_toners":  {"sellers": set(), "category_codes": set()},
         "apple":      {"sellers": set()},
         "xmas_tree":  {"sellers": set(), "keywords": set()},
+        "rice":       {},   # brand_lower -> {"sellers": set, "category_codes": set}
+        "powerbanks": {"brands": set(), "category_codes": set()},
     }
 
     if not os.path.exists(FILE_NAME):
@@ -828,6 +830,60 @@ def load_nigeria_qc_rules() -> Dict:
     except Exception as e:
         logger.warning(f"load_nigeria_qc_rules xmas_tree: {e}")
 
+    # ── Rice ──────────────────────────────────────────────────────────────────
+    # Sheet layout: Brand | Sellers (comma-separated in one cell) | Categories
+    # Rule: Only the listed sellers may sell a given rice brand in those category codes.
+    try:
+        df = safe_excel_read(FILE_NAME, sheet_name="Rice")
+        if not df.empty:
+            df.columns = [str(c).strip() for c in df.columns]
+            brand_col   = df.columns[0]
+            sellers_col = df.columns[1]
+            cat_col     = df.columns[2] if len(df.columns) > 2 else None
+            for _, row in df.iterrows():
+                brand = str(row[brand_col]).strip().lower()
+                if not brand or brand == "nan":
+                    continue
+                raw_sellers = str(row.get(sellers_col, "")).strip()
+                # Sellers are comma-separated inside a single cell
+                sellers = set()
+                if raw_sellers and raw_sellers.lower() != "nan":
+                    sellers = {s.strip().lower() for s in raw_sellers.split(",") if s.strip()}
+                cat_code = ""
+                if cat_col:
+                    raw_cat = str(row.get(cat_col, "")).strip()
+                    if raw_cat and raw_cat.lower() != "nan":
+                        cat_code = clean_category_code(raw_cat)
+                if brand not in result["rice"]:
+                    result["rice"][brand] = {"sellers": set(), "category_codes": set()}
+                result["rice"][brand]["sellers"].update(sellers)
+                if cat_code:
+                    result["rice"][brand]["category_codes"].add(cat_code)
+    except Exception as e:
+        logger.warning(f"load_nigeria_qc_rules rice: {e}")
+
+    # ── 20,000mAh+ Powerbanks ─────────────────────────────────────────────────
+    # Sheet layout: Brand | Categories
+    # Rule: If a product name contains a mAh value >= 20,000, only the listed
+    #       brands are permitted within the powerbank category codes.
+    try:
+        df = safe_excel_read(FILE_NAME, sheet_name="20,000mah Powerbanks")
+        if not df.empty:
+            df.columns = [str(c).strip() for c in df.columns]
+            brand_col = df.columns[0]
+            cat_col   = df.columns[1] if len(df.columns) > 1 else None
+            result["powerbanks"]["brands"] = (
+                set(df[brand_col].dropna().astype(str).str.strip().str.lower())
+                - {"", "nan", "brand"}
+            )
+            if cat_col:
+                result["powerbanks"]["category_codes"] = (
+                    set(df[cat_col].dropna().astype(str).apply(clean_category_code))
+                    - {"", "nan"}
+                )
+    except Exception as e:
+        logger.warning(f"load_nigeria_qc_rules powerbanks: {e}")
+
     return result
 
 # -------------------------------------------------
@@ -866,6 +922,8 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
         'NG - HP Toners Seller':  ('1000003 - Restricted Brand', "Seller not authorised to sell HP Ink/Toners in these categories."),
         'NG - Apple Seller':      ('1000003 - Restricted Brand', "Seller not authorised to sell Apple products."),
         'NG - Xmas Tree Seller':  ('1000003 - Restricted Brand', "Seller not authorised to sell Christmas Tree products."),
+        'NG - Rice Brand Seller': ('1000003 - Restricted Brand', "Seller not authorised to sell this rice brand."),
+        'NG - Powerbank Capacity':('1000007 - Other Reason',     "Only approved brands may list powerbanks with 20,000mAh or above capacity."),
     }
 
     default_mapping = {}
@@ -1113,6 +1171,8 @@ FLAG_RELEVANT_COLS = {
     "NG - HP Toners Seller":  ["CATEGORY_CODE", "BRAND", "SELLER_NAME"],
     "NG - Apple Seller":      ["BRAND", "SELLER_NAME"],
     "NG - Xmas Tree Seller":  ["NAME", "SELLER_NAME"],
+    "NG - Rice Brand Seller": ["CATEGORY_CODE", "BRAND", "SELLER_NAME"],
+    "NG - Powerbank Capacity":["CATEGORY_CODE", "NAME", "BRAND"],
 }
 
 def compute_flag_input_hash(data: pd.DataFrame, flag_name: str, kwargs: dict) -> str:
@@ -1788,6 +1848,115 @@ def check_nigeria_xmas_tree(data: pd.DataFrame, ng_rules: Dict) -> pd.DataFrame:
     return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
+def check_nigeria_rice(data: pd.DataFrame, ng_rules: Dict) -> pd.DataFrame:
+    """
+    Per-brand rice seller restriction (Nigeria only).
+    Sheet: Rice  |  Cols: Brand | Sellers (comma-separated) | Categories
+    Rule : For each brand row, only the sellers listed in that row's Sellers
+           cell may list products of that brand in the matching category codes.
+    Reason: 1000003 - Restricted Brand
+    """
+    rice_rules = ng_rules.get("rice", {})  # brand_lower -> {sellers, category_codes}
+    if not rice_rules:
+        return pd.DataFrame(columns=data.columns)
+    if not {"BRAND", "SELLER_NAME", "CATEGORY_CODE"}.issubset(data.columns):
+        return pd.DataFrame(columns=data.columns)
+
+    d = data.copy()
+    d["_brand_l"]  = d["BRAND"].astype(str).str.strip().str.lower()
+    d["_seller_l"] = d["SELLER_NAME"].astype(str).str.strip().str.lower()
+    d["_cat"]      = d["CATEGORY_CODE"].apply(clean_category_code)
+
+    chunks: list = []
+    for brand_lower, rules in rice_rules.items():
+        approved  = rules.get("sellers", set())
+        cat_codes = rules.get("category_codes", set())
+        brand_rows = d[d["_brand_l"] == brand_lower].copy()
+        if brand_rows.empty:
+            continue
+        # If category codes are specified, restrict to those categories
+        if cat_codes:
+            brand_rows = brand_rows[brand_rows["_cat"].isin(cat_codes)]
+        if brand_rows.empty:
+            continue
+        # Flag rows whose seller is NOT in the approved set
+        bad = brand_rows[~brand_rows["_seller_l"].isin(approved)].copy()
+        if not bad.empty:
+            bad["Comment_Detail"] = (
+                f"Seller not authorised to sell {brand_lower.title()} rice: "
+                + bad["SELLER_NAME"].astype(str)
+            )
+            chunks.append(bad)
+
+    if not chunks:
+        return pd.DataFrame(columns=data.columns)
+
+    result = pd.concat(chunks)
+    return result.drop_duplicates(subset=["PRODUCT_SET_SID"])
+
+
+def check_nigeria_powerbanks(data: pd.DataFrame, ng_rules: Dict) -> pd.DataFrame:
+    """
+    High-capacity powerbank brand restriction (Nigeria only).
+    Sheet: 20,000mah Powerbanks  |  Cols: Brand | Categories
+    Rule : If a product name contains a mAh value >= 20,000, only the brands
+           listed in the sheet are permitted within those category codes.
+    Reason: 1000007 - Other Reason (same as Prohibited products)
+    """
+    pb_rules       = ng_rules.get("powerbanks", {})
+    allowed_brands = pb_rules.get("brands", set())
+    cat_codes      = pb_rules.get("category_codes", set())
+    MIN_MAH        = 20_000
+
+    if not allowed_brands:
+        return pd.DataFrame(columns=data.columns)
+    if not {"CATEGORY_CODE", "NAME", "BRAND"}.issubset(data.columns):
+        return pd.DataFrame(columns=data.columns)
+
+    _mah_pat = re.compile(r'\b(\d[\d,]*)\s*mah\b', re.IGNORECASE)
+
+    def _exceeds_threshold(name: str) -> bool:
+        for m in _mah_pat.finditer(str(name)):
+            try:
+                val = int(m.group(1).replace(',', ''))
+                if val >= MIN_MAH:
+                    return True
+            except ValueError:
+                pass
+        return False
+
+    d = data.copy()
+    d["_cat"]     = d["CATEGORY_CODE"].apply(clean_category_code)
+    d["_name"]    = d["NAME"].astype(str)
+    d["_brand_l"] = d["BRAND"].astype(str).str.strip().str.lower()
+
+    # Scope: within powerbank category codes (if specified)
+    in_scope = d[d["_cat"].isin(cat_codes)].copy() if cat_codes else d.copy()
+    if in_scope.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    # Keep only products whose name has a mAh value >= 20,000
+    high_cap = in_scope[in_scope["_name"].apply(_exceeds_threshold)].copy()
+    if high_cap.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    # Flag those whose brand is NOT in the allowed list
+    flagged = high_cap[~high_cap["_brand_l"].isin(allowed_brands)].copy()
+    if not flagged.empty:
+        def _comment(row):
+            m = _mah_pat.search(row["_name"])
+            mah_str = m.group(0) if m else ">=20,000mAh"
+            return (
+                f"Brand '{row['BRAND']}' not approved for {mah_str} powerbanks. "
+                f"Approved: {', '.join(b.title() for b in sorted(allowed_brands))}"
+            )
+        flagged["Comment_Detail"] = flagged.apply(_comment, axis=1)
+
+    return flagged[
+        [c for c in data.columns if c in flagged.columns] + ["Comment_Detail"]
+    ].drop_duplicates(subset=["PRODUCT_SET_SID"])
+
+
 # -------------------------------------------------
 # REGISTER CHECK FUNCTIONS FOR postqc.py
 # -------------------------------------------------
@@ -1824,6 +1993,8 @@ if _reg is not None:
         'check_nigeria_hp_toners':           check_nigeria_hp_toners,
         'check_nigeria_apple':               check_nigeria_apple,
         'check_nigeria_xmas_tree':           check_nigeria_xmas_tree,
+        'check_nigeria_rice':                check_nigeria_rice,
+        'check_nigeria_powerbanks':          check_nigeria_powerbanks,
         'load_nigeria_qc_rules':             load_nigeria_qc_rules,
     })
 
@@ -1868,12 +2039,14 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
     if country_validator.code == "NG":
         _ng = support_files.get("ng_qc_rules", {})
         validations += [
-            ("NG - Gift Card Seller",  check_nigeria_gift_card,  {"ng_rules": _ng}),
-            ("NG - Books Seller",      check_nigeria_books,      {"ng_rules": _ng}),
-            ("NG - TV Brand Seller",   check_nigeria_tvs,        {"ng_rules": _ng}),
-            ("NG - HP Toners Seller",  check_nigeria_hp_toners,  {"ng_rules": _ng}),
-            ("NG - Apple Seller",      check_nigeria_apple,      {"ng_rules": _ng}),
-            ("NG - Xmas Tree Seller",  check_nigeria_xmas_tree,  {"ng_rules": _ng}),
+            ("NG - Gift Card Seller",  check_nigeria_gift_card,   {"ng_rules": _ng}),
+            ("NG - Books Seller",      check_nigeria_books,       {"ng_rules": _ng}),
+            ("NG - TV Brand Seller",   check_nigeria_tvs,         {"ng_rules": _ng}),
+            ("NG - HP Toners Seller",  check_nigeria_hp_toners,   {"ng_rules": _ng}),
+            ("NG - Apple Seller",      check_nigeria_apple,       {"ng_rules": _ng}),
+            ("NG - Xmas Tree Seller",  check_nigeria_xmas_tree,   {"ng_rules": _ng}),
+            ("NG - Rice Brand Seller", check_nigeria_rice,        {"ng_rules": _ng}),
+            ("NG - Powerbank Capacity",check_nigeria_powerbanks,  {"ng_rules": _ng}),
         ]
 
     results = {}
@@ -2519,6 +2692,7 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
         "Incomplete Smartphone Name", "Duplicate product", "Poor images", "Perfume Tester",
         "NG - Gift Card Seller", "NG - Books Seller", "NG - TV Brand Seller",
         "NG - HP Toners Seller", "NG - Apple Seller", "NG - Xmas Tree Seller",
+        "NG - Rice Brand Seller", "NG - Powerbank Capacity",
         "Other Reason (Custom)",
     ]
 
