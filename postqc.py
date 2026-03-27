@@ -450,7 +450,7 @@ REQUIRED_SYMBOLS = [
     'check_generic_with_brand_in_name', 'check_missing_color',
     'check_weight_volume_in_name', 'check_incomplete_smartphone_name',
     'check_duplicate_products', 'check_miscellaneous_category',
-    'compile_regex_patterns', 'FX_RATE',
+    'compile_regex_patterns',
 ]
 NG_SYMBOLS = [
     'check_nigeria_gift_card', 'check_nigeria_books', 'check_nigeria_tvs',
@@ -547,7 +547,9 @@ def build_quality_report(
 
     if have_preqc:
         crx = symbols['compile_regex_patterns']
-        FX  = symbols['FX_RATE']
+        # Slice suspected_fake to the current country — each sheet uses local currency
+        _sf_all = support_files.get('suspected_fake', {})
+        suspected_fake_df = _sf_all.get(country_code, pd.DataFrame()) if isinstance(_sf_all, dict) else pd.DataFrame()
 
         # CRITICAL
         _register(symbols['check_prohibited_products'](df, prohibited_rules=support_files.get('prohibited_words_all', {}).get(country_code, [])),
@@ -556,7 +558,7 @@ def build_quality_report(
                   'critical', 'Counterfeit Flag', 'Counterfeit sneaker detected')
         _register(symbols['check_counterfeit_jerseys'](df, jerseys_data=support_files.get('jerseys_data', {}), country_code=country_code),
                   'critical', 'Counterfeit Flag', 'Counterfeit jersey detected')
-        _register(symbols['check_suspected_fake_products'](df, suspected_fake_df=support_files.get('suspected_fake', pd.DataFrame()), fx_rate=FX),
+        _register(symbols['check_suspected_fake_products'](df, suspected_fake_df=suspected_fake_df),
                   'critical', 'Counterfeit Flag', 'Suspected counterfeit (price)') # also flags Suspicious Price below
 
         # HIGH
@@ -566,7 +568,7 @@ def build_quality_report(
                   'high', 'Restricted Brand')
         _register(symbols['check_unnecessary_words'](df, pattern=crx(support_files.get('blacklisted_words', []))),
                   'high', 'Blacklisted Keyword')
-        _register(symbols['check_suspected_fake_products'](df, suspected_fake_df=support_files.get('suspected_fake', pd.DataFrame()), fx_rate=FX),
+        _register(symbols['check_suspected_fake_products'](df, suspected_fake_df=suspected_fake_df),
                   'high', 'Suspicious Price', 'Price below threshold for brand/category')
 
         # HIGH — Nigeria-specific seller restrictions
