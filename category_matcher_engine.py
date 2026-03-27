@@ -34,10 +34,15 @@ class CategoryMatcherEngine:
         self.categories = []
         self._tfidf_built = False
         self.learning_db = {}
+        self.compiled_rules = {}  # Store JSON rules directly in the engine
         self.correction_classifier = None
         self.correction_vectorizer = None
         self._init_db()
         self.load_learning_db()
+
+    def set_compiled_rules(self, rules: dict):
+        """Loads the JSON heuristic rules into the engine."""
+        self.compiled_rules = rules or {}
 
     def _init_db(self):
         try:
@@ -159,63 +164,55 @@ class CategoryMatcherEngine:
                     return cat
         return ""
 
-    def get_category_with_boost(self, name: str, compiled_rules: dict, top_n: int = 15) -> str:
+    def get_category_with_boost(self, name: str, top_n: int = 20) -> str:
         """
-        Gets the top N TF-IDF predictions, applies JSON heuristic boosts, 
+        Gets the top N TF-IDF predictions, applies internal JSON heuristic boosts, 
         and returns the highest scoring category.
         """
-        # Always check learning DB first - exact human corrections override everything
         learned = self.predict_category_from_learning(name)
         if learned: 
             return learned
 
-        # Fallback if the engine hasn't been trained yet
         if not getattr(self, '_tfidf_built', False):
             return ""
         
         try:
-            # 1. Get base TF-IDF scores for this product name
             name_clean = clean_text(name)
             name_vec = self.vectorizer.transform([name_clean])
-            cosine_similarities = cosine_similarity(name_vec, self.tfidf_matrix).flatten()
+            similarities = cosine_similarity(name_vec, self.tfidf_matrix).flatten()
             
-            # 2. Get the indices of the top N scores to save processing time
-            # np.argsort sorts ascending, so we take the last `top_n` and reverse them
-            top_indices = cosine_similarities.argsort()[-top_n:][::-1]
+            top_indices = similarities.argsort()[-top_n:][::-1]
             
             best_category = ""
             best_score = -1.0
             name_lower = str(name).lower()
             
-            # 3. Apply boosting ONLY to the Top N categories
             for idx in top_indices:
                 cat_path = self.categories[idx]
-                base_score = float(cosine_similarities[idx])
-                boost_amount = 0.0
+                base_score = float(similarities[idx])
+                boost = 0.0
                 
-                # Check if we have compiled JSON rules for this specific category
-                if cat_path in compiled_rules:
-                    rule = compiled_rules[cat_path]
-                    
-                    # Find all keyword matches in the product name instantly
+                # Use internal self.compiled_rules instead of passing it as an arg
+                if cat_path in self.compiled_rules:
+                    rule = self.compiled_rules[cat_path]
                     matches = rule['pattern'].findall(name_lower)
-                    
                     if matches:
-                        # Sum the weights for unique matches found in the title
-                        boost_amount = sum(rule['weights'].get(m.lower(), 0.0) for m in set(matches))
+                        boost = sum(rule['weights'].get(m.lower(), 0.0) for m in set(matches))
                 
-                # Calculate final score: Base TF-IDF + (JSON Boost * Multiplier)
-                final_score = base_score + (boost_amount * 0.5) 
+                final_score = base_score + (boost * 0.6) # Increased multiplier slightly for more authority
                 
-                # Keep track of the highest scoring category
                 if final_score > best_score:
                     best_score = final_score
                     best_category = cat_path
-                    
+            
+            # Reject garbage matches if confidence is too low
+            if best_score < 0.12:
+                return ""
+                
             return best_category
             
         except Exception as e:
-            logger.warning(f"Error in boosted prediction: {e}")
+            logger.warning(f"Boosted prediction failed: {e}")
             return ""
 
     def build_keyword_to_category_mapping(self) -> dict:
@@ -240,7 +237,7 @@ def get_engine(db_path="cat_learning.db"):
             _engine_instance = None
     return _engine_instance
 
-def check_wrong_category(data: pd.DataFrame, categories_list: list, cat_path_to_code: dict = None, code_to_path: dict = None, confidence_threshold: float = 0.0):
+def check_wrong_category(data: pd.DataFrame, categories_list: list, compiled_rules: dict = None, cat_path_to_code: dict = None, code_to_path: dict = None, confidence_threshold: float = 0.0):
     if not {'NAME', 'CATEGORY'}.issubset(data.columns) or not categories_list:
         return pd.DataFrame(columns=data.columns)
         
@@ -250,6 +247,10 @@ def check_wrong_category(data: pd.DataFrame, categories_list: list, cat_path_to_
 
     if not engine._tfidf_built:
         engine.build_tfidf_index(categories_list)
+
+    # CRITICAL: Feed the engine the JSON rules so it can use them!
+    if compiled_rules:
+        engine.set_compiled_rules(compiled_rules)
 
     if cat_path_to_code is None: cat_path_to_code = {}
     if code_to_path is None: code_to_path = {}
@@ -283,13 +284,19 @@ def check_wrong_category(data: pd.DataFrame, categories_list: list, cat_path_to_
             comment_map[idx] = "Category is 'Miscellaneous'"
             continue
 
-        predicted = engine.get_category_with_fallback(name, kw_map, categories_list)
+        # ---> CRITICAL FIX: The automated scanner now uses the JSON boost!
+        predicted = engine.get_category_with_boost(name)
+        
+        # Fallback to standard tf-idf if boost rejected it for low confidence
+        if not predicted:
+            predicted = engine.get_category_with_fallback(name, kw_map, categories_list)
         
         if predicted and predicted.lower() != current_cat.lower():
-            p_parts = [p.strip() for p in predicted.split('>')]
-            c_parts = [p.strip() for p in current_cat.split('>')]
+            # Extract just the "leaf" category (the final word in the path) for a cleaner comparison
+            p_leaf = predicted.split('>')[-1].strip().lower()
+            c_leaf = current_cat.split('>')[-1].strip().lower()
             
-            if p_parts[-1].lower() != c_parts[-1].lower():
+            if p_leaf != c_leaf:
                 flagged_indices.append(idx)
                 comment_map[idx] = f"Wrong Category. Suggested: {predicted}"
 
