@@ -2657,11 +2657,11 @@ def bulk_approve_dialog(sids_to_process, title, subset_data, data_has_warranty_c
                     st.session_state.final_report.loc[st.session_state.final_report['ProductSetSid'] == sid, ['Status', 'Reason', 'Comment', 'FLAG']] = ['Rejected', new_row.iloc[0]['Reason'], new_row.iloc[0]['Comment'], new_flag]
                     msg_moved[new_flag] = msg_moved.get(new_flag, 0) + 1
 
-            if title == "Wrong Category" and _CAT_MATCHER_AVAILABLE:
+                        if title == "Wrong Category" and _CAT_MATCHER_AVAILABLE:
                 try:
                     _engine = _get_cat_matcher_engine()
                     if _engine is not None:
-                                                learned_count = 0
+                        learned_count = 0
                         for sid in sids_to_process:
                             row = subset_data[subset_data['PRODUCT_SET_SID'].astype(str).str.strip() == str(sid)]
                             if row.empty:
@@ -2670,10 +2670,10 @@ def bulk_approve_dialog(sids_to_process, title, subset_data, data_has_warranty_c
                             if not name:
                                 continue
 
-                            # === REPLACEMENT 3 START ===
+                            # === FIXED REPLACEMENT 3 ===
                             _engine.set_compiled_rules(st.session_state.get('compiled_json_rules', {}))
                             predicted = _engine.get_category_with_boost(name)
-                            # === REPLACEMENT 3 END ===
+                            # === END OF FIX ===
 
                             if predicted and predicted.lower() not in ('nan', 'none', 'uncategorized', ''):
                                 _engine.apply_learned_correction(name, predicted, auto_save=False)
@@ -2681,11 +2681,15 @@ def bulk_approve_dialog(sids_to_process, title, subset_data, data_has_warranty_c
                         if learned_count:
                             _engine.save_learning_db()
                             if _CAT_MATCHER_AVAILABLE and hasattr(_engine, '_retrain_correction_classifier'):
-                                try: _engine._retrain_correction_classifier()
-                                except: pass
+                                try:
+                                    _engine._retrain_correction_classifier()
+                                except:
+                                    pass
                             st.session_state.main_toasts.append(
                                 f"🧠 Engine learned {learned_count} correction(s) from your approvals."
                             )
+                except Exception as _le:
+                    logger.warning("Wrong Category approval learning failed: %s", _le)
                 except Exception as _le:
                     logger.warning("Wrong Category approval learning failed: %s", _le)
 
@@ -2822,7 +2826,7 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
                             if _engine is not None and _cats:
                                 if not _engine._tfidf_built:
                                     _engine.build_tfidf_index(_cats)
-                                                                learned_count = 0
+                                                                                                learned_count = 0
                                 for sid in to_reject:
                                     prod_row = data[data['PRODUCT_SET_SID'].astype(str).str.strip() == str(sid)]
                                     if prod_row.empty:
@@ -2831,10 +2835,10 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
                                     if not name:
                                         continue
 
-                                    # === REPLACEMENT 3 START ===
+                                    # === FIXED REPLACEMENT 3 ===
                                     _engine.set_compiled_rules(st.session_state.get('compiled_json_rules', {}))
                                     predicted = _engine.get_category_with_boost(name)
-                                    # === REPLACEMENT 3 END ===
+                                    # === END OF FIX ===
 
                                     if predicted and predicted.lower() not in ('nan', 'none', 'uncategorized', ''):
                                         _engine.apply_learned_correction(name, predicted, auto_save=False)
@@ -2842,8 +2846,10 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
                                 if learned_count:
                                     _engine.save_learning_db()
                                     if _CAT_MATCHER_AVAILABLE and hasattr(_engine, '_retrain_correction_classifier'):
-                                        try: _engine._retrain_correction_classifier()
-                                        except: pass
+                                        try:
+                                            _engine._retrain_correction_classifier()
+                                        except:
+                                            pass
                                     st.session_state.main_toasts.append(
                                         f"🧠 Engine noted {learned_count} missed Wrong Category item(s) for future runs."
                                     )
