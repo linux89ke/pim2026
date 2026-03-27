@@ -147,7 +147,8 @@ FULL_DATA_COLS = [
 
 GRID_COLS = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'CATEGORY', 'SELLER_NAME', 'MAIN_IMAGE', 'GLOBAL_SALE_PRICE', 'GLOBAL_PRICE', 'COLOR']
 
-FX_RATE = 128.0
+# FX_RATE removed — price thresholds in suspected_fake.xlsx are stored in each
+# country's local currency, so no conversion is needed or applicable.
 
 COUNTRY_CURRENCY = {
     "Kenya":   {"code": "KES", "symbol": "KSh", "pair": "USD/KES"},
@@ -574,8 +575,9 @@ def load_refurb_data_from_local() -> dict:
             df = safe_excel_read(FILE_NAME, sheet_name=tab, usecols=[0, 1])
             if not df.empty:
                 df.columns = [str(c).strip() for c in df.columns]
-                laptops_set = set(df.iloc[:, 1].dropna().astype(str).str.strip().str.lower()) - {"", "nan", "laptops"}
-                result["sellers"][tab] = {"Phones": set(), "Laptops": laptops_set}
+                phones_set  = set(df.iloc[:, 0].dropna().astype(str).str.strip().str.lower()) - {"", "nan", "phones", "phone"}
+                laptops_set = set(df.iloc[:, 1].dropna().astype(str).str.strip().str.lower()) - {"", "nan", "laptops", "laptop"}
+                result["sellers"][tab] = {"Phones": phones_set, "Laptops": laptops_set}
         except Exception as e:
             logger.warning(f"load_refurb_data tab={tab}: {e}")
             result["sellers"][tab] = {"Phones": set(), "Laptops": set()}
@@ -685,13 +687,21 @@ def load_jerseys_from_local() -> Dict:
     return result
 
 @st.cache_data(ttl=3600)
-def load_suspected_fake_from_local() -> pd.DataFrame:
-    try:
-        if os.path.exists('suspected_fake.xlsx'):
-            return pd.read_excel('suspected_fake.xlsx', sheet_name=0, engine='openpyxl', dtype=str)
-    except Exception as e:
-        logger.warning(f"load_suspected_fake: {e}")
-    return pd.DataFrame()
+def load_suspected_fake_from_local() -> Dict:
+    """Returns {country_code: DataFrame} for all countries.
+    Each sheet uses that country's local currency — no FX conversion needed."""
+    country_codes = ["KE", "UG", "NG", "MA", "GH"]
+    if not os.path.exists('suspected_fake.xlsx'):
+        logger.warning("suspected_fake.xlsx not found")
+        return {code: pd.DataFrame() for code in country_codes}
+    result = {}
+    for code in country_codes:
+        try:
+            result[code] = pd.read_excel('suspected_fake.xlsx', sheet_name=code, engine='openpyxl', dtype=str)
+        except Exception as e:
+            logger.warning(f"load_suspected_fake country={code}: {e}")
+            result[code] = pd.DataFrame()
+    return result
 
 # -------------------------------------------------
 # NIGERIA QC RULES LOADER
@@ -1320,7 +1330,7 @@ def check_prohibited_products(data: pd.DataFrame, prohibited_rules: List[Dict]) 
     for idx, new_name in name_replacements.items(): result.loc[idx, 'NAME'] = new_name
     return result.drop_duplicates(subset=['PRODUCT_SET_SID'])
 
-def check_suspected_fake_products(data: pd.DataFrame, suspected_fake_df: pd.DataFrame, fx_rate: float) -> pd.DataFrame:
+def check_suspected_fake_products(data: pd.DataFrame, suspected_fake_df: pd.DataFrame) -> pd.DataFrame:
     if not all(c in data.columns for c in ['CATEGORY_CODE', 'BRAND', 'GLOBAL_SALE_PRICE', 'GLOBAL_PRICE']) or suspected_fake_df.empty:
         return pd.DataFrame(columns=data.columns)
     try:
@@ -1985,7 +1995,6 @@ if _reg is not None:
         'check_duplicate_products':          check_duplicate_products,
         'check_miscellaneous_category':      check_miscellaneous_category,
         'compile_regex_patterns':            compile_regex_patterns,
-        'FX_RATE':                           FX_RATE,
         # Nigeria-specific
         'check_nigeria_gift_card':           check_nigeria_gift_card,
         'check_nigeria_books':               check_nigeria_books,
@@ -2005,6 +2014,7 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
     data['PRODUCT_SET_SID'] = data['PRODUCT_SET_SID'].astype(str).str.strip()
     flags_mapping = support_files['flags_mapping']
     country_restricted_rules = support_files.get('restricted_brands_all', {}).get(country_validator.country, [])
+    suspected_fake_df = support_files.get('suspected_fake', {}).get(country_validator.code, pd.DataFrame()) if isinstance(support_files.get('suspected_fake'), dict) else pd.DataFrame()
     country_prohibited_words = support_files.get('prohibited_words_all', {}).get(country_validator.code, [])
     validations = [
         ("Wrong Category", check_miscellaneous_category, {
@@ -2013,7 +2023,7 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
             'code_to_path': support_files.get('code_to_path', {}),
         }),
         ("Restricted brands", check_restricted_brands, {'country_rules': country_restricted_rules}),
-        ("Suspected Fake product", check_suspected_fake_products, {'suspected_fake_df': support_files['suspected_fake'], 'fx_rate': FX_RATE}),
+        ("Suspected Fake product", check_suspected_fake_products, {'suspected_fake_df': suspected_fake_df}),
         ("Seller Not approved to sell Refurb", check_refurb_seller_approval, {'refurb_data': support_files.get('refurb_data', {}), 'country_code': country_validator.code}),
         ("Product Warranty", check_product_warranty, {'warranty_category_codes': support_files['warranty_category_codes']}),
         ("Seller Approve to sell books", check_seller_approved_for_books, {'books_data': support_files.get('books_data', {}), 'country_code': country_validator.code, 'book_category_codes': support_files['book_category_codes']}),
