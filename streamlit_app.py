@@ -255,6 +255,8 @@ if 'ls_processed_flag' not in st.session_state: st.session_state.ls_processed_fl
 if 'ls_read_trigger' not in st.session_state: st.session_state.ls_read_trigger = 0
 if 'flags_expanded_initialized' not in st.session_state: st.session_state.flags_expanded_initialized = False
 
+if 'compiled_json_rules' not in st.session_state: st.session_state.compiled_json_rules = load_and_compile_json_rules()
+
 _pre_country = st.session_state.get("country_selector") or st.session_state.get("selected_country", "Kenya")
 if _pre_country == "Morocco":
     st.session_state.ui_lang = "fr"
@@ -1033,6 +1035,30 @@ def load_all_support_files() -> Dict:
 
 @st.cache_data(ttl=3600)
 def load_support_files_lazy(): return load_all_support_files()
+
+@st.cache_data(ttl=3600)
+def load_and_compile_json_rules(json_path="category_qc_weighted.json") -> dict:
+    if not os.path.exists(json_path):
+        logger.warning(f"{json_path} not found. Running without JSON boosts.")
+        return {}
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            raw_rules = json.load(f)
+    except Exception as e:
+        logger.warning(f"Could not load JSON rules: {e}")
+        return {}
+
+    compiled_rules = {}
+    for cat_path, keywords_dict in raw_rules.items():
+        if not keywords_dict:
+            continue
+        sorted_kws = sorted(keywords_dict.keys(), key=len, reverse=True)
+        pattern_str = r'\b(' + '|'.join(re.escape(k) for k in sorted_kws) + r')\b'
+        compiled_rules[cat_path] = {
+            'pattern': re.compile(pattern_str, re.IGNORECASE),
+            'weights': {k.lower(): float(w) for k, w in keywords_dict.items()}
+        }
+    return compiled_rules
 
 @st.cache_data(ttl=3600)
 def compile_regex_patterns(words: List[str]) -> re.Pattern:
@@ -2747,7 +2773,6 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
                             if _engine is not None and _cats:
                                 if not _engine._tfidf_built:
                                     _engine.build_tfidf_index(_cats)
-                                _kw_map = _engine.build_keyword_to_category_mapping()
                                 learned_count = 0
                                 for sid in to_reject:
                                     prod_row = data[data['PRODUCT_SET_SID'].astype(str).str.strip() == str(sid)]
@@ -2756,7 +2781,10 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
                                     name = str(prod_row.iloc[0].get('NAME', '')).strip()
                                     if not name:
                                         continue
-                                    predicted = _engine.get_category_with_fallback(name, _kw_map, _cats)
+                                        
+                                    # Call the new boosted prediction
+                                    predicted = _engine.get_category_with_boost(name, st.session_state.compiled_json_rules)
+                                    
                                     if predicted and predicted.lower() not in ('nan', 'none', 'uncategorized', ''):
                                         _engine.apply_learned_correction(name, predicted, auto_save=False)
                                         learned_count += 1
