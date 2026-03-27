@@ -1036,7 +1036,7 @@ def load_all_support_files() -> Dict:
 @st.cache_data(ttl=3600)
 def load_support_files_lazy(): return load_all_support_files()
 
-@st.cache_data(ttl=3600)
+@st.cache_resource(ttl=3600)
 def load_and_compile_json_rules(json_path="category_qc_weighted.json") -> dict:
     if not os.path.exists(json_path):
         logger.warning(f"{json_path} not found. Running without JSON boosts.")
