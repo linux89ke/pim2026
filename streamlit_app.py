@@ -1168,7 +1168,7 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
                 comment_str = base_comment
             # Honour a Reason override set by the check function itself
             row_reason = reason_map.get(sid, rinfo['reason'])
-            rows.append({'ProductSetSid': sid, 'ParentSKU': r.get('PARENTSKU', ''), 'Status': 'Rejected', 'Reason': row_reason, 'Comment': comment_str, 'FLAG': name, 'SellerName': r.get('SELLER_NAME', '')})
+            rows.append({'ProductSetSid': sid, 'ParentSKU': r.get('PARENTSKU', ''), 'Status': 'Rejected', 'Reason': row_reason, 'Comment': comment_str, 'FLAG': name, 'SellerName': r.get('SELLER_NAME', ''), 'CAT_MAX_PRICE': _cat_max_map.get(sid, '') if name == 'Category Max Price Exceeded' else ''})
 
     for _, r in data[~data['PRODUCT_SET_SID'].astype(str).str.strip().isin(processed)].iterrows():
         sid = str(r['PRODUCT_SET_SID']).strip()
