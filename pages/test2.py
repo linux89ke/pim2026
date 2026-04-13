@@ -1134,11 +1134,18 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
         if 'Comment_Detail' not in flagged.columns and 'Comment_Detail' in res.columns:
             if isinstance(res['Comment_Detail'], pd.DataFrame): flagged['Comment_Detail'] = res['Comment_Detail'].iloc[:, 0]
             else: flagged['Comment_Detail'] = res['Comment_Detail']
+        
         # Merge Reason from result df if the check set it explicitly (e.g. powerbank counterfeit vs wrong-cat)
         if 'Reason' in res.columns:
             reason_map = res.set_index('PRODUCT_SET_SID')['Reason'].to_dict()
         else:
             reason_map = {}
+
+        # Merge CAT_MAX_PRICE explicitly to avoid NameError on list comprehension below
+        if 'CAT_MAX_PRICE' in res.columns:
+            _cat_max_map = res.set_index('PRODUCT_SET_SID')['CAT_MAX_PRICE'].to_dict()
+        else:
+            _cat_max_map = {}
 
         for _, r in flagged.iterrows():
             sid = str(r['PRODUCT_SET_SID']).strip()
