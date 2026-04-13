@@ -209,64 +209,68 @@ CATEGORY_MAP_XLSX = "category_map.xlsx"
 
 
 # ---------------------------------------------------------------------------
-# VALIDATION 1 — Discount too high
-# Flags products where discount exceeds 51% (when both prices are present
-# and valid). If either price is blank/zero/missing, the check is skipped.
+# VALIDATION 1 — Suspicious Discount (unified, replaces check_wrong_price)
+# Flags any discount > 51% when both prices are present and valid.
+# If either price is blank/zero/missing the check is skipped entirely.
 # ---------------------------------------------------------------------------
+
+_SUSP_DISCOUNT_REASON = (
+    "1000031 - Kindly Review & Update This Product's Price "
+    "or Confirm The Price Is Correct By Raising A Claim"
+)
+
+_SUSP_DISCOUNT_COMMENT = {
+    "en": (
+        "The current price of your product differs significantly from the market average. "
+        "Please review and update the price accordingly, or if you believe the current price "
+        "is correct, raise a claim with supporting justification. "
+        "Also, keep in mind: "
+        "Promotional periods must not exceed 90 days. "
+        "Misleading promotions are strictly prohibited. "
+        "The original (pre-discount) price must be accurate and should not be inflated "
+        "before applying a discount."
+    ),
+    "fr": (
+        "Le prix actuel de votre produit diffère fortement de la moyenne du marché. "
+        "Veuillez le revoir et le mettre à jour en conséquence. "
+        "Si vous estimez que le prix est justifié, vous pouvez soumettre une réclamation "
+        "accompagnée de preuves. "
+        "À noter également : "
+        "Les périodes promotionnelles ne doivent pas dépasser 90 jours. "
+        "Les promotions trompeuses sont strictement interdites. "
+        "Le prix d'origine (avant remise) doit être exact et ne doit pas être artificiellement "
+        "gonflé avant l'application de la réduction."
+    ),
+    "ar": (
+        "سعر المنتج الحالي يختلف بشكل ملحوظ عن متوسط السوق. "
+        "يرجى مراجعة السعر وتحديثه، أو في حال كنت ترى أن السعر صحيح، يمكنك تقديم طلب مراجعة "
+        "(Claim) مع تقديم ما يثبت ذلك. "
+        "يرجى أيضًا الالتزام بالتالي: "
+        "يجب ألا تتجاوز فترات العروض الترويجية 90 يومًا. "
+        "يُمنع تمامًا استخدام عروض ترويجية مضللة. "
+        "يجب أن يكون السعر الأصلي (قبل الخصم) دقيقًا وغير مبالغ فيه قبل تطبيق التخفيض. "
+        "الالتزام بهذه القواعد يعزز الشفافية ويُزيد من ثقة العملاء."
+    ),
+}
+
+# Morocco uses French; Arabic-speaking countries use Arabic; all others use English
+_COUNTRY_LANG = {
+    "MA": "fr",
+    "EG": "ar",
+}
+
+
+def _susp_discount_comment(country_code: str) -> str:
+    lang = _COUNTRY_LANG.get(country_code, "en")
+    return _SUSP_DISCOUNT_COMMENT[lang]
+
+
 def check_wrong_price(data: pd.DataFrame, country_code: str = "KE") -> pd.DataFrame:
     """
-    Flags products with a discount > 51% (sale price vs regular price).
-
-    Rules:
-      • If GLOBAL_PRICE is blank/zero/missing → skip (no discount to check)
-      • If GLOBAL_SALE_PRICE is blank/zero/missing → skip (no discount applied)
-      • Only flag when both prices are valid positive numbers AND
-        discount = (1 - sale/price) > 0.51
-
-    Input prices are assumed to be in USD and are converted to local currency
-    for the comment string only — the ratio check is currency-neutral.
+    Deprecated alias — delegates to check_suspicious_discount.
+    Kept so existing call-sites in main.py don't break.
     """
-    if not {"GLOBAL_PRICE", "GLOBAL_SALE_PRICE"}.issubset(data.columns):
-        return pd.DataFrame(columns=data.columns)
-
-    rate = _get_usd_rate(country_code)
-    sym  = _get_symbol(country_code)
-
-    d = data.copy()
-    d["price"]      = pd.to_numeric(d["GLOBAL_PRICE"],      errors="coerce")
-    d["sale_price"] = pd.to_numeric(d["GLOBAL_SALE_PRICE"], errors="coerce")
-
-    # Both prices must be present and positive — skip if either is blank/zero
-    valid_both = (
-        d["price"].notna()      & (d["price"]      > 0) &
-        d["sale_price"].notna() & (d["sale_price"] > 0)
-    )
-
-    discount_pct  = 1 - (d["sale_price"] / d["price"])
-    high_discount = valid_both & (discount_pct > 0.51)
-
-    flagged = d[high_discount].copy()
-
-    if not flagged.empty:
-        def build_comment(row):
-            p_usd  = row["price"]
-            sp_usd = row["sale_price"]
-            pct    = (1 - sp_usd / p_usd) * 100
-            p_loc  = p_usd  * rate
-            sp_loc = sp_usd * rate
-            return (
-                f"Discount too high: {pct:.1f}% "
-                f"(Price: USD {p_usd:,.2f} / {sym}{p_loc:,.0f} → "
-                f"Sale: USD {sp_usd:,.2f} / {sym}{sp_loc:,.0f})"
-            )
-
-        flagged["Comment_Detail"] = flagged.apply(build_comment, axis=1)
-
-    return (
-        flagged
-        .drop(columns=["price", "sale_price"], errors="ignore")
-        .drop_duplicates(subset=["PRODUCT_SET_SID"])
-    )
+    return check_suspicious_discount(data, country_code)
 
 
 # ---------------------------------------------------------------------------
@@ -355,39 +359,42 @@ def check_category_max_price(
 
 
 # ---------------------------------------------------------------------------
-# VALIDATION 3 — Suspicious Discount (> 50 %, up to 95 %)
-# Discounts > 95 % are handled exclusively by check_wrong_price.
+# VALIDATION 3 — Suspicious Discount (unified, > 51 %, no upper cap)
+# Flags products where the discount exceeds 51% when BOTH prices are present
+# and valid. Skipped entirely if either price is absent, zero, or missing.
+# Reason and comment are language-aware (EN / FR / AR by country).
 # ---------------------------------------------------------------------------
 def check_suspicious_discount(data: pd.DataFrame, country_code: str = "KE") -> pd.DataFrame:
     """
-    Flags products where the sale price is more than 50 % below the regular
-    price.  The 50–95 % window is checked here; > 95 % belongs to Wrong Price.
+    Flags products with a discount > 51% (sale price vs regular price).
 
-    Input prices are in USD; they are converted to local currency for the
-    comment string so QC agents see familiar figures.
+    Rules:
+      • Both GLOBAL_PRICE and GLOBAL_SALE_PRICE must be present and > 0.
+      • If either is blank / zero / missing → skip entirely.
+      • Flags when discount = (1 - sale/price) > 0.51, with no upper cap.
+      • Reason  : _SUSP_DISCOUNT_REASON (code 1000031)
+      • Comment : language-aware — FR for Morocco, AR for Egypt,
+                  EN for all other countries.
     """
     if not {"GLOBAL_PRICE", "GLOBAL_SALE_PRICE"}.issubset(data.columns):
         return pd.DataFrame(columns=data.columns)
 
-    rate = _get_usd_rate(country_code)
-    sym  = _get_symbol(country_code)
+    rate    = _get_usd_rate(country_code)
+    sym     = _get_symbol(country_code)
+    comment = _susp_discount_comment(country_code)
 
     d = data.copy()
     d["price"]      = pd.to_numeric(d["GLOBAL_PRICE"],      errors="coerce")
     d["sale_price"] = pd.to_numeric(d["GLOBAL_SALE_PRICE"], errors="coerce")
 
-    # Both prices must be valid, positive, and sale must actually be lower
-    valid = (
+    # Both prices must be present and positive
+    valid_both = (
         d["price"].notna()      & (d["price"]      > 0) &
-        d["sale_price"].notna() & (d["sale_price"] > 0) &
-        (d["sale_price"] < d["price"])
+        d["sale_price"].notna() & (d["sale_price"] > 0)
     )
 
     discount_pct = 1 - (d["sale_price"] / d["price"])
-
-    # Only the 51–95 % window is now handled by check_wrong_price (> 51 %).
-    # Suspicious Discount covers the same range for legacy/separate reporting.
-    flagged_mask = valid & (discount_pct > 0.50) & (discount_pct <= 0.95)
+    flagged_mask = valid_both & (discount_pct > 0.51)
 
     flagged = d[flagged_mask].copy()
 
@@ -398,13 +405,15 @@ def check_suspicious_discount(data: pd.DataFrame, country_code: str = "KE") -> p
             pct    = (1 - sp_usd / p_usd) * 100
             p_loc  = p_usd  * rate
             sp_loc = sp_usd * rate
-            return (
+            header = (
                 f"Suspicious discount of {pct:.1f}% "
                 f"(Regular: USD {p_usd:,.2f} / {sym}{p_loc:,.0f} → "
-                f"Sale: USD {sp_usd:,.2f} / {sym}{sp_loc:,.0f})"
+                f"Sale: USD {sp_usd:,.2f} / {sym}{sp_loc:,.0f})\n"
             )
+            return header + comment
 
         flagged["Comment_Detail"] = flagged.apply(build_comment, axis=1)
+        flagged["Reason_Detail"]  = _SUSP_DISCOUNT_REASON
 
     return (
         flagged
