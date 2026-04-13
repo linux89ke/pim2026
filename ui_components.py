@@ -144,14 +144,14 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
         _extra_cols = [c for c in current_display_cols if c in data.columns]
         if 'CATEGORY_CODE' in data.columns and 'CATEGORY_CODE' not in _extra_cols:
             _extra_cols.append('CATEGORY_CODE')
-        _sid_cols = ['ProductSetSid']
-        if title == "Category Max Price Exceeded" and 'CAT_MAX_PRICE' in df_flagged_sids.columns:
-            _sid_cols.append('CAT_MAX_PRICE')
         df_display = pd.merge(
-            df_flagged_sids[_sid_cols], data,
+            df_flagged_sids[['ProductSetSid']], data,
             left_on='ProjectSetSid' if 'ProjectSetSid' in df_flagged_sids.columns else 'ProductSetSid',
             right_on='PRODUCT_SET_SID', how='left'
-        )[[c for c in _sid_cols[1:] + _extra_cols if c in list(df_flagged_sids.columns) + list(data.columns)]]
+        )[[c for c in _extra_cols if c in data.columns]]
+        if title == 'Category Max Price Exceeded' and 'CAT_MAX_PRICE' in df_flagged_sids.columns:
+            _cap_map = df_flagged_sids.set_index('ProductSetSid')['CAT_MAX_PRICE'].to_dict()
+            df_display['CAT_MAX_PRICE'] = df_display['PRODUCT_SET_SID'].map(_cap_map)
 
         _code_to_path = support_files.get('code_to_path', {})
         if _code_to_path and 'CATEGORY_CODE' in df_display.columns:
