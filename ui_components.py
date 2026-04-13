@@ -136,22 +136,31 @@ def render_flag_expander(title, df_flagged_sids, data, data_has_warranty_cols_ch
         for col in ('COUNT_VARIATIONS', 'LIST_VARIATIONS'):
             if col in data.columns:
                 current_display_cols.append(col)
+    
+    # We DO NOT remove PRODUCT_SET_SID here anymore, we just append CAT_MAX_PRICE
     if title == "Category Max Price Exceeded":
-        current_display_cols = [c for c in current_display_cols if c != 'PRODUCT_SET_SID']
         current_display_cols.append('CAT_MAX_PRICE')
 
     if cache_key not in st.session_state.display_df_cache:
         _extra_cols = [c for c in current_display_cols if c in data.columns]
         if 'CATEGORY_CODE' in data.columns and 'CATEGORY_CODE' not in _extra_cols:
             _extra_cols.append('CATEGORY_CODE')
+        
+        # Ensure PRODUCT_SET_SID is definitely in the extra cols so it isn't dropped during merge
+        if 'PRODUCT_SET_SID' not in _extra_cols:
+            _extra_cols.append('PRODUCT_SET_SID')
+            
         df_display = pd.merge(
             df_flagged_sids[['ProductSetSid']], data,
             left_on='ProjectSetSid' if 'ProjectSetSid' in df_flagged_sids.columns else 'ProductSetSid',
             right_on='PRODUCT_SET_SID', how='left'
         )[[c for c in _extra_cols if c in data.columns]]
+        
         if title == 'Category Max Price Exceeded' and 'CAT_MAX_PRICE' in df_flagged_sids.columns:
             _cap_map = df_flagged_sids.set_index('ProductSetSid')['CAT_MAX_PRICE'].to_dict()
-            df_display['CAT_MAX_PRICE'] = df_display['PRODUCT_SET_SID'].map(_cap_map)
+            # Use safe sid column fallback to prevent KeyError
+            sid_col = 'PRODUCT_SET_SID' if 'PRODUCT_SET_SID' in df_display.columns else 'ProductSetSid'
+            df_display['CAT_MAX_PRICE'] = df_display[sid_col].map(_cap_map)
 
         _code_to_path = support_files.get('code_to_path', {})
         if _code_to_path and 'CATEGORY_CODE' in df_display.columns:
@@ -575,7 +584,6 @@ def build_fast_grid_html(page_data, flags_mapping, country, page_warnings,
 </head>
 <body>
 
-<!-- Inline custom reason panel (replaces browser prompt()) -->
 <div id="custom-reason-panel">
   <h4>✏️ Enter custom rejection reason</h4>
   <input id="custom-reason-input" type="text" placeholder="Type your reason here…" maxlength="200">
@@ -952,7 +960,7 @@ function renderCard(card) {{
       <div id="debug-${{escapeHtml(sid)}}" class="debug-hud"></div>
       <img class="card-img-placeholder" src="${{PLACEHOLDER}}" alt="">
       <img class="card-img" decoding="async" loading="${{loadingAttr}}" ${{priorityAttr}} ${{imgSrcAttr}} referrerpolicy="no-referrer"
-           onload="onImgLoad(this,'${{safeSid}}')" onerror="onImgError(this,'${{safeSid}}')">
+            onload="onImgLoad(this,'${{safeSid}}')" onerror="onImgError(this,'${{safeSid}}')">
       ${{zoomHtml}}
       ${{overlayHtml}}
       <div class="tick">\u2714</div>
