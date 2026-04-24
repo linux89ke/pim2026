@@ -1094,6 +1094,20 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
     final_df = pd.DataFrame(rows)
     for c in ["ProductSetSid", "ParentSKU", "Status", "Reason", "Comment", "FLAG", "SellerName"]:
         if c not in final_df.columns: final_df[c] = ""
+
+    # ── FORCE-APPROVAL GUARD ──────────────────────────────────────────────────
+    # Re-apply any SIDs the user previously force-approved so that re-validation
+    # never overwrites a deliberate manual decision and causes an approval loop.
+    try:
+        force_approved = st.session_state.get('user_force_approved', set())
+        if force_approved:
+            fa_mask = final_df['ProductSetSid'].isin(force_approved)
+            final_df.loc[fa_mask, ['Status', 'Reason', 'Comment', 'FLAG']] = \
+                ['Approved', '', '', 'Approved by User']
+    except Exception:
+        pass  # session_state unavailable inside cached calls – safe to skip
+    # ─────────────────────────────────────────────────────────────────────────
+
     return country_validator.ensure_status_column(final_df), results
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -1451,6 +1465,7 @@ if _has_files:
         st.session_state.flags_expanded_initialized = False
         st.session_state.pop("_grid_review_data_cache", None)
         st.session_state.pop("_grid_warm_urls", None)
+        st.session_state.pop('user_force_approved', None)
         _dead_keys = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_", "_sf_"))]
         for k in _dead_keys:
             del st.session_state[k]
@@ -1511,6 +1526,9 @@ if st.session_state.get('last_processed_files') != process_signature:
     st.session_state.flags_expanded_initialized = False
     st.session_state.pop("_grid_review_data_cache", None)
     st.session_state.pop("_grid_warm_urls", None)
+    # ── FORCE-APPROVAL GUARD: clear overrides for a fresh file upload ─────────
+    st.session_state.pop('user_force_approved', None)
+    # ─────────────────────────────────────────────────────────────────────────
     keys_to_delete = [k for k in st.session_state.keys() if k.startswith(("quick_rej_", "grid_chk_", "toast_"))]
     for k in keys_to_delete: del st.session_state[k]
 
@@ -1659,6 +1677,11 @@ if st.session_state.get('last_processed_files') != process_signature:
 
 def restore_single_item(sid):
     st.session_state.final_report.loc[st.session_state.final_report['ProductSetSid'] == sid, ['Status', 'Reason', 'Comment', 'FLAG']] = ['Approved', '', '', 'Approved by User']
+    # ── FORCE-APPROVAL GUARD: remember this SID so re-validation cannot undo it
+    if 'user_force_approved' not in st.session_state:
+        st.session_state.user_force_approved = set()
+    st.session_state.user_force_approved.add(str(sid))
+    # ─────────────────────────────────────────────────────────────────────────
     st.session_state.pop(f"quick_rej_{sid}", None)
     st.session_state.pop(f"quick_rej_reason_{sid}", None)
     st.session_state.exports_cache.clear()
