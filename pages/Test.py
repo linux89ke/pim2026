@@ -885,74 +885,135 @@ if _reg is not None:
     })
 
 # -------------------------------------------------
-# MASTER VALIDATION RUNNER
+# MASTER VALIDATION RUNNER  (Fix #11 — split into three testable units)
+#
+#   build_validations()  → pure, returns (name, func, kwargs) list for a country
+#   run_validations()    → pure, runs checks in parallel, returns raw results
+#   build_final_report() → pure, turns results into the final DataFrame
+#   validate_products()  → thin orchestrator: calls the three above + UI spinner
 # -------------------------------------------------
-def validate_products(data: pd.DataFrame, support_files: Dict, country_validator: CountryValidator, data_has_warranty_cols: bool, common_sids: Optional[set] = None, skip_validators: Optional[List[str]] = None):
-    data['PRODUCT_SET_SID'] = data['PRODUCT_SET_SID'].astype(str).str.strip()
-    
-    data['_name_lower'] = data['NAME'].astype(str).str.lower().fillna('')
-    data['_brand_lower'] = data['BRAND'].astype(str).str.lower().str.strip().fillna('')
-    data['_seller_lower'] = data['SELLER_NAME'].astype(str).str.lower().str.strip().fillna('')
-    data['_cat_clean'] = data['CATEGORY_CODE'].apply(clean_category_code)
 
-    flags_mapping = support_files.get('flags_mapping', {})
+def build_validations(
+    support_files: Dict,
+    country_validator: CountryValidator,
+) -> List[tuple]:
+    """
+    Pure function — no Streamlit, no data access.
+    Returns the ordered list of (name, check_func, kwargs) tuples for the
+    given country.  Easy to unit-test and to extend with new rules.
+    """
     country_restricted_rules = support_files.get('restricted_brands_all', {}).get(country_validator.country, [])
-    suspected_fake_df = support_files.get('suspected_fake', {}).get(country_validator.code, pd.DataFrame()) if isinstance(support_files.get('suspected_fake'), dict) else pd.DataFrame()
+    suspected_fake_df = (
+        support_files.get('suspected_fake', {}).get(country_validator.code, pd.DataFrame())
+        if isinstance(support_files.get('suspected_fake'), dict)
+        else pd.DataFrame()
+    )
     country_prohibited_words = support_files.get('prohibited_words_all', {}).get(country_validator.code, [])
-    
+
     validations = [
         ("Wrong Category", check_miscellaneous_category, {
-            'categories_list': support_files.get('categories_names_list', []),
-            'compiled_rules': st.session_state.get('compiled_json_rules', {}),
+            'categories_list':  support_files.get('categories_names_list', []),
+            'compiled_rules':   support_files.get('compiled_json_rules', {}),
             'cat_path_to_code': support_files.get('cat_path_to_code', {}),
-            'code_to_path': support_files.get('code_to_path', {}),
+            'code_to_path':     support_files.get('code_to_path', {}),
         }),
         ("Restricted brands", check_restricted_brands, {'country_rules': country_restricted_rules}),
         ("Suspected Fake product", check_suspected_fake_products, {'suspected_fake_df': suspected_fake_df}),
-        ("Seller Not approved to sell Refurb", check_refurb_seller_approval, {'refurb_data': support_files.get('refurb_data', {}), 'country_code': country_validator.code}),
-        ("Product Warranty", check_product_warranty, {'warranty_category_codes': support_files.get('warranty_category_codes', [])}),
-        ("Seller Approve to sell books", check_seller_approved_for_books, {'books_data': support_files.get('books_data', {}), 'country_code': country_validator.code, 'book_category_codes': support_files.get('book_category_codes', [])}),
-        ("Seller Approved to Sell Perfume", check_seller_approved_for_perfume, {'perfume_category_codes': support_files.get('perfume_category_codes', []), 'perfume_data': support_files.get('perfume_data', {}), 'country_code': country_validator.code}),
-        ("Perfume Tester", check_perfume_tester, {'perfume_category_codes': support_files.get('perfume_category_codes', []), 'perfume_data': support_files.get('perfume_data', {})}),
-        ("Counterfeit Sneakers", check_counterfeit_sneakers, {'sneaker_category_codes': support_files.get('sneaker_category_codes', []), 'sneaker_sensitive_brands': support_files.get('sneaker_sensitive_brands', [])}),
-        ("Suspected counterfeit Jerseys", check_counterfeit_jerseys, {'jerseys_data': support_files.get('jerseys_data', {}), 'country_code': country_validator.code}),
-        ("Prohibited products", check_prohibited_products, {'prohibited_rules': country_prohibited_words}),
-        ("Unnecessary words in NAME", check_unnecessary_words, {'pattern': compile_regex_patterns(support_files.get('unnecessary_words', []))}),
-        ("Single-word NAME", check_single_word_name, {'book_category_codes': support_files.get('book_category_codes', []), 'books_data': support_files.get('books_data', {})}),
-        ("Generic BRAND Issues", check_generic_brand_issues, {'valid_category_codes_fas': support_files.get('category_fas', [])}),
-        ("Fashion brand issues", check_fashion_brand_issues, {'valid_category_codes_fas': support_files.get('category_fas', []), 'code_to_path': support_files.get('code_to_path', {})}),
-        ("BRAND name repeated in NAME", check_brand_in_name, {}),
-        ("Wrong Variation", check_wrong_variation, {'allowed_variation_codes': list(set(support_files.get('variation_allowed_codes', []) + support_files.get('category_fas', [])))}),
-        ("Generic branded products with genuine brands", check_generic_with_brand_in_name, {'brands_list': support_files.get('known_brands', [])}),
-        ("Missing COLOR", check_missing_color, {'pattern': compile_regex_patterns(support_files.get('colors', [])), 'color_categories': support_files.get('color_categories', []), 'country_code': country_validator.code}),
-        ("Missing Weight/Volume", check_weight_volume_in_name, {'weight_category_codes': support_files.get('weight_category_codes', [])}),
-        ("Incomplete Smartphone Name", check_incomplete_smartphone_name, {'smartphone_category_codes': support_files.get('smartphone_category_codes', [])}),
-        ("Duplicate product", check_duplicate_products, {'exempt_categories': support_files.get('duplicate_exempt_codes', []), 'known_colors': support_files.get('colors', [])}),
-        ("Image Stretched", check_image_stretched, {}),
-        ("Image Blurry", check_image_blurry, {}),
-        ("Image Mismatch", check_image_mismatch, {}),
-        ("Image Infringing", check_image_infringing, {}),
-        ("Image Too Many things displayed", check_image_too_many_things, {}),
-        ("Discount too high", check_wrong_price, {'country_code': country_validator.code}),
-        ("Category Max Price Exceeded", check_category_max_price, {
-            'max_price_map': CATEGORY_MAX_PRICES_USD,
-            'code_to_path': support_files.get('code_to_path', {}),
+        ("Seller Not approved to sell Refurb", check_refurb_seller_approval, {
+            'refurb_data': support_files.get('refurb_data', {}),
             'country_code': country_validator.code,
         }),
-        ("Suspicious Discount", check_suspicious_discount, {'country_code': country_validator.code}),
+        ("Product Warranty", check_product_warranty, {
+            'warranty_category_codes': support_files.get('warranty_category_codes', []),
+        }),
+        ("Seller Approve to sell books", check_seller_approved_for_books, {
+            'books_data': support_files.get('books_data', {}),
+            'country_code': country_validator.code,
+            'book_category_codes': support_files.get('book_category_codes', []),
+        }),
+        ("Seller Approved to Sell Perfume", check_seller_approved_for_perfume, {
+            'perfume_category_codes': support_files.get('perfume_category_codes', []),
+            'perfume_data': support_files.get('perfume_data', {}),
+            'country_code': country_validator.code,
+        }),
+        ("Perfume Tester", check_perfume_tester, {
+            'perfume_category_codes': support_files.get('perfume_category_codes', []),
+            'perfume_data': support_files.get('perfume_data', {}),
+        }),
+        ("Counterfeit Sneakers", check_counterfeit_sneakers, {
+            'sneaker_category_codes': support_files.get('sneaker_category_codes', []),
+            'sneaker_sensitive_brands': support_files.get('sneaker_sensitive_brands', []),
+        }),
+        ("Suspected counterfeit Jerseys", check_counterfeit_jerseys, {
+            'jerseys_data': support_files.get('jerseys_data', {}),
+            'country_code': country_validator.code,
+        }),
+        ("Prohibited products", check_prohibited_products, {'prohibited_rules': country_prohibited_words}),
+        ("Unnecessary words in NAME", check_unnecessary_words, {
+            'pattern': compile_regex_patterns(support_files.get('unnecessary_words', [])),
+        }),
+        ("Single-word NAME", check_single_word_name, {
+            'book_category_codes': support_files.get('book_category_codes', []),
+            'books_data': support_files.get('books_data', {}),
+        }),
+        ("Generic BRAND Issues", check_generic_brand_issues, {
+            'valid_category_codes_fas': support_files.get('category_fas', []),
+        }),
+        ("Fashion brand issues", check_fashion_brand_issues, {
+            'valid_category_codes_fas': support_files.get('category_fas', []),
+            'code_to_path': support_files.get('code_to_path', {}),
+        }),
+        ("BRAND name repeated in NAME", check_brand_in_name, {}),
+        ("Wrong Variation", check_wrong_variation, {
+            'allowed_variation_codes': list(set(
+                support_files.get('variation_allowed_codes', []) +
+                support_files.get('category_fas', [])
+            )),
+        }),
+        ("Generic branded products with genuine brands", check_generic_with_brand_in_name, {
+            'brands_list': support_files.get('known_brands', []),
+        }),
+        ("Missing COLOR", check_missing_color, {
+            'pattern': compile_regex_patterns(support_files.get('colors', [])),
+            'color_categories': support_files.get('color_categories', []),
+            'country_code': country_validator.code,
+        }),
+        ("Missing Weight/Volume", check_weight_volume_in_name, {
+            'weight_category_codes': support_files.get('weight_category_codes', []),
+        }),
+        ("Incomplete Smartphone Name", check_incomplete_smartphone_name, {
+            'smartphone_category_codes': support_files.get('smartphone_category_codes', []),
+        }),
+        ("Duplicate product", check_duplicate_products, {
+            'exempt_categories': support_files.get('duplicate_exempt_codes', []),
+            'known_colors': support_files.get('colors', []),
+        }),
+        ("Image Stretched",                 check_image_stretched,         {}),
+        ("Image Blurry",                    check_image_blurry,            {}),
+        ("Image Mismatch",                  check_image_mismatch,          {}),
+        ("Image Infringing",                check_image_infringing,        {}),
+        ("Image Too Many things displayed", check_image_too_many_things,   {}),
+        ("Discount too high",               check_wrong_price,             {'country_code': country_validator.code}),
+        ("Category Max Price Exceeded",     check_category_max_price,      {
+            'max_price_map': CATEGORY_MAX_PRICES_USD,
+            'code_to_path':  support_files.get('code_to_path', {}),
+            'country_code':  country_validator.code,
+        }),
+        ("Suspicious Discount",             check_suspicious_discount,     {'country_code': country_validator.code}),
     ]
 
+    # ── Country-specific additions ────────────────────────────────────────────
     if country_validator.code == "NG":
         _ng = support_files.get("ng_qc_rules", {})
         validations += [
-            ("NG - Gift Card Seller",  check_nigeria_gift_card,  {"ng_rules": _ng}),
-            ("NG - Books Seller",      check_nigeria_books,      {"ng_rules": _ng}),
-            ("NG - TV Brand Seller",   check_nigeria_tvs,        {"ng_rules": _ng}),
-            ("NG - HP Toners Seller",  check_nigeria_hp_toners,  {"ng_rules": _ng}),
-            ("NG - Apple Seller",      check_nigeria_apple,      {"ng_rules": _ng}),
-            ("NG - Xmas Tree Seller",  check_nigeria_xmas_tree,  {"ng_rules": _ng}),
-            ("NG - Rice Brand Seller", check_nigeria_rice,       {"ng_rules": _ng}),
-            ("Powerbank Not Authorized",check_nigeria_powerbanks, {"ng_rules": _ng}),
+            ("NG - Gift Card Seller",    check_nigeria_gift_card,   {"ng_rules": _ng}),
+            ("NG - Books Seller",        check_nigeria_books,       {"ng_rules": _ng}),
+            ("NG - TV Brand Seller",     check_nigeria_tvs,         {"ng_rules": _ng}),
+            ("NG - HP Toners Seller",    check_nigeria_hp_toners,   {"ng_rules": _ng}),
+            ("NG - Apple Seller",        check_nigeria_apple,       {"ng_rules": _ng}),
+            ("NG - Xmas Tree Seller",    check_nigeria_xmas_tree,   {"ng_rules": _ng}),
+            ("NG - Rice Brand Seller",   check_nigeria_rice,        {"ng_rules": _ng}),
+            ("Powerbank Not Authorized", check_nigeria_powerbanks,  {"ng_rules": _ng}),
         ]
 
     if country_validator.code in ("KE", "UG"):
@@ -964,11 +1025,15 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
     if country_validator.code == "MA":
         _ma = load_morocco_qc_rules()
         validations = [v for v in validations if v[0] != "Restricted brands"]
-        validations.insert(1, ("Restricted brands", check_restricted_brands, {"country_rules": _ma.get("restricted", [])}))
-        ma_prohibited_rules = [{"keyword": kw, "categories": set()} for kw in _ma.get("prohibited_keywords", [])]
+        validations.insert(1, ("Restricted brands", check_restricted_brands,
+                               {"country_rules": _ma.get("restricted", [])}))
+        ma_prohibited_rules = [{"keyword": kw, "categories": set()}
+                                for kw in _ma.get("prohibited_keywords", [])]
         validations = [v for v in validations if v[0] != "Prohibited products"]
-        validations.append(("Prohibited products", check_prohibited_products, {"prohibited_rules": ma_prohibited_rules}))
-        validations.append(("MA - Marque Interdite", check_morocco_prohibited_brands, {"ma_rules": _ma}))
+        validations.append(("Prohibited products", check_prohibited_products,
+                            {"prohibited_rules": ma_prohibited_rules}))
+        validations.append(("MA - Marque Interdite", check_morocco_prohibited_brands,
+                            {"ma_rules": _ma}))
 
     if country_validator.code == "GH":
         _gh = load_ghana_qc_rules()
@@ -976,128 +1041,211 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
             ("GH - Smart Glasses with Camera", check_ghana_smart_glasses, {"gh_rules": _gh}),
         ]
 
-    results = {}
-    dup_groups = {}
-    if {'NAME','BRAND','SELLER_NAME','COLOR'}.issubset(data.columns):
+    return validations
+
+
+def run_validations(
+    data: pd.DataFrame,
+    validations: List[tuple],
+    country_validator: CountryValidator,
+    skip_validators: Optional[List[str]] = None,
+) -> tuple:
+    """
+    Pure function — no Streamlit UI calls, no report assembly.
+    Runs all check functions in parallel and returns:
+        results           dict[name -> flagged DataFrame]
+        restricted_keys   dict[name -> set of match_keys]
+        validation_errors list[(name, error_message)]
+
+    Testable in isolation: pass a small DataFrame + build_validations() output
+    and inspect results directly.
+    """
+    # Pre-compute duplicate groups for cross-SID expansion
+    dup_groups: Dict[str, List[str]] = {}
+    if {'NAME', 'BRAND', 'SELLER_NAME', 'COLOR'}.issubset(data.columns):
         dt = data.copy()
-        dt['dup_key'] = dt[['NAME','BRAND','SELLER_NAME','COLOR']].apply(lambda r: tuple(str(v).strip().lower() for v in r), axis=1)
+        dt['dup_key'] = dt[['NAME', 'BRAND', 'SELLER_NAME', 'COLOR']].apply(
+            lambda r: tuple(str(v).strip().lower() for v in r), axis=1
+        )
         for k, v in dt.groupby('dup_key')['PRODUCT_SET_SID'].apply(list).items():
             if len(v) > 1:
-                for sid in v: dup_groups[sid] = v
-    restricted_keys = {}
-    validation_errors = []
+                for sid in v:
+                    dup_groups[sid] = v
 
-    with st.spinner("Validating products... This may take a moment."):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            future_to_name = {}
-            for i, (name, func, kwargs) in enumerate(validations):
-                if skip_validators and name in skip_validators: continue
-                if country_validator.should_skip_validation(name): continue
-                ckwargs = {'data': data, **kwargs}
-                flag_hash = compute_flag_input_hash(data, name, ckwargs)
-                cache_path = os.path.join(FLAG_CACHE_DIR, f"{flag_hash}.pkl")
-                future_to_name[executor.submit(run_cached_check, func, cache_path, ckwargs)] = name
+    results: Dict[str, pd.DataFrame] = {}
+    restricted_keys: Dict[str, set] = {}
+    validation_errors: List[tuple] = []
 
-            for future in concurrent.futures.as_completed(future_to_name):
-                name = future_to_name[future]
-                try:
-                    res = future.result()
-                    if not res.empty and 'PRODUCT_SET_SID' in res.columns:
-                        res = res.loc[:, ~res.columns.duplicated()].copy()
-                        res['PRODUCT_SET_SID'] = res['PRODUCT_SET_SID'].astype(str).str.strip()
-                        if name in ["Seller Approve to sell books", "Seller Approved to Sell Perfume", "Counterfeit Sneakers", "Seller Not approved to sell Refurb", "Restricted brands"]:
-                            res['match_key'] = res.apply(create_match_key, axis=1)
-                            restricted_keys.setdefault(name, set()).update(res['match_key'].unique())
-                        expanded_sids = set()
-                        for sid in set(res['PRODUCT_SET_SID'].unique()): expanded_sids.update(dup_groups.get(sid, [sid]))
-                        final_res = data[data['PRODUCT_SET_SID'].isin(expanded_sids)].copy()
-                        if 'Comment_Detail' in res.columns:
-                            _cd_map = res.set_index('PRODUCT_SET_SID')['Comment_Detail'].to_dict()
-                            final_res['Comment_Detail'] = final_res['PRODUCT_SET_SID'].map(_cd_map)
-                        if 'Reason' in res.columns:
-                            _r_map = res.set_index('PRODUCT_SET_SID')['Reason'].to_dict()
-                            final_res['Reason'] = final_res['PRODUCT_SET_SID'].map(_r_map)
-                        if name in results and not results[name].empty: results[name] = pd.concat([results[name], final_res]).drop_duplicates(subset=['PRODUCT_SET_SID'])
-                        else: results[name] = final_res
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_name = {}
+        for name, func, kwargs in validations:
+            if skip_validators and name in skip_validators:
+                continue
+            if country_validator.should_skip_validation(name):
+                continue
+            ckwargs = {'data': data, **kwargs}
+            flag_hash  = compute_flag_input_hash(data, name, ckwargs)
+            cache_path = os.path.join(FLAG_CACHE_DIR, f"{flag_hash}.pkl")
+            future_to_name[executor.submit(run_cached_check, func, cache_path, ckwargs)] = name
+
+        for future in concurrent.futures.as_completed(future_to_name):
+            name = future_to_name[future]
+            try:
+                res = future.result()
+                if not res.empty and 'PRODUCT_SET_SID' in res.columns:
+                    res = res.loc[:, ~res.columns.duplicated()].copy()
+                    res['PRODUCT_SET_SID'] = res['PRODUCT_SET_SID'].astype(str).str.strip()
+                    if name in ["Seller Approve to sell books", "Seller Approved to Sell Perfume",
+                                "Counterfeit Sneakers", "Seller Not approved to sell Refurb",
+                                "Restricted brands"]:
+                        res['match_key'] = res.apply(create_match_key, axis=1)
+                        restricted_keys.setdefault(name, set()).update(res['match_key'].unique())
+                    expanded_sids: set = set()
+                    for sid in res['PRODUCT_SET_SID'].unique():
+                        expanded_sids.update(dup_groups.get(sid, [sid]))
+                    final_res = data[data['PRODUCT_SET_SID'].isin(expanded_sids)].copy()
+                    if 'Comment_Detail' in res.columns:
+                        _cd_map = res.set_index('PRODUCT_SET_SID')['Comment_Detail'].to_dict()
+                        final_res['Comment_Detail'] = final_res['PRODUCT_SET_SID'].map(_cd_map)
+                    if 'Reason' in res.columns:
+                        _r_map = res.set_index('PRODUCT_SET_SID')['Reason'].to_dict()
+                        final_res['Reason'] = final_res['PRODUCT_SET_SID'].map(_r_map)
+                    if name in results and not results[name].empty:
+                        results[name] = pd.concat([results[name], final_res]).drop_duplicates(subset=['PRODUCT_SET_SID'])
                     else:
-                        if name not in results: results[name] = pd.DataFrame(columns=data.columns)
-                except Exception as e:
-                    logger.error(f"Validation error in '{name}': {e}")
-                    validation_errors.append((name, str(e)))
-                    if name not in results: results[name] = pd.DataFrame(columns=data.columns)
+                        results[name] = final_res
+                else:
+                    if name not in results:
+                        results[name] = pd.DataFrame(columns=data.columns)
+            except Exception as e:
+                logger.error(f"Validation error in '{name}': {e}")
+                validation_errors.append((name, str(e)))
+                if name not in results:
+                    results[name] = pd.DataFrame(columns=data.columns)
 
-    if validation_errors:
-        st.warning(f"{len(validation_errors)} validation checks encountered errors.")
-        with st.expander("View Error Details"):
-            for e_name, e_msg in validation_errors: st.error(f"**{e_name}**: {e_msg}")
-    
+    # Expand restricted-key matches across the full dataset
     if restricted_keys:
         data['match_key'] = data.apply(create_match_key, axis=1)
         for fname, keys in restricted_keys.items():
             extra = data[data['match_key'].isin(keys)].copy()
-            results[fname] = pd.concat([results.get(fname, pd.DataFrame()), extra]).drop_duplicates(subset=['PRODUCT_SET_SID'])
+            results[fname] = pd.concat(
+                [results.get(fname, pd.DataFrame()), extra]
+            ).drop_duplicates(subset=['PRODUCT_SET_SID'])
 
+    return results, restricted_keys, validation_errors
+
+
+def build_final_report(
+    data: pd.DataFrame,
+    validations: List[tuple],
+    results: Dict[str, pd.DataFrame],
+    flags_mapping: Dict,
+    country_validator: CountryValidator,
+) -> pd.DataFrame:
+    """
+    Pure function — no Streamlit, no I/O.
+    Turns the raw results dict into the final report DataFrame.
+    Testable: pass a small data + results and assert on the output DataFrame.
+    """
     target_lang = 'fr' if country_validator.country == "Morocco" else 'en'
-
     rows = []
-    processed = set()
+    processed: set = set()
+
     for name, _, _ in validations:
-        if name not in results or results[name].empty or 'PRODUCT_SET_SID' not in results[name].columns: continue
+        if name not in results or results[name].empty or 'PRODUCT_SET_SID' not in results[name].columns:
+            continue
         res = results[name]
-        rinfo = flags_mapping.get(name, {'reason': "1000007 - Other Reason", 'en': f"Flagged by {name}", 'fr': f"Flagged by {name}", 'ar': f"Flagged by {name}"})
+        rinfo = flags_mapping.get(name, {
+            'reason': "1000007 - Other Reason",
+            'en': f"Flagged by {name}",
+            'fr': f"Flagged by {name}",
+            'ar': f"Flagged by {name}",
+        })
         base_comment = rinfo.get(target_lang, rinfo.get('en'))
         res['PRODUCT_SET_SID'] = res['PRODUCT_SET_SID'].astype(str).str.strip()
-        flagged = pd.merge(res[['PRODUCT_SET_SID', 'Comment_Detail']] if 'Comment_Detail' in res.columns else res[['PRODUCT_SET_SID']], data, on='PRODUCT_SET_SID', how='left')
-        if 'Comment_Detail' not in flagged.columns and 'Comment_Detail' in res.columns:
-            if isinstance(res['Comment_Detail'], pd.DataFrame): flagged['Comment_Detail'] = res['Comment_Detail'].iloc[:, 0]
-            else: flagged['Comment_Detail'] = res['Comment_Detail']
-        
-        if 'Reason' in res.columns:
-            reason_map = res.set_index('PRODUCT_SET_SID')['Reason'].to_dict()
-        else:
-            reason_map = {}
 
-        if 'CAT_MAX_PRICE' in res.columns:
-            _cat_max_map = res.set_index('PRODUCT_SET_SID')['CAT_MAX_PRICE'].to_dict()
-        else:
-            _cat_max_map = {}
+        flagged = pd.merge(
+            res[['PRODUCT_SET_SID', 'Comment_Detail']] if 'Comment_Detail' in res.columns
+            else res[['PRODUCT_SET_SID']],
+            data, on='PRODUCT_SET_SID', how='left',
+        )
+        if 'Comment_Detail' not in flagged.columns and 'Comment_Detail' in res.columns:
+            flagged['Comment_Detail'] = (
+                res['Comment_Detail'].iloc[:, 0]
+                if isinstance(res['Comment_Detail'], pd.DataFrame)
+                else res['Comment_Detail']
+            )
+
+        reason_map   = res.set_index('PRODUCT_SET_SID')['Reason'].to_dict()        if 'Reason'       in res.columns else {}
+        _cat_max_map = res.set_index('PRODUCT_SET_SID')['CAT_MAX_PRICE'].to_dict() if 'CAT_MAX_PRICE' in res.columns else {}
 
         for _, r in flagged.iterrows():
             sid = str(r['PRODUCT_SET_SID']).strip()
-            if sid in processed: continue
+            if sid in processed:
+                continue
             processed.add(sid)
-            det = r.get('Comment_Detail', '')
+            det     = r.get('Comment_Detail', '')
             det_str = str(det) if pd.notna(det) and det else ''
+
             if name == "Powerbank Not Authorized":
-                _pb_reason = reason_map.get(sid, '')
+                _pb_reason    = reason_map.get(sid, '')
                 _is_wrong_cat = (
                     'wrong category' in str(_pb_reason).lower()
-                    or 'power bank' in det_str.lower() and 'category' in det_str.lower()
+                    or ('power bank' in det_str.lower() and 'category' in det_str.lower())
                 )
                 if _is_wrong_cat:
-                    rows.append({'ProductSetSid': sid, 'ParentSKU': r.get('PARENTSKU', ''), 'Status': 'Rejected', 'Reason': _pb_reason or '1000007 - Wrong Category', 'Comment': det_str or flags_mapping.get("Wrong Category", rinfo).get(target_lang, ''), 'FLAG': 'Wrong Category', 'SellerName': r.get('SELLER_NAME', '')})
+                    rows.append({
+                        'ProductSetSid': sid,
+                        'ParentSKU':     r.get('PARENTSKU', ''),
+                        'Status':        'Rejected',
+                        'Reason':        _pb_reason or '1000007 - Wrong Category',
+                        'Comment':       det_str or flags_mapping.get("Wrong Category", rinfo).get(target_lang, ''),
+                        'FLAG':          'Wrong Category',
+                        'SellerName':    r.get('SELLER_NAME', ''),
+                    })
                     continue
+
             if det_str and len(det_str) > 60:
                 comment_str = det_str
             elif det_str:
                 comment_str = f"{base_comment} ({det_str})"
             else:
                 comment_str = base_comment
-            row_reason = reason_map.get(sid, rinfo['reason'])
-            rows.append({'ProductSetSid': sid, 'ParentSKU': r.get('PARENTSKU', ''), 'Status': 'Rejected', 'Reason': row_reason, 'Comment': comment_str, 'FLAG': name, 'SellerName': r.get('SELLER_NAME', ''), 'CAT_MAX_PRICE': _cat_max_map.get(sid, '') if name == 'Category Max Price Exceeded' else ''})
 
+            rows.append({
+                'ProductSetSid': sid,
+                'ParentSKU':     r.get('PARENTSKU', ''),
+                'Status':        'Rejected',
+                'Reason':        reason_map.get(sid, rinfo['reason']),
+                'Comment':       comment_str,
+                'FLAG':          name,
+                'SellerName':    r.get('SELLER_NAME', ''),
+                'CAT_MAX_PRICE': _cat_max_map.get(sid, '') if name == 'Category Max Price Exceeded' else '',
+            })
+
+    # Append approved rows (everything not already flagged)
     for _, r in data[~data['PRODUCT_SET_SID'].astype(str).str.strip().isin(processed)].iterrows():
         sid = str(r['PRODUCT_SET_SID']).strip()
         if sid not in processed:
-            rows.append({'ProductSetSid': sid, 'ParentSKU': r.get('PARENTSKU', ''), 'Status': 'Approved', 'Reason': "", 'Comment': "", 'FLAG': "", 'SellerName': r.get('SELLER_NAME', '')})
+            rows.append({
+                'ProductSetSid': sid,
+                'ParentSKU':     r.get('PARENTSKU', ''),
+                'Status':        'Approved',
+                'Reason':        '',
+                'Comment':       '',
+                'FLAG':          '',
+                'SellerName':    r.get('SELLER_NAME', ''),
+            })
             processed.add(sid)
+
     final_df = pd.DataFrame(rows)
     for c in ["ProductSetSid", "ParentSKU", "Status", "Reason", "Comment", "FLAG", "SellerName"]:
-        if c not in final_df.columns: final_df[c] = ""
+        if c not in final_df.columns:
+            final_df[c] = ""
 
-    # ── FORCE-APPROVAL GUARD ──────────────────────────────────────────────────
-    # Re-apply any SIDs the user previously force-approved so that re-validation
-    # never overwrites a deliberate manual decision and causes an approval loop.
+    # ── FORCE-APPROVAL GUARD ─────────────────────────────────────────────────
+    # Re-apply user force-approvals so re-validation can never undo a deliberate
+    # manual decision and create the approval loop described in the original bug.
     try:
         force_approved = st.session_state.get('user_force_approved', set())
         if force_approved:
@@ -1105,10 +1253,55 @@ def validate_products(data: pd.DataFrame, support_files: Dict, country_validator
             final_df.loc[fa_mask, ['Status', 'Reason', 'Comment', 'FLAG']] = \
                 ['Approved', '', '', 'Approved by User']
     except Exception:
-        pass  # session_state unavailable inside cached calls – safe to skip
+        pass  # safe to skip when called outside a Streamlit context (e.g. tests)
     # ─────────────────────────────────────────────────────────────────────────
 
-    return country_validator.ensure_status_column(final_df), results
+    return country_validator.ensure_status_column(final_df)
+
+
+def validate_products(
+    data: pd.DataFrame,
+    support_files: Dict,
+    country_validator: CountryValidator,
+    data_has_warranty_cols: bool,
+    common_sids: Optional[set] = None,
+    skip_validators: Optional[List[str]] = None,
+):
+    """
+    Thin orchestrator — the only function here that is allowed to call Streamlit.
+    Delegates all logic to build_validations / run_validations / build_final_report.
+    Returns (final_report_df, raw_results_dict) — same public contract as before.
+    """
+    # Normalise shared derived columns once, up-front
+    data['PRODUCT_SET_SID'] = data['PRODUCT_SET_SID'].astype(str).str.strip()
+    data['_name_lower']     = data['NAME'].astype(str).str.lower().fillna('')
+    data['_brand_lower']    = data['BRAND'].astype(str).str.lower().str.strip().fillna('')
+    data['_seller_lower']   = data['SELLER_NAME'].astype(str).str.lower().str.strip().fillna('')
+    data['_cat_clean']      = data['CATEGORY_CODE'].apply(clean_category_code)
+
+    flags_mapping = support_files.get('flags_mapping', {})
+
+    # 1. Build the rule list (pure, no I/O)
+    validations = build_validations(support_files, country_validator)
+
+    # 2. Run all checks in parallel (pure, no UI)
+    with st.spinner("Validating products… This may take a moment."):
+        results, _restricted_keys, validation_errors = run_validations(
+            data, validations, country_validator, skip_validators=skip_validators
+        )
+
+    # 3. Surface any check-level errors in the UI (only Streamlit call left here)
+    if validation_errors:
+        st.warning(f"{len(validation_errors)} validation checks encountered errors.")
+        with st.expander("View Error Details"):
+            for e_name, e_msg in validation_errors:
+                st.error(f"**{e_name}**: {e_msg}")
+
+    # 4. Assemble the final report (pure, no UI)
+    final_df = build_final_report(data, validations, results, flags_mapping, country_validator)
+
+    return final_df, results
+
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def cached_validate_products(data_hash: str, _data: pd.DataFrame, _support_files: Dict, country_code: str, data_has_warranty_cols: bool, skip_validators: Optional[List[str]] = None):
@@ -1537,12 +1730,43 @@ if st.session_state.get('last_processed_files') != process_signature:
     else:
         _engine_for_cache = _get_cat_matcher_engine() if _CAT_MATCHER_AVAILABLE else None
         _learning_stamp   = str(len(_engine_for_cache.learning_db)) if _engine_for_cache else "0"
-        sig_hash = hashlib.md5((process_signature + _learning_stamp).encode()).hexdigest()
+
+        # ── FIX #8: include a fingerprint of the support files so that any rule
+        # change (new restricted brand, updated category list, etc.) automatically
+        # busts the parquet cache and forces a fresh validation run.
+        def _support_files_fingerprint(sf: dict) -> str:
+            try:
+                _parts = []
+                for key in sorted(sf.keys()):
+                    val = sf[key]
+                    if isinstance(val, pd.DataFrame):
+                        _parts.append(f"{key}:{df_hash(val)}")
+                    elif isinstance(val, dict):
+                        _parts.append(f"{key}:{hashlib.md5(json.dumps(sorted(str(val.items()))).encode(), usedforsecurity=False).hexdigest()[:8]}")
+                    else:
+                        _parts.append(f"{key}:{str(val)[:64]}")
+                return hashlib.md5("|".join(_parts).encode(), usedforsecurity=False).hexdigest()[:16]
+            except Exception:
+                return "unknown"
+
+        _support_stamp = _support_files_fingerprint(support_files)
+        sig_hash = hashlib.md5((process_signature + _learning_stamp + _support_stamp).encode()).hexdigest()
         
         cached_data = load_df_parquet(f"{sig_hash}_data.parquet")
         cached_report = load_df_parquet(f"{sig_hash}_report.parquet")
 
         if cached_data is not None and cached_report is not None:
+            # ── FIX #1: re-apply any user force-approvals that were recorded before
+            # this page reload. Without this, the parquet cache would silently
+            # restore the original rejected status, re-creating the approval loop.
+            try:
+                force_approved = st.session_state.get('user_force_approved', set())
+                if force_approved:
+                    fa_mask = cached_report['ProductSetSid'].isin(force_approved)
+                    cached_report.loc[fa_mask, ['Status', 'Reason', 'Comment', 'FLAG']] = \
+                        ['Approved', '', '', 'Approved by User']
+            except Exception:
+                pass
             st.session_state.final_report = cached_report
             st.session_state.all_data_map = cached_data
             st.session_state.last_processed_files = process_signature
