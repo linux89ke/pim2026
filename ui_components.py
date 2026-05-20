@@ -1662,6 +1662,21 @@ def build_fast_grid_html(
   <button class="desel-btn" onclick="window.doSelectAll()">{labels_dict["select_all"]}</button>
   <button class="desel-btn" onclick="doDeselAll()">{labels_dict["deselect_all"]}</button>
   <button class="batch-btn top-btn" onclick="window.scrollTo(0, document.body.scrollHeight)">{_t("go_bottom")}</button>
+  <select class="reason-sel sort-sel" id="sort-sel-top" onchange="applySort(this.value)" style="max-width:170px;" title="Sort by image issue">
+    <option value="">Sort by issue</option>
+    <option value="low_res">Low Resolution</option>
+    <option value="tall">Tall (Screenshot?)</option>
+    <option value="wide">Wide Aspect</option>
+    <option value="broken">Broken Image</option>
+    <option disabled>── Prefetched ──</option>
+    <option value="Wrong Category">Wrong Category</option>
+    <option value="Restricted brands">Restricted brands</option>
+    <option value="Suspected Fake product">Suspected Fake</option>
+    <option value="Missing COLOR">Missing Color</option>
+    <option value="Product Warranty">Warranty Issues</option>
+    <option value="Duplicate product">Duplicates</option>
+    <option value="no_issue">No Issues First</option>
+  </select>
 </div>
 
 <div id="shortcut-help" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);
@@ -1679,22 +1694,6 @@ def build_fast_grid_html(
       style="margin-top:20px;width:100%;padding:10px;border-radius:8px;
       background:var(--accent);color:#fff;border:none;cursor:pointer;font-weight:700;">Got it!</button>
   </div>
-</div>
-  <select class="reason-sel sort-sel" id="sort-sel-top" onchange="applySort(this.value)" style="max-width:170px;" title="Sort by image issue">
-    <option value="">Sort by issue</option>
-    <option value="low_res">Low Resolution</option>
-    <option value="tall">Tall (Screenshot?)</option>
-    <option value="wide">Wide Aspect</option>
-    <option value="broken">Broken Image</option>
-    <option disabled>── Prefetched ──</option>
-    <option value="Wrong Category">Wrong Category</option>
-    <option value="Restricted brands">Restricted brands</option>
-    <option value="Suspected Fake product">Suspected Fake</option>
-    <option value="Missing COLOR">Missing Color</option>
-    <option value="Product Warranty">Warranty Issues</option>
-    <option value="Duplicate product">Duplicates</option>
-    <option value="no_issue">No Issues First</option>
-  </select>
 </div>
 
 <div class="grid" id="card-grid"></div>
@@ -2579,7 +2578,7 @@ document.addEventListener('keydown', function(e) {{
 
 // 🚀 Dark Mode
 var _dark = false;
-try {{ _dark = localStorage.getItem('gridDark') === '1'; }} catch(e) {{}}
+try {{ if (typeof localStorage !== 'undefined') {{ _dark = localStorage.getItem('gridDark') === '1'; }} }} catch(e) {{}}
 window.applyDark = function(on) {{
   document.documentElement.style.setProperty('--bg',    on ? '#18181b' : '#f9fafb');
   document.documentElement.style.setProperty('--card',  on ? '#27272a' : '#ffffff');
@@ -2592,36 +2591,7 @@ window.applyDark = function(on) {{
 window.toggleDark = function() {{ _dark = !_dark; applyDark(_dark); }}
 try {{ applyDark(_dark); }} catch(e) {{}}
 
-// 🚀 Keyboard Navigation
-var _focused = -1;
-var _cards = [];
-document.addEventListener('keydown', function(e) {{
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-  
-  _cards = Array.from(document.querySelectorAll('.card:not([style*="none"])'));
-  
-  if (e.key === 'j' || e.key === 'ArrowRight') {{
-    e.preventDefault();
-    _focused = Math.min(_focused + 1, _cards.length - 1);
-    _cards[_focused]?.scrollIntoView({{block:'center', behavior:'smooth'}});
-    _cards[_focused]?.focus();
-  }} else if (e.key === 'k' || e.key === 'ArrowLeft') {{
-    e.preventDefault();
-    _focused = Math.max(_focused - 1, 0);
-    _cards[_focused]?.scrollIntoView({{block:'center', behavior:'smooth'}});
-    _cards[_focused]?.focus();
-  }} else if (e.key === 'a' && _focused >= 0) {{
-    var sid = _cards[_focused].id.replace('card-', '');
-    window.batchApproveSingle(sid);
-  }} else if (e.key === 'r' && _focused >= 0) {{
-    var sid = _cards[_focused].id.replace('card-', '');
-    if (!(sid in selected)) window.toggleSelect(sid);
-    document.getElementById('batch-reason-top').focus();
-  }} else if (e.key === '?') {{
-    var h = document.getElementById('shortcut-help');
-    h.style.display = h.style.display === 'flex' ? 'none' : 'flex';
-  }}
-}});
+// (keyboard navigation handled by the listener above)
 
 window.batchApproveSingle = function(sid) {{
   window.parent.postMessage({{type:'staged_reject', sid:sid, reason:'Approved'}}, '*');
