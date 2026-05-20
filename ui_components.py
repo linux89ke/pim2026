@@ -2675,13 +2675,15 @@ def visual_review_modal(support_files):
     )
     with c1:
         search_n = st.text_input(
-            "Search by Name", placeholder="Product name…", icon=":material/search:"
+            "Search by Name", placeholder="Product name…", icon=":material/search:",
+            key="grid_search_n",
         )
     with c2:
         search_sc = st.text_input(
             "Search by Seller/Category",
             placeholder="Seller or Category…",
             icon=":material/store:",
+            key="grid_search_sc",
         )
     with c3:
         st.session_state.grid_items_per_page = st.select_slider(
@@ -2729,6 +2731,20 @@ def visual_review_modal(support_files):
                     _code_to_path.get(str(c).strip(), str(c)) if pd.notna(c) else ""
                 )
             )
+
+    # ── Save/restore grid page per search context ─────────────────────────────
+    # When the user types a search term, save the current page for the old context
+    # and restore the saved page for the new context (default 0).
+    # This means clearing the search always returns to the exact page they were on.
+    if "_grid_page_contexts" not in st.session_state:
+        st.session_state._grid_page_contexts = {}
+    _curr_ctx = (search_n or "", search_sc or "")
+    _prev_ctx = st.session_state.get("_grid_last_ctx", ("", ""))
+    if _curr_ctx != _prev_ctx:
+        st.session_state._grid_page_contexts[_prev_ctx] = st.session_state.get("grid_page", 0)
+        st.session_state.grid_page = st.session_state._grid_page_contexts.get(_curr_ctx, 0)
+        st.session_state["_grid_last_ctx"] = _curr_ctx
+    # ──────────────────────────────────────────────────────────────────────────
 
     if search_n:
         review_data = review_data[

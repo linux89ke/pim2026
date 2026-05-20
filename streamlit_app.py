@@ -3305,6 +3305,8 @@ if _has_files:
         st.session_state.intersection_sids = set()
         st.session_state.intersection_count = 0
         st.session_state.grid_page = 0
+        st.session_state.pop("_grid_page_contexts", None)
+        st.session_state.pop("_grid_last_ctx", None)
         st.session_state.flags_expanded_initialized = False
         st.session_state.pop("_grid_review_data_cache", None)
         st.session_state.pop("_grid_warm_urls", None)
@@ -3414,6 +3416,8 @@ if st.session_state.get("last_processed_files") != process_signature:
     st.session_state.intersection_sids = set()
     st.session_state.intersection_count = 0
     st.session_state.grid_page = 0
+    st.session_state.pop("_grid_page_contexts", None)
+    st.session_state.pop("_grid_last_ctx", None)
     st.session_state.exports_cache = {}
     st.session_state.display_df_cache = {}
     st.session_state.flags_expanded_initialized = False
