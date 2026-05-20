@@ -2874,8 +2874,6 @@ if "grid_page" not in st.session_state:
     st.session_state.grid_page = 0
 if "grid_items_per_page" not in st.session_state:
     st.session_state.grid_items_per_page = 50
-if "grid_cols_per_row" not in st.session_state:
-    st.session_state.grid_cols_per_row = 5
 if "main_toasts" not in st.session_state:
     st.session_state.main_toasts = []
 if "exports_cache" not in st.session_state:

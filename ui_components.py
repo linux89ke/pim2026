@@ -2670,8 +2670,8 @@ def visual_review_modal(support_files):
         | (fr["ProductSetSid"].isin(poor_img_rej_sids))
     ]
 
-    c1, c2, c3, c4, c5 = st.columns(
-        [1.5, 1.5, 1.5, 1.5, 0.8], gap="large", vertical_alignment="bottom"
+    c1, c2, c3, c4 = st.columns(
+        [1.5, 1.5, 1.5, 0.8], gap="large", vertical_alignment="bottom"
     )
     with c1:
         search_n = st.text_input(
@@ -2692,12 +2692,6 @@ def visual_review_modal(support_files):
             value=st.session_state.get("grid_items_per_page", 50),
         )
     with c4:
-        st.session_state.grid_cols_per_row = st.select_slider(
-            "Columns per row",
-            options=[3, 4, 5, 6, 7, 8],
-            value=st.session_state.get("grid_cols_per_row", 5),
-        )
-    with c5:
         if st.button("Close", use_container_width=True, type="secondary"):
             st.session_state.show_review_modal = False
             st.rerun()
@@ -2915,7 +2909,7 @@ def visual_review_modal(support_files):
             else:
                 rejected_state[_sid] = "Poor images"
 
-    cols_per_row = st.session_state.get("grid_cols_per_row", 5)
+    cols_per_row = 5
     skeleton_html = (
         """
 <style>
