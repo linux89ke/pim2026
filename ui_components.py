@@ -2131,7 +2131,7 @@ function renderCard(card) {{
       ${{priceHtml}}
       <div class="warn-wrap">${{warnHtml}}</div>
       <div id="debug-${{escapeHtml(sid)}}" class="debug-hud"></div>
-      <img class="card-img skeleton" src="${{PLACEHOLDER}}" data-lazy-src="${{safeImgSrcForHtml}}" decoding="async" loading="${{loadingAttr}}" ${{priorityAttr}} referrerpolicy="no-referrer"
+      <img class="card-img skeleton" ${{imgSrcAttr}} decoding="async" loading="${{loadingAttr}}" ${{priorityAttr}} referrerpolicy="no-referrer"
             onload="onImgLoad(this,'${{safeSid}}')" onerror="onImgError(this,'${{safeSid}}')">
       ${{zoomHtml}}
       ${{overlayHtml}}
@@ -2926,7 +2926,7 @@ def visual_review_modal(support_files):
     )
 
     placeholder.empty()
-    st.iframe(grid_html, height=750)
+    components.html(grid_html, height=750, scrolling=True)
 
     st.markdown("---")
 
