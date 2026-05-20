@@ -1049,8 +1049,6 @@ Boucheron
 Boudreauxs
 Bourjois
 Boutique
-Bowl Set
-Boy
 Boya
 Brabantia
 Bracelets
@@ -1062,7 +1060,6 @@ Brandy Melville
 Brasso
 Brateck
 Braun
-Brazilian Hair
 Breithling
 Breitling
 Brembo
@@ -1070,13 +1067,11 @@ Brenda
 Breville
 Bridgestone
 Briggs & Stratton
-Bright
 Bright Office
 Brimix
 Brita
 Britney Spears
 Britool
-Bronze
 Brooke Bond
 Brooks Brothers
 Brookside
@@ -1682,7 +1677,6 @@ HANGERS
 HANMAC
 Hannah Martin
 Hanson
-Happy
 Happy HOME
 Happy Valentine
 Hard Wax Beans
@@ -4829,7 +4823,6 @@ Lattafa
 Lattafa PRIDE
 Lava
 Lava The Original
-Lavalier
 Lbc
 Ldino
 Ldnio

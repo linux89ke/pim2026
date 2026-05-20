@@ -873,32 +873,34 @@ else:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.toggle("🖼️  Show Images", value=False, key=f"qcri_{_fn}"):
                 _img_count = min(len(_fl), 48)
-                for _cs in range(0, _img_count, 4):
-                    _chunk = _fl.iloc[_cs:_cs+4]
-                    _gcols = st.columns(4)
+                for _cs in range(0, _img_count, 5):
+                    _chunk = _fl.iloc[_cs:_cs+5]
+                    _gcols = st.columns(5)
                     for _gc, (_, _row) in zip(_gcols, _chunk.iterrows()):
                         with _gc:
-                            _rfn  = str(_row.get("image_filename", _row.get("MAIN_IMAGE",""))).strip()
-                            _rraw = img_to_raw(_rfn, _imgs)
-                            if _rraw:
-                                st.image(_rraw, use_container_width=True)
-                            else:
+                            with st.container(border=True):
+                                _rfn  = str(_row.get("image_filename", _row.get("MAIN_IMAGE",""))).strip()
+                                _rraw = img_to_raw(_rfn, _imgs)
+                                if _rraw:
+                                    st.image(_rraw, use_container_width=True)
+                                else:
+                                    st.markdown(
+                                        '<div style="height:130px;background:#f5f5f5;border-radius:6px;'
+                                        'display:flex;align-items:center;justify-content:center;'
+                                        'color:#ccc;font-size:2rem;">🖼️</div>',
+                                        unsafe_allow_html=True,
+                                    )
+                                _rnm  = str(_row.get("NAME",""))
+                                _rsid = str(_row.get("PRODUCT_SET_SID",""))
+                                _rrs  = str(_row.get(_rc,"")) if _rc in _row.index else ""
+                                _rrs  = "" if _rrs.strip().lower() in ("nan","none","") else _rrs.strip()
                                 st.markdown(
-                                    '<div style="height:130px;background:#f5f5f5;border-radius:6px;'
-                                    'display:flex;align-items:center;justify-content:center;'
-                                    'color:#ccc;font-size:2rem;">🖼️</div>',
+                                    f'<div style="font-size:0.85rem; font-weight:700; height:40px; overflow:hidden; text-overflow:ellipsis;" title="{_rnm}">{_rnm}</div>'
+                                    f'<div style="font-size:0.75rem; color:#666; margin-bottom:10px;">SID: {_rsid}</div>',
                                     unsafe_allow_html=True,
                                 )
-                            _rnm  = str(_row.get("NAME",""))
-                            _rsid = str(_row.get("PRODUCT_SET_SID",""))
-                            _rrs  = str(_row.get(_rc,"")) if _rc in _row.index else ""
-                            _rrs  = "" if _rrs.strip().lower() in ("nan","none","") else _rrs.strip()
-                            st.markdown(
-                                f'<div class="img-card-name" title="{_rnm}">{_rnm}</div>'
-                                f'<div class="img-card-sid">SID: {_rsid}</div>'
-                                + (f'<div class="img-card-reason">⚠ {_rrs}</div>' if _rrs else ""),
-                                unsafe_allow_html=True,
-                            )
+                                if _rrs:
+                                    st.error(f"{_rrs}", icon=":material/error:")
                 if len(_fl) > 48:
                     st.info(f"Showing first 48 of {len(_fl)} images.")
 

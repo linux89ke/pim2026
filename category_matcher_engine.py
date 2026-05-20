@@ -10,6 +10,13 @@ import sqlite3
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.linear_model import LogisticRegression
+try:
+    from sentence_transformers import SentenceTransformer, util
+    _SENTENCE_TRANSFORMERS_AVAILABLE = True
+except (ImportError, OSError) as e:
+    print(f"Warning: SentenceTransformers failed to load ({e}). AI matching disabled.")
+    _SENTENCE_TRANSFORMERS_AVAILABLE = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -73,14 +80,8 @@ def compile_rules_from_json(raw_rules: list, code_to_path: dict = None) -> dict:
 class CategoryMatcherEngine:
     def __init__(self, db_path="cat_learning.db"):
         self.db_path = db_path
-        self.vectorizer = TfidfVectorizer(
-            analyzer='word',
-            ngram_range=(1, 2),
-            min_df=1,
-            max_df=0.95,
-            stop_words='english'
-        )
-        self.tfidf_matrix = None
+        self.model = None
+        self.cat_embeddings = None
         self.categories = []
         self._tfidf_built = False
         self.learning_db = {}
@@ -176,22 +177,31 @@ class CategoryMatcherEngine:
             logger.warning(f"Failed to batch save learning DB: {e}")
 
     def build_tfidf_index(self, categories_list: list):
+        """Now builds a semantic index using sentence-transformers."""
         if not categories_list: return
         self.categories = [str(c).strip() for c in categories_list if str(c).strip() and str(c).strip().lower() != 'nan']
         if not self.categories: return
-        clean_cats = [clean_text(c) for c in self.categories]
-        # Detect if index is built on full paths (contains separators) or bare leaves.
-        # Full paths give much richer TF-IDF signal; bare leaves score near-zero.
+        
         sep_count = sum(1 for c in self.categories if '/' in c or '>' in c)
         self._index_has_full_paths = (sep_count / max(len(self.categories), 1)) > 0.3
+        
         try:
-            self.tfidf_matrix = self.vectorizer.fit_transform(clean_cats)
-            self._tfidf_built = True
-            logger.info(f'[TF-IDF] Built index: {len(self.categories)} categories, '
-                        f'full_paths={self._index_has_full_paths} '
-                        f'(sep_count={sep_count})')
+            if _SENTENCE_TRANSFORMERS_AVAILABLE:
+                if self.model is None:
+                    # CPU-friendly, 80MB model
+                    self.model = SentenceTransformer('all-MiniLM-L6-v2')
+                self.cat_embeddings = self.model.encode(self.categories, convert_to_tensor=True, show_progress_bar=False)
+                self._tfidf_built = True
+                logger.info(f'[Semantic] Built embeddings for {len(self.categories)} categories')
+            else:
+                # Fallback to TF-IDF if model can't load
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                self.vectorizer = TfidfVectorizer(ngram_range=(1, 2), stop_words='english')
+                self.tfidf_matrix = self.vectorizer.fit_transform(self.categories)
+                self._tfidf_built = True
+                logger.warning("[Semantic] Sentence-Transformers NOT available, falling back to TF-IDF")
         except Exception as e:
-            logger.warning(f"Failed to build TF-IDF index: {e}")
+            logger.warning(f"Failed to build semantic index: {e}")
 
     def predict_category_from_learning(self, name: str) -> str:
         clean_n = clean_text(name)
@@ -214,12 +224,18 @@ class CategoryMatcherEngine:
         
         if self._tfidf_built:
             try:
-                name_clean = clean_text(name)
-                name_vec = self.vectorizer.transform([name_clean])
-                similarities = cosine_similarity(name_vec, self.tfidf_matrix).flatten()
-                best_idx = np.argmax(similarities)
-                if similarities[best_idx] > 0.35:
-                    return self.categories[best_idx]
+                if _SENTENCE_TRANSFORMERS_AVAILABLE and self.cat_embeddings is not None:
+                    name_emb = self.model.encode([name], convert_to_tensor=True, show_progress_bar=False)
+                    cos_scores = util.cos_sim(name_emb, self.cat_embeddings)[0]
+                    best_idx = int(cos_scores.argmax())
+                    if cos_scores[best_idx] > 0.45:
+                        return self.categories[best_idx]
+                elif hasattr(self, 'vectorizer'):
+                    name_vec = self.vectorizer.transform([name])
+                    similarities = cosine_similarity(name_vec, self.tfidf_matrix).flatten()
+                    best_idx = int(np.argmax(similarities))
+                    if similarities[best_idx] > 0.35:
+                        return self.categories[best_idx]
             except Exception:
                 pass
                 
@@ -291,11 +307,10 @@ class CategoryMatcherEngine:
             return ""
 
     def batch_predict_categories(self, names: list, top_n: int = 20) -> list:
-        """Predict categories for ALL names at once using a single TF-IDF transform + cosine_similarity."""
+        """Predict categories for ALL names at once using semantic embeddings."""
         n = len(names)
         results = [''] * n
 
-        # 1. Check learning DB for all names
         pending_indices = []
         for i, name in enumerate(names):
             learned = self.predict_category_from_learning(name)
@@ -307,19 +322,19 @@ class CategoryMatcherEngine:
         if not pending_indices or not self._tfidf_built:
             return results
 
-        # 2. Batch TF-IDF transform — ONE call for all names
-        pending_names = [clean_text(names[i]) for i in pending_indices]
+        pending_names = [names[i] for i in pending_indices]
         try:
-            name_vectors = self.vectorizer.transform(pending_names)
+            if _SENTENCE_TRANSFORMERS_AVAILABLE and self.cat_embeddings is not None:
+                name_embeddings = self.model.encode(pending_names, convert_to_tensor=True, show_progress_bar=False)
+                sim_matrix = util.cos_sim(name_embeddings, self.cat_embeddings).cpu().numpy()
+            else:
+                name_vectors = self.vectorizer.transform(pending_names)
+                sim_matrix = cosine_similarity(name_vectors, self.tfidf_matrix)
         except Exception as e:
-            logger.warning(f"Batch TF-IDF transform failed: {e}")
+            logger.warning(f"Batch prediction failed: {e}")
             return results
 
-        # 3. Batch cosine similarity — ONE matrix op
-        sim_matrix = cosine_similarity(name_vectors, self.tfidf_matrix)
-
-        # 4. For each name, pick top N candidates and apply heuristic boosts
-        threshold = 0.35 if getattr(self, '_index_has_full_paths', True) else 0.15
+        threshold = 0.45 if _SENTENCE_TRANSFORMERS_AVAILABLE else 0.35
 
         for j, orig_idx in enumerate(pending_indices):
             similarities = sim_matrix[j]
@@ -331,9 +346,6 @@ class CategoryMatcherEngine:
 
             for idx in top_indices:
                 base_score = float(similarities[idx])
-                if base_score < 0.01 and best_score > threshold:
-                    break  # remaining candidates too weak
-
                 cat_path = self.categories[idx]
                 boost = 0.0
 
@@ -345,7 +357,7 @@ class CategoryMatcherEngine:
                     if matches:
                         boost = sum(rule['weights'].get(m.lower(), 0.0) for m in set(matches))
 
-                final_score = base_score + (boost * 0.6)
+                final_score = base_score + (boost * 0.4) # Slightly lower boost for semantic matches
                 if final_score > best_score:
                     best_score = final_score
                     best_category = cat_path

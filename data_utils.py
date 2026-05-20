@@ -5,14 +5,32 @@ data_utils.py - Data loading, cleaning, transformation and validation helpers
 import re
 import hashlib
 import logging
+import os
 import pandas as pd
 from io import BytesIO
 from typing import Dict, List, Set, Tuple, Optional
 from dataclasses import dataclass
 
-from constants import NEW_FILE_MAPPING, COLOR_VARIANT_TO_BASE, MULTI_COUNTRY_VALUES
+from constants import NEW_FILE_MAPPING, COLOR_VARIANT_TO_BASE, MULTI_COUNTRY_VALUES, PARQUET_CACHE_DIR
 
 logger = logging.getLogger(__name__)
+
+def save_df_parquet(df, filename):
+    try:
+        os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
+        df.to_parquet(os.path.join(PARQUET_CACHE_DIR, filename))
+    except Exception as e:
+        logger.warning(f"Failed to save parquet {filename}: {e}")
+
+
+def load_df_parquet(filename):
+    path = os.path.join(PARQUET_CACHE_DIR, filename)
+    if os.path.exists(path):
+        try:
+            return pd.read_parquet(path)
+        except Exception as e:
+            logger.warning(f"Failed to load parquet {filename}: {e}")
+    return None
 
 
 # -------------------------------------------------
@@ -50,16 +68,13 @@ def create_match_key(row: pd.Series) -> str:
 
 
 def df_hash(df: pd.DataFrame) -> str:
-    """Fast fingerprint: shape + first-column hash + boundary rows."""
+    """Fast fingerprint: full content hash."""
     try:
-        parts = [str(df.shape), str(sorted(df.columns.tolist()))]
-        n = len(df)
-        if n > 0 and len(df.columns) > 0:
-            first_col = df.iloc[:, 0].astype(str)
-            parts.append(hashlib.md5(first_col.str.cat(sep='|').encode()).hexdigest())
-            for i in [0, min(n // 2, n - 1), n - 1]:
-                parts.append(str(df.iloc[i].values.tolist()))
-        return hashlib.md5('|'.join(parts).encode()).hexdigest()
+        if df.empty:
+            return "empty"
+        # Use pandas built-in hashing for fast, accurate full-content hashing
+        import hashlib
+        return hashlib.md5(pd.util.hash_pandas_object(df, index=False).values.tobytes()).hexdigest()
     except Exception as e:
         logger.warning(f"df_hash primary failed, using fallback: {e}")
         fallback_str = str(df.shape) + str(df.columns.tolist())
@@ -202,11 +217,25 @@ def filter_by_country(df: pd.DataFrame, country_validator) -> Tuple[pd.DataFrame
     else:
         filtered = df[df['ACTIVE_STATUS_COUNTRY'] == country_validator.code].copy()
         filtered['_IS_MULTI_COUNTRY'] = False
-    detected_names = []
-    if filtered.empty:
-        detected_codes = [c for c in df['ACTIVE_STATUS_COUNTRY'].unique() if str(c).strip() and str(c).strip().lower() != 'nan']
-        emoji_map = {"KE": "Kenya", "UG": "Uganda", "NG": "Nigeria", "GH": "Ghana", "MA": "Morocco"}
-        detected_names = [emoji_map.get(c, f"'{c}'") for c in detected_codes]
+    # Detect all countries present in the file
+    sku_cols = [c for c in df.columns if 'SKU' in c.upper() or 'SID' in c.upper()]
+    prefix_map = {"KE": "Kenya", "UG": "Uganda", "NG": "Nigeria", "GH": "Ghana", "MA": "Morocco"}
+    
+    detected_codes = set()
+    # From ACTIVE_STATUS_COUNTRY
+    if 'ACTIVE_STATUS_COUNTRY' in df.columns:
+        detected_codes.update(df['ACTIVE_STATUS_COUNTRY'].dropna().unique())
+    
+    # From SKU prefixes (fallback/verification)
+    for col in sku_cols:
+        vals = df[col].dropna().astype(str).str.strip().str.upper()
+        for prefix in prefix_map.keys():
+            if vals.str.startswith(prefix).any():
+                detected_codes.add(prefix)
+    
+    emoji_map = {"KE": "Kenya", "UG": "Uganda", "NG": "Nigeria", "GH": "Ghana", "MA": "Morocco"}
+    detected_names = sorted(list(set(emoji_map.get(c, str(c)) for c in detected_codes if str(c).strip() and str(c).strip().lower() != 'nan')))
+    
     return filtered, detected_names
 
 
@@ -263,3 +292,58 @@ def format_local_price(usd_price, country: str) -> str:
             return f"{symbol} {local:,.2f}"
     except (ValueError, TypeError):
         return ""
+
+# -------------------------------------------------
+# ZIP IMAGE LAZY LOADING (CACHED BASE64)
+# -------------------------------------------------
+
+def _basename_lower(value) -> str:
+    name = str(value).strip().replace("\\", "/").split("/")[-1].lower()
+    return name if name and name != "nan" else ""
+
+def _load_zip_image_by_key(key: str) -> Optional[str]:
+    import streamlit as st
+    import zipfile
+    import base64
+    from io import BytesIO
+    key = _basename_lower(key)
+    if not key:
+        return None
+    store = st.session_state.setdefault('zip_image_store', {})
+    if key in store:
+        return store[key]
+    member = st.session_state.get('zip_image_index', {}).get(key)
+    source_bytes = st.session_state.get('zip_image_source_bytes')
+    if not member or not source_bytes:
+        return None
+    try:
+        with zipfile.ZipFile(BytesIO(source_bytes)) as zf:
+            img_bytes = zf.read(member)
+            encoded = base64.b64encode(img_bytes).decode('utf-8')
+            mime = "image/jpeg"
+            if key.endswith(".png"): mime = "image/png"
+            elif key.endswith(".webp"): mime = "image/webp"
+            elif key.endswith(".gif"): mime = "image/gif"
+            data_uri = f"data:{mime};base64,{encoded}"
+            store[key] = data_uri
+            return data_uri
+    except Exception as e:
+        logger.warning(f"Failed lazy-loading ZIP image {member}: {e}")
+        return None
+
+IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.gif')
+
+def _get_image_from_zip(name, brand, image_name=None) -> Optional[str]:
+    """Try to find image in zip store by product name-Brand or explicit filename."""
+    if image_name:
+        img_data = _load_zip_image_by_key(image_name)
+        if img_data:
+            return img_data
+    # Product name-Brand
+    key = f"{str(name).strip()}-{str(brand).strip()}".lower()
+    # Also try variations of extensions
+    for ext in [*IMAGE_EXTENSIONS, '']:
+        img_data = _load_zip_image_by_key(key + ext)
+        if img_data:
+            return img_data
+    return None

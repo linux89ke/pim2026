@@ -93,6 +93,19 @@ COLOR_PATTERNS = {
     'multicolor': ['multicolor', 'multicolour', 'multi-color', 'rainbow', 'mixed']
 }
 
+COUNTRY_VALIDATOR_CONFIG = {
+    "Kenya": {"code": "KE", "skip_validations": []},
+    "Uganda": {
+        "code": "UG",
+        "skip_validations": ["Counterfeit Sneakers", "Product Warranty"],
+    },
+    "Nigeria": {"code": "NG", "skip_validations": []},
+    "Ghana": {"code": "GH", "skip_validations": []},
+    "Morocco": {"code": "MA", "skip_validations": ["Generic BRAND Issues"]},
+}
+
+
+# Pre-computed map for faster extraction in data_utils
 COLOR_VARIANT_TO_BASE = {}
 for _base_color, _variants in COLOR_PATTERNS.items():
     for _variant in _variants:

@@ -12,3 +12,6 @@ plotly
 imagehash
 opencv-python-headless
 st-styled
+orjson==3.10.3
+polars>=0.20.0
+sentence-transformers>=2.2.2
