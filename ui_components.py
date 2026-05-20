@@ -1521,6 +1521,17 @@ def build_fast_grid_html(
     opacity: 1;
     pointer-events: auto;
   }}
+  #floating-action-bar.collapsed {{
+    padding: 10px 20px;
+    gap: 12px;
+  }}
+  #floating-action-bar.collapsed .fab-actions {{ display: none; }}
+  #floating-action-bar.collapsed .fab-count {{ border-right: none; padding-right: 0; font-size:14px; }}
+  .fab-toggle {{
+    background: none; border: none; color: rgba(255,255,255,0.6); cursor: pointer;
+    font-size: 18px; line-height: 1; padding: 0 0 0 8px; flex-shrink: 0;
+  }}
+  .fab-toggle:hover {{ color: #fff; }}
   .fab-count {{ color: {O}; font-weight: 800; font-size: 18px; border-right: 1px solid rgba(255,255,255,0.2); padding-right: 25px; }}
 
   /* 🚀 Skeleton Shimmer */
@@ -1731,10 +1742,13 @@ def build_fast_grid_html(
 
 <div id="floating-action-bar">
   <div class="fab-count" id="fab-count-txt">0 {labels_dict["items_pending"].upper()}</div>
-  <button class="batch-btn" onclick="window.batchApprove()" style="border-radius:24px; padding:10px 24px; background:#16a34a; font-size:15px; font-weight:600;">Approve All</button>
-  <button class="batch-btn" onclick="doBatchReject('bottom')" style="border-radius:24px; padding:10px 24px; font-size:15px; font-weight:600;">Reject All</button>
-  <button class="desel-btn" onclick="doBatchUndo()" style="border-radius:24px; padding:10px 24px; color:#fff; background:#4b4b4b; border:1px solid #777; font-size:15px; font-weight:600;">{labels_dict["undo"]}</button>
-  <button class="desel-btn" onclick="doDeselAll()" style="border-radius:24px; padding:10px 24px; color:#fff; background:#e73c17; border:1px solid #e73c17; font-size:15px; font-weight:600;">{labels_dict["clear_sel"]}</button>
+  <button class="fab-toggle" onclick="(function(){{var f=document.getElementById('floating-action-bar');f.classList.toggle('collapsed');}})()" title="Minimize / restore">&#8211;</button>
+  <div class="fab-actions" style="display:flex;align-items:center;gap:32px;">
+    <button class="batch-btn" onclick="window.batchApprove()" style="border-radius:24px; padding:10px 24px; background:#16a34a; font-size:15px; font-weight:600;">Approve All</button>
+    <button class="batch-btn" onclick="doBatchReject('bottom')" style="border-radius:24px; padding:10px 24px; font-size:15px; font-weight:600;">Reject All</button>
+    <button class="desel-btn" onclick="doBatchUndo()" style="border-radius:24px; padding:10px 24px; color:#fff; background:#4b4b4b; border:1px solid #777; font-size:15px; font-weight:600;">{labels_dict["undo"]}</button>
+    <button class="desel-btn" onclick="doDeselAll()" style="border-radius:24px; padding:10px 24px; color:#fff; background:#e73c17; border:1px solid #e73c17; font-size:15px; font-weight:600;">{labels_dict["clear_sel"]}</button>
+  </div>
 </div>
 
 <script>
@@ -2402,16 +2416,15 @@ function _applyBatchReject(br) {{
   var payload = {{}}, count = 0;
   for (var s in staged) {{ payload[s] = staged[s]; count++; }}
   for (var s in selected) {{
-    if (!(s in COMMITTED)) {{ payload[s] = br; count++; }}
+    // Allow overwriting committed items (e.g. re-reject brand-image-check with a different reason)
+    payload[s] = br; count++;
   }}
   if (count === 0) {{
-    // Even if no new rejections, clear the current selection to avoid "phantom" pending counts
     for (var s in selected) delete selected[s];
     for (var s in staged) delete staged[s];
     updateSelCount();
     return;
   }}
-  // Clear EVERYTHING that was selected or staged
   var allSids = Object.assign({{}}, selected, staged);
   for (var s in payload) {{ COMMITTED[s] = payload[s]; }}
   for (var s in allSids) {{ delete selected[s]; delete staged[s]; }}
