@@ -1198,9 +1198,12 @@ def build_fast_grid_html(
     O = JUMIA_COLORS["primary_orange"]
     G = JUMIA_COLORS["success_green"]
     R = JUMIA_COLORS["jumia_red"]
-    committed_json = json.dumps(rejected_state)
-    poor_img_sids_json = json.dumps(list(poor_img_sids or []))
-    prefetch_json = json.dumps(prefetch_urls or [])
+    def _js_json(v):
+        return json.dumps(v).replace("</", "<\\/")
+
+    committed_json = _js_json(rejected_state)
+    poor_img_sids_json = _js_json(list(poor_img_sids or []))
+    prefetch_json = _js_json(prefetch_urls or [])
     html_dir = "rtl" if st.session_state.get("ui_lang") == "ar" else "ltr"
 
     labels_dict = {
@@ -1221,7 +1224,7 @@ def build_fast_grid_html(
         "deselect_all": _t("deselect_all"),
         "rejected": str(_t("rejected") or "REJECTED").upper(),
     }
-    labels_json = json.dumps(labels_dict)
+    labels_json = _js_json(labels_dict)
 
     _PLACEHOLDER_SVG = (
         "data:image/svg+xml;utf8,"
@@ -1308,7 +1311,7 @@ def build_fast_grid_html(
             }
         )
 
-    cards_json = orjson.dumps(cards_data).decode("utf-8")
+    cards_json = orjson.dumps(cards_data).decode("utf-8").replace("</", "<\\/")
 
     scroll_js = ""
     if scroll_to_top:
@@ -2014,9 +2017,9 @@ function buildCardActionsHtml(safeSid) {{
 }}
 
 // ── Smart Features Utility ──
-var UNNECESSARY_WORDS = {json.dumps(support_files.get("unnecessary_words", []))};
-var PROHIBITED_WORDS = {json.dumps(support_files.get("prohibited_words", []))};
-var SELLER_TRUST = {json.dumps(seller_trust)};
+var UNNECESSARY_WORDS = {_js_json(support_files.get("unnecessary_words", []))};
+var PROHIBITED_WORDS = {_js_json(support_files.get("prohibited_words", []))};
+var SELLER_TRUST = {_js_json(seller_trust)};
 
 function getHighlightedName(card) {{
   var name = card.name;
