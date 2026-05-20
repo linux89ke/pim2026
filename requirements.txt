@@ -1,0 +1,14 @@
+streamlit
+pandas>=2.1.0
+numpy>=1.26.0
+openpyxl
+Pillow
+requests>=2.31.0
+xlsxwriter
+scikit-learn
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+plotly
+imagehash
+opencv-python-headless
+st-styled
