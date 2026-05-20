@@ -2124,7 +2124,7 @@ function renderCard(card) {{
       trustBadge = `<div class="trust-badge" onclick="event.stopPropagation();window.rejectAllFromSeller('${{card.seller.replace(/'/g,"\\\\'")}}')" title="Seller has ${{score}}% rejection rate. Click to reject all from this seller.">High Risk Seller</div>`;
     }}
 
-  var dataAttrs = `data-sid="${{card.data_sid}}" data-name="${{card.data_name}}" data-brand="${{card.data_brand}}" data-cat="${{card.data_cat}}"`;
+  var dataAttrs = 'data-sid="' + escapeHtml(String(card.data_sid||'')) + '" data-name="' + escapeHtml(String(card.data_name||'')) + '" data-brand="' + escapeHtml(String(card.data_brand||'')) + '" data-cat="' + escapeHtml(String(card.data_cat||'')) + '"';
   return `<div class="${{cls}}" id="card-${{escapeHtml(sid)}}" ${{dataAttrs}} tabindex="0" onclick="window.toggleSelect('${{safeSid}}',event)">
     <div class="card-img-wrap">
       ${{trustBadge}}
