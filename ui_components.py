@@ -1417,6 +1417,8 @@ def build_fast_grid_html(
 
   .tick{{position:absolute;bottom:6px;left:6px;width:22px;height:22px;border-radius:50%;background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;color:transparent;font-size:13px;font-weight:900;pointer-events:none;z-index:10;}}
   .card.selected .tick{{background:{O};color:#fff;}}
+  .card.committed-rej.selected .tick{{z-index:25;background:{O};color:#fff;}}
+  .card.committed-rej.selected{{box-shadow:0 0 0 4px {O},0 0 0 8px rgba(255,136,0,.25)!important;}}
 
   .rej-overlay{{display:none;position:absolute;inset:0;background:rgba(255,255,255,.90);border-radius:8px;flex-direction:column;align-items:center;justify-content:center;z-index:20;gap:8px;padding:12px;text-align:center;}}
   .card.committed-rej .rej-overlay{{display:flex;}}
@@ -2613,7 +2615,8 @@ window.batchApproveSingle = function(sid) {{
 }}
 
 window.batchApprove = function() {{
-  var sids = Object.keys(selected);
+  // Exclude already-committed items — approve only genuinely unreviewed selected items
+  var sids = Object.keys(selected).filter(s => !(s in COMMITTED));
   if (sids.length === 0) return;
   if (confirm('Approve ' + sids.length + ' selected items?')) {{
     sids.forEach(sid => window.batchApproveSingle(sid));
