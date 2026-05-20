@@ -1192,9 +1192,8 @@ def build_fast_grid_html(
     
     from translations import get_translation
     lang = "fr" if country == "Morocco" else "en"
-    labels_dict = get_translation(lang)
-    
-    def _t(key): return labels_dict.get(key, key)
+
+    def _t(key): return get_translation(lang, key)
 
     O = JUMIA_COLORS["primary_orange"]
     G = JUMIA_COLORS["success_green"]
