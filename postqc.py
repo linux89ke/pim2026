@@ -116,6 +116,7 @@ def detect_file_type(df: pd.DataFrame) -> str:
     return 'pre_qc'
 
 
+@st.cache_data(ttl=3600)
 def load_category_map(filename: str = "category_map.xlsx") -> Dict[str, str]:
     import os
     if not os.path.exists(filename):
@@ -133,18 +134,18 @@ def load_category_map(filename: str = "category_map.xlsx") -> Dict[str, str]:
         path_col = next((c for c in df.columns if 'path' in c.lower()), None)
         if not name_col or not code_col:
             return {}
-        mapping: Dict[str, str] = {}
-        for _, row in df.iterrows():
-            name = str(row[name_col]).strip()
-            code = str(row[code_col]).strip().split('.')[0]
-            if name and code and name.lower() != 'nan' and code.lower() != 'nan':
-                mapping[name.lower()] = code
-            if path_col:
-                path = str(row.get(path_col, '')).strip()
-                if path and path.lower() != 'nan':
-                    last = path.split('/')[-1].strip().lower()
-                    if last and last not in mapping:
-                        mapping[last] = code
+        names = df[name_col].astype(str).str.strip()
+        codes = df[code_col].astype(str).str.strip().str.split('.').str[0]
+        valid = names.str.lower().ne("nan") & codes.str.lower().ne("nan") & names.ne("") & codes.ne("")
+        mapping: Dict[str, str] = dict(zip(names[valid].str.lower(), codes[valid]))
+        if path_col:
+            paths = df[path_col].astype(str).str.strip()
+            path_valid = paths.str.lower().ne("nan") & paths.ne("")
+            lasts = paths[path_valid].str.split('/').str[-1].str.strip().str.lower()
+            path_codes = codes[path_valid]
+            for last, code in zip(lasts, path_codes):
+                if last and last not in mapping:
+                    mapping[last] = code
         return mapping
     except Exception as e:
         logger.warning(f"load_category_map: {e}")

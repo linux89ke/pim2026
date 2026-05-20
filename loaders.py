@@ -98,25 +98,23 @@ def load_prohibited_from_local() -> Dict[str, List[Dict]]:
                 df.columns[0],
             )
             category_col = next((c for c in df.columns if "cat" in c), None)
-            country_rules = []
-            for _, row in df.iterrows():
-                keyword = str(row.get(keyword_col, "")).strip().lower()
-                if not keyword or keyword in ("nan", "keywords"):
-                    continue
-                categories = set()
-                if category_col:
-                    cats_raw = str(row.get(category_col, "")).strip()
-                    if cats_raw and cats_raw.lower() != "nan":
-                        split_cats = re.split(r"[,\n]+", cats_raw)
-                        categories.update(
-                            [
-                                clean_category_code(c.strip())
-                                for c in split_cats
-                                if c.strip()
-                            ]
-                        )
-                country_rules.append({"keyword": keyword, "categories": categories})
-            prohibited_by_country[tab] = country_rules
+            kw_series = df[keyword_col].astype(str).str.strip().str.lower()
+            valid_mask = kw_series.ne("") & ~kw_series.isin(("nan", "keywords"))
+            df_v = df[valid_mask].copy()
+            kw_series = kw_series[valid_mask]
+            if category_col:
+                def _parse_cats(raw):
+                    raw = str(raw).strip()
+                    if not raw or raw.lower() == "nan":
+                        return set()
+                    return {clean_category_code(c.strip()) for c in re.split(r"[,\n]+", raw) if c.strip()}
+                cats_series = df_v[category_col].map(_parse_cats)
+            else:
+                cats_series = pd.Series([set()] * len(df_v), index=df_v.index)
+            prohibited_by_country[tab] = [
+                {"keyword": kw, "categories": cats}
+                for kw, cats in zip(kw_series, cats_series)
+            ]
         except Exception as e:
             logger.warning(f"load_prohibited_from_local tab={tab}: {e}")
             prohibited_by_country[tab] = []
@@ -134,54 +132,56 @@ def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
                 config_by_country[country_name] = []
                 continue
             df.columns = [str(c).strip().lower() for c in df.columns]
-            brand_dict = {}
-            for _, row in df.iterrows():
-                brand = str(row.get("brand", "")).strip()
-                if not brand or brand.lower() == "nan":
-                    continue
-                b_lower = brand.lower()
+            brand_col_vals = df.get("brand", pd.Series(dtype=str)).astype(str).str.strip()
+            valid = brand_col_vals.str.lower().ne("nan") & brand_col_vals.ne("")
+            df = df[valid].copy()
+            df["_b_lower"] = brand_col_vals[valid].str.lower().values
+
+            def _split_set(series, sep=","):
+                return series.astype(str).str.strip().apply(
+                    lambda x: set() if not x or x.lower() == "nan"
+                    else {v.strip() for v in x.split(sep) if v.strip()}
+                )
+
+            def _split_cats(series):
+                return series.astype(str).str.strip().apply(
+                    lambda x: None if (not x or x.lower() == "nan")
+                    else {clean_category_code(c.strip()) for c in x.split(",") if c.strip()}
+                )
+
+            sellers_s = _split_set(df.get("approved sellers", pd.Series([""] * len(df), index=df.index)), ",")
+            cats_s = _split_cats(df.get("categories", pd.Series([""] * len(df), index=df.index)))
+            vars_s = _split_set(df.get("variations", pd.Series([""] * len(df), index=df.index)), ",")
+
+            brand_dict: dict = {}
+            for b_lower, brand_raw, sellers, cats, variations in zip(
+                df["_b_lower"], brand_col_vals[valid], sellers_s, cats_s, vars_s
+            ):
                 if b_lower not in brand_dict:
                     brand_dict[b_lower] = {
-                        "brand_raw": brand,
+                        "brand_raw": brand_raw,
                         "sellers": set(),
                         "categories": set(),
                         "variations": set(),
                         "has_blank_category": False,
                     }
-                sellers_raw = str(row.get("approved sellers", "")).strip().lower()
-                if sellers_raw != "nan" and sellers_raw:
-                    brand_dict[b_lower]["sellers"].update(
-                        [s.strip() for s in sellers_raw.split(",") if s.strip()]
-                    )
-                cats_raw = str(row.get("categories", "")).strip()
-                if cats_raw == "nan" or not cats_raw:
+                brand_dict[b_lower]["sellers"].update(sellers)
+                if cats is None:
                     brand_dict[b_lower]["has_blank_category"] = True
                 else:
-                    brand_dict[b_lower]["categories"].update(
-                        [
-                            clean_category_code(c.strip())
-                            for c in cats_raw.split(",")
-                            if c.strip()
-                        ]
-                    )
-                vars_raw = str(row.get("variations", "")).strip().lower()
-                if vars_raw != "nan" and vars_raw:
-                    brand_dict[b_lower]["variations"].update(
-                        [v.strip() for v in vars_raw.split(",") if v.strip()]
-                    )
-            country_rules = []
-            for b_lower, data in brand_dict.items():
-                if data["has_blank_category"]:
-                    data["categories"] = set()
-                country_rules.append(
-                    {
-                        "brand": b_lower,
-                        "brand_raw": data["brand_raw"],
-                        "sellers": data["sellers"],
-                        "categories": data["categories"],
-                        "variations": list(data["variations"]),
-                    }
-                )
+                    brand_dict[b_lower]["categories"].update(cats)
+                brand_dict[b_lower]["variations"].update(variations)
+
+            country_rules = [
+                {
+                    "brand": b_lower,
+                    "brand_raw": data["brand_raw"],
+                    "sellers": data["sellers"],
+                    "categories": set() if data["has_blank_category"] else data["categories"],
+                    "variations": list(data["variations"]),
+                }
+                for b_lower, data in brand_dict.items()
+            ]
             config_by_country[country_name] = country_rules
         except Exception as e:
             logger.warning(f"load_restricted_brands tab={tab_name}: {e}")
@@ -494,39 +494,35 @@ def load_perfume_catalog_from_local(_mtime: float = 0.0) -> Dict:
                     "load_perfume_catalog: 'brand' column not found in enriched_perfume_catalog"
                 )
             else:
-                for _, row in df.iterrows():
-                    # ─ canonical brand ────────────────────────────────────────
-                    brand = str(row.get(brand_col, "")).strip()
-                    if not brand or brand.lower() in ("", "nan"):
-                        continue
-                    b_low = brand.lower()
-                    result["legit_brand_terms"].add(b_low)
-                    result["term_to_brand"][b_low] = brand
+                brands = df[brand_col].astype(str).str.strip()
+                valid_brands = ~brands.str.lower().isin(("", "nan"))
+                df_v = df[valid_brands].copy()
+                brands_v = brands[valid_brands]
+                brands_low = brands_v.str.lower()
+                result["legit_brand_terms"].update(brands_low)
+                result["term_to_brand"].update(dict(zip(brands_low, brands_v)))
 
-                    # ─ aliases (also_known_as, "/"-separated) ─────────────────
-                    if aka_col:
-                        aka = str(row.get(aka_col, "")).strip()
-                        if aka and aka.lower() not in ("", "nan", "-", "none"):
-                            for alias in re.split(r"[/,]", aka):
-                                alias = alias.strip().lower()
-                                if alias:
-                                    result["legit_brand_terms"].add(alias)
-                                    result["term_to_brand"].setdefault(alias, brand)
+                if aka_col:
+                    _skip = {"", "nan", "-", "none"}
+                    for brand, aka_raw in zip(brands_v, df_v[aka_col].astype(str).str.strip()):
+                        if aka_raw.lower() in _skip:
+                            continue
+                        for alias in re.split(r"[/,]", aka_raw):
+                            alias = alias.strip().lower()
+                            if alias and alias not in _skip:
+                                result["legit_brand_terms"].add(alias)
+                                result["term_to_brand"].setdefault(alias, brand)
 
-                    # ─ model names (";"-separated) ─────────────────────────
-                    if model_col:
-                        models_raw = str(row.get(model_col, "")).strip()
-                        if models_raw and models_raw.lower() not in (
-                            "",
-                            "nan",
-                            "-",
-                            "none",
-                        ):
-                            for model in models_raw.split(";"):
-                                model = model.strip().lower()
-                                if model:
-                                    result["model_terms"].add(model)
-                                    result["term_to_brand"].setdefault(model, brand)
+                if model_col:
+                    _skip = {"", "nan", "-", "none"}
+                    for brand, models_raw in zip(brands_v, df_v[model_col].astype(str).str.strip()):
+                        if models_raw.lower() in _skip:
+                            continue
+                        for model in models_raw.split(";"):
+                            model = model.strip().lower()
+                            if model:
+                                result["model_terms"].add(model)
+                                result["term_to_brand"].setdefault(model, brand)
     except Exception as e:
         logger.warning(f"load_perfume_catalog enriched_perfume_catalog: {e}")
 
@@ -768,24 +764,20 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
                 and "reason" in df.columns
                 and "comment" in df.columns
             ):
-                custom_mapping = {}
-                for _, row in df.iterrows():
-                    flag = str(row["flag"]).strip()
-                    reason = str(row["reason"]).strip()
-                    comment_en = str(row["comment"]).strip()
-                    comment_fr = str(row.get("french", comment_en)).strip()
-                    comment_ar = str(row.get("arabic", comment_en)).strip()
-                    if comment_fr.lower() == "nan" or not comment_fr:
-                        comment_fr = comment_en
-                    if comment_ar.lower() == "nan" or not comment_ar:
-                        comment_ar = comment_en
-                    if flag and flag.lower() != "nan":
-                        custom_mapping[flag] = {
-                            "reason": reason,
-                            "en": comment_en,
-                            "fr": comment_fr,
-                            "ar": comment_ar,
-                        }
+                flags = df["flag"].astype(str).str.strip()
+                reasons = df["reason"].astype(str).str.strip()
+                en_col = df["comment"].astype(str).str.strip()
+                fr_col = df["french"].astype(str).str.strip() if "french" in df.columns else en_col.copy()
+                ar_col = df["arabic"].astype(str).str.strip() if "arabic" in df.columns else en_col.copy()
+                fr_col = fr_col.where(fr_col.str.lower().ne("nan") & fr_col.ne(""), en_col)
+                ar_col = ar_col.where(ar_col.str.lower().ne("nan") & ar_col.ne(""), en_col)
+                valid = flags.str.lower().ne("nan") & flags.ne("")
+                custom_mapping = {
+                    flag: {"reason": reason, "en": en, "fr": fr, "ar": ar}
+                    for flag, reason, en, fr, ar in zip(
+                        flags[valid], reasons[valid], en_col[valid], fr_col[valid], ar_col[valid]
+                    )
+                }
                 if custom_mapping:
                     ng_keys = {
                         k: v

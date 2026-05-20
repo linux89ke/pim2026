@@ -2242,6 +2242,8 @@ window.doSelectAll = function() {{
 }};
 
 window.toggleSelect = function(sid, e) {{
+  var t = e && e.target;
+  if (t && (t.tagName === 'SELECT' || t.tagName === 'OPTION' || t.tagName === 'BUTTON' || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.closest('select,button,input,textarea,a'))) return;
   if (sid in staged) delete staged[sid];
   else if (sid in selected) delete selected[sid];
   else selected[sid] = true;

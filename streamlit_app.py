@@ -86,6 +86,7 @@ from data_utils import (
     _repair_mojibake,
     clean_category_code,
     create_match_key,
+    create_match_key_vectorized,
     df_hash,
     filter_by_country,
     load_df_parquet,
@@ -1529,19 +1530,15 @@ def check_single_word_name(
         non_books_mask = ~d["CATEGORY_CODE"].apply(clean_category_code).isin(cat_codes)
     flagged = d[bad_name_mask & non_books_mask].copy()
     if not flagged.empty:
-
-        def get_reason(row):
-            name_str = str(row["NAME"]).strip()
-            w_count = len(name_str.split())
-            c_count = len(name_str)
-            if w_count <= 2 and c_count < 15:
-                return f"{w_count} words, {c_count} chars"
-            elif w_count <= 2:
-                return f"{w_count} words"
-            else:
-                return f"{c_count} chars"
-
-        flagged["Comment_Detail"] = flagged.apply(get_reason, axis=1)
+        import numpy as np
+        _fw = flagged["NAME"].astype(str).str.strip()
+        _wc = _fw.str.split().str.len().fillna(0).astype(int)
+        _cc = _fw.str.len()
+        flagged["Comment_Detail"] = np.where(
+            (_wc <= 2) & (_cc < 15),
+            _wc.astype(str) + " words, " + _cc.astype(str) + " chars",
+            np.where(_wc <= 2, _wc.astype(str) + " words", _cc.astype(str) + " chars"),
+        )
     return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
@@ -2081,22 +2078,18 @@ def check_duplicate_products(
     d["_size_key"] = d["NAME"].astype(str).apply(_extract_size_key)
 
     # ── 2. Color key — extracted from the NAME first, then the COLOR column ───
-    # BUG FIX: previously returned '' when a color WAS found in the name,
-    # meaning 'Red Headlamp' and 'Blue Headlamp' both got '' and looked identical.
-    # Now we return the ACTUAL color found so they get DIFFERENT keys.
-    def _get_color_key(row):
-        nl = str(row.get("NAME", "")).lower()
-        if _color_pat:
-            m = _color_pat.search(nl)
-            if m:
-                return m.group(0).lower().strip()  # e.g. 'red', 'silver'
-        for col in ("COLOR", "COLOR_FAMILY"):
-            val = str(row.get(col, "")).strip().lower()
-            if val and val not in ("nan", "none", "", "n/a"):
-                return val
-        return ""
-
-    d["_color_key"] = d.apply(_get_color_key, axis=1)
+    _names_lower = d["NAME"].astype(str).str.lower()
+    if _color_pat:
+        _from_name = _names_lower.str.extract(_color_pat.pattern, flags=re.IGNORECASE, expand=False).str.lower().str.strip().fillna("")
+    else:
+        _from_name = pd.Series("", index=d.index)
+    _fallback = pd.Series("", index=d.index)
+    for _fc in ("COLOR", "COLOR_FAMILY"):
+        if _fc in d.columns:
+            _v = d[_fc].astype(str).str.strip().str.lower()
+            _valid = ~_v.isin(["nan", "none", "", "n/a"]) & (_fallback == "")
+            _fallback = _fallback.where(~_valid, _v)
+    d["_color_key"] = _from_name.where(_from_name != "", _fallback)
 
     # ── 3. Normalised name (noise words + punctuation + spaces stripped) ───────
     d["_norm_name"] = d["NAME"].astype(str).str.lower()
@@ -2485,9 +2478,12 @@ def validate_products(
     rejected_sids: set = set()
     dup_groups = {}
     if {"NAME", "BRAND", "SELLER_NAME", "COLOR"}.issubset(data.columns):
-        dt = data.copy()
-        dt["dup_key"] = dt[["NAME", "BRAND", "SELLER_NAME", "COLOR"]].apply(
-            lambda r: tuple(str(v).strip().lower() for v in r), axis=1
+        dt = data[["NAME", "BRAND", "SELLER_NAME", "COLOR", "PRODUCT_SET_SID"]].copy()
+        dt["dup_key"] = (
+            dt["NAME"].astype(str).str.strip().str.lower() + "||" +
+            dt["BRAND"].astype(str).str.strip().str.lower() + "||" +
+            dt["SELLER_NAME"].astype(str).str.strip().str.lower() + "||" +
+            dt["COLOR"].astype(str).str.strip().str.lower()
         )
         for k, v in dt.groupby("dup_key")["PRODUCT_SET_SID"].apply(list).items():
             if len(v) > 1:
@@ -2549,7 +2545,7 @@ def validate_products(
                             "Counterfeit Sneakers", "Seller Not approved to sell Refurb",
                             "Restricted brands", "MA - Marque Interdite", "GH - Smart Glasses with Camera"
                         ]:
-                            res["match_key"] = res.apply(create_match_key, axis=1)
+                            res["match_key"] = create_match_key_vectorized(res)
                             restricted_keys.setdefault(name, set()).update(res["match_key"].unique())
 
                         _sids = set(res["PRODUCT_SET_SID"].unique())
@@ -2587,7 +2583,7 @@ def validate_products(
                 st.error(f"**{e_name}**: {e_msg}")
 
     if restricted_keys:
-        data["match_key"] = data.apply(create_match_key, axis=1)
+        data["match_key"] = create_match_key_vectorized(data)
         for fname, keys in restricted_keys.items():
             extra = data[data["match_key"].isin(keys)].copy()
             results[fname] = pd.concat(
