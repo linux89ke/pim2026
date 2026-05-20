@@ -2034,7 +2034,7 @@ function getHighlightedName(card) {{
   
   // Sort by length descending to avoid partial matches
   words.sort((a,b) => b.length - a.length);
-  var regex = new RegExp('(' + words.map(w => w.replace(/[.*+?^${{}}()|[\\]\\]/g, '\\\\$&')).join('|') + ')', 'gi');
+  var regex = new RegExp('(' + words.map(w => w.replace(/[.*+?^${{}}()|[\\]\\\\]/g, '\\\\$&')).join('|') + ')', 'gi');
   var hName = name.replace(regex, '<span class="hlt">$1</span>');
   
   // Truncate if still too long (preserving HTML tags is tricky, so we limit characters but skip tags)
