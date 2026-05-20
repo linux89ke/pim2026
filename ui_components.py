@@ -2559,30 +2559,35 @@ document.addEventListener('keydown', function(e) {{
 }});
 
 // 🚀 Live Search
-document.getElementById('grid-search').addEventListener('input', function() {{
-  var q = this.value.toLowerCase().trim();
-  document.querySelectorAll('.card').forEach(function(card) {{
-    var text = (card.dataset.name + ' ' + card.dataset.brand + ' ' +
-                card.dataset.sid + ' ' + card.dataset.cat).toLowerCase();
-    card.style.display = (!q || text.includes(q)) ? '' : 'none';
+(function() {{
+  var _gs = document.getElementById('grid-search');
+  if (_gs) _gs.addEventListener('input', function() {{
+    var q = this.value.toLowerCase().trim();
+    document.querySelectorAll('.card').forEach(function(card) {{
+      var text = (card.dataset.name + ' ' + card.dataset.brand + ' ' +
+                  card.dataset.sid + ' ' + card.dataset.cat).toLowerCase();
+      card.style.display = (!q || text.includes(q)) ? '' : 'none';
+    }});
+    var vis = document.querySelectorAll('.card:not([style*="none"])').length;
+    var el = document.getElementById('grid-count');
+    if (el) el.textContent = q ? vis + ' matching' : vis + ' products';
   }});
-  var vis = document.querySelectorAll('.card:not([style*="none"])').length;
-  var el = document.getElementById('grid-count');
-  if (el) el.textContent = q ? vis + ' matching' : vis + ' products';
-}});
+}})();
 
 // 🚀 Dark Mode
-var _dark = localStorage.getItem('gridDark') === '1';
+var _dark = false;
+try {{ _dark = localStorage.getItem('gridDark') === '1'; }} catch(e) {{}}
 window.applyDark = function(on) {{
   document.documentElement.style.setProperty('--bg',    on ? '#18181b' : '#f9fafb');
   document.documentElement.style.setProperty('--card',  on ? '#27272a' : '#ffffff');
   document.documentElement.style.setProperty('--text',  on ? '#f4f4f5' : '#111827');
   document.documentElement.style.setProperty('--border',on ? '#3f3f46' : '#e5e7eb');
-  document.getElementById('dark-toggle').textContent = on ? 'Light' : 'Dark';
-  localStorage.setItem('gridDark', on ? '1' : '0');
+  var dtEl = document.getElementById('dark-toggle');
+  if (dtEl) dtEl.textContent = on ? 'Light' : 'Dark';
+  try {{ localStorage.setItem('gridDark', on ? '1' : '0'); }} catch(e) {{}}
 }}
 window.toggleDark = function() {{ _dark = !_dark; applyDark(_dark); }}
-applyDark(_dark);
+try {{ applyDark(_dark); }} catch(e) {{}}
 
 // 🚀 Keyboard Navigation
 var _focused = -1;
@@ -2628,7 +2633,11 @@ window.batchApprove = function() {{
   }}
 }}
 
-renderAll();
+try {{
+  renderAll();
+}} catch(e) {{
+  document.getElementById('card-grid').innerHTML = '<div style="color:red;padding:20px;font-size:14px;font-family:monospace;white-space:pre-wrap;background:#fff3f3;border:2px solid red;border-radius:8px;margin:20px;">&#x26A0; JS ERROR in renderAll():<br>' + String(e) + '<br><br>Stack:<br>' + (e.stack||'') + '</div>';
+}}
 </script>
 </body>
 </html>"""
