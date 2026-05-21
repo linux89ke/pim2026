@@ -1219,6 +1219,19 @@ def check_product_warranty(
     def is_present(s):
         return (s != "nan") & (s != "") & (s != "none") & (s != "nat") & (s != "n/a")
 
+    # Only flag rows that actually came from a file with warranty columns — when
+    # multiple files are merged, rows from file formats without warranty data will
+    # have blank warranty columns even though no data was supplied.
+    # Use _has_warranty_data sentinel set during merge; fall back to any non-empty
+    # value in the column across the whole dataset as a proxy.
+    if "_has_warranty_data" in target.columns:
+        target = target[target["_has_warranty_data"] == True]
+    elif not is_present(d["PRODUCT_WARRANTY"]).any() and not is_present(d["WARRANTY_DURATION"]).any():
+        return pd.DataFrame(columns=d.columns)
+
+    if target.empty:
+        return pd.DataFrame(columns=d.columns)
+
     mask = ~(
         is_present(target["PRODUCT_WARRANTY"]) | is_present(target["WARRANTY_DURATION"])
     )
@@ -2522,6 +2535,11 @@ def validate_products(
         "Variation Name Mismatch"
     }
     _skip_set = {s.lower() for s in (skip_validators or [])}
+    if not data_has_warranty_cols:
+        # Warranty columns (PRODUCT_WARRANTY, WARRANTY_DURATION) only exist in the
+        # third file format. Skip the native check when they're absent so products
+        # aren't incorrectly flagged — the prefetch ZIP check covers this instead.
+        _skip_set.add("product warranty")
     _needs_image_cache = any(v[0].lower() not in _skip_set and v[1] in (check_image_stretched, check_image_blurry, check_duplicate_products) for v in validations)
     _image_cache = _fetch_all_image_dimensions(data) if _needs_image_cache else {}
 
@@ -3586,6 +3604,10 @@ if st.session_state.get("last_processed_files") != process_signature:
                             if "PRODUCT_SET_SID" in _std.columns:
                                 _std["PRODUCT_SET_SID"] = _std["PRODUCT_SET_SID"].astype(str).str.strip()
                                 file_sids_sets.append(set(_std["PRODUCT_SET_SID"].unique()))
+                            # Mark rows that actually came from a file with warranty columns
+                            _std["_has_warranty_data"] = (
+                                "PRODUCT_WARRANTY" in _std.columns or "WARRANTY_DURATION" in _std.columns
+                            )
                             std_dfs.append(_std)
 
                         merged_data = pd.concat(std_dfs, ignore_index=True)
