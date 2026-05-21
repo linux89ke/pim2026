@@ -1199,7 +1199,7 @@ def build_fast_grid_html(
     G = JUMIA_COLORS["success_green"]
     R = JUMIA_COLORS["jumia_red"]
     def _js_json(v):
-        return json.dumps(v).replace("</", "<\\/")
+        return orjson.dumps(v).decode("utf-8").replace("</", "<\\/")
 
     committed_json = _js_json(rejected_state)
     poor_img_sids_json = _js_json(list(poor_img_sids or []))
@@ -1238,6 +1238,7 @@ def build_fast_grid_html(
         "</svg>"
     )
 
+    _zip_img_cache: dict = {}
     cards_data = []
     for _, row in page_data.iterrows():
         sid = str(row["PRODUCT_SET_SID"])
@@ -1247,7 +1248,10 @@ def build_fast_grid_html(
         elif img_url:
             name = str(row.get("NAME", "")).strip()
             brand = str(row.get("BRAND", "")).strip()
-            img_data = _get_image_from_zip(name, brand, img_url)
+            _zip_cache_key = (name, brand, img_url)
+            if _zip_cache_key not in _zip_img_cache:
+                _zip_img_cache[_zip_cache_key] = _get_image_from_zip(name, brand, img_url)
+            img_data = _zip_img_cache[_zip_cache_key]
             if img_data:
                 img_url = img_data
             else:

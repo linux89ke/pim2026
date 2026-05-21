@@ -15,6 +15,9 @@ from data_utils import clean_category_code
 
 logger = logging.getLogger(__name__)
 
+# Module-level cache for compiled regex patterns (avoids re-compilation cost)
+_REGEX_CACHE: dict = {}
+
 COUNTRY_TABS = ["KE", "UG", "NG", "GH", "MA"]
 COUNTRY_NAME_TO_TAB = {
     "Kenya": "KE",
@@ -929,11 +932,15 @@ def load_support_files_lazy():
     return load_all_support_files()
 
 
-@st.cache_data(ttl=3600)
-def compile_regex_patterns(words: List[str]) -> re.Pattern:
+def compile_regex_patterns(words: List[str], flags=re.IGNORECASE) -> re.Pattern:
     if not words:
         return None
+    key = (tuple(sorted(words)), flags)
+    if key in _REGEX_CACHE:
+        return _REGEX_CACHE[key]
     pattern = "|".join(
         r"\b" + re.escape(w) + r"\b" for w in sorted(words, key=len, reverse=True)
     )
-    return re.compile(pattern, re.IGNORECASE)
+    compiled = re.compile(pattern, flags)
+    _REGEX_CACHE[key] = compiled
+    return compiled
