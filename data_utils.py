@@ -267,20 +267,21 @@ def filter_by_country(df: pd.DataFrame, country_validator) -> Tuple[pd.DataFrame
         filtered = df[df['ACTIVE_STATUS_COUNTRY'] == country_validator.code].copy()
         filtered['_IS_MULTI_COUNTRY'] = False
     # Detect all countries present in the file
-    sku_cols = [c for c in df.columns if 'SKU' in c.upper() or 'SID' in c.upper()]
     prefix_map = {"KE": "Kenya", "UG": "Uganda", "NG": "Nigeria", "GH": "Ghana", "MA": "Morocco"}
-    
+
     detected_codes = set()
-    # From ACTIVE_STATUS_COUNTRY
     if 'ACTIVE_STATUS_COUNTRY' in df.columns:
+        # Prefer the explicit country column — SKU prefix scanning produces false positives
+        # (e.g. seller SKUs like "MA-D1502W2ME" or "MAX 90" wrongly match Morocco)
         detected_codes.update(df['ACTIVE_STATUS_COUNTRY'].dropna().unique())
-    
-    # From SKU prefixes (fallback/verification)
-    for col in sku_cols:
-        vals = df[col].dropna().astype(str).str.strip().str.upper()
-        for prefix in prefix_map.keys():
-            if vals.str.startswith(prefix).any():
-                detected_codes.add(prefix)
+    else:
+        # Fallback: infer from SKU prefixes only when the country column is absent
+        sku_cols = [c for c in df.columns if 'SKU' in c.upper() or 'SID' in c.upper()]
+        for col in sku_cols:
+            vals = df[col].dropna().astype(str).str.strip().str.upper()
+            for prefix in prefix_map.keys():
+                if vals.str.startswith(prefix).any():
+                    detected_codes.add(prefix)
     
     emoji_map = {"KE": "Kenya", "UG": "Uganda", "NG": "Nigeria", "GH": "Ghana", "MA": "Morocco"}
     detected_names = sorted(list(set(emoji_map.get(c, str(c)) for c in detected_codes if str(c).strip() and str(c).strip().lower() != 'nan')))
