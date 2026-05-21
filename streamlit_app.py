@@ -960,16 +960,22 @@ def check_restricted_brands(
     ldf = _to_polars_cached(df_hash(data), data)
 
     all_keywords = set()
+    brand_names_only = set()
     for rule in country_rules:
         all_keywords.add(rule["brand"])
         all_keywords.update(rule.get("variations", []))
+        brand_names_only.add(rule["brand"])
 
-    # 🚀 Polars Filtering (10x faster than pandas .str.contains)
+    # Pre-filter using brand names only (not typo-variations) for the name regex.
+    # Short variation strings (e.g. 'niver', 'nivel') appear as substrings in
+    # thousands of unrelated product names, bloating candidates 10x with false
+    # positives. The per-rule step already uses word-boundary regex on variations.
+    _name_pattern = "(?i)" + "|".join(
+        r"\b" + re.escape(k) + r"\b" for k in brand_names_only if k
+    )
     candidate_ldf = ldf.filter(
         pl.col("_brand_lower").is_in(list(all_keywords))
-        | pl.col("_name_lower").str.contains(
-            "(?i)" + "|".join(re.escape(k) for k in all_keywords)
-        )
+        | pl.col("_name_lower").str.contains(_name_pattern)
     )
 
     if candidate_ldf.is_empty():
