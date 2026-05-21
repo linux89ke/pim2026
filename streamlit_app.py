@@ -4461,7 +4461,9 @@ def render_main_results():
                 df_flagged = rej_df[rej_df["FLAG"] == title]
                 is_zip = "(Prefetched)" in title
                 exp_label = f"[{len(df_flagged)}] {title}"
-                if is_zip: exp_label += " ⚡ ZIP"
+                if is_zip:
+                    exp_label += " ⚡ ZIP"
+                    st.markdown('<div class="dashboard-marker"></div>', unsafe_allow_html=True)
                 with st.expander(exp_label, expanded=st.session_state.get(f"exp_{title}", False)):
                     st.html(flag_pill_header(title, len(df_flagged), is_zip=is_zip))
                     render_flag_expander(

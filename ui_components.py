@@ -76,7 +76,6 @@ PREFETCH_DISPLAY_COLUMNS = {
         "Product Name_Brand Name_Status",
         "Product name_Brand name_rejection reason",
         "Product_Name_Brand_Name_Status",
-        "Product name_Brand name_rejection reason",
         "Product Name_Brand Name_Rejection_Reason",
     ],
     "Poor images": [
@@ -91,6 +90,59 @@ PREFETCH_DISPLAY_COLUMNS = {
     ],
     "Duplicate product": ["Duplicate_Flag"],
     "FDA": ["FDA_Check_Status", "FDA_Rejection_Reason", "FDA"],
+    # New prefetch-only flags
+    "Category Check": [
+        "Category_Check_Status",
+        "Category_Check_Rejection_Reason",
+        "Initial_Category_Path",
+        "Suggested_Categories",
+        "Top1_Category",
+        "AI_Product_Caption",
+        "Category_Match_Score",
+        "Top1_Score",
+    ],
+    "Warranty Check": [
+        "Warranty_Check_Status",
+        "Warranty_Rejection_Reason",
+        "product_warranty",
+        "warranty_duration",
+        "warranty_type",
+        "warranty_address",
+    ],
+    "Color Check": [
+        "Color_Check_Status",
+        "Color_Rejection_Reason",
+        "Color_AI_Normalized",
+        "color",
+    ],
+    "Variation Check": [
+        "Variation_Check_Status",
+        "Variation_Rejection_Reason",
+        "count_variations",
+        "list_variations",
+        "COUNT_VARIATIONS",
+        "LIST_VARIATIONS",
+    ],
+    "Brand Image Check": [
+        "Brand_Image_Check_Status",
+        "Brand_Image_Check_Reason",
+        "Brand_Detected_On_Product",
+    ],
+    "Product Name Brand Name": [
+        "Product Name_Brand Name_Status",
+        "Product name_Brand name_rejection reason",
+        "Product Name_Brand Name_Rejection_Reason",
+    ],
+    "Title Language Check": [
+        "Title_Language_Check_Status",
+        "Title_Language_Check_Reason",
+    ],
+    "Image Quality Check": [
+        "Image_Quality_Check_Status",
+        "Image_Quality_Check_Reason",
+        "Image_Extraction_Status",
+        "Image_Filename",
+    ],
 }
 
 
