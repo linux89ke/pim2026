@@ -2532,6 +2532,18 @@ def validate_products(
                     dup_groups[sid] = v
 
     _overall_data_hash = df_hash(data)
+
+    # Include a fingerprint of the support files so that updating rules files
+    # (e.g. Restricted_Brands.xlsx) automatically busts the validator cache.
+    _rules_files = ["Restricted_Brands.xlsx", "suspected_fake.xlsx", "Prohibbited.xlsx",
+                    "reason.xlsx", "Refurb.xlsx", "category_map.xlsx"]
+    _rules_sig = hashlib.md5(
+        "".join(
+            f"{f}:{os.path.getmtime(f):.0f}" for f in _rules_files if os.path.exists(f)
+        ).encode()
+    ).hexdigest()[:8]
+    _overall_data_hash = _overall_data_hash + _rules_sig
+
     EXPENSIVE_VALIDATORS = {
         "Image Stretched", "Image Blurry", "Image Mismatch", "Image Infringing",
         "Image Too Many things displayed", "Duplicate product", "Wrong Category",
