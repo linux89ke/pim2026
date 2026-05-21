@@ -2002,8 +2002,26 @@ function addWarnings(sid, warns) {{
   warns.forEach(w => {{ if (!window._imageIssues[sid].includes(w)) window._imageIssues[sid].push(w); }});
 }}
 
-function buildCardActionsHtml(safeSid) {{
+function buildCardActionsHtml(safeSid, warnings) {{
+  var FLAG_MAP = {{
+    'Wrong Category':         ['REJECT_WRONG_CAT',   LABELS.wrong_cat],
+    'Missing COLOR':          ['REJECT_COLOR',        LABELS.missing_color],
+    'Restricted Brand':       ['REJECT_BRAND',        LABELS.restr_brand],
+    'Restricted brands':      ['REJECT_BRAND',        LABELS.restr_brand],
+    'Prohibited':             ['REJECT_PROHIBITED',   LABELS.prohibited],
+    'Prohibited products':    ['REJECT_PROHIBITED',   LABELS.prohibited],
+    'Wrong Brand':            ['REJECT_WRONG_BRAND',  LABELS.wrong_brand],
+    'Suspected Fake product': ['REJECT_FAKE',         LABELS.fake_prod],
+    'Poor images':            ['REJECT_POOR_IMAGE',   LABELS.poor_img],
+  }};
+  var defaultCode  = 'REJECT_POOR_IMAGE';
+  var defaultLabel = LABELS.poor_img;
+  for (var i = 0; i < (warnings||[]).length; i++) {{
+    var match = FLAG_MAP[warnings[i]];
+    if (match) {{ defaultCode = match[0]; defaultLabel = match[1]; break; }}
+  }}
   var opts = [
+    ['REJECT_POOR_IMAGE',    LABELS.poor_img],
     ['REJECT_IMG_STRETCHED', 'Image Stretched'],
     ['REJECT_IMG_BLURRY',    'Image Blurry'],
     ['REJECT_IMG_MISMATCH',  'Image Mismatch'],
@@ -2022,7 +2040,9 @@ function buildCardActionsHtml(safeSid) {{
   }}).join('');
   return (
     `<div class="acts">` +
-      `<button class="act-btn" onclick="event.stopPropagation();window.stageReject('${{safeSid}}','REJECT_POOR_IMAGE')">${{escapeHtml(LABELS.poor_img)}}</button>` +
+      `<button class="act-btn" onclick="event.stopPropagation();window.stageReject('${{safeSid}}','${{defaultCode}}')">` +
+        escapeHtml(defaultLabel) +
+      `</button>` +
       `<select class="act-more" onchange="if(this.value){{event.stopPropagation();window.stageReject('${{safeSid}}',this.value);this.value=''}}">` +
         `<option value="">${{escapeHtml(LABELS.more_options)}}</option>` +
         optionsHtml +
@@ -2133,7 +2153,7 @@ function renderCard(card) {{
       <button class="undo-btn" onclick="event.stopPropagation();window.clearStaged('${{safeSid}}')">${{escapeHtml(LABELS.clear_sel)}}</button>
     </div>`;
   }} else {{
-    actHtml = buildCardActionsHtml(safeSid);
+    actHtml = buildCardActionsHtml(safeSid, card.warnings);
   }}
 
     var trustBadge = '';
@@ -2350,7 +2370,7 @@ window.undoReject = function(sid) {{
 
       var acts = cardEl.querySelector('.acts');
       if (acts) acts.remove();
-      cardEl.insertAdjacentHTML('beforeend', buildCardActionsHtml(safeSid));
+      cardEl.insertAdjacentHTML('beforeend', buildCardActionsHtml(safeSid, (CARDS.find(c=>c.sid===safeSid)||{{}}).warnings));
 
       // Add a slight shimmer to the card without blocking interaction
       cardEl.classList.add('undo-processing');
