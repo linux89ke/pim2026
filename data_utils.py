@@ -86,22 +86,35 @@ def create_match_key_vectorized(df: pd.DataFrame) -> pd.Series:
 
 
 def df_hash(df: pd.DataFrame) -> str:
-    """Fast fingerprint: full content hash."""
+    """Fast fingerprint: full content hash. Result is cached in df.attrs to avoid recomputation."""
+    cached = df.attrs.get('__pim_hash__')
+    if cached is not None:
+        return cached
     try:
         if df.empty:
-            return "empty"
-        # Use pandas built-in hashing for fast, accurate full-content hashing
-        import hashlib
-        return hashlib.md5(pd.util.hash_pandas_object(df, index=False).values.tobytes()).hexdigest()
+            result = "empty"
+        else:
+            # Use pandas built-in hashing for fast, accurate full-content hashing
+            import hashlib
+            result = hashlib.md5(pd.util.hash_pandas_object(df, index=False).values.tobytes()).hexdigest()
     except Exception as e:
         logger.warning(f"df_hash primary failed, using fallback: {e}")
         fallback_str = str(df.shape) + str(df.columns.tolist())
-        return hashlib.md5(fallback_str.encode()).hexdigest()
+        result = hashlib.md5(fallback_str.encode()).hexdigest()
+    df.attrs['__pim_hash__'] = result
+    return result
 
 
 # -------------------------------------------------
 # COLOR EXTRACTION HELPERS
 # -------------------------------------------------
+
+# Pre-compiled at module load — avoids rebuilding the pattern on every call
+_COLOR_PATTERN = re.compile(
+    r'\b(' + '|'.join(re.escape(k) for k in sorted(COLOR_VARIANT_TO_BASE.keys(), key=len, reverse=True)) + r')\b',
+    re.IGNORECASE
+)
+
 
 def extract_colors(text: str, explicit_color: Optional[str] = None) -> Set[str]:
     colors = set()
@@ -111,16 +124,16 @@ def extract_colors(text: str, explicit_color: Optional[str] = None) -> Set[str]:
         for variant, base in COLOR_VARIANT_TO_BASE.items():
             if variant in color_lower:
                 colors.add(base)
-    for variant, base in COLOR_VARIANT_TO_BASE.items():
-        if re.search(r'\b' + re.escape(variant) + r'\b', text_lower):
+    for m in _COLOR_PATTERN.finditer(text_lower):
+        base = COLOR_VARIANT_TO_BASE.get(m.group(1).lower())
+        if base:
             colors.add(base)
     return colors
 
 
 def remove_attributes(text: str) -> str:
     base = str(text).lower() if text else ""
-    for variant in COLOR_VARIANT_TO_BASE.keys():
-        base = re.sub(r'\b' + re.escape(variant) + r'\b', '', base)
+    base = _COLOR_PATTERN.sub('', base)
     base = re.sub(r'\b(?:xxs|xs|small|medium|large|xl|xxl|xxxl)\b', '', base)
     base = re.sub(r'\b\d+\s*(?:gb|tb|inch|inches|"|ram|memory|ddr|pack|piece|pcs)\b', '', base)
     for word in ['new', 'original', 'genuine', 'authentic', 'official', 'premium', 'quality', 'best', 'hot', 'sale', 'promo', 'deal']:
@@ -191,7 +204,23 @@ def _repair_mojibake(df: pd.DataFrame) -> pd.DataFrame:
         return _ILLEGAL_XML.sub('', val)
 
     for col in df.select_dtypes(include='object').columns:
-        df[col] = df[col].apply(_fix)
+        try:
+            # Vectorized path: encode as latin-1 bytes then decode as utf-8
+            repaired = (
+                df[col].astype(str)
+                .str.encode('latin-1', errors='replace')
+                .str.decode('utf-8', errors='replace')
+            )
+            # Only accept the vectorized result where it actually changed something
+            # and didn't introduce replacement chars where original had none
+            mask = repaired != df[col].astype(str)
+            no_replacement = ~repaired.str.contains('\ufffd', na=False)
+            df[col] = df[col].astype(str).where(~(mask & no_replacement), repaired)
+            # Strip illegal XML control chars vectorized
+            df[col] = df[col].str.replace(_ILLEGAL_XML.pattern, '', regex=True)
+        except Exception:
+            # Fallback to row-by-row for any column that fails vectorization
+            df[col] = df[col].apply(_fix)
     return df
 
 
@@ -208,8 +237,10 @@ def standardize_input_data(df: pd.DataFrame) -> pd.DataFrame:
         col_lower = col.lower()
         renamed[col] = map_lower[col_lower] if col_lower in map_lower else col.upper()
     df = df.rename(columns=renamed)
+    # dtype=str is already set at read time in _detect_and_read_csv; .astype(str) is
+    # still applied here as a safety net for DataFrames produced by other paths
     for col in ['ACTIVE_STATUS_COUNTRY', 'CATEGORY_CODE', 'BRAND', 'TAX_CLASS', 'NAME', 'SELLER_NAME']:
-        if col in df.columns:
+        if col in df.columns and df[col].dtype != object:
             df[col] = df[col].astype(str)
     if 'MAIN_IMAGE' not in df.columns:
         df['MAIN_IMAGE'] = ''
