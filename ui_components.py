@@ -3017,6 +3017,20 @@ def visual_review_modal(support_files):
             elif _flag == "Manual review":
                 _warns.append("Manual review")
 
+        # ADD PREFETCH ZIP FLAGS AS WARNINGS (warranty, FDA, color, category etc.)
+        _zip_index = st.session_state.get("_zip_sid_index")
+        if _zip_index is not None and _sid in _zip_index.index:
+            _zrow = _zip_index.loc[_sid]
+            if hasattr(_zrow, "iloc") and hasattr(_zrow, "shape") and len(_zrow.shape) == 2:
+                _zrow = _zrow.iloc[0]
+            _zip_status_cols = st.session_state.get("_zip_status_cols", [])
+            _zip_prefetch_map = st.session_state.get("_zip_prefetch_map", {})
+            for _zcol in _zip_status_cols:
+                if str(_zrow.get(_zcol, "")).lower() == "rejected":
+                    _zflag = _zip_prefetch_map.get(_zcol, _zcol.replace("_Status", "").replace("_", " ").title())
+                    if _zflag not in _warns:
+                        _warns.append(_zflag)
+
         if _warns:
             page_warnings[_sid] = list(dict.fromkeys(_warns)) # Remove duplicates
 

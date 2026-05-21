@@ -237,6 +237,25 @@ def _prefetch_key_from_status_col(col: str) -> str:
     )
 
 
+def _build_zip_sid_index(qc_df: pd.DataFrame) -> None:
+    """Build session-state lookup tables so ui_components can show prefetch warnings on cards."""
+    if qc_df.empty:
+        return
+    for possible in ("cod_productset_sid", "PRODUCT_SET_SID", "ProductSetSid", "SID"):
+        if possible in qc_df.columns:
+            st.session_state["_zip_sid_index"] = qc_df.set_index(
+                qc_df[possible].astype(str).str.strip()
+            )
+            break
+    status_cols = [c for c in qc_df.columns if "status" in c.lower()]
+    st.session_state["_zip_status_cols"] = status_cols
+    st.session_state["_zip_prefetch_map"] = {
+        col: PREFETCH_MAP.get(_prefetch_key_from_status_col(col),
+                              col.replace("_Status", "").replace("_", " ").title())
+        for col in status_cols
+    }
+
+
 def _prefetch_reason_from_row(row, status_col: str, qc_columns) -> str:
     base_key = _prefetch_key_from_status_col(status_col)
     for candidate in PREFETCH_REASON_COLUMNS.get(base_key, []):
@@ -3483,6 +3502,9 @@ if st.session_state.get("last_processed_files") != process_signature:
                     st.session_state.zip_image_index = {}
                     st.session_state.zip_image_source_bytes = None
                     st.session_state.zip_qc_results = pd.DataFrame()
+                    st.session_state.pop("_zip_sid_index", None)
+                    st.session_state.pop("_zip_status_cols", None)
+                    st.session_state.pop("_zip_prefetch_map", None)
                     _sid_col_qc: str | None = None   # SID column name inside the QC file
 
                     for uf in _files_for_processing:
@@ -3509,6 +3531,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                                         if qc_file.filename.lower().endswith(".csv")
                                         else pd.read_excel(BytesIO(qc_data), dtype=str)
                                     )
+                                    _build_zip_sid_index(st.session_state.zip_qc_results)
                                     raw_data = st.session_state.zip_qc_results.copy()
                                 st.session_state.zip_image_index = _index_zip_images(zf)
                                 st.session_state.zip_image_source_bytes = uf["bytes"]
@@ -3521,6 +3544,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                                 if uf["name"].lower().endswith(".csv")
                                 else pd.read_excel(_buf, engine="openpyxl", dtype=str)
                             )
+                            _build_zip_sid_index(st.session_state.zip_qc_results)
                             raw_data = st.session_state.zip_qc_results.copy()
 
                         elif uf["name"].lower().endswith(".xlsx"):
