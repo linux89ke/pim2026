@@ -221,7 +221,7 @@ def render_rejection_donut(final_report: pd.DataFrame):
         height=240,
         paper_bgcolor="rgba(0,0,0,0)",
     )
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, width='stretch', config={"displayModeBar": False})
 
 
 def _base_prefetched_title(title: str) -> str:
@@ -439,8 +439,8 @@ def bulk_approve_dialog(
         f"Preview {len(_preview_df)} item(s) to be approved",
         expanded=len(_preview_df) <= 10,
     ):
-        st.dataframe(_preview_df, hide_index=True, use_container_width=True)
-    if st.button(_t("approve_btn"), type="primary", use_container_width=True):
+        st.dataframe(_preview_df, hide_index=True, width='stretch')
+    if st.button(_t("approve_btn"), type="primary", width='stretch'):
         with st.spinner("Validating…"):
             _progress = st.progress(0, text="Running validation…")
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _executor:
@@ -782,7 +782,7 @@ def render_flag_expander(
     event = st.dataframe(
         df_styled,
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
         selection_mode="multi-row",
         on_select="rerun",
         column_config={
@@ -938,7 +938,7 @@ def render_flag_expander(
                         st.markdown(f'<div class="grid-price-badge">{local_price}</div>', unsafe_allow_html=True)
 
                     # Image (Streamlit handles ZIP extraction here)
-                    st.image(img_url, use_container_width=True)
+                    st.image(img_url, width='stretch')
 
                     # Details
                     st.markdown(
@@ -1016,7 +1016,7 @@ def render_flag_expander(
             _t("approve_btn"),
             key=f"approve_sel_{title}",
             type="primary",
-            use_container_width=True,
+            width='stretch',
             disabled=not has_selection,
         ):
             sids_to_process = df_view.iloc[selected_indices]["PRODUCT_SET_SID"].tolist()
@@ -1037,7 +1037,7 @@ def render_flag_expander(
         popover_key = f"popover_rej_{title}_{pop_ver}"
         with st.popover(
             _t("reject_as"),
-            use_container_width=True,
+            width='stretch',
             disabled=not has_selection,
             key=popover_key,
         ):
@@ -1062,7 +1062,7 @@ def render_flag_expander(
                     "Apply",
                     key=f"apply_custom_{title}",
                     type="primary",
-                    use_container_width=True,
+                    width='stretch',
                     disabled=not has_selection,
                 ):
                     to_reject = df_view.iloc[selected_indices][
@@ -1101,7 +1101,7 @@ def render_flag_expander(
                     "Apply",
                     key=f"apply_dd_{title}",
                     type="primary",
-                    use_container_width=True,
+                    width='stretch',
                     disabled=not has_selection,
                 ):
                     to_reject = df_view.iloc[selected_indices][
@@ -2712,7 +2712,7 @@ def visual_review_modal(support_files):
             value=st.session_state.get("grid_items_per_page", 50),
         )
     with c4:
-        if st.button("Close", use_container_width=True, type="secondary"):
+        if st.button("Close", width='stretch', type="secondary"):
             st.session_state.show_review_modal = False
             st.rerun()
 
@@ -2803,7 +2803,7 @@ def visual_review_modal(support_files):
             key="prev_top",
             icon=":material/arrow_back:",
             icon_position="left",
-            use_container_width=True,
+            width='stretch',
             disabled=st.session_state.get("grid_page", 0) == 0,
         ):
             st.session_state.grid_page = max(
@@ -2830,7 +2830,7 @@ def visual_review_modal(support_files):
             key="next_top",
             icon=":material/arrow_forward:",
             icon_position="right",
-            use_container_width=True,
+            width='stretch',
             disabled=st.session_state.grid_page >= total_pages - 1,
         ):
             st.session_state.grid_page += 1
@@ -2974,7 +2974,7 @@ def visual_review_modal(support_files):
             key="prev_bot",
             icon=":material/arrow_back:",
             icon_position="left",
-            use_container_width=True,
+            width='stretch',
             disabled=st.session_state.get("grid_page", 0) == 0,
         ):
             st.session_state.grid_page = max(
@@ -3001,7 +3001,7 @@ def visual_review_modal(support_files):
             key="next_bot",
             icon=":material/arrow_forward:",
             icon_position="right",
-            use_container_width=True,
+            width='stretch',
             disabled=st.session_state.grid_page >= total_pages - 1,
         ):
             st.session_state.grid_page += 1
@@ -3009,7 +3009,7 @@ def visual_review_modal(support_files):
             st.rerun(scope="fragment")
     with pg_cols_bot[3]:
         if st.button(
-            "Close Review", key="close_bot", use_container_width=True, type="secondary"
+            "Close Review", key="close_bot", width='stretch', type="secondary"
         ):
             st.session_state.show_review_modal = False
             st.rerun()
@@ -3040,7 +3040,7 @@ def render_image_grid(support_files):
         st.header(_t("manual_review"), anchor=False)
         st.caption("Open Focus Mode to rapidly visually review and reject products.")
     with c2:
-        if st.button("Start Visual Review", type="primary", use_container_width=True):
+        if st.button("Start Visual Review", type="primary", width='stretch'):
             st.session_state.show_review_modal = True
 
     if st.session_state.get("show_review_modal", False):
@@ -3060,7 +3060,7 @@ def _render_export_card(title, df, desc, func, exports_config):
                 "Generate",
                 key=f"gen_{title}",
                 type="primary",
-                use_container_width=True,
+                width='stretch',
                 icon=":material/download:",
                 icon_position="left",
             ):
@@ -3081,12 +3081,12 @@ def _render_export_card(title, df, desc, func, exports_config):
                 data=cache["data"],
                 file_name=cache["fname"],
                 mime=cache["mime"],
-                use_container_width=True,
+                width='stretch',
                 type="primary",
                 icon=":material/file_download:",
                 key=f"dl_{title}",
             )
-            if st.button("Clear", key=f"clr_{title}", use_container_width=True):
+            if st.button("Clear", key=f"clr_{title}", width='stretch'):
                 del st.session_state.exports_cache[title]
                 st.rerun()
 
@@ -3166,7 +3166,7 @@ def render_exports_section(support_files, country_validator):
     if all_cached:
         st.success("All reports generated and ready to download.")
     else:
-        if st.button("Generate All Reports", type="primary", use_container_width=True):
+        if st.button("Generate All Reports", type="primary", width='stretch'):
             with st.spinner("Generating all reports…"):
                 for t2, d2, _, f2 in exports_config:
                     if t2 not in st.session_state.exports_cache:

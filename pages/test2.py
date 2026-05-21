@@ -431,7 +431,7 @@ with st.sidebar:
         st.error(f"✗ {int((_frsb['Status']=='Rejected').sum()):,} rejected", icon="❌")
     else:
         st.info("No file loaded yet.")
-    if st.button(_t("clear_cache"), use_container_width=True, type="secondary"):
+    if st.button(_t("clear_cache"), width='stretch', type="secondary"):
         for _k in ["qcr_df","qcr_img_store","qcr_final_report","qcr_all_data",
                    "qcr_zip_hash","qcr_exports","qcr_display_cache"]:
             st.session_state[_k] = (
@@ -626,7 +626,7 @@ def _render_dashboard(fr: pd.DataFrame, df: pd.DataFrame):
             annotations=[dict(text=f"<b>{_rate_d:.1f}%</b><br>rejected",
                               x=0.5,y=0.5,font_size=15,showarrow=False,font_color=R)],
         )
-        st.plotly_chart(_fig_d, use_container_width=True, config={"displayModeBar":False})
+        st.plotly_chart(_fig_d, width='stretch', config={"displayModeBar":False})
 
     with col2:
         st.markdown("**Rejections by Flag Type**")
@@ -645,7 +645,7 @@ def _render_dashboard(fr: pd.DataFrame, df: pd.DataFrame):
             xaxis=dict(showgrid=True,gridcolor="#f0f0f0",zeroline=False),
             yaxis=dict(showgrid=False), font=dict(size=11),
         )
-        st.plotly_chart(_fig_b, use_container_width=True, config={"displayModeBar":False})
+        st.plotly_chart(_fig_b, width='stretch', config={"displayModeBar":False})
 
     # row 2 — seller stacked bar + category bar
     col3,col4 = st.columns(2, gap="large")
@@ -668,7 +668,7 @@ def _render_dashboard(fr: pd.DataFrame, df: pd.DataFrame):
                 xaxis=dict(showgrid=True,gridcolor="#f0f0f0"),yaxis=dict(showgrid=False),
                 legend=dict(orientation="h",yanchor="bottom",y=-0.18,xanchor="center",x=0.5),font=dict(size=10),
             )
-            st.plotly_chart(_fig_s,use_container_width=True,config={"displayModeBar":False})
+            st.plotly_chart(_fig_s,width='stretch',config={"displayModeBar":False})
         else:
             st.info("No SELLER_NAME column.")
 
@@ -694,7 +694,7 @@ def _render_dashboard(fr: pd.DataFrame, df: pd.DataFrame):
                 xaxis=dict(showgrid=True,gridcolor="#f0f0f0",zeroline=False),
                 yaxis=dict(showgrid=False),font=dict(size=10),
             )
-            st.plotly_chart(_fig_c,use_container_width=True,config={"displayModeBar":False})
+            st.plotly_chart(_fig_c,width='stretch',config={"displayModeBar":False})
         else:
             st.info("No CATEGORY column.")
 
@@ -710,7 +710,7 @@ def _render_dashboard(fr: pd.DataFrame, df: pd.DataFrame):
     _rr.index += 1
     _rr["% of Rejected"] = (_rr["Count"]/max(_rej_d,1)*100).round(1).astype(str)+"%"
     _rr.columns = ["Check / Flag","Rejection Reason","Count","% of Rejected"]
-    st.dataframe(_rr, use_container_width=True, hide_index=False,
+    st.dataframe(_rr, width='stretch', hide_index=False,
                  column_config={"Count":st.column_config.NumberColumn(format="%d"),
                                 "Check / Flag":st.column_config.TextColumn(width="medium"),
                                 "Rejection Reason":st.column_config.TextColumn(width="large")})
@@ -741,7 +741,7 @@ def _render_dashboard(fr: pd.DataFrame, df: pd.DataFrame):
             xaxis=dict(tickangle=-30,tickfont=dict(size=10)),
             yaxis=dict(tickfont=dict(size=10)),
         )
-        st.plotly_chart(_fig_h,use_container_width=True,config={"displayModeBar":False})
+        st.plotly_chart(_fig_h,width='stretch',config={"displayModeBar":False})
 
     # row 5 — treemap
     if not _rej_df.empty:
@@ -759,7 +759,7 @@ def _render_dashboard(fr: pd.DataFrame, df: pd.DataFrame):
         )
         _fig_t.update_layout(margin=dict(t=10,b=10,l=10,r=10),height=340,
                               paper_bgcolor="rgba(0,0,0,0)",coloraxis_showscale=False)
-        st.plotly_chart(_fig_t,use_container_width=True,config={"displayModeBar":False})
+        st.plotly_chart(_fig_t,width='stretch',config={"displayModeBar":False})
 
 
 with st.expander(
@@ -822,7 +822,7 @@ else:
                 _sh = _sh[_sh["Seller"].isin(_ss)]
 
             _ev = st.dataframe(
-                _sh, hide_index=True, use_container_width=True,
+                _sh, hide_index=True, width='stretch',
                 selection_mode="multi-row", on_select="rerun",
                 column_config={
                     "Product Set SID":  st.column_config.TextColumn(pinned=True),
@@ -841,7 +841,7 @@ else:
             _b1,_b2 = st.columns(2)
             with _b1:
                 if st.button(_t("approve_btn"), key=f"qcra_{_fn}", type="primary",
-                             use_container_width=True, disabled=not _hs):
+                             width='stretch', disabled=not _hs):
                     if "Product Set SID" in _sh.columns:
                         _ids = _sh.iloc[_si]["Product Set SID"].tolist()
                         st.session_state.qcr_final_report.loc[
@@ -852,11 +852,11 @@ else:
                         st.session_state.qcr_toasts.append(f"{len(_ids)} items approved.")
                         st.rerun()
             with _b2:
-                with st.popover(_t("reject_as"), use_container_width=True,
+                with st.popover(_t("reject_as"), width='stretch',
                                 disabled=not _hs, key=f"qcrp_{_fn}"):
                     _cr = st.selectbox("Reason", _RLIST, key=f"qcrr_{_fn}",
                                        label_visibility="collapsed")
-                    if st.button("Apply", key=f"qcrap_{_fn}", type="primary", use_container_width=True):
+                    if st.button("Apply", key=f"qcrap_{_fn}", type="primary", width='stretch'):
                         if "Product Set SID" in _sh.columns:
                             _ids = _sh.iloc[_si]["Product Set SID"].tolist()
                             _lkup_e  = _build_flag_lookup().get(_cr.lower(), {})
@@ -882,7 +882,7 @@ else:
                                 _rfn  = str(_row.get("image_filename", _row.get("MAIN_IMAGE",""))).strip()
                                 _rraw = img_to_raw(_rfn, _imgs)
                                 if _rraw:
-                                    st.image(_rraw, use_container_width=True)
+                                    st.image(_rraw, width='stretch')
                                 else:
                                     st.markdown(
                                         '<div style="height:130px;background:#f5f5f5;border-radius:6px;'
@@ -913,7 +913,7 @@ with _vc1:
     st.caption("Open Focus Mode to visually review Approved products and reject as needed.")
 with _vc2:
     if st.button("Start Visual Review", type="primary",
-                 icon=":material/pageview:", use_container_width=True):
+                 icon=":material/pageview:", width='stretch'):
         st.session_state.qcr_show_review = True
         st.session_state.grid_page       = 0
 
@@ -972,7 +972,7 @@ def _vr_dialog():
             help="Lower = faster image loading",
         )
     with c4:
-        if st.button("Close", use_container_width=True, type="secondary"):
+        if st.button("Close", width='stretch', type="secondary"):
             st.session_state.qcr_show_review = False
             st.rerun()
 
@@ -996,7 +996,7 @@ def _vr_dialog():
 
     pg1,pg2,pg3 = st.columns([1,2,1], vertical_alignment="center", gap="small")
     with pg1:
-        if st.button("Prev Page", key="qvr_prev", use_container_width=True,
+        if st.button("Prev Page", key="qvr_prev", width='stretch',
                      icon=":material/arrow_back:", disabled=(_pg==0)):
             st.session_state.grid_page = _pg-1
             st.session_state.do_scroll_top = True; st.rerun()
@@ -1009,7 +1009,7 @@ def _vr_dialog():
             st.session_state.grid_page = _npg-1
             st.session_state.do_scroll_top = True; st.rerun()
     with pg3:
-        if st.button("Next Page", key="qvr_next", use_container_width=True,
+        if st.button("Next Page", key="qvr_next", width='stretch',
                      icon=":material/arrow_forward:", disabled=(_pg>=_tpgs-1)):
             st.session_state.grid_page = _pg+1
             st.session_state.do_scroll_top = True; st.rerun()
@@ -1117,7 +1117,7 @@ def _vr_dialog():
                         )
                     # data URI → st.image
                     elif _gres.startswith("data:"):
-                        st.image(_gres, use_container_width=True)
+                        st.image(_gres, width='stretch')
                     # placeholder
                     else:
                         st.markdown(
@@ -1137,7 +1137,7 @@ def _vr_dialog():
                     )
                     if _gst2:
                         if st.button("↺ Undo", key=f"qvr_u_{_gs}",
-                                     use_container_width=True, type="secondary"):
+                                     width='stretch', type="secondary"):
                             st.session_state.qcr_final_report.loc[
                                 st.session_state.qcr_final_report["ProductSetSid"]==_gs,
                                 ["Status","Reason","Comment","FLAG"]
@@ -1146,12 +1146,12 @@ def _vr_dialog():
                             st.session_state.qcr_toasts.append("Reverted to Approved.")
                             st.rerun()
                     else:
-                        with st.popover("✘ Reject", use_container_width=True,
+                        with st.popover("✘ Reject", width='stretch',
                                         key=f"qvr_rp_{_gs}"):
                             _grr = st.selectbox("Reason", _RLIST,
                                                 key=f"qvr_rs_{_gs}",
                                                 label_visibility="collapsed")
-                            if st.button("Apply", key=f"qvr_ra_{_gs}", type="primary", use_container_width=True):
+                            if st.button("Apply", key=f"qvr_ra_{_gs}", type="primary", width='stretch'):
                                 _lkup_e  = _build_flag_lookup().get(_grr.lower(), {})
                                 _rsn_g   = _lkup_e.get("reason",  f"1000007 - {_grr}")
                                 _cmt_g   = _lkup_e.get("comment", _grr)
@@ -1189,7 +1189,7 @@ def _vr_dialog():
     # ── bottom pagination ─────────────────────────────────────────────────
     pb1,pb2,pb3,pb4 = st.columns([1,2,1,1], vertical_alignment="center", gap="small")
     with pb1:
-        if st.button("Prev Page", key="qvr_prev_b", use_container_width=True,
+        if st.button("Prev Page", key="qvr_prev_b", width='stretch',
                      icon=":material/arrow_back:", disabled=(_pg==0)):
             st.session_state.grid_page = _pg-1; st.rerun()
     with pb2:
@@ -1200,12 +1200,12 @@ def _vr_dialog():
         if _nb-1 != _pg:
             st.session_state.grid_page = _nb-1; st.rerun()
     with pb3:
-        if st.button("Next Page", key="qvr_next_b", use_container_width=True,
+        if st.button("Next Page", key="qvr_next_b", width='stretch',
                      icon=":material/arrow_forward:", disabled=(_pg>=_tpgs-1)):
             st.session_state.grid_page = _pg+1; st.rerun()
     with pb4:
         if st.button("Close Review", key="qvr_close_b",
-                     use_container_width=True, type="secondary"):
+                     width='stretch', type="secondary"):
             st.session_state.qcr_show_review = False; st.rerun()
 
 
@@ -1319,7 +1319,7 @@ if _ar:
     st.success("All reports ready to download.", icon=":material/check_circle:")
 else:
     if st.button(":material/download: Generate All Reports", type="primary",
-                 use_container_width=True, key="qcr_gen_all"):
+                 width='stretch', key="qcr_gen_all"):
         with st.spinner("Generating all reports…"):
             for _n, *_ in _CARDS:
                 _bex(_n)
@@ -1334,7 +1334,7 @@ for _ecol, (_cn, _cd, _cr) in zip(_ecols, _CARDS):
             st.metric("Rows", f"{_cr:,}")
             if _cn not in st.session_state.qcr_exports:
                 if st.button(":material/download: Generate", key=f"qcr_gen_{_cn}",
-                             type="primary", use_container_width=True):
+                             type="primary", width='stretch'):
                     with st.spinner(f"Building {_cn}…"):
                         _bex(_cn)
                     st.rerun()
@@ -1345,9 +1345,9 @@ for _ecol, (_cn, _cd, _cr) in zip(_ecols, _CARDS):
                     file_name=f"{_cc3}_{_cn.replace(' ','_')}_{_ts}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key=f"qcr_dl_{_cn}",
-                    use_container_width=True,
+                    width='stretch',
                     type="primary",
                 )
-                if st.button("Clear", key=f"qcr_clr_{_cn}", use_container_width=True):
+                if st.button("Clear", key=f"qcr_clr_{_cn}", width='stretch'):
                     del st.session_state.qcr_exports[_cn]
                     st.rerun()

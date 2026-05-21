@@ -1443,7 +1443,7 @@ with st.sidebar:
         st.rerun()
     st.markdown("---")
     st.header(_t("system_status"))
-    if st.button(_t("clear_cache"), use_container_width=True, type="secondary"):
+    if st.button(_t("clear_cache"), width='stretch', type="secondary"):
         st.cache_data.clear()
         st.session_state.display_df_cache = {}
         if os.path.exists(PARQUET_CACHE_DIR): shutil.rmtree(PARQUET_CACHE_DIR)
@@ -2037,7 +2037,7 @@ if _files_for_processing and not st.session_state.final_report.empty and st.sess
                         'Resolution Note': _comment,
                     })
             if _advisory_rows:
-                st.dataframe(pd.DataFrame(_advisory_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(_advisory_rows), hide_index=True, width='stretch')
     if not rej_df.empty:
         if not st.session_state.flags_expanded_initialized and not rej_df.empty:
             top_flag = rej_df['FLAG'].value_counts().index[0]

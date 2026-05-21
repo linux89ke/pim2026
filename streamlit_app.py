@@ -3035,7 +3035,7 @@ with st.sidebar:
         st.rerun()
     st.markdown("---")
     st.header(_t("system_status"))
-    if st.button(_t("clear_cache"), use_container_width=True, type="secondary"):
+    if st.button(_t("clear_cache"), width='stretch', type="secondary"):
         st.cache_data.clear()
         st.session_state.display_df_cache = {}
 
@@ -3272,7 +3272,7 @@ _has_files = bool(st.session_state.get("cached_uploaded_files"))
 if _has_files:
     if st.button(
         "Force re-validate",
-        use_container_width=True,
+        width='stretch',
         help="Bypass cache and run validation again",
     ):
         for uf in st.session_state.get("cached_uploaded_files", []):
@@ -4129,7 +4129,7 @@ def render_main_results():
                     )
                     st.plotly_chart(
                         fig_bar,
-                        use_container_width=True,
+                        width='stretch',
                         config={"displayModeBar": False},
                     )
 
@@ -4154,7 +4154,7 @@ def render_main_results():
                 showlegend=False, margin=dict(t=40, b=0, l=0, r=0), height=280
             )
             st.plotly_chart(
-                fig_mix, use_container_width=True, config={"displayModeBar": False}
+                fig_mix, width='stretch', config={"displayModeBar": False}
             )
 
         with g2:
@@ -4180,7 +4180,7 @@ def render_main_results():
                 )
                 st.plotly_chart(
                     fig_flags,
-                    use_container_width=True,
+                    width='stretch',
                     config={"displayModeBar": False},
                 )
             else:
@@ -4210,7 +4210,7 @@ def render_main_results():
                 )
                 st.plotly_chart(
                     fig_seller,
-                    use_container_width=True,
+                    width='stretch',
                     config={"displayModeBar": False},
                 )
 
@@ -4239,7 +4239,7 @@ def render_main_results():
             )
             fig_savings.update_layout(height=300, margin=dict(t=60, b=20, l=30, r=30))
             st.plotly_chart(
-                fig_savings, use_container_width=True, config={"displayModeBar": False}
+                fig_savings, width='stretch', config={"displayModeBar": False}
             )
 
     # 🚀 FLOATING SID LOOKUP & UNDO TOAST
@@ -4339,7 +4339,7 @@ def render_main_results():
                 st.dataframe(
                     pd.DataFrame(_advisory_rows),
                     hide_index=True,
-                    use_container_width=True,
+                    width='stretch',
                 )
     if not rej_df.empty:
         if group_by_seller:

@@ -199,12 +199,12 @@ if not master_df.empty:
                 fig_trend = px.line(trend_data, x='Date', y='Count', color=status_col, markers=True, 
                                     color_discrete_map={"Approved": "#2e7d32", "Rejected": "#d32f2f"})
                 fig_trend.update_layout(xaxis_title="", yaxis_title="Products Processed", margin=dict(l=0, r=0, t=30, b=0))
-                st.plotly_chart(fig_trend, use_container_width=True)
+                st.plotly_chart(fig_trend, width='stretch')
 
             with col_table:
                 st.markdown("#### :material/calendar_today: Daily Breakdown")
                 styled_daily_summary = daily_summary.style.apply(highlight_weekends, axis=1)
-                st.dataframe(styled_daily_summary, use_container_width=True)
+                st.dataframe(styled_daily_summary, width='stretch')
 
         # === TAB 2: REJECTION DEEP-DIVE ===
         with tab_deepdive:
@@ -221,7 +221,7 @@ if not master_df.empty:
                         fig_pie = px.pie(reason_counts, values='Count', names='Reason', hole=0.4)
                         fig_pie.update_layout(margin=dict(l=0, r=0, t=30, b=0), showlegend=False)
                         fig_pie.update_traces(textposition='inside', textinfo='percent+label')
-                        st.plotly_chart(fig_pie, use_container_width=True)
+                        st.plotly_chart(fig_pie, width='stretch')
 
                 with c_bar:
                     st.markdown("#### :material/storefront: Top 5 Rejected Sellers")
@@ -231,7 +231,7 @@ if not master_df.empty:
                                             text='Rejection Rate (%)', color_discrete_sequence=['#ef5350'])
                         fig_seller.update_layout(yaxis={'categoryorder':'total ascending'}, margin=dict(l=0, r=0, t=30, b=0))
                         fig_seller.update_traces(texttemplate='%{text}% Rate', textposition='outside')
-                        st.plotly_chart(fig_seller, use_container_width=True)
+                        st.plotly_chart(fig_seller, width='stretch')
 
                 st.divider()
                 c_cat, c_rea = st.columns(2)
@@ -240,14 +240,14 @@ if not master_df.empty:
                     if cat_col:
                         top_categories = rejected_df[cat_col].value_counts().head(5).reset_index()
                         top_categories.columns = ['Category', 'Rejected Count']
-                        st.dataframe(top_categories, use_container_width=True, hide_index=True)
+                        st.dataframe(top_categories, width='stretch', hide_index=True)
 
                 with c_rea:
                     st.markdown("#### :material/report: Top 5 Rejection Reasons (Data)")
                     if flag_col:
                         top_reasons = rejected_df[flag_col].value_counts().head(5).reset_index()
                         top_reasons.columns = ['Reason', 'Rejected Count']
-                        st.dataframe(top_reasons, use_container_width=True, hide_index=True)
+                        st.dataframe(top_reasons, width='stretch', hide_index=True)
 
         # === TAB 3: DATA EXPLORER ===
         with tab_data:
@@ -266,7 +266,7 @@ if not master_df.empty:
             if seller_col and seller_search:
                 filtered_df = filtered_df[filtered_df[seller_col].astype(str).str.contains(seller_search, case=False, na=False)]
                 
-            st.dataframe(filtered_df, use_container_width=True)
+            st.dataframe(filtered_df, width='stretch')
 
         # === DOWNLOAD REPORT ===
         st.divider()

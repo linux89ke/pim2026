@@ -1038,7 +1038,7 @@ def render_post_qc_section(support_files: Dict) -> None:
 
         if st.button(
             f"▶  Run {country} Quality Check  ({len(data_pq):,} products)",
-            type="primary", use_container_width=True, key="pq_run_btn",
+            type="primary", width='stretch', key="pq_run_btn",
         ):
             with st.spinner(f"Running full QC for {country}…"):
                 report = build_quality_report(data_pq, support_files, country_code)
@@ -1192,7 +1192,7 @@ def render_post_qc_section(support_files: Dict) -> None:
         st.dataframe(
             page_display[view_cols],
             hide_index=True,
-            use_container_width=True,
+            width='stretch',
             column_config={
                 "Link": st.column_config.LinkColumn(
                     "🔗", display_text="🔗", help="Open on Jumia", width="small",
