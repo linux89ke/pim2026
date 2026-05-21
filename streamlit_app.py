@@ -989,7 +989,7 @@ def check_restricted_brands(
         if rule["variations"]:
             sorted_vars = sorted(rule["variations"], key=len, reverse=True)
             var_pattern = (
-                r"(?<!\w)(" + "|".join([re.escape(v) for v in sorted_vars]) + r")(?!\w)"
+                r"(?<!\w)(?:" + "|".join([re.escape(v) for v in sorted_vars]) + r")(?!\w)"
             )
             var_brand_matches = d["_brand_lower"].str.contains(
                 var_pattern, regex=True, na=False
@@ -1168,7 +1168,7 @@ def check_refurb_seller_approval(
     if not keywords:
         return pd.DataFrame(columns=data.columns)
     kw_pattern = re.compile(
-        r"\b("
+        r"\b(?:"
         + "|".join(re.escape(k) for k in sorted(keywords, key=len, reverse=True))
         + r")\b",
         re.IGNORECASE,
@@ -1296,7 +1296,7 @@ def check_seller_approved_for_perfume(
     }
     if keywords:
         kw_pattern = re.compile(
-            r"\b("
+            r"\b(?:"
             + "|".join(re.escape(k) for k in sorted(keywords, key=len, reverse=True))
             + r")\b",
             re.IGNORECASE,
@@ -1393,7 +1393,7 @@ def check_counterfeit_jerseys(
     if not categories or not keywords:
         return pd.DataFrame(columns=data.columns)
     kw_pattern = re.compile(
-        r"(?<!\w)("
+        r"(?<!\w)(?:"
         + "|".join(re.escape(k) for k in sorted(keywords, key=len, reverse=True))
         + r")(?!\w)",
         re.IGNORECASE,
