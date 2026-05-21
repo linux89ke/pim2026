@@ -1043,8 +1043,12 @@ def check_restricted_brands(
                 comment_map[idx] = f"Restricted Brand: {match_info} - {seller_status}"
     if not flagged_indices:
         return pd.DataFrame(columns=data.columns)
-    result = data.loc[list(flagged_indices)].copy()
-    result["Comment_Detail"] = result.index.map(comment_map)
+    # Use SID-based lookup — d has a fresh 0-based index from Polars and cannot
+    # be used to index into data directly (labels would point to wrong rows).
+    flagged_sids = {d.loc[idx, "PRODUCT_SET_SID"] for idx in flagged_indices}
+    sid_comment = {d.loc[idx, "PRODUCT_SET_SID"]: comment_map[idx] for idx in flagged_indices}
+    result = data[data["PRODUCT_SET_SID"].isin(flagged_sids)].copy()
+    result["Comment_Detail"] = result["PRODUCT_SET_SID"].map(sid_comment)
     return result.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 

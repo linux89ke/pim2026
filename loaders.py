@@ -143,7 +143,7 @@ def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
             def _split_set(series, sep=","):
                 return series.astype(str).str.strip().apply(
                     lambda x: set() if not x or x.lower() == "nan"
-                    else {v.strip() for v in x.split(sep) if v.strip()}
+                    else {v.strip().lower() for v in x.split(sep) if v.strip()}
                 )
 
             def _split_cats(series):
@@ -156,9 +156,26 @@ def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
             cats_s = _split_cats(df.get("categories", pd.Series([""] * len(df), index=df.index)))
             vars_s = _split_set(df.get("variations", pd.Series([""] * len(df), index=df.index)), ",")
 
+            # Parse "Expanded Variations" — stored as Python list strings e.g. "['axiz-y', ...]"
+            import ast as _ast
+            def _parse_expanded(val):
+                s = str(val).strip()
+                if not s or s.lower() == "nan":
+                    return set()
+                try:
+                    parsed = _ast.literal_eval(s)
+                    if isinstance(parsed, list):
+                        return {str(v).strip().lower() for v in parsed if str(v).strip()}
+                except Exception:
+                    pass
+                return {v.strip().lower() for v in s.split(",") if v.strip()}
+
+            exp_vars_col = "expanded variations"
+            exp_vars_s = df.get(exp_vars_col, pd.Series([""] * len(df), index=df.index)).apply(_parse_expanded)
+
             brand_dict: dict = {}
-            for b_lower, brand_raw, sellers, cats, variations in zip(
-                df["_b_lower"], brand_col_vals[valid], sellers_s, cats_s, vars_s
+            for b_lower, brand_raw, sellers, cats, variations, exp_vars in zip(
+                df["_b_lower"], brand_col_vals[valid], sellers_s, cats_s, vars_s, exp_vars_s
             ):
                 if b_lower not in brand_dict:
                     brand_dict[b_lower] = {
@@ -174,6 +191,7 @@ def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
                 else:
                     brand_dict[b_lower]["categories"].update(cats)
                 brand_dict[b_lower]["variations"].update(variations)
+                brand_dict[b_lower]["variations"].update(exp_vars)
 
             country_rules = [
                 {
