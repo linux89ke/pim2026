@@ -367,12 +367,6 @@ def restore_single_item(sid):
                                 else default_cmt
                             )
 
-                            if (
-                                flag == "BRAND name repeated in NAME"
-                                and "brand_image_check" in col.lower()
-                            ):
-                                final_comment = "Brand Image Check"
-
                             apply_status_change(
                                 [sid_str],
                                 status="Rejected",
@@ -563,6 +557,8 @@ FLAG_RELEVANT_COLS = {
     "Generic BRAND Issues": ["CATEGORY_CODE", "BRAND"],
     "Fashion brand issues": ["CATEGORY_CODE", "BRAND"],
     "BRAND name repeated in NAME": ["BRAND", "NAME"],
+    "Brand Image Check": ["BRAND", "NAME", "Brand_Image_Check_Reason", "Brand_Detected_On_Product"],
+    "Product Name Brand Name": ["BRAND", "NAME", "Product name_Brand name_rejection reason"],
     "Wrong Variation": ["COUNT_VARIATIONS", "CATEGORY_CODE"],
     "Generic branded products with genuine brands": ["NAME", "BRAND", "CATEGORY"],
     "Missing COLOR": ["CATEGORY_CODE", "NAME", "COLOR"],
@@ -3841,8 +3837,6 @@ if st.session_state.get("last_processed_files") != process_signature:
                                     _cr = str(_r["Category_Check_Rejection_Reason"]).strip()
                                     if _cr and _cr.lower() not in ("nan", "rejected"):
                                         _final_cmt = _cr
-                                elif _flag == "BRAND name repeated in NAME" and "brand_image_check" in _col.lower():
-                                    _final_cmt = "Brand Image Check"
 
                                 _fidx = _fr_sid_to_idx.get(_sid)
                                 if _fidx is not None:
