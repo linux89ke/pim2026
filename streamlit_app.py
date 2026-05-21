@@ -137,31 +137,38 @@ st.markdown(
     function colorExpander() {
         const markers = document.querySelectorAll('.dashboard-marker');
         markers.forEach(marker => {
-            let parentBlock = marker.closest('div[data-testid="stVerticalBlock"]');
-            if (!parentBlock) return;
-            let expanderWrapper = parentBlock.nextElementSibling;
-            if (!expanderWrapper) return;
-            let expander = expanderWrapper.querySelector('div[data-testid="stExpander"]');
+            // Streamlit wraps each element in an element-container div.
+            // The marker and the expander are siblings at that level.
+            let container = marker.closest('[data-testid="element-container"]');
+            if (!container) return;
+            let next = container.nextElementSibling;
+            // Skip any non-expander siblings (e.g. empty containers)
+            while (next && !next.querySelector('[data-testid="stExpander"]')) {
+                next = next.nextElementSibling;
+            }
+            if (!next) return;
+            let expander = next.querySelector('[data-testid="stExpander"]');
             if (!expander) return;
             let summary = expander.querySelector('summary');
             if (summary && summary.style.backgroundColor !== 'rgb(246, 139, 30)') {
                 summary.style.setProperty('background-color', '#f68b1e', 'important');
                 summary.style.setProperty('color', 'white', 'important');
                 summary.style.setProperty('border-radius', '8px', 'important');
-                summary.style.setProperty('margin-bottom', '8px', 'important');
+                summary.style.setProperty('margin-bottom', '4px', 'important');
                 let p = summary.querySelector('p');
                 if (p) {
                     p.style.setProperty('color', 'white', 'important');
                     p.style.setProperty('font-weight', '800', 'important');
-                    p.style.setProperty('font-size', '1.15rem', 'important');
+                    p.style.setProperty('font-size', '1.05rem', 'important');
                 }
                 let svg = summary.querySelector('svg');
                 if (svg) svg.style.setProperty('fill', 'white', 'important');
             }
         });
     }
-    setTimeout(colorExpander, 200);
-    setInterval(colorExpander, 1500);
+    setTimeout(colorExpander, 300);
+    setTimeout(colorExpander, 800);
+    setInterval(colorExpander, 2000);
     </script>
 """,
     unsafe_allow_html=True,
