@@ -1007,6 +1007,16 @@ def render_flag_expander(
         "Category Max Price Exceeded",
         "Suspicious Discount",
         "Color Mismatch",
+        # Prefetch-sourced flags
+        "FDA",
+        "Category Check",
+        "Warranty Check",
+        "Color Check",
+        "Variation Check",
+        "Brand Image Check",
+        "Title Language Check",
+        "Image Quality Check",
+        "Product Name Brand Name",
         "Other Reason (Custom)",
     ]
 
@@ -1737,6 +1747,16 @@ def build_fast_grid_html(
     <option value="Missing COLOR">Missing Color</option>
     <option value="Product Warranty">Warranty Issues</option>
     <option value="Duplicate product">Duplicates</option>
+    <option disabled>── Prefetch Flags ──</option>
+    <option value="Category Check">Category Check</option>
+    <option value="Warranty Check">Warranty Check</option>
+    <option value="FDA">FDA</option>
+    <option value="Color Check">Color Check</option>
+    <option value="Variation Check">Variation Check</option>
+    <option value="Brand Image Check">Brand Image Check</option>
+    <option value="Title Language Check">Title Language Check</option>
+    <option value="Image Quality Check">Image Quality Check</option>
+    <option value="Product Name Brand Name">Name/Brand Check</option>
   </select>
   <select class="reason-sel sort-sel" id="filter-sel-top" onchange="applyFilter(this.value)" style="max-width:180px;" title="Filter to show only cards matching a flag">
     <option value="">Filter by flag</option>
@@ -1756,6 +1776,16 @@ def build_fast_grid_html(
     <option value="BRAND name repeated in NAME">Brand in Name</option>
     <option value="Unnecessary words">Unnecessary Words</option>
     <option value="Prohibited Words">Prohibited Words</option>
+    <option disabled>── Prefetch Flags ──</option>
+    <option value="Category Check">Category Check</option>
+    <option value="Warranty Check">Warranty Check</option>
+    <option value="FDA">FDA</option>
+    <option value="Color Check">Color Check</option>
+    <option value="Variation Check">Variation Check</option>
+    <option value="Brand Image Check">Brand Image Check</option>
+    <option value="Title Language Check">Title Language Check</option>
+    <option value="Image Quality Check">Image Quality Check</option>
+    <option value="Product Name Brand Name">Name/Brand Check</option>
     <option disabled>── Image Flags ──</option>
     <option value="Poor images">Poor Image</option>
     <option value="Low Resolution">Low Resolution</option>
@@ -2078,15 +2108,27 @@ function addWarnings(sid, warns) {{
 function buildCardActionsHtml(safeSid, warnings, cardData) {{
   var card = cardData || {{}};
   var FLAG_MAP = {{
-    'Wrong Category':         ['REJECT_WRONG_CAT',   LABELS.wrong_cat],
-    'Missing COLOR':          ['REJECT_COLOR',        LABELS.missing_color],
-    'Restricted Brand':       ['REJECT_BRAND',        LABELS.restr_brand],
-    'Restricted brands':      ['REJECT_BRAND',        LABELS.restr_brand],
-    'Prohibited':             ['REJECT_PROHIBITED',   LABELS.prohibited],
-    'Prohibited products':    ['REJECT_PROHIBITED',   LABELS.prohibited],
-    'Wrong Brand':            ['REJECT_WRONG_BRAND',  LABELS.wrong_brand],
-    'Suspected Fake product': ['REJECT_FAKE',         LABELS.fake_prod],
-    'Poor images':            ['REJECT_POOR_IMAGE',   LABELS.poor_img],
+    'Wrong Category':         ['REJECT_WRONG_CAT',     LABELS.wrong_cat],
+    'Category Check':         ['REJECT_WRONG_CAT',     LABELS.wrong_cat],
+    'Missing COLOR':          ['REJECT_COLOR',          LABELS.missing_color],
+    'Color Check':            ['REJECT_COLOR',          LABELS.missing_color],
+    'Restricted Brand':       ['REJECT_BRAND',          LABELS.restr_brand],
+    'Restricted brands':      ['REJECT_BRAND',          LABELS.restr_brand],
+    'Prohibited':             ['REJECT_PROHIBITED',     LABELS.prohibited],
+    'Prohibited products':    ['REJECT_PROHIBITED',     LABELS.prohibited],
+    'Wrong Brand':            ['REJECT_WRONG_BRAND',    LABELS.wrong_brand],
+    'Suspected Fake product': ['REJECT_FAKE',           LABELS.fake_prod],
+    'Poor images':            ['REJECT_POOR_IMAGE',     LABELS.poor_img],
+    'Image Quality Check':    ['REJECT_POOR_IMAGE',     LABELS.poor_img],
+    'Brand Image Check':      ['REJECT_POOR_IMAGE',     LABELS.poor_img],
+    'Product Warranty':       ['REJECT_WARRANTY',       'Product Warranty'],
+    'Warranty Check':         ['REJECT_WARRANTY',       'Product Warranty'],
+    'FDA':                    ['REJECT_FDA',            'FDA'],
+    'Wrong Variation':        ['REJECT_VARIATION',      'Wrong Variation'],
+    'Variation Check':        ['REJECT_VARIATION',      'Wrong Variation'],
+    'BRAND name repeated in NAME': ['REJECT_BRAND_IN_NAME', 'Brand in Name'],
+    'Product Name Brand Name':     ['REJECT_BRAND_IN_NAME', 'Brand in Name'],
+    'Title Language Check':   ['REJECT_TITLE_LANG',    'Title Language'],
   }};
   var defaultCode  = 'REJECT_POOR_IMAGE';
   var defaultLabel = LABELS.poor_img;

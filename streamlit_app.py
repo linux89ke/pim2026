@@ -169,28 +169,31 @@ st.markdown(
 # ──────────────────────────────────────────────────────────────────────────────
 
 PREFETCH_MAP = {
+    # Native validator flags (unchanged)
     "wrong_category": "Wrong Category",
-    "category_check": "Wrong Category",
     "poor_images": "Poor images",
     "restricted_brands": "Restricted brands",
     "prohibited_products": "Prohibited products",
     "suspected_fake": "Suspected Fake product",
     "duplicate_product": "Duplicate product",
     "wrong_variation": "Wrong Variation",
-    "variation_check": "Wrong Variation",
     "missing_color": "Missing COLOR",
-    "color_check": "Missing COLOR",
-    "warranty_check": "Product Warranty",
-    "fda_check": "FDA",
     "unnecessary_words": "Unnecessary words in NAME",
     "brand_repeated": "BRAND name repeated in NAME",
-    "product_name_brand_name": "BRAND name repeated in NAME",
     "generic_brand": "Generic BRAND Issues",
     "incomplete_smartphone": "Incomplete Smartphone Name",
     "missing_weight": "Missing Weight/Volume",
-    "title_language_check": "Missing Weight/Volume",
     "product_warranty": "Product Warranty",
-    "brand_image_check": "BRAND name repeated in NAME",
+    # Prefetch-only flags — each ZIP column gets its own distinct flag
+    "category_check": "Category Check",
+    "warranty_check": "Warranty Check",
+    "fda_check": "FDA",
+    "color_check": "Color Check",
+    "variation_check": "Variation Check",
+    "product_name_brand_name": "Product Name Brand Name",
+    "title_language_check": "Title Language Check",
+    "image_quality_check": "Image Quality Check",
+    "brand_image_check": "Brand Image Check",
 }
 
 PREFETCH_REASON_COLUMNS = {
@@ -209,16 +212,17 @@ PREFETCH_REASON_COLUMNS = {
 }
 PROCESSING_CACHE_VERSION = "prefetch_context_v3"
 PREFETCH_VALIDATOR_SKIP_MAP = {
-    "category_check": ["Wrong Category"],
-    "warranty_check": ["Product Warranty"],
+    "category_check": ["Wrong Category", "Category Check"],
+    "warranty_check": ["Product Warranty", "Warranty Check"],
     "fda_check": ["FDA"],
-    "color_check": ["Missing COLOR"],
-    "variation_check": ["Wrong Variation"],
-    "product_name_brand_name": ["BRAND name repeated in NAME"],
-    "brand_image_check": ["BRAND name repeated in NAME"],
-    "title_language_check": ["Missing Weight/Volume"],
+    "color_check": ["Missing COLOR", "Color Check"],
+    "variation_check": ["Wrong Variation", "Variation Check"],
+    "product_name_brand_name": ["BRAND name repeated in NAME", "Product Name Brand Name"],
+    "brand_image_check": ["Brand Image Check"],
+    "title_language_check": ["Missing Weight/Volume", "Title Language Check"],
     "image_quality_check": [
         "Poor images",
+        "Image Quality Check",
         "Image Stretched",
         "Image Blurry",
         "Image Mismatch",

@@ -701,6 +701,43 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
             "1000007 - Other Reason",
             "Only approved brands may list powerbanks with 20,000mAh or above capacity.",
         ),
+        # Prefetch-only validations (sourced from QC ZIP file)
+        "FDA": (
+            "1000007 - Other Reason",
+            "Kindly Provide Product's Health/Food Regulation Registration Number.",
+        ),
+        "Title Language Check": (
+            "1000008 - Kindly Improve Product Name Description",
+            "Include weight or volume (e.g., '1kg', '500ml').",
+        ),
+        "Brand Image Check": (
+            "1000042 - Kindly follow our product image upload guideline.",
+            "Brand detected on product image does not match the declared brand.",
+        ),
+        "Image Quality Check": (
+            "1000042 - Kindly follow our product image upload guideline.",
+            "Poor Image Quality",
+        ),
+        "Variation Check": (
+            "1000039 - Product Poorly Created. Each Variation Of This Product Should Be Created Uniquely (Not Authorized)",
+            "Create different SKUs instead of variations (variations only for sizes).",
+        ),
+        "Color Check": (
+            "1000005 - Kindly confirm the actual product colour",
+            "Product color must be mentioned in title/color tab.",
+        ),
+        "Category Check": (
+            "1000004 - Wrong Category",
+            "Assigned to Wrong Category. Please use correct category.",
+        ),
+        "Warranty Check": (
+            "1000013 - Kindly Provide Product Warranty Details",
+            "Valid warranty required in Description/Warranty tabs.",
+        ),
+        "Product Name Brand Name": (
+            "1000007 - Other Reason",
+            "Brand name should not be repeated in product name.",
+        ),
     }
 
     default_mapping = {
