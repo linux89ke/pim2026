@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Architecture</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #07071a; font-family: 'Segoe UI', sans-serif; color: #fff; padding: 28px; min-height: 100vh; }
+
+.bg {
+  position: fixed; inset: 0; z-index: 0;
+  background:
+    radial-gradient(ellipse 60% 40% at 10% 20%, rgba(246,139,30,0.08) 0%, transparent 60%),
+    radial-gradient(ellipse 80% 80% at 50% 50%, #0d0d2b 0%, #07071a 100%);
+}
+.content { position: relative; z-index: 1; max-width: 900px; margin: 0 auto; }
+
+h2 { font-size: 20px; font-weight: 800; margin-bottom: 6px; }
+.sub { font-size: 13px; color: rgba(255,255,255,0.45); margin-bottom, 28px; }
+
+/* LAYERS */
+.arch { display: flex; flex-direction: column; gap: 0; margin-top: 24px; }
+
+.layer {
+  border-radius: 18px; padding: 18px 20px;
+  border: 1px solid rgba(255,255,255,0.08);
+  background: rgba(255,255,255,0.03);
+  backdrop-filter: blur(12px);
+  position: relative;
+}
+.layer-label {
+  font-size: 10px; font-weight: 700; letter-spacing: 1.2px; text-transform: uppercase;
+  margin-bottom: 12px; display: flex; align-items: center; gap: 8px;
+}
+.layer-dot { width: 8px; height: 8px; border-radius: 50%; }
+
+.layer.browser { border-color: rgba(246,139,30,0.3); }
+.layer.browser .layer-dot { background: #F68B1E; }
+.layer.browser .layer-label { color: #F68B1E; }
+
+.layer.api { border-color: rgba(96,165,250,0.3); margin-top: -1px; }
+.layer.api .layer-dot { background: #60a5fa; }
+.layer.api .layer-label { color: #60a5fa; }
+
+.layer.data { border-color: rgba(34,197,94,0.3); margin-top: -1px; }
+.layer.data .layer-dot { background: #22c55e; }
+.layer.data .layer-label { color: #22c55e; }
+
+/* BOXES inside layers */
+.boxes { display: flex; gap: 10px; flex-wrap: wrap; }
+.box {
+  border-radius: 12px; padding: 12px 14px; flex: 1; min-width: 140px;
+  border: 1px solid rgba(255,255,255,0.08);
+}
+.box.orange { background: rgba(246,139,30,0.1); border-color: rgba(246,139,30,0.25); }
+.box.blue { background: rgba(96,165,250,0.08); border-color: rgba(96,165,250,0.2); }
+.box.green { background: rgba(34,197,94,0.08); border-color: rgba(34,197,94,0.2); }
+.box.purple { background: rgba(167,139,250,0.08); border-color: rgba(167,139,250,0.2); }
+.box.gray { background: rgba(255,255,255,0.04); border-color: rgba(255,255,255,0.1); }
+
+.box-title { font-size: 12px; font-weight: 700; margin-bottom: 4px; }
+.box-title.orange { color: #F68B1E; }
+.box-title.blue { color: #60a5fa; }
+.box-title.green { color: #22c55e; }
+.box-title.purple { color: #a78bfa; }
+.box-title.gray { color: rgba(255,255,255,0.7); }
+.box-desc { font-size: 11px; color: rgba(255,255,255,0.45); line-height: 1.5; }
+.box-tag { display: inline-block; margin-top: 6px; font-size: 9px; font-weight: 700; padding: 2px 7px; border-radius: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+.box-tag.new { background: rgba(246,139,30,0.2); color: #F68B1E; }
+.box-tag.keep { background: rgba(34,197,94,0.15); color: #22c55e; }
+.box-tag.upgrade { background: rgba(96,165,250,0.15); color: #60a5fa; }
+
+/* ARROWS between layers */
+.arrow-row {
+  display: flex; align-items: center; justify-content: center;
+  gap: 24px; padding: 8px 0; z-index: 2; position: relative;
+}
+.arrow {
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  font-size: 10px; color: rgba(255,255,255,0.35);
+}
+.arrow .line {
+  width: 1px; height: 20px;
+  background: linear-gradient(to bottom, rgba(255,255,255,0.15), rgba(255,255,255,0.05));
+}
+.arrow.fetch .label { color: #60a5fa; }
+.arrow.fetch .line { background: linear-gradient(to bottom, rgba(96,165,250,0.4), rgba(96,165,250,0.1)); }
+.arrow.stream .label { color: #a78bfa; }
+.arrow.stream .line { background: linear-gradient(to bottom, rgba(167,139,250,0.4), rgba(167,139,250,0.1)); }
+.arrow .label { font-size: 9px; font-weight: 600; letter-spacing: 0.3px; }
+
+/* FLOW NOTE */
+.flow {
+  margin-top: 20px;
+  background: rgba(246,139,30,0.06); border: 1px solid rgba(246,139,30,0.15);
+  border-radius: 14px; padding: 16px 18px;
+}
+.flow-title { font-size: 11px; font-weight: 700; color: #F68B1E; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 10px; }
+.flow-steps { display: flex; flex-direction: column; gap: 6px; }
+.flow-step { display: flex; align-items: flex-start; gap: 10px; font-size: 12px; color: rgba(255,255,255,0.65); line-height: 1.5; }
+.flow-num { width: 20px; height: 20px; border-radius: 50%; background: rgba(246,139,30,0.2); color: #F68B1E; font-size: 10px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; }
+.flow-step strong { color: rgba(255,255,255,0.9); }
+
+.kept-note {
+  margin-top: 12px;
+  background: rgba(34,197,94,0.05); border: 1px solid rgba(34,197,94,0.15);
+  border-radius: 14px; padding: 14px 18px;
+  font-size: 12px; color: rgba(255,255,255,0.6); line-height: 1.6;
+}
+.kept-note strong { color: #22c55e; }
+</style>
+</head>
+<body>
+<div class="bg"></div>
+<div class="content">
+
+  <h2>System Architecture</h2>
+  <p class="sub" style="margin-bottom:0">How the custom shell connects to your existing Python backend</p>
+
+  <div class="arch">
+
+    <!-- BROWSER LAYER -->
+    <div class="layer browser">
+      <div class="layer-label"><div class="layer-dot"></div> Browser — Custom HTML/CSS/JS Shell (full page)</div>
+      <div class="boxes">
+        <div class="box orange">
+          <div class="box-title orange">Product Grid</div>
+          <div class="box-desc">Virtualized cards, lazy image loading, swipe gestures, mobile-responsive</div>
+          <span class="box-tag new">New</span>
+        </div>
+        <div class="box orange">
+          <div class="box-title orange">Cmd+K Palette</div>
+          <div class="box-desc">Ctrl+K opens search: filter by country, product, flag type, jump to action</div>
+          <span class="box-tag new">New</span>
+        </div>
+        <div class="box orange">
+          <div class="box-title orange">Sidebar + Nav</div>
+          <div class="box-desc">Country switcher, status filters, stats — all client-side, instant</div>
+          <span class="box-tag new">New</span>
+        </div>
+        <div class="box gray">
+          <div class="box-title gray">File Upload</div>
+          <div class="box-desc">Drag-and-drop uploader, hands off to Streamlit for QC processing</div>
+          <span class="box-tag keep">Kept</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ARROW 1 -->
+    <div class="arrow-row">
+      <div class="arrow fetch">
+        <div class="label">fetch() approve/reject</div>
+        <div class="line"></div>
+        <div class="label">~20–50ms ↕</div>
+      </div>
+      <div class="arrow stream">
+        <div class="label">upload → QC validate</div>
+        <div class="line"></div>
+        <div class="label">Streamlit rerun (once)</div>
+      </div>
+    </div>
+
+    <!-- API LAYER -->
+    <div class="layer api">
+      <div class="layer-label"><div class="layer-dot"></div> Python Backend</div>
+      <div class="boxes">
+        <div class="box blue">
+          <div class="box-title blue">api.py (FastAPI)</div>
+          <div class="box-desc">REST endpoints: GET /products, POST /approve, POST /reject, GET /export — already exists, needs small additions</div>
+          <span class="box-tag upgrade">Upgrade</span>
+        </div>
+        <div class="box blue">
+          <div class="box-title blue">streamlit_app.py</div>
+          <div class="box-desc">Handles file upload, QC validation pipeline, writes results to parquet cache. Streamlit stays as the processing engine.</div>
+          <span class="box-tag keep">Kept</span>
+        </div>
+        <div class="box blue">
+          <div class="box-title blue">QC Rules Engine</div>
+          <div class="box-desc">nigeria_rules, ghana_rules, morocco_rules, pricing_rules — unchanged, still run server-side</div>
+          <span class="box-tag keep">Kept</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ARROW 2 -->
+    <div class="arrow-row">
+      <div class="arrow fetch" style="flex-direction:column; align-items:center;">
+        <div class="label">read / write parquet</div>
+        <div class="line"></div>
+      </div>
+    </div>
+
+    <!-- DATA LAYER -->
+    <div class="layer data">
+      <div class="layer-label"><div class="layer-dot"></div> Data Layer — Local Files</div>
+      <div class="boxes">
+        <div class="box green">
+          <div class="box-title green">Parquet Cache</div>
+          <div class="box-desc">Product data snapshots (already exists in app_cache_parquet/)</div>
+          <span class="box-tag keep">Kept</span>
+        </div>
+        <div class="box green">
+          <div class="box-title green">Flag Cache</div>
+          <div class="box-desc">Validation flag results (already exists in app_cache_flags/)</div>
+          <span class="box-tag keep">Kept</span>
+        </div>
+        <div class="box green">
+          <div class="box-title green">Session State</div>
+          <div class="box-desc">Approve/reject decisions stored locally, flushed to export on demand</div>
+          <span class="box-tag keep">Kept</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- FLOW -->
+  <div class="flow" style="margin-top:20px;">
+    <div class="flow-title">What happens when a reviewer clicks Approve</div>
+    <div class="flow-steps">
+      <div class="flow-step"><div class="flow-num">1</div><span>Reviewer clicks <strong>Approve</strong> on a product card in the shell</span></div>
+      <div class="flow-step"><div class="flow-num">2</div><span>Shell sends <strong>fetch('POST /approve', {id: ...})</strong> directly to api.py — <strong>~20ms</strong></span></div>
+      <div class="flow-step"><div class="flow-num">3</div><span>api.py writes the decision to the parquet cache — <strong>no Streamlit rerun</strong></span></div>
+      <div class="flow-step"><div class="flow-num">4</div><span>Shell receives <strong>200 OK</strong>, animates the card to "Approved" state — <strong>instant</strong></span></div>
+      <div class="flow-step"><div class="flow-num">5</div><span>Stats counter updates client-side — no page reload needed</span></div>
+    </div>
+  </div>
+
+  <div class="kept-note">
+    <strong>90% of your existing code stays.</strong> The QC rules, parquet cache, flag cache, export logic, and Streamlit upload flow are untouched. Only the visual layer (what the reviewer sees) gets rebuilt. The shell replaces <code>ui_components.py</code>'s HTML string generation with a proper JS frontend that calls <code>api.py</code> directly.
+  </div>
+
+</div>
+</body>
+</html>

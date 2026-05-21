@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Read(//c/Users/New/Desktop/pim2026-test - Copy - Copy 14th/**)",
+      "Bash(Get-ChildItem -Recurse -Name)",
+      "Bash(dir \"C:\\\\Users\\\\New\\\\Desktop\\\\pim2026-test - Copy - Copy 14th\" -Recurse -Name)",
+      "Bash(python -c \"import streamlit; print\\(streamlit.__version__\\)\")",
+      "Bash(python -c \"from streamlit.elements.iframe import iframe_proto; import inspect; print\\(inspect.getsource\\(iframe_proto\\)\\)\")",
+      "Bash(Get-ChildItem \"C:\\\\Users\\\\New\\\\Desktop\\\\pim2026-test - Copy - Copy 14th\" -Filter \"ui_components.py\")",
+      "Bash(Select-Object FullName)",
+      "mcp__Desktop_Commander__read_file",
+      "Bash(python -c \"import streamlit as st; print\\(st.__version__\\); print\\(hasattr\\(st, 'iframe'\\)\\)\")",
+      "Bash(python -c \"import streamlit as st; help\\(st.iframe\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\New\\\\Desktop\\\\pim2026-test - Copy\" -Recurse -Filter \"*.py\")",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "mcp__Desktop_Commander__list_directory",
+      "Bash(dir \"C:\\\\Users\\\\New\\\\Desktop\\\\pim2026-test - Copy\" /s /b *.py)",
+      "Bash(git revert *)",
+      "Skill(superpowers:brainstorming)",
+      "Skill(superpowers:brainstorming:*)",
+      "Bash(ls \"C:\\\\Users\\\\New\\\\.claude\\\\plugins\\\\cache\\\\claude-plugins-official\\\\superpowers\\\\5.1.0\\\\skills\\\\brainstorming\\\\..\\\\..\\\\scripts\\\\\")",
+      "Bash(bash \"C:/Users/New/.claude/plugins/cache/claude-plugins-official/superpowers/5.1.0/skills/brainstorming/scripts/start-server.sh\" --project-dir \"C:/Users/New/Desktop/pim2026-test - Copy\")",
+      "Bash(git commit *)"
+    ]
+  }
+}
