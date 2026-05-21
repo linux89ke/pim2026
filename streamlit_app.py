@@ -2923,8 +2923,8 @@ if "display_df_cache" not in st.session_state:
     st.session_state.display_df_cache = {}
 if "main_bridge_counter" not in st.session_state:
     st.session_state.main_bridge_counter = 0
-if "flags_expanded_initialized" not in st.session_state:
-    st.session_state.flags_expanded_initialized = False
+
+
 
 try:
     st.set_page_config(page_title="Product Tool", layout=st.session_state.layout_mode)
@@ -3299,7 +3299,7 @@ if country_choice and country_choice != current_country:
     st.session_state.all_data_rows = pd.DataFrame()
     st.session_state.exports_cache = {}
     st.session_state.display_df_cache = {}
-    st.session_state.flags_expanded_initialized = False
+
     st.session_state.ui_lang = "fr" if country_choice == "Morocco" else "en"
     st.session_state.country_bridge_counter += 1
     st.toast(f"Switching to {country_choice}…", icon=":material/public:")
@@ -3346,7 +3346,7 @@ if _has_files:
         st.session_state.grid_page = 0
         st.session_state.pop("_grid_page_contexts", None)
         st.session_state.pop("_grid_last_ctx", None)
-        st.session_state.flags_expanded_initialized = False
+
         st.session_state.pop("_grid_review_data_cache", None)
         st.session_state.pop("_grid_warm_urls", None)
         _dead_keys = [
@@ -3459,7 +3459,7 @@ if st.session_state.get("last_processed_files") != process_signature:
     st.session_state.pop("_grid_last_ctx", None)
     st.session_state.exports_cache = {}
     st.session_state.display_df_cache = {}
-    st.session_state.flags_expanded_initialized = False
+
     st.session_state.pop("_grid_review_data_cache", None)
     st.session_state.pop("_grid_warm_urls", None)
     keys_to_delete = [
@@ -4452,10 +4452,6 @@ def render_main_results():
                         cached_validate_products,
                     )
         else:
-            if not st.session_state.flags_expanded_initialized and not rej_df.empty:
-                top_flag = rej_df["FLAG"].value_counts().index[0]
-                st.session_state[f"exp_{top_flag}"] = True
-                st.session_state.flags_expanded_initialized = True
 
             for title in rej_df["FLAG"].unique():
                 df_flagged = rej_df[rej_df["FLAG"] == title]
