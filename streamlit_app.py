@@ -46,8 +46,8 @@ def get_image_session() -> requests.Session:
         retry = Retry(total=2, backoff_factor=0.3, status_forcelist=[500, 502, 503])
         adapter = HTTPAdapter(
             max_retries=retry,
-            pool_connections=20,  # keep 20 TCP connections alive
-            pool_maxsize=50,  # up to 50 concurrent
+            pool_connections=50,  # keep 50 TCP connections alive
+            pool_maxsize=100,  # up to 100 concurrent
         )
         s.mount("https://", adapter)
         s.mount("http://", adapter)
@@ -283,8 +283,11 @@ def restore_single_item(sid):
     if "manual_undone_tracker" not in st.session_state:
         st.session_state.manual_undone_tracker = {}
 
-    if len(st.session_state.manual_undone_tracker) > 500:
-        st.session_state.manual_undone_tracker.clear()
+    if len(st.session_state.manual_undone_tracker) > 200:
+        # evict oldest 50%
+        keys = list(st.session_state.manual_undone_tracker.keys())
+        for k in keys[:100]:
+            del st.session_state.manual_undone_tracker[k]
 
     current_flag = fr.loc[mask, "FLAG"].iloc[0]
     st.session_state.manual_undone_tracker.setdefault(sid_str, set()).add(current_flag)
@@ -712,12 +715,11 @@ def _fetch_all_image_dimensions(data: pd.DataFrame) -> dict:
     """
     if "MAIN_IMAGE" not in data.columns:
         return {}
-    urls = data[data["MAIN_IMAGE"].astype(str).str.startswith("http")][
-        "MAIN_IMAGE"
-    ].unique()
+    _all_urls = data["MAIN_IMAGE"].astype(str)
+    urls = _all_urls[_all_urls.str.strip().str.startswith("http")].unique()
     with _IMAGE_DIM_LOCK:
-        # Skip URLs already in BOTH caches
-        new_urls = [u for u in urls if u not in _IMAGE_DIM_CACHE]
+        # Skip URLs already cached; deduplicate before submitting
+        new_urls = list(dict.fromkeys(u for u in urls if u and u not in _IMAGE_DIM_CACHE))
 
     # ZIP images: read raw bytes from the store so we can hash them too
     zip_images_to_check = []  # list of (key, raw_bytes)
@@ -773,11 +775,11 @@ def _fetch_all_image_dimensions(data: pd.DataFrame) -> dict:
 
     results = []
     if new_urls:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(64, (os.cpu_count() or 4) * 8)) as executor:
             results.extend(list(executor.map(fetch, new_urls)))
 
     if zip_images_to_check:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 4) * 4)) as executor:
             results.extend(list(executor.map(process_zip_img, zip_images_to_check)))
 
     with _IMAGE_DIM_LOCK:
@@ -1269,11 +1271,11 @@ def check_seller_approved_for_perfume(
         )
         sneaky_mask = perfume["_brand_lower"].isin(GENERIC_PLACEHOLDERS) & perfume[
             "_name_lower"
-        ].apply(lambda x: bool(kw_pattern.search(x)))
+        ].str.contains(kw_pattern, na=False)
     else:
         sneaky_mask = pd.Series([False] * len(perfume), index=perfume.index)
     brand_sens_mask = (
-        perfume["_brand_lower"].apply(lambda x: bool(kw_pattern.search(x)))
+        perfume["_brand_lower"].str.contains(kw_pattern, na=False)
         if keywords
         else pd.Series([False] * len(perfume), index=perfume.index)
     )
@@ -2508,7 +2510,7 @@ def validate_products(
     def run_batch(v_list, current_data):
         nonlocal processed_count
         batch_results = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 4) * 4)) as executor:
             future_to_name = {}
             for name, func, kwargs in v_list:
                 if name.lower() in _skip_set or country_validator.should_skip_validation(name):
