@@ -1675,20 +1675,44 @@ def build_fast_grid_html(
   <button class="desel-btn" onclick="window.doSelectAll()">{labels_dict["select_all"]}</button>
   <button class="desel-btn" onclick="doDeselAll()">{labels_dict["deselect_all"]}</button>
   <button class="batch-btn top-btn" onclick="window.scrollTo(0, document.body.scrollHeight)">{_t("go_bottom")}</button>
-  <select class="reason-sel sort-sel" id="sort-sel-top" onchange="applySort(this.value)" style="max-width:170px;" title="Sort by image issue">
+  <select class="reason-sel sort-sel" id="sort-sel-top" onchange="applySort(this.value)" style="max-width:170px;" title="Sort by issue">
     <option value="">Sort by issue</option>
+    <option value="most_flagged">⚑ Most Flagged First</option>
+    <option value="no_issue">✓ No Issues First</option>
+    <option disabled>── Image ──</option>
     <option value="low_res">Low Resolution</option>
     <option value="tall">Tall (Screenshot?)</option>
     <option value="wide">Wide Aspect</option>
     <option value="broken">Broken Image</option>
-    <option disabled>── Prefetched ──</option>
+    <option disabled>── QC Flags ──</option>
     <option value="Wrong Category">Wrong Category</option>
     <option value="Restricted brands">Restricted brands</option>
     <option value="Suspected Fake product">Suspected Fake</option>
     <option value="Missing COLOR">Missing Color</option>
     <option value="Product Warranty">Warranty Issues</option>
     <option value="Duplicate product">Duplicates</option>
-    <option value="no_issue">No Issues First</option>
+  </select>
+  <select class="reason-sel sort-sel" id="filter-sel-top" onchange="applyFilter(this.value)" style="max-width:180px;" title="Filter to show only cards matching a flag">
+    <option value="">Filter by flag</option>
+    <option value="brand_ocr">🔍 Brand Image OCR</option>
+    <option value="committed">All Rejected</option>
+    <option value="no_flags">✓ Clean (no flags)</option>
+    <option disabled>── QC Flags ──</option>
+    <option value="Wrong Category">Wrong Category</option>
+    <option value="Restricted brands">Restricted brands</option>
+    <option value="Suspected Fake product">Suspected Fake</option>
+    <option value="Missing COLOR">Missing Color</option>
+    <option value="Product Warranty">Warranty Issues</option>
+    <option value="Duplicate product">Duplicates</option>
+    <option value="BRAND name repeated in NAME">Brand in Name</option>
+    <option value="Unnecessary words">Unnecessary Words</option>
+    <option value="Prohibited Words">Prohibited Words</option>
+    <option disabled>── Image Flags ──</option>
+    <option value="Poor images">Poor Image</option>
+    <option value="Low Resolution">Low Resolution</option>
+    <option value="Tall (Screenshot?)">Tall/Screenshot</option>
+    <option value="Wide Aspect">Wide Aspect</option>
+    <option value="Broken Image">Broken Image</option>
   </select>
 </div>
 
@@ -2242,6 +2266,8 @@ function updateSelCount() {{
   updateParentPagination();
 }}
 
+window._currentFilter = window._currentFilter || '';
+
 function getSortedCards() {{
   var sort = window._currentSort;
   if (!sort) return CARDS;
@@ -2249,11 +2275,27 @@ function getSortedCards() {{
   var sorted = CARDS.slice();
   if (sort === 'no_issue') {{
     sorted.sort(function(a,b) {{ return ((window._imageIssues[a.sid]||[]).length>0?1:0) - ((window._imageIssues[b.sid]||[]).length>0?1:0); }});
+  }} else if (sort === 'most_flagged') {{
+    sorted.sort(function(a,b) {{ return (b.warnings||[]).length - (a.warnings||[]).length; }});
   }} else {{
     var target = ISSUE_MAP[sort] || sort;
     sorted.sort(function(a,b) {{ return ((window._imageIssues[a.sid]||[]).includes(target)?0:1) - ((window._imageIssues[b.sid]||[]).includes(target)?0:1); }});
   }}
   return sorted;
+}}
+
+function getDisplayCards() {{
+  var cards = getSortedCards();
+  var f = window._currentFilter;
+  if (!f) return cards;
+  if (f === 'committed') return cards.filter(function(c) {{ return c.sid in COMMITTED; }});
+  if (f === 'brand_ocr') return cards.filter(function(c) {{ return c.sid in COMMITTED && (COMMITTED[c.sid]||'').includes('Brand Image Check'); }});
+  if (f === 'no_flags') return cards.filter(function(c) {{ return !(c.warnings||[]).length && !(c.sid in COMMITTED) && !(c.sid in staged); }});
+  return cards.filter(function(c) {{
+    var inWarnings = (c.warnings||[]).some(function(w) {{ return w === f; }});
+    var inCommitted = c.sid in COMMITTED && (COMMITTED[c.sid]||'').replace(/_/g,' ').toLowerCase() === f.replace(/_/g,' ').toLowerCase();
+    return inWarnings || inCommitted;
+  }});
 }}
 
 window.applySort = function(val) {{
@@ -2262,7 +2304,19 @@ window.applySort = function(val) {{
   renderAll();
 }};
 
-function renderAll() {{ document.getElementById('card-grid').innerHTML = getSortedCards().map(renderCard).join(''); updateSelCount(); activateLazyImages(); }}
+window.applyFilter = function(val) {{
+  window._currentFilter = val;
+  ['filter-sel-top','filter-sel-bottom'].forEach(function(id) {{ var el=document.getElementById(id); if(el) el.value=val; }});
+  renderAll();
+}};
+
+function renderAll() {{
+  var cards = getDisplayCards();
+  document.getElementById('card-grid').innerHTML = cards.map(renderCard).join('');
+  var countEl = document.getElementById('grid-count');
+  if (countEl) countEl.textContent = cards.length + ' products' + (window._currentFilter ? ' (filtered)' : '');
+  updateSelCount(); activateLazyImages();
+}}
 
 function replaceCard(sid) {{
   var el = document.getElementById('card-' + escapeHtml(sid));
