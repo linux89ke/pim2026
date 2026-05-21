@@ -3967,8 +3967,17 @@ def handle_jtbridge():
     if _bridge_val:
         try:
             _msg = json.loads(_bridge_val)
-            if _msg.get("action") == "reject":
+            if _msg.get("action") == "reject_comments":
+                # Store auto-comments keyed by SID — picked up by the next reject action
+                _ac = _msg.get("payload", {})
+                if isinstance(_ac, dict):
+                    if "pending_auto_comments" not in st.session_state:
+                        st.session_state.pending_auto_comments = {}
+                    st.session_state.pending_auto_comments.update(_ac)
+
+            elif _msg.get("action") == "reject":
                 _payload = _msg.get("payload", {})
+                _auto_comments = st.session_state.pop("pending_auto_comments", {})
                 if isinstance(_payload, dict) and _payload:
                     _rgroups = {}
                     for _sid, _rkey in _payload.items():
@@ -4005,15 +4014,17 @@ def handle_jtbridge():
                             )
                             _cmt = _rinfo.get(_cmt_lang, _rinfo.get("en"))
 
-                        apply_status_change(
-                            _sids,
-                            status="Rejected",
-                            reason=_code,
-                            comment=_cmt,
-                            flag=_flag,
-                            is_manual=True,
-                            is_zip=False,
-                        )
+                        for _sid in _sids:
+                            _sid_cmt = _auto_comments.get(_sid, _cmt)
+                            apply_status_change(
+                                [_sid],
+                                status="Rejected",
+                                reason=_code,
+                                comment=_sid_cmt,
+                                flag=_flag,
+                                is_manual=True,
+                                is_zip=False,
+                            )
                         _total += len(_sids)
 
                     st.session_state.main_toasts.append(f"Rejected {_total} product(s)")

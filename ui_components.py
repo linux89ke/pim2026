@@ -1274,6 +1274,42 @@ def build_fast_grid_html(
         if color_val.lower() in ("nan", "none", "null"):
             color_val = ""
 
+        # Color mismatch: AI-normalized vs declared
+        color_ai = str(row.get("Color_AI_Normalized", "")).strip()
+        if color_ai.lower() in ("nan", "none", "null", ""):
+            color_ai = ""
+        color_mismatch = ""
+        if color_ai and color_val:
+            _ai_n = color_ai.lower().replace(" ", "")
+            _dec_n = color_val.lower().replace(" ", "")
+            if _ai_n != _dec_n and _ai_n not in _dec_n and _dec_n not in _ai_n:
+                color_mismatch = f"AI detected '{color_ai}' but declared '{color_val}'"
+        elif color_ai and not color_val:
+            color_mismatch = f"AI detected color '{color_ai}' but no color declared"
+
+        # Duplicate flag from prefetch CSV
+        dup_raw = str(row.get("Duplicate_Flag", "")).strip()
+        is_duplicate = dup_raw.lower() not in ("", "nan", "none", "false")
+
+        # Manual review flag
+        mr_raw = str(row.get("Manual_Review", "")).strip().lower()
+        is_manual_review = mr_raw in ("true", "1", "yes")
+
+        # Category AI reason + suggested category
+        cat_reason = str(row.get("Category_Check_Rejection_Reason", "")).strip()
+        if cat_reason.lower() in ("nan", "none", "rejected", ""):
+            cat_reason = ""
+        suggested_cats_raw = str(row.get("Suggested_Categories", "")).strip()
+        suggested_cat = ""
+        if suggested_cats_raw and suggested_cats_raw.lower() not in ("nan", "none", ""):
+            first_pipe = suggested_cats_raw.split("|")[0]
+            suggested_cat = re.sub(r"\s*\(\d+%\)\s*$", "", first_pipe).strip()
+
+        # AI caption
+        ai_caption = str(row.get("AI_Product_Caption", "")).strip()
+        if ai_caption.lower() in ("nan", "none", ""):
+            ai_caption = ""
+
         cards_data.append(
             {
                 "sid": sid,
@@ -1308,6 +1344,12 @@ def build_fast_grid_html(
                 "data_brand": str(row.get("BRAND", "")).replace('"', "&quot;"),
                 "data_sid": sid,
                 "data_cat": str(row.get("CATEGORY", "")).replace('"', "&quot;"),
+                "is_duplicate": is_duplicate,
+                "is_manual_review": is_manual_review,
+                "color_mismatch": color_mismatch,
+                "cat_reason": cat_reason,
+                "suggested_cat": suggested_cat,
+                "ai_caption": ai_caption,
             }
         )
 
@@ -1695,6 +1737,9 @@ def build_fast_grid_html(
   <select class="reason-sel sort-sel" id="filter-sel-top" onchange="applyFilter(this.value)" style="max-width:180px;" title="Filter to show only cards matching a flag">
     <option value="">Filter by flag</option>
     <option value="brand_ocr">🔍 Brand Image OCR</option>
+    <option value="duplicates">⧉ Duplicates</option>
+    <option value="manual_review">👁 Manual Review</option>
+    <option value="color_mismatch">⚠ Color Mismatch</option>
     <option value="committed">All Rejected</option>
     <option value="no_flags">✓ Clean (no flags)</option>
     <option disabled>── QC Flags ──</option>
@@ -2026,7 +2071,8 @@ function addWarnings(sid, warns) {{
   warns.forEach(w => {{ if (!window._imageIssues[sid].includes(w)) window._imageIssues[sid].push(w); }});
 }}
 
-function buildCardActionsHtml(safeSid, warnings) {{
+function buildCardActionsHtml(safeSid, warnings, cardData) {{
+  var card = cardData || {{}};
   var FLAG_MAP = {{
     'Wrong Category':         ['REJECT_WRONG_CAT',   LABELS.wrong_cat],
     'Missing COLOR':          ['REJECT_COLOR',        LABELS.missing_color],
@@ -2062,15 +2108,27 @@ function buildCardActionsHtml(safeSid, warnings) {{
   var optionsHtml = opts.map(function(o) {{
     return `<option value="${{o[0]}}">${{o[1]}}</option>`;
   }}).join('');
+  // Build pre-filled comment for Wrong Category rejections
+  var autoCommentHtml = '';
+  if (defaultCode === 'REJECT_WRONG_CAT' && (card.ai_caption || card.suggested_cat || card.cat_reason)) {{
+    var parts = [];
+    if (card.cat_reason) parts.push(card.cat_reason);
+    else if (card.ai_caption) parts.push(card.ai_caption);
+    if (card.suggested_cat) parts.push('Suggested: ' + card.suggested_cat);
+    var autoTxt = parts.join(' | ').slice(0, 250);
+    autoCommentHtml = `<textarea class="auto-comment" id="ac-${{safeSid}}" onclick="event.stopPropagation()" rows="2" style="width:100%;font-size:10px;margin-top:4px;padding:4px 6px;border-radius:6px;border:1px solid #e5e7eb;resize:vertical;background:#fffbf5;color:#333;">${{escapeHtml(autoTxt)}}</textarea>`;
+  }}
+
   return (
     `<div class="acts">` +
-      `<button class="act-btn" onclick="event.stopPropagation();window.stageReject('${{safeSid}}','${{defaultCode}}')">` +
+      `<button class="act-btn" onclick="event.stopPropagation();window.stageRejectWithComment('${{safeSid}}','${{defaultCode}}')">` +
         escapeHtml(defaultLabel) +
       `</button>` +
-      `<select class="act-more" onchange="if(this.value){{event.stopPropagation();window.stageReject('${{safeSid}}',this.value);this.value=''}}">` +
+      `<select class="act-more" onchange="if(this.value){{event.stopPropagation();window.stageRejectWithComment('${{safeSid}}',this.value);this.value=''}}">` +
         `<option value="">${{escapeHtml(LABELS.more_options)}}</option>` +
         optionsHtml +
       `</select>` +
+      autoCommentHtml +
     `</div>`
   );
 }}
@@ -2126,8 +2184,15 @@ function renderCard(card) {{
   var safeImgSrcForHtml = card.img ? card.img.replace(/'/g, "%27").replace(/"/g, "%22") : PLACEHOLDER;
   var shortName = card.name.length > 38 ? escapeHtml(card.name.slice(0,38)) + '\u2026' : escapeHtml(card.name);
   var warnHtml = (card.warnings || []).map(w => `<span class="warn-badge">${{escapeHtml(w)}}</span>`).join('');
+  if (card.is_duplicate) warnHtml += `<span class="warn-badge" style="background:#7c3aed;color:#fff;font-weight:800;">⧉ DUPLICATE</span>`;
+  if (card.is_manual_review) warnHtml += `<span class="warn-badge" style="background:#0369a1;color:#fff;font-weight:800;">👁 MANUAL REVIEW</span>`;
+  if (card.color_mismatch) warnHtml += `<span class="warn-badge" style="background:#b45309;color:#fff;" title="${{escapeHtml(card.color_mismatch)}}">⚠ Color Mismatch</span>`;
   var priceHtml = card.price ? `<div class="price-badge">${{escapeHtml(card.price)}}</div>` : '';
   var colorHtml = card.color ? `<div class="co" title="Color: ${{escapeHtml(card.color)}}">Color: ${{escapeHtml(card.color)}}</div>` : '';
+  var colorMismatchHtml = card.color_mismatch ? `<div class="co" style="color:#b45309;border-color:#fde68a;" title="${{escapeHtml(card.color_mismatch)}}">⚠ ${{escapeHtml(card.color_mismatch)}}</div>` : '';
+  var catReasonHtml = (card.cat_reason && (card.warnings||[]).some(w => w.includes('Category'))) ?
+    `<div class="co" style="color:#9333ea;font-size:10px;white-space:normal;line-height:1.3;" title="${{escapeHtml(card.cat_reason)}}">${{escapeHtml(card.cat_reason.length > 80 ? card.cat_reason.slice(0,80)+'…' : card.cat_reason)}}</div>` : '';
+  var suggestedCatHtml = card.suggested_cat ? `<div class="co" style="color:#0369a1;" title="AI suggests: ${{escapeHtml(card.suggested_cat)}}">→ ${{escapeHtml(card.suggested_cat.length > 50 ? card.suggested_cat.slice(0,50)+'…' : card.suggested_cat)}}</div>` : '';
   var brandDetectedHtml = (isBrandImgRej && card.brand_detected) ? `<div class="co" style="background:#E8F5E9;color:#2E7D32;border:1px solid #C8E6C9;" title="Brand Detected: ${{escapeHtml(card.brand_detected)}}">Detected Brand: ${{escapeHtml(card.brand_detected)}}</div>` : '';
 
   var zoomHtml = `<button class="zoom-btn" onclick="event.stopPropagation();showZoom('${{safeSid}}', event)" title="Preview">
@@ -2177,7 +2242,7 @@ function renderCard(card) {{
       <button class="undo-btn" onclick="event.stopPropagation();window.clearStaged('${{safeSid}}')">${{escapeHtml(LABELS.clear_sel)}}</button>
     </div>`;
   }} else {{
-    actHtml = buildCardActionsHtml(safeSid, card.warnings);
+    actHtml = buildCardActionsHtml(safeSid, card.warnings, card);
   }}
 
     var trustBadge = '';
@@ -2206,6 +2271,9 @@ function renderCard(card) {{
       <div class="ct" title="${{escapeHtml(card.cat)}}">Category: ${{escapeHtml(card.cat)}}</div>
       <div class="sl" title="${{escapeHtml(card.seller)}}">Seller: ${{escapeHtml(card.seller)}}</div>
       ${{colorHtml}}
+      ${{colorMismatchHtml}}
+      ${{catReasonHtml}}
+      ${{suggestedCatHtml}}
       ${{brandDetectedHtml}}
     </div>
     ${{actHtml}}
@@ -2291,6 +2359,9 @@ function getDisplayCards() {{
   if (f === 'committed') return cards.filter(function(c) {{ return c.sid in COMMITTED; }});
   if (f === 'brand_ocr') return cards.filter(function(c) {{ return c.sid in COMMITTED && (COMMITTED[c.sid]||'').includes('Brand Image Check'); }});
   if (f === 'no_flags') return cards.filter(function(c) {{ return !(c.warnings||[]).length && !(c.sid in COMMITTED) && !(c.sid in staged); }});
+  if (f === 'duplicates') return cards.filter(function(c) {{ return c.is_duplicate; }});
+  if (f === 'manual_review') return cards.filter(function(c) {{ return c.is_manual_review; }});
+  if (f === 'color_mismatch') return cards.filter(function(c) {{ return !!c.color_mismatch; }});
   return cards.filter(function(c) {{
     var inWarnings = (c.warnings||[]).some(function(w) {{ return w === f; }});
     var inCommitted = c.sid in COMMITTED && (COMMITTED[c.sid]||'').replace(/_/g,' ').toLowerCase() === f.replace(/_/g,' ').toLowerCase();
@@ -2338,6 +2409,16 @@ window.toggleSelect = function(sid, e) {{
   else if (sid in selected) delete selected[sid];
   else selected[sid] = true;
   replaceCard(sid); updateSelCount();
+}};
+
+window.stageRejectWithComment = function(sid, r) {{
+  var safeSid = sid.replace(/'/g, "\\\\'");
+  var ta = document.getElementById('ac-' + safeSid);
+  if (ta && ta.value.trim()) {{
+    window._autoComments = window._autoComments || {{}};
+    window._autoComments[sid] = ta.value.trim();
+  }}
+  window.stageReject(sid, r);
 }};
 
 window.stageReject = function(sid, r) {{
@@ -2424,7 +2505,8 @@ window.undoReject = function(sid) {{
 
       var acts = cardEl.querySelector('.acts');
       if (acts) acts.remove();
-      cardEl.insertAdjacentHTML('beforeend', buildCardActionsHtml(safeSid, (CARDS.find(c=>c.sid===safeSid)||{{}}).warnings));
+      var _c = CARDS.find(c=>c.sid===safeSid)||{{}};
+      cardEl.insertAdjacentHTML('beforeend', buildCardActionsHtml(safeSid, _c.warnings, _c));
 
       // Add a slight shimmer to the card without blocking interaction
       cardEl.classList.add('undo-processing');
@@ -2490,11 +2572,16 @@ window.doBatchReject = function(pos) {{
 
 function _applyBatchReject(br) {{
   var payload = {{}}, count = 0;
+  var autoC = window._autoComments || {{}};
   for (var s in staged) {{ payload[s] = staged[s]; count++; }}
   for (var s in selected) {{
     // Allow overwriting committed items (e.g. re-reject brand-image-check with a different reason)
     payload[s] = br; count++;
   }}
+  // Attach auto-comments as a separate payload key for Streamlit to pick up
+  var commentPayload = {{}};
+  for (var s in payload) {{ if (autoC[s]) commentPayload[s] = autoC[s]; }}
+  if (Object.keys(commentPayload).length) sendMsg('reject_comments', commentPayload);
   if (count === 0) {{
     for (var s in selected) delete selected[s];
     for (var s in staged) delete staged[s];
