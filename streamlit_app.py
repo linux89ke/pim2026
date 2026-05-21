@@ -2544,14 +2544,29 @@ def validate_products(
         # aren't incorrectly flagged — the prefetch ZIP check covers this instead.
         _skip_set.add("product warranty")
     _needs_image_cache = any(v[0].lower() not in _skip_set and v[1] in (check_image_stretched, check_image_blurry, check_duplicate_products) for v in validations)
-    _image_cache = _fetch_all_image_dimensions(data) if _needs_image_cache else {}
+
+    # Start image fetching in background so cheap validators run concurrently with downloads.
+    # Image validators are all EXPENSIVE_VALIDATORS (second batch), so we have the full
+    # cheap-batch duration to prefetch — typically eliminating the wait entirely.
+    _img_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1) if _needs_image_cache else None
+    _image_future = _img_executor.submit(_fetch_all_image_dimensions, data) if _img_executor else None
 
     total_tasks = len([v for v in validations if v[0].lower() not in _skip_set and not country_validator.should_skip_validation(v[0])])
     processed_count = 0
     restricted_keys = {}
     validation_errors = []
+    _last_progress_t = 0.0
 
-    def run_batch(v_list, current_data):
+    def _emit_progress(name: str, i: int, total: int):
+        nonlocal _last_progress_t
+        if not on_progress:
+            return
+        now = time.monotonic()
+        if i == total or (now - _last_progress_t) >= 0.4:
+            on_progress(name, i, total)
+            _last_progress_t = now
+
+    def run_batch(v_list, current_data, img_cache: dict):
         nonlocal processed_count
         batch_results = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 4) * 4)) as executor:
@@ -2565,13 +2580,13 @@ def validate_products(
                     working_data = current_data[~current_data["PRODUCT_SET_SID"].astype(str).isin(rejected_sids)]
                     if working_data.empty:
                         processed_count += 1
-                        if on_progress: on_progress(name, processed_count, total_tasks)
+                        _emit_progress(name, processed_count, total_tasks)
                         continue
 
                 ckwargs = {"data": working_data, **kwargs}
                 if func in (check_image_stretched, check_image_blurry):
-                    ckwargs["_image_cache"] = _image_cache
-                
+                    ckwargs["_image_cache"] = img_cache
+
                 flag_hash = hashlib.md5((_overall_data_hash + name).encode()).hexdigest()
                 cache_path = os.path.join(FLAG_CACHE_DIR, f"{flag_hash}.pkl")
                 future_to_name[executor.submit(run_cached_check, func, cache_path, ckwargs)] = name
@@ -2579,13 +2594,13 @@ def validate_products(
             for future in concurrent.futures.as_completed(future_to_name):
                 name = future_to_name[future]
                 processed_count += 1
-                if on_progress: on_progress(name, processed_count, total_tasks)
+                _emit_progress(name, processed_count, total_tasks)
                 try:
                     res = future.result()
                     if not res.empty and "PRODUCT_SET_SID" in res.columns:
                         res = res.loc[:, ~res.columns.duplicated()].copy()
                         res["PRODUCT_SET_SID"] = res["PRODUCT_SET_SID"].astype(str).str.strip()
-                        
+
                         if name in [
                             "Seller Approve to sell books", "Seller Approved to Sell Perfume",
                             "Counterfeit Sneakers", "Seller Not approved to sell Refurb",
@@ -2597,7 +2612,7 @@ def validate_products(
                         _sids = set(res["PRODUCT_SET_SID"].unique())
                         _expanded = set()
                         for _s in _sids: _expanded.update(dup_groups.get(_s, [_s]))
-                        
+
                         final_res = data[data["PRODUCT_SET_SID"].astype(str).isin(_expanded)].copy()
                         if "Comment_Detail" in res.columns:
                             _cd = res.set_index("PRODUCT_SET_SID")["Comment_Detail"].to_dict()
@@ -2605,7 +2620,7 @@ def validate_products(
                         if "Reason" in res.columns:
                             _r = res.set_index("PRODUCT_SET_SID")["Reason"].to_dict()
                             final_res["Reason"] = final_res["PRODUCT_SET_SID"].astype(str).map(_r)
-                        
+
                         batch_results[name] = final_res
                         rejected_sids.update(_expanded)
                     else:
@@ -2615,12 +2630,23 @@ def validate_products(
                     validation_errors.append((name, str(e)))
         return batch_results
 
-    # Run in two stages: Cheap then Expensive
+    # Stage 1: cheap validators run while image downloads happen in the background.
     cheap_v = [v for v in validations if v[0] not in EXPENSIVE_VALIDATORS]
     expensive_v = [v for v in validations if v[0] in EXPENSIVE_VALIDATORS]
 
-    results.update(run_batch(cheap_v, data))
-    results.update(run_batch(expensive_v, data))
+    results.update(run_batch(cheap_v, data, img_cache={}))
+
+    # Collect image cache (should already be ready by now) then run expensive validators.
+    _image_cache: dict = {}
+    if _image_future is not None:
+        try:
+            _image_cache = _image_future.result()
+        except Exception as _ie:
+            logger.warning("Image prefetch failed: %s", _ie)
+    if _img_executor is not None:
+        _img_executor.shutdown(wait=False)
+
+    results.update(run_batch(expensive_v, data, img_cache=_image_cache))
 
     if validation_errors:
         st.warning(f"{len(validation_errors)} validation checks encountered errors.")
@@ -3601,17 +3627,25 @@ if st.session_state.get("last_processed_files") != process_signature:
                     else:
                         # ── 4. Merge, standardise, propagate, filter ──────────────
                         st.write("Standardising and merging data…")
-                        std_dfs = []
-                        for _raw in all_dfs:
-                            _std = standardize_input_data(_raw)
+
+                        def _standardize_one(raw_df):
+                            _std = standardize_input_data(raw_df)
                             if "PRODUCT_SET_SID" in _std.columns:
                                 _std["PRODUCT_SET_SID"] = _std["PRODUCT_SET_SID"].astype(str).str.strip()
-                                file_sids_sets.append(set(_std["PRODUCT_SET_SID"].unique()))
-                            # Mark rows that actually came from a file with warranty columns
                             _std["_has_warranty_data"] = (
                                 "PRODUCT_WARRANTY" in _std.columns or "WARRANTY_DURATION" in _std.columns
                             )
-                            std_dfs.append(_std)
+                            return _std
+
+                        if len(all_dfs) > 1:
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=len(all_dfs)) as _std_pool:
+                                std_dfs = list(_std_pool.map(_standardize_one, all_dfs))
+                        else:
+                            std_dfs = [_standardize_one(all_dfs[0])]
+
+                        for _std in std_dfs:
+                            if "PRODUCT_SET_SID" in _std.columns:
+                                file_sids_sets.append(set(_std["PRODUCT_SET_SID"].unique()))
 
                         merged_data = pd.concat(std_dfs, ignore_index=True)
                         st.session_state.intersection_sids = (
