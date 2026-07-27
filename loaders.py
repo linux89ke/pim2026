@@ -2,21 +2,31 @@
 loaders.py - All file loading functions for support/config data
 """
 
+import ast
 import json
 import logging
 import os
 import re
+import uuid
 from typing import Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
 
-from data_utils import clean_category_code
+from data_utils import clean_category_code, normalize_text
 
 logger = logging.getLogger(__name__)
 
 # Module-level cache for compiled regex patterns (avoids re-compilation cost)
 _REGEX_CACHE: dict = {}
+
+
+def _atomic_to_parquet(df: pd.DataFrame, pq_path: str) -> None:
+    """Write a parquet cache file atomically (temp file + rename) so concurrent
+    thread-pool workers rebuilding the same cache can't corrupt it for each other."""
+    tmp_path = f"{pq_path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    df.to_parquet(tmp_path)
+    os.replace(tmp_path, pq_path)
 
 COUNTRY_TABS = ["KE", "UG", "NG", "GH", "MA"]
 COUNTRY_NAME_TO_TAB = {
@@ -49,8 +59,25 @@ def load_excel_file(filename: str, column: Optional[str] = None):
     try:
         if not os.path.exists(filename):
             return [] if column else pd.DataFrame()
-        df = pd.read_excel(filename, engine="openpyxl", dtype=str)
-        df.columns = df.columns.str.strip()
+            
+        from data_utils import PARQUET_CACHE_DIR
+        pq_name = os.path.basename(filename) + ".parquet"
+        pq_path = os.path.join(PARQUET_CACHE_DIR, pq_name)
+        
+        if os.path.exists(pq_path) and os.path.getmtime(pq_path) > os.path.getmtime(filename):
+            try:
+                df = pd.read_parquet(pq_path)
+            except Exception:
+                df = pd.read_excel(filename, engine="openpyxl", dtype=str)
+                df.columns = df.columns.astype(str).str.strip()
+                os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
+                _atomic_to_parquet(df, pq_path)
+        else:
+            df = pd.read_excel(filename, engine="openpyxl", dtype=str)
+            df.columns = df.columns.astype(str).str.strip()
+            os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
+            _atomic_to_parquet(df, pq_path)
+            
         if column and column in df.columns:
             return df[column].apply(clean_category_code).tolist()
         return df
@@ -63,6 +90,18 @@ def safe_excel_read(filename: str, sheet_name, usecols=None) -> pd.DataFrame:
     if not os.path.exists(filename):
         return pd.DataFrame()
     try:
+        from data_utils import PARQUET_CACHE_DIR
+        usecols_str = str(usecols).replace(' ', '').replace('[', '').replace(']', '').replace(',', '_') if usecols else 'all'
+        pq_name = f"{os.path.basename(filename)}_{sheet_name}_{usecols_str}.parquet"
+        pq_name = pq_name.replace(' ', '_').replace('/', '_').replace('\\', '_')
+        pq_path = os.path.join(PARQUET_CACHE_DIR, pq_name)
+        
+        if os.path.exists(pq_path) and os.path.getmtime(pq_path) > os.path.getmtime(filename):
+            try:
+                return pd.read_parquet(pq_path)
+            except Exception:
+                pass
+                
         df = pd.read_excel(
             filename,
             sheet_name=sheet_name,
@@ -70,7 +109,16 @@ def safe_excel_read(filename: str, sheet_name, usecols=None) -> pd.DataFrame:
             engine="openpyxl",
             dtype=str,
         )
-        return df.dropna(how="all")
+        df = df.dropna(how="all")
+        
+        try:
+            os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
+            df.columns = df.columns.astype(str)
+            _atomic_to_parquet(df, pq_path)
+        except Exception as cache_e:
+            logger.warning(f"Failed to cache {pq_path}: {cache_e}")
+            
+        return df
     except Exception as e:
         logger.error(f"safe_excel_read: tab='{sheet_name}' file={filename}: {e}")
         return pd.DataFrame()
@@ -139,31 +187,29 @@ def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
             valid = brand_col_vals.str.lower().ne("nan") & brand_col_vals.ne("")
             df = df[valid].copy()
             df["_b_lower"] = brand_col_vals[valid].str.lower().values
+            df["_b_norm"] = brand_col_vals[valid].map(normalize_text).values
 
             def _split_set(series, sep=","):
                 return series.astype(str).str.strip().apply(
-                    lambda x: set() if not x or x.lower() == "nan"
+                    lambda x: set() if not x or x.lower() in ("nan", "none")
                     else {v.strip().lower() for v in x.split(sep) if v.strip()}
                 )
 
             def _split_cats(series):
                 return series.astype(str).str.strip().apply(
-                    lambda x: None if (not x or x.lower() == "nan")
+                    lambda x: None if (not x or x.lower() in ("nan", "none"))
                     else {clean_category_code(c.strip()) for c in x.split(",") if c.strip()}
                 )
 
             sellers_s = _split_set(df.get("approved sellers", pd.Series([""] * len(df), index=df.index)), ",")
             cats_s = _split_cats(df.get("categories", pd.Series([""] * len(df), index=df.index)))
             vars_s = _split_set(df.get("variations", pd.Series([""] * len(df), index=df.index)), ",")
-
-            # Parse "Expanded Variations" — stored as Python list strings e.g. "['axiz-y', ...]"
-            import ast as _ast
             def _parse_expanded(val):
                 s = str(val).strip()
                 if not s or s.lower() == "nan":
                     return set()
                 try:
-                    parsed = _ast.literal_eval(s)
+                    parsed = ast.literal_eval(s)
                     if isinstance(parsed, list):
                         return {str(v).strip().lower() for v in parsed if str(v).strip()}
                 except Exception:
@@ -174,28 +220,29 @@ def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
             exp_vars_s = df.get(exp_vars_col, pd.Series([""] * len(df), index=df.index)).apply(_parse_expanded)
 
             brand_dict: dict = {}
-            for b_lower, brand_raw, sellers, cats, variations, exp_vars in zip(
-                df["_b_lower"], brand_col_vals[valid], sellers_s, cats_s, vars_s, exp_vars_s
+            for b_lower, b_norm, brand_raw, sellers, cats, variations, exp_vars in zip(
+                df["_b_lower"], df["_b_norm"], brand_col_vals[valid], sellers_s, cats_s, vars_s, exp_vars_s
             ):
-                if b_lower not in brand_dict:
-                    brand_dict[b_lower] = {
+                if b_norm not in brand_dict:
+                    brand_dict[b_norm] = {
+                        "brand": b_norm,
                         "brand_raw": brand_raw,
                         "sellers": set(),
                         "categories": set(),
                         "variations": set(),
                         "has_blank_category": False,
                     }
-                brand_dict[b_lower]["sellers"].update(sellers)
+                brand_dict[b_norm]["sellers"].update(normalize_text(s) for s in sellers)
                 if cats is None:
-                    brand_dict[b_lower]["has_blank_category"] = True
+                    brand_dict[b_norm]["has_blank_category"] = True
                 else:
-                    brand_dict[b_lower]["categories"].update(cats)
-                brand_dict[b_lower]["variations"].update(variations)
-                brand_dict[b_lower]["variations"].update(exp_vars)
+                    brand_dict[b_norm]["categories"].update(cats)
+                brand_dict[b_norm]["variations"].update(normalize_text(v) for v in variations)
+                brand_dict[b_norm]["variations"].update(normalize_text(v) for v in exp_vars)
 
             country_rules = [
                 {
-                    "brand": b_lower,
+                    "brand": data["brand"],
                     "brand_raw": data["brand_raw"],
                     "sellers": data["sellers"],
                     "categories": set() if data["has_blank_category"] else data["categories"],
@@ -627,8 +674,8 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
             "Jersey confirmed counterfeit.",
         ),
         "Suspected Fake Perfume": (
-            "1000023 - Confirmation of counterfeit product by Jumia technical team (Not Authorized)",
-            "Perfume confirmed counterfeit — genuine brand/model detected in product name.",
+            "1000030 - Suspected Counterfeit/Fake Product.Please Contact Seller Support By Raising A Claim , For Questions & Inquiries (Not Authorized)",
+            "This product is suspected to be a counterfeit perfume. A genuine brand name or model was detected in the product title while the listed brand is a known evasion label.",
         ),
         "Prohibited products": (
             "1000007 - Other Reason",
@@ -756,11 +803,34 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
             "1000007 - Other Reason",
             "Brand name should not be repeated in product name.",
         ),
+        "Brand Image Mismatch": (
+            "1000042 - Kindly follow our product image upload guideline.",
+            "The brand detected on the product image does not match the declared brand. Kindly confirm the correct brand or update the product image.",
+        ),
+        "Off-Platform Contact": (
+            "1000033 - Keywords in your content/ Product name / description has been blacklisted",
+            "The product name/description appears to contain a phone number, WhatsApp link, website, or wording directing buyers off-platform. Kindly remove all off-platform contact details.",
+        ),
+        "Specs Inconsistency": (
+            "1000008 - Kindly Improve Product Name Description",
+            "The RAM/Storage spec stated in the product title does not match what's stated in the description. Kindly correct the description to match the exact variant being sold.",
+        ),
     }
 
     default_mapping = {
         k: {"reason": v[0], "en": v[1], "fr": v[1], "ar": v[1]}
         for k, v in raw_default.items()
+    }
+
+    # Override FDA with proper French translation (for Senegal / Ivory Coast)
+    default_mapping["FDA"] = {
+        "reason": "1000007 - Other Reason",
+        "en": "Kindly Provide Product's Health/Food Regulation Registration Number.",
+        "fr": (
+            "Veuillez fournir le numéro d'enregistrement réglementaire "
+            "sanitaire/alimentaire du produit (numéro FDA ou équivalent)."
+        ),
+        "ar": "يرجى تقديم رقم تسجيل المنتج الصحي/الغذائي (رقم FDA أو ما يعادله).",
     }
 
     # Pricing flags
@@ -785,7 +855,7 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
         "سعر المنتج الحالي يختلف بشكل ملحوظ عن متوسط السوق.\n"
         "يرجى مراجعة السعر وتحديثه، أو في حال كنت ترى أن السعر صحيح، يمكنك تقديم طلب مراجعة (Claim) مع تقديم ما يثبت ذلك."
     )
-    for flag_key in ("Wrong Price", "Category Max Price Exceeded"):
+    for flag_key in ("Wrong Price", "Category Max Price Exceeded", "Discount too high", "Suspicious Discount"):
         default_mapping[flag_key] = {
             "reason": pricing_reason_code,
             "en": pricing_en,
@@ -837,12 +907,23 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
                     )
                 }
                 if custom_mapping:
-                    ng_keys = {
-                        k: v
-                        for k, v in default_mapping.items()
-                        if k.startswith("NG - ")
-                    }
-                    return {**custom_mapping, **ng_keys}
+                    # Merge on top of default_mapping instead of replacing it —
+                    # reason.xlsx has historically covered only a subset of the
+                    # flags the app can actually produce (e.g. it was missing
+                    # "Perfume Tester", "Suspected Fake Perfume", "Title Language
+                    # Check", and used "Discount too High" where the code looks
+                    # up "Discount too high"). Any flag the spreadsheet doesn't
+                    # cover now keeps its code-defined default instead of
+                    # silently falling back to generic "Other Reason" text.
+                    # Case-insensitive match so spreadsheet casing typos (like
+                    # the "High"/"high" example above) still land on the
+                    # correct canonically-cased key the app looks up by.
+                    merged = dict(default_mapping)
+                    lower_to_canonical = {k.lower(): k for k in merged}
+                    for flag, info in custom_mapping.items():
+                        canonical = lower_to_canonical.get(flag.lower(), flag)
+                        merged[canonical] = info
+                    return merged
     except Exception as e:
         logger.warning(f"load_flags_mapping({filename}): {e}")
 
@@ -907,12 +988,14 @@ def load_all_support_files() -> Dict:
                 _valid = _valid[_valid.str.strip().ne("")]
                 _cat_names = _valid.tolist()
                 if _code_col:
-                    for _, _row in _cm_df[[_path_col, _code_col]].dropna().iterrows():
-                        _p = str(_row[_path_col]).strip()
-                        _c = str(_row[_code_col]).strip().split(".")[0]
-                        if _p and _c:
-                            _cat_path_to_code[_p.lower()] = _c
-                            _code_to_path[_c] = _p
+                    _sub = _cm_df[[_path_col, _code_col]].dropna()
+                    _sub = _sub.copy()
+                    _sub[_code_col] = _sub[_code_col].astype(str).str.strip().str.split('.').str[0]
+                    _sub[_path_col] = _sub[_path_col].astype(str).str.strip()
+                    _valid_mask = _sub[_path_col].ne('') & _sub[_code_col].ne('')
+                    _sub = _sub[_valid_mask]
+                    _cat_path_to_code = dict(zip(_sub[_path_col].str.lower(), _sub[_code_col]))
+                    _code_to_path     = dict(zip(_sub[_code_col], _sub[_path_col]))
         else:
             logger.warning(f"[CategoryMap] {_cm_path} not found.")
     except Exception as _ce:
@@ -982,7 +1065,12 @@ def load_and_compile_json_rules(json_path="category_qc_weighted.json") -> dict:
     return compiled_rules
 
 
-@st.cache_data(ttl=3600)
+# cache_resource, not cache_data: this dict is read-only reference data shared
+# by every rerun and every session. cache_data stores the value pickled and
+# hands back a fresh deep copy on each access — ~97ms per rerun for this ~6.5MB
+# payload, paid on every click. cache_resource returns the same object for free.
+# Callers only ever read from it (verified: no writes to support_files anywhere).
+@st.cache_resource(ttl=3600)
 def load_support_files_lazy():
     return load_all_support_files()
 

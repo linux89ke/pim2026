@@ -162,3 +162,17 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+# ── Derived caches (safe to delete; regenerated on demand) ──
+# The trained category-correction model, rebuilt automatically whenever the
+# corrections table changes. ~28MB — never commit it.
+*.clf.v*.pkl
+cat_learning.db.clf.*
+
+# On-disk validation caches
+app_cache_flags/
+app_cache_parquet/
+
+# NOTE: app_cache_flags/, app_cache_parquet/ and cat_learning.db are ALREADY
+# tracked (539 cache files, ~360MB .git). These patterns only stop new ones.
+# To untrack the existing ones:
+#   git rm -r --cached app_cache_flags app_cache_parquet

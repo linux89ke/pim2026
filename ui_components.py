@@ -4,10 +4,13 @@ ui_components.py - All Streamlit UI rendering components, dialogs, and the image
 
 import base64
 import concurrent.futures
+import gc
+import html as html_lib
 import json
 import logging
 import re
 import zipfile
+from collections import OrderedDict
 from io import BytesIO
 
 import orjson
@@ -24,8 +27,11 @@ from data_utils import (
     df_hash,
     format_local_price,
     load_df_parquet,
+    save_df_parquet,
+    save_manual_decisions,
 )
 from export_utils import generate_smart_export, prepare_full_data_merged
+from targeted_audit import targeted_audit_modal
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +96,6 @@ PREFETCH_DISPLAY_COLUMNS = {
     ],
     "Duplicate product": ["Duplicate_Flag"],
     "FDA": ["FDA_Check_Status", "FDA_Rejection_Reason", "FDA"],
-    # New prefetch-only flags
     "Category Check": [
         "Category_Check_Status",
         "Category_Check_Rejection_Reason",
@@ -100,6 +105,98 @@ PREFETCH_DISPLAY_COLUMNS = {
         "AI_Product_Caption",
         "Category_Match_Score",
         "Top1_Score",
+    ],
+    # ── Category Check sub-buckets (all inherit same display columns) ─────────
+    "Category Check – Prohibited Category": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "Top1_Category",
+        "AI_Product_Caption", "Category_Match_Score", "Top1_Score",
+    ],
+    "Category Check – Inactive Category": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "Top1_Category",
+        "AI_Product_Caption", "Category_Match_Score", "Top1_Score",
+    ],
+    "Category Check – Replica Jersey / IP Violation": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Adult product listed under Baby category": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Baby/toddler listed under non-baby category": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Pet product listed under non-pet category": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Sexual Wellness Miscategory": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Fragrance/Perfume Mismatch": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Clothing Subcategory Mismatch": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Books Wrong Subcategory": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Electronics / Accessories Mismatch": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Hair / Grooming Appliance Mismatch": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Kitchen / Home Appliance Mismatch": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Health / Supplement Mismatch": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Food / Beverage Mismatch": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Skincare Subcategory Mismatch": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Lighting Mismatch": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Bedding / Linen Mismatch": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Tools / Hardware Mismatch": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Medical Device Mismatch": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    "Category Check – Other Mismatch": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "Suggested_Categories", "AI_Product_Caption",
+    ],
+    # ── AI API Errors bucket ─────────────────────────────────────────────────
+    "Category Check – AI API Errors": [
+        "Category_Check_Status", "Category_Check_Rejection_Reason",
+        "Initial_Category_Path", "AI_Product_Caption",
     ],
     "Warranty Check": [
         "Warranty_Check_Status",
@@ -128,12 +225,36 @@ PREFETCH_DISPLAY_COLUMNS = {
         "Brand_Image_Check_Reason",
         "Brand_Detected_On_Product",
     ],
-    "Product Name Brand Name": [
+    "Product Name Brand Name – Brand Repeated In Title": [
         "Product Name_Brand Name_Status",
         "Product name_Brand name_rejection reason",
         "Product Name_Brand Name_Rejection_Reason",
     ],
-    "Title Language Check": [
+    "Product Name Brand Name – Inspired/Alternative Perfume Brand": [
+        "Product Name_Brand Name_Status",
+        "Product name_Brand name_rejection reason",
+        "Product Name_Brand Name_Rejection_Reason",
+    ],
+    "Product Name Brand Name – Generic/Placeholder Brand": [
+        "Product Name_Brand Name_Status",
+        "Product name_Brand name_rejection reason",
+        "Product Name_Brand Name_Rejection_Reason",
+    ],
+    "Product Name Brand Name – High-End Brand Counterfeit Suspected": [
+        "Product Name_Brand Name_Status",
+        "Product name_Brand name_rejection reason",
+        "Product Name_Brand Name_Rejection_Reason",
+    ],
+    "Product Name Brand Name – Other": [
+        "Product Name_Brand Name_Status",
+        "Product name_Brand name_rejection reason",
+        "Product Name_Brand Name_Rejection_Reason",
+    ],
+    "Title Language Check - Not In English": [
+        "Title_Language_Check_Status",
+        "Title_Language_Check_Reason",
+    ],
+    "Title Language Check - Other": [
         "Title_Language_Check_Status",
         "Title_Language_Check_Reason",
     ],
@@ -152,16 +273,26 @@ def flag_pill_header(flag_name: str, count: int, is_zip: bool = False) -> str:
         "Restricted brands": ("#fee2e2", "#dc2626"),
         "Suspected Fake product": ("#fee2e2", "#b91c1c"),
         "BRAND name repeated in NAME": ("#ede9fe", "#7c3aed"),
+        "Product Name Brand Name – Brand Repeated In Title": ("#ede9fe", "#7c3aed"),
+        "Product Name Brand Name – Inspired/Alternative Perfume Brand": ("#ede9fe", "#6d28d9"),
+        "Product Name Brand Name – Generic/Placeholder Brand": ("#ede9fe", "#5b21b6"),
+        "Product Name Brand Name – High-End Brand Counterfeit Suspected": ("#fee2e2", "#b91c1c"),
+        "Product Name Brand Name – Other": ("#f3f4f6", "#4b5563"),
+        "Title Language Check - Not In English": ("#e0f2fe", "#0369a1"),
+        "Title Language Check - Other": ("#f1f5f9", "#475569"),
         "Duplicate product": ("#dcfce7", "#15803d"),
     }
     bg, fg = color_map.get(flag_name, ("#f3f4f6", "#374151"))
-    
+
+    if is_zip:
+        bg, fg = ("#f8fafc", "#334155")
+
     zip_badge = (
         ' <span style="background:linear-gradient(135deg, #3b82f6, #1d4ed8);color:white;border-radius:6px;padding:2px 8px;font-size:10px;font-weight:900;box-shadow:0 2px 4px rgba(0,0,0,0.1);margin-left:8px;">ZIP</span>'
         if is_zip
         else ""
     )
-    
+
     return (
         f'<div style="display:flex;align-items:center;padding:10px 0;">'
         f'<span style="background:{fg};color:white;border-radius:8px;'
@@ -176,7 +307,7 @@ def render_kpi_bar(final_report: pd.DataFrame):
     approved = int((final_report["Status"] == "Approved").sum())
     rejected = int((final_report["Status"] == "Rejected").sum())
     zip_rej = (
-        int((final_report["Is_Zip"] == True).sum())
+        int(((final_report["Is_Zip"] == True) & (final_report["Status"] == "Rejected")).sum())
         if "Is_Zip" in final_report.columns
         else 0
     )
@@ -277,7 +408,13 @@ def render_rejection_donut(final_report: pd.DataFrame):
 
 
 def _base_prefetched_title(title: str) -> str:
-    return str(title).replace("(Prefetched)", "").strip()
+    # Strip (Prefetched) and then also strip known sub-bucket suffixes so that
+    # sub-buckets like "Category Check – Prohibited Category" still resolve to
+    # their exact key in PREFETCH_DISPLAY_COLUMNS (which is registered fully).
+    t = str(title).replace("(Prefetched)", "").strip()
+    # Remove trailing " ➡ ZIP" marker if present
+    t = t.replace("\u26a1 ZIP", "").strip()
+    return t
 
 
 def _clean_reason_value(value) -> str:
@@ -320,11 +457,41 @@ def _normalize_sid_set(sids) -> set:
     return {str(s).strip() for s in sids if str(s).strip()}
 
 
-def _clear_result_caches() -> None:
+# Counter for deferred GC — only force-collect every N cache clears (or explicitly)
+_cache_clear_count: int = 0
+_GC_COLLECT_INTERVAL: int = 50  # run gc.collect() at most once per 50 status changes
+
+
+def _clear_result_caches(*, batch_gc: bool = False) -> None:
+    """Clear display/export caches after a status change.
+
+    ``gc.collect()`` is intentionally NOT called on every invocation — doing so
+    forces Python to walk the entire object graph on every single row-level edit,
+    which is expensive and blocks the event loop.  Instead we either:
+    * Call it once per ``_GC_COLLECT_INTERVAL`` routine clears, OR
+    * Call it immediately when ``batch_gc=True`` (e.g. after a large batch op).
+    """
+    global _cache_clear_count
     st.session_state.exports_cache.clear()
     st.session_state.display_df_cache.clear()
     st.session_state.pop("_grid_review_data_cache", None)
     st.session_state.pop("_grid_warm_urls", None)
+    _cache_clear_count += 1
+    if batch_gc or (_cache_clear_count % _GC_COLLECT_INTERVAL == 0):
+        gc.collect()
+
+
+def _get_norm_col(df: pd.DataFrame, col: str) -> pd.Series:
+    """Return a cached normalized (str-stripped) Series for *col* on *df*.
+
+    The result is stored in a hidden column ``_norm_<col>`` so the expensive
+    ``.astype(str).str.strip()`` scan is done at most once per unique DataFrame
+    object, saving O(N × B) work in tight batch loops.
+    """
+    cache_col = f"_norm_{col}"
+    if cache_col not in df.columns:
+        df[cache_col] = df[col].astype(str).str.strip()
+    return df[cache_col]
 
 
 def _drop_sids_from_post_qc_results(sid_set: set) -> None:
@@ -338,7 +505,7 @@ def _drop_sids_from_post_qc_results(sid_set: set) -> None:
             or "PRODUCT_SET_SID" not in df.columns
         ):
             continue
-        mask = df["PRODUCT_SET_SID"].astype(str).str.strip().isin(sid_set)
+        mask = _get_norm_col(df, "PRODUCT_SET_SID").isin(sid_set)
         if mask.any():
             results[flag] = df.loc[~mask].copy()
 
@@ -355,7 +522,7 @@ def _add_sids_to_post_qc_results(sid_set: set, flag: str, comment: str = "") -> 
     ):
         return
     base_rows = data[
-        data["PRODUCT_SET_SID"].astype(str).str.strip().isin(sid_set)
+        _get_norm_col(data, "PRODUCT_SET_SID").isin(sid_set)
     ].copy()
     if base_rows.empty:
         return
@@ -370,6 +537,53 @@ def _add_sids_to_post_qc_results(sid_set: set, flag: str, comment: str = "") -> 
         results[base_flag] = base_rows
 
 
+def _get_image_maps(all_data):
+    if "_image_maps" not in st.session_state or st.session_state.get("_image_maps_df_id") != id(all_data):
+        if all_data is None or "PRODUCT_SET_SID" not in all_data.columns or "IMAGE1" not in all_data.columns:
+            st.session_state["_image_maps"] = ({}, {})
+        else:
+            sid_to_img = dict(zip(all_data["PRODUCT_SET_SID"].astype(str).str.strip(), all_data["IMAGE1"]))
+            img_to_sids = {}
+            for sid, img in sid_to_img.items():
+                if pd.isna(img) or not str(img).strip():
+                    continue
+                if img not in img_to_sids:
+                    img_to_sids[img] = set()
+                img_to_sids[img].add(sid)
+            st.session_state["_image_maps"] = (sid_to_img, img_to_sids)
+            st.session_state["_image_maps_df_id"] = id(all_data)
+    return st.session_state["_image_maps"]
+
+def checkpoint_final_report(fr: pd.DataFrame = None) -> bool:
+    """Persist the current report — including manual decisions — to disk.
+
+    Manual approvals/rejections otherwise live only in st.session_state, and
+    Streamlit discards a disconnected session after 2 minutes
+    (MemorySessionStorage ttl_seconds = 2 * 60), so a dropped websocket loses
+    every decision made since validation finished. The startup fast path reads
+    this same `{sig_hash}_report.parquet`, so a reconnect resumes with the
+    decisions intact instead of reverting to the post-validation state.
+
+    Writes are atomic (temp file + os.replace) and failures are swallowed and
+    logged by save_df_parquet — a checkpoint must never break the review UI.
+    """
+    if fr is None:
+        fr = st.session_state.get("final_report")
+    if not isinstance(fr, pd.DataFrame) or fr.empty:
+        return False
+
+    # Journal first: it is keyed on the uploaded file content alone, so it is
+    # the copy that still resolves when sig_hash shifts (learning DB grows,
+    # cache version bumps) and the report checkpoint below is orphaned.
+    save_manual_decisions(st.session_state.get("last_processed_files"), fr)
+
+    sig = st.session_state.get("current_sig_hash")
+    if not sig:
+        return False
+    save_df_parquet(fr, f"{sig}_report.parquet")
+    return True
+
+
 def apply_status_change(
     sids,
     *,
@@ -382,26 +596,15 @@ def apply_status_change(
     sync_quick_rejects: bool = True,
 ) -> int:
     sid_set = _normalize_sid_set(sids)
-    
-    # ── Global Similar Image Rejection ──
-    # If this is an image-related rejection, apply it to ALL products sharing the same image globally.
+
     is_image_rej = status == "Rejected" and any(x in str(flag).lower() for x in ["image", "stretched", "blurry", "poor", "mismatch"])
     if is_image_rej:
         all_data = st.session_state.get("all_data_map")
         if all_data is not None and "PRODUCT_SET_SID" in all_data.columns and "IMAGE1" in all_data.columns:
-            # 1. Identify the unique images associated with the input SIDs
-            _input_sids_clean = list(sid_set)
-            _target_images = set(
-                all_data[all_data["PRODUCT_SET_SID"].astype(str).str.strip().isin(_input_sids_clean)]["IMAGE1"]
-                .dropna().unique()
-            )
-            # 2. Find every other SID in the entire dataset that uses these images
-            if _target_images:
-                _global_similar_sids = set(
-                    all_data[all_data["IMAGE1"].isin(_target_images)]["PRODUCT_SET_SID"]
-                    .astype(str).str.strip().unique()
-                )
-                sid_set.update(_global_similar_sids)
+            sid_to_img, img_to_sids = _get_image_maps(all_data)
+            _target_images = {sid_to_img[sid] for sid in sid_set if sid in sid_to_img and pd.notna(sid_to_img[sid])}
+            for img in _target_images:
+                sid_set.update(img_to_sids.get(img, set()))
 
     fr = st.session_state.get("final_report", pd.DataFrame())
     if (
@@ -412,13 +615,12 @@ def apply_status_change(
     ):
         return 0
 
-    mask = fr["ProductSetSid"].astype(str).str.strip().isin(sid_set)
+    mask = _get_norm_col(fr, "ProductSetSid").isin(sid_set)
     if not mask.any():
         return 0
 
     from datetime import datetime
 
-    # 🚀 Store snapshot for Undo functionality
     st.session_state["undo_snapshot"] = {
         "final_report": fr.copy(),
         "timestamp": datetime.now(),
@@ -438,23 +640,27 @@ def apply_status_change(
         _add_sids_to_post_qc_results(sid_set, flag, comment)
 
     if sync_quick_rejects:
+        if "quick_rejects" not in st.session_state:
+            st.session_state["quick_rejects"] = {}
         for sid in sid_set:
             if status == "Rejected":
-                st.session_state[f"quick_rej_{sid}"] = True
-                st.session_state[f"quick_rej_reason_{sid}"] = flag or comment or reason
+                st.session_state["quick_rejects"][sid] = flag or comment or reason
             else:
-                st.session_state.pop(f"quick_rej_{sid}", None)
-                st.session_state.pop(f"quick_rej_reason_{sid}", None)
+                st.session_state["quick_rejects"].pop(sid, None)
 
-    _clear_result_caches()
+    st.session_state.data_version = st.session_state.get("data_version", 0) + 1
+    _clear_result_caches(batch_gc=len(sid_set) >= 20)
 
-    # 🚀 Trigger Undo Toast for bulk actions
     if len(sid_set) > 1:
         st.session_state["show_undo_toast"] = {
             "count": len(sid_set),
             "status": status,
             "time": datetime.now(),
         }
+
+    # Every manual approve/reject funnels through here, so this is the one place
+    # a checkpoint is needed to make decisions survive a disconnect.
+    checkpoint_final_report(fr)
 
     return int(mask.sum())
 
@@ -520,19 +726,17 @@ def bulk_approve_dialog(
                 _future.result()
             _progress.progress(1.0, text="Done!")
             _progress.empty()
-            msg_moved, msg_approved = {}, 0
-            for sid in sids_to_process:
-                sid_str = str(sid).strip()
-                if apply_status_change(
-                    [sid_str],
-                    status="Approved",
-                    reason="",
-                    comment="",
-                    flag="Approved by User",
-                    is_manual=True,
-                    is_zip=False,
-                ):
-                    msg_approved += 1
+            msg_moved = {}
+            sids_str = [str(sid).strip() for sid in sids_to_process]
+            msg_approved = apply_status_change(
+                sids_str,
+                status="Approved",
+                reason="",
+                comment="",
+                flag="Approved by User",
+                is_manual=True,
+                is_zip=False,
+            )
 
             if msg_approved > 0:
                 st.toast(
@@ -618,6 +822,7 @@ def render_flag_expander(
     base_display_cols = [
         "PRODUCT_SET_SID",
         "NAME",
+        "Detected Issue",
         "BRAND",
         "CATEGORY",
         "COLOR",
@@ -641,28 +846,39 @@ def render_flag_expander(
     if title == "Wrong Category":
         current_display_cols.append("AI Suggested Category")
 
-    # 🚀 Pre-detect image column to ensure it's kept in the merge
     possible_img_cols = [
         "image1",
         "MAIN_IMAGE_URL",
         "MAIN_IMAGE",
         "IMAGE_URL",
         "IMAGE1_ZIP",
+        "MainImage",
+        "Image",
+        "IMAGE",
+        "url",
+        "Url",
+        "IMAGE_URL_1",
+        "Image1",
     ]
     img_col = next((c for c in possible_img_cols if c in data.columns), None)
     if img_col and img_col not in current_display_cols:
         current_display_cols.append(img_col)
 
     if cache_key not in st.session_state.display_df_cache:
-        _extra_cols = [c for c in current_display_cols if c in data.columns]
+        # "Detected Issue" isn't a product column — it's final_report's
+        # Comment (what a check found + which field, e.g. "Off-platform
+        # contact detected — DESCRIPTION: 'whatsapp, 0712...'"), carried
+        # through df_flagged_sids. Keep it in scope here even though the
+        # data.columns filter below wouldn't otherwise include it — this
+        # table previously showed the flag NAME but never the reason a
+        # reviewer would need to act on it without opening the grid card.
+        _extra_cols = [c for c in current_display_cols if c in data.columns or c == "Detected Issue"]
         if "CATEGORY_CODE" in data.columns and "CATEGORY_CODE" not in _extra_cols:
             _extra_cols.append("CATEGORY_CODE")
 
         if "PRODUCT_SET_SID" not in _extra_cols:
             _extra_cols.append("PRODUCT_SET_SID")
 
-        # Ensure Is_Zip exists (may be absent on first render before any
-        # apply_status_change call, or when loaded from a cached parquet).
         if "Is_Zip" not in df_flagged_sids.columns:
             df_flagged_sids = df_flagged_sids.copy()
             df_flagged_sids["Is_Zip"] = False
@@ -673,12 +889,21 @@ def render_flag_expander(
                 else df_flagged_sids
             )
             df_flagged_sids["Is_Manual"] = False
+        if "Comment" not in df_flagged_sids.columns:
+            df_flagged_sids = df_flagged_sids.copy()
+            df_flagged_sids["Comment"] = ""
         df_display = pd.merge(
-            df_flagged_sids[["ProductSetSid", "Is_Zip"]],
+            df_flagged_sids[["ProductSetSid", "Is_Zip", "Comment"]].rename(
+                columns={"Comment": "Detected Issue"}
+            ),
             data,
-            left_on="ProductSetSid",   # FIX #3: was "ProjectSetSid" (typo), dead ternary removed
+            left_on="ProductSetSid",
             right_on="PRODUCT_SET_SID",
             how="left",
+        )
+        _di = df_display["Detected Issue"].astype(str).str.strip()
+        df_display["Detected Issue"] = _di.where(
+            ~_di.str.lower().isin(["nan", "none", "", "manual rejection", "rejected"]), ""
         )
         _extra_cols_cleaned = [c for c in _extra_cols if c in df_display.columns]
         if "IMAGE1_ZIP" in df_display.columns:
@@ -727,11 +952,85 @@ def render_flag_expander(
             )
         )
         df_display = df_display[_final_cols]
+        if "NAME" in df_display.columns:
+            df_display["NAME"] = df_display["NAME"].apply(
+                lambda t: re.sub("<[^<]+?>", "", t) if isinstance(t, str) else t
+            )
+
+        if "GLOBAL_PRICE" in df_display.columns and "GLOBAL_SALE_PRICE" in df_display.columns:
+            def _local_p(row):
+                sp, rp = row.get("GLOBAL_SALE_PRICE"), row.get("GLOBAL_PRICE")
+                val = sp if pd.notna(sp) and str(sp).strip() != "" else rp
+                return format_local_price(val, country_validator.country)
+            df_display.insert(
+                df_display.columns.get_loc("GLOBAL_PRICE") + 1 if "GLOBAL_PRICE" in df_display.columns else len(df_display.columns),
+                "Local Price",
+                df_display.apply(_local_p, axis=1),
+            )
+            
+        img_candidate = img_col or next((c for c in possible_img_cols if c in df_display.columns), None)
+        img_s = df_display[img_candidate].copy() if (img_candidate and img_candidate in df_display.columns) else pd.Series("", index=df_display.index)
+        mask_empty = img_s.isna() | (img_s.astype(str).str.strip() == "")
+        for fallback in ["MainImage", "Image", "IMAGE1_ZIP", "Url", "url", "main_image", "MAIN_IMAGE", "IMAGE_URL", "image1"]:
+            if not mask_empty.any(): break
+            if fallback in df_display.columns:
+                fallback_s = df_display[fallback]
+                valid_fallback = fallback_s.notna() & (fallback_s.astype(str).str.strip() != "")
+                update_mask = mask_empty & valid_fallback
+                img_s.loc[update_mask] = fallback_s[update_mask]
+                mask_empty = img_s.isna() | (img_s.astype(str).str.strip() == "")
+        names = df_display.get("NAME", pd.Series([""] * len(df_display))).fillna("").astype(str).values
+        brands = df_display.get("BRAND", pd.Series([""] * len(df_display))).fillna("").astype(str).values
+        imgs = img_s.fillna("").astype(str).values
+        res = []
+        for n, b, i in zip(names, brands, imgs):
+            zip_img = _get_image_from_zip(n, b, i)
+            if zip_img:
+                res.append(zip_img)
+            else:
+                u = str(i).strip()
+                if u.lower().startswith("http") or u.startswith("//") or u.startswith("data:image/"):
+                    if u.startswith("//"):
+                        u = "https:" + u
+                    elif u.lower().startswith("http://"):
+                        u = "https://" + u[7:]
+                    res.append(u)
+                else:
+                    res.append(None)
+        if "_Image_Preview_Cached" in df_display.columns:
+            df_display["_Image_Preview_Cached"] = res
+        else:
+            df_display.insert(0, "_Image_Preview_Cached", res)
+
         st.session_state.display_df_cache[cache_key] = df_display
     else:
         df_display = st.session_state.display_df_cache[cache_key]
+        if "_Image_Preview_Cached" not in df_display.columns:
+            names = df_display.get("NAME", pd.Series([""] * len(df_display))).fillna("").astype(str).values
+            brands = df_display.get("BRAND", pd.Series([""] * len(df_display))).fillna("").astype(str).values
+            img_s = pd.Series("", index=df_display.index)
+            for c in possible_img_cols + ["MainImage", "Image", "IMAGE1_ZIP", "Url", "url", "main_image", "MAIN_IMAGE"]:
+                if c in df_display.columns:
+                    valid_mask = (img_s == "") & df_display[c].notna() & (df_display[c].astype(str).str.strip() != "")
+                    img_s.loc[valid_mask] = df_display[c][valid_mask]
+            imgs = img_s.fillna("").astype(str).values
+            res = []
+            for n, b, i in zip(names, brands, imgs):
+                zip_img = _get_image_from_zip(n, b, i)
+                if zip_img:
+                    res.append(zip_img)
+                else:
+                    u = str(i).strip()
+                    if u.lower().startswith("http") or u.startswith("//") or u.startswith("data:image/"):
+                        if u.startswith("//"):
+                            u = "https:" + u
+                        elif u.lower().startswith("http://"):
+                            u = "https://" + u[7:]
+                        res.append(u)
+                    else:
+                        res.append(None)
+            df_display.insert(0, "_Image_Preview_Cached", res)
 
-    # 🚀 Add "Show Images" toggle here for the detailed view
     show_table_images = st.toggle(
         "Show Image Previews",
         value=st.session_state.get("show_table_images", False),
@@ -739,7 +1038,7 @@ def render_flag_expander(
     )
     st.session_state.show_table_images = show_table_images
 
-    c1, c2 = st.columns([1, 1], gap="large")
+    c1, c2, c3 = st.columns([1, 1, 1], gap="large")
     with c1:
         search_term = st.text_input(
             _t("search_grid"),
@@ -749,13 +1048,20 @@ def render_flag_expander(
         )
     with c2:
         _seller_key = f"f_{title}"
+        _seller_options = sorted(df_display["SELLER_NAME"].dropna().astype(str).unique()) if "SELLER_NAME" in df_display.columns else []
         seller_filter = st.multiselect(
             "Filter by Seller",
-            sorted(df_display["SELLER_NAME"].astype(str).unique()),
-            default=st.session_state.get(f"_sf_{title}", []),
+            _seller_options,
+            default=[s for s in st.session_state.get(f"_sf_{title}", []) if s in _seller_options],
             key=_seller_key,
         )
         st.session_state[f"_sf_{title}"] = seller_filter
+    with c3:
+        _cat_key = f"fc_{title}"
+        _cat_options = sorted(df_display["CATEGORY"].dropna().astype(str).unique()) if "CATEGORY" in df_display.columns else []
+        _cat_default = [c for c in st.session_state.get(f"_cf_{title}", []) if c in _cat_options]
+        category_filter = st.multiselect("Filter by Category", _cat_options, default=_cat_default, key=_cat_key)
+        st.session_state[f"_cf_{title}"] = category_filter
 
     df_view = df_display.copy()
     if search_term:
@@ -775,71 +1081,77 @@ def render_flag_expander(
             df_view = df_view[mask]
     if seller_filter:
         df_view = df_view[df_view["SELLER_NAME"].isin(seller_filter)]
+    if category_filter and "CATEGORY" in df_view.columns:
+        df_view = df_view[df_view["CATEGORY"].astype(str).isin(category_filter)]
+    if "CATEGORY" in df_view.columns:
+        df_view = df_view.sort_values("CATEGORY", na_position="last")
     df_view = df_view.reset_index(drop=True)
 
-    if "NAME" in df_view.columns:
-        df_view["NAME"] = df_view["NAME"].apply(
-            lambda t: re.sub("<[^<]+?>", "", t) if isinstance(t, str) else t
+    if "Is_Zip" in df_view.columns:
+        # Visible marker for ZIP/prefetch-origin rows — the red/bold styling below
+        # (style_rows) is color-only and invisible to colorblind users, so surface
+        # the same signal as a text badge too.
+        df_view.insert(0, "Source", df_view["Is_Zip"].map(lambda v: "⚡ ZIP" if v else ""))
+
+    if df_view.empty and not df_display.empty:
+        st.info("No products match your current filters. Try clearing the search, seller, or category filters above.")
+
+    # Cap the table at one page of rows. style_rows below is a row-wise Python
+    # Styler callback, so styling an unbounded df_view re-styled thousands of
+    # rows on every keystroke/rerun in large flag buckets.
+    _FLAG_TABLE_PAGE_SIZE = 500
+    _total_view_rows = len(df_view)
+    _flag_pg = 0
+    if _total_view_rows > _FLAG_TABLE_PAGE_SIZE:
+        _num_pages = (_total_view_rows + _FLAG_TABLE_PAGE_SIZE - 1) // _FLAG_TABLE_PAGE_SIZE
+        _flag_pg = st.selectbox(
+            "Table page",
+            options=list(range(_num_pages)),
+            format_func=lambda p: f"Page {p + 1} of {_num_pages} (rows {p * _FLAG_TABLE_PAGE_SIZE + 1:,}–{min((p + 1) * _FLAG_TABLE_PAGE_SIZE, _total_view_rows):,} of {_total_view_rows:,})",
+            key=f"flag_tbl_pg_{title}",
         )
-
-    # Image column is already in img_col from above
-    if img_col and img_col in df_view.columns:
-
-        def get_img(row):
-            sid = row.get("PRODUCT_SET_SID")
-            name = row.get("NAME", "")
-            brand = row.get("BRAND", "")
-            img_val = row.get(img_col, "")
-            if pd.isna(img_val):
-                img_val = ""
-            zip_img = _get_image_from_zip(name, brand, img_val)
-            if zip_img:
-                return zip_img
-            if (
-                "IMAGE1_ZIP" in row
-                and pd.notna(row["IMAGE1_ZIP"])
-                and str(row["IMAGE1_ZIP"]).startswith("http")
-            ):
-                return str(row["IMAGE1_ZIP"])
-            if str(img_val).startswith("http"):
-                return str(img_val).replace("http://", "https://", 1)
-            return None
-
-        if show_table_images:
-            df_view["Image Preview"] = df_view.apply(get_img, axis=1)
-    if "GLOBAL_PRICE" in df_view.columns and "GLOBAL_SALE_PRICE" in df_view.columns:
-
-        def _local_p(row):
-            sp, rp = row.get("GLOBAL_SALE_PRICE"), row.get("GLOBAL_PRICE")
-            val = sp if pd.notna(sp) and str(sp).strip() != "" else rp
-            return format_local_price(val, country_validator.country)
-
-        df_view.insert(
-            df_view.columns.get_loc("GLOBAL_PRICE") + 1
-            if "GLOBAL_PRICE" in df_view.columns
-            else len(df_view.columns),
-            "Local Price",
-            df_view.apply(_local_p, axis=1),
-        )
+        df_view = df_view.iloc[_flag_pg * _FLAG_TABLE_PAGE_SIZE:(_flag_pg + 1) * _FLAG_TABLE_PAGE_SIZE].reset_index(drop=True)
 
     def style_rows(row):
         if row.get("Is_Zip"):
             return ["color: #ff4b4b; font-weight: 900;"] * len(row)
         return [""] * len(row)
 
-    df_styled = df_view.style.apply(style_rows, axis=1)
+    # Page number is part of the selection key so a positional selection made
+    # on one page can never silently target different products on another page.
+    _df_key = f"df_{title}_{st.session_state.get(f'df_ver_{title}', 0)}_p{_flag_pg}"
 
+    _filters_active = bool(search_term or seller_filter)
+    sel_all_col, sel_clear_col, _sel_spacer = st.columns([1, 1, 3])
+    with sel_all_col:
+        _sel_all_label = f"Select All ({len(df_view)} filtered)" if _filters_active else f"Select All ({len(df_view)})"
+        if st.button(_sel_all_label, key=f"selall_{title}", disabled=df_view.empty, help="Select every row currently shown below"):
+            st.session_state[_df_key] = {"selection": {"rows": list(range(len(df_view)))}}
+    with sel_clear_col:
+        if st.button("Clear Selection", key=f"selclear_{title}"):
+            st.session_state[_df_key] = {"selection": {"rows": []}}
+    df_kwargs = {
+        "hide_index": True,
+        "width": "stretch",
+        "selection_mode": "multi-row",
+        "on_select": "rerun",
+        "key": _df_key,
+    }
+    if len(df_view) <= 2:
+        df_kwargs["height"] = 150
 
-
-    event = st.dataframe(
-        df_styled,
-        hide_index=True,
-        width='stretch',
-        selection_mode="multi-row",
-        on_select="rerun",
-        column_config={
+    _col_cfg = {
+            "Source": st.column_config.TextColumn("Source", width="small", pinned=True, help="Product came from a ZIP/prefetch upload"),
             "PRODUCT_SET_SID": st.column_config.TextColumn(pinned=True),
             "NAME": st.column_config.TextColumn(pinned=True),
+            "Detected Issue": st.column_config.TextColumn(
+                "Detected Issue",
+                width="large",
+                help="What the check found and which field it was found in (e.g. NAME, DESCRIPTION)",
+            ),
+            "PARENTSKU": st.column_config.TextColumn(),
+            "SELLER_SKU": st.column_config.TextColumn(),
+            "SID": st.column_config.TextColumn(),
             "CATEGORY": st.column_config.TextColumn("Full Category", width="large"),
             "GLOBAL_SALE_PRICE": st.column_config.NumberColumn(
                 "Sale Price (USD)", format="$%.2f"
@@ -859,151 +1171,34 @@ def render_flag_expander(
                 width="large",
                 help="AI predicted correct category path",
             ),
-            "Is_Zip": None,  # Hide the helper column
-            "Image Preview": None,  # Don't show in table
-        },
-        key=f"df_{title}_{st.session_state.get(f'df_ver_{title}', 0)}",
-    )
+            "Is_Zip": None,
+        }
 
-    # 🚀 NEW: Grid View Implementation (BELOW the table)
-    if show_table_images and not df_view.empty:
-        fr = st.session_state.get("final_report", pd.DataFrame())
-        # Filter final_report for these specific SIDs to get their comments/flags
-        sids_in_view = df_view["PRODUCT_SET_SID"].astype(str).tolist()
-        fr_subset = fr[fr["ProductSetSid"].astype(str).isin(sids_in_view)].set_index(
-            "ProductSetSid"
+    # Wire up the Show Image Previews toggle
+    if show_table_images and "_Image_Preview_Cached" in df_view.columns:
+        df_view.insert(0, "_Image_Preview", df_view["_Image_Preview_Cached"])
+        _col_cfg["_Image_Preview"] = st.column_config.ImageColumn(
+            "Preview", help="Main Image Preview"
         )
+        
+    if "_Image_Preview_Cached" in df_view.columns:
+        df_view = df_view.drop(columns=["_Image_Preview_Cached"])
 
-        # 🚀 Use Streamlit containers for robust rendering + ZIP support (Max 50)
-        grid_data = df_view.head(50)
-        if len(df_view) > 50:
-            st.info(f"Showing first 50 of {len(df_view)} items in grid view.")
-
-        st.markdown(
-            """
-        <style>
-            [data-testid="stVerticalBlockBorderWrapper"] {
-                height: 520px !important;
-                display: flex;
-                flex-direction: column;
-                margin-bottom: 20px;
-                position: relative;
-            }
-            .grid-price-badge {
-                position: absolute;
-                top: 80px;
-                left: 10px;
-                background: rgba(246, 139, 30, 0.95);
-                color: white;
-                padding: 4px 10px;
-                border-radius: 4px;
-                font-weight: 800;
-                font-size: 13px;
-                z-index: 100;
-                box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-            }
-            .grid-reason {
-                background: #fff5f5;
-                border-bottom: 1px solid #ffe3e3;
-                padding: 12px;
-                color: #d63031;
-                font-size: 14px;
-                border-left: 5px solid #ff7675;
-                height: 70px;
-                overflow-y: auto;
-                font-weight: 700;
-            }
-            .grid-name {
-                font-size: 15px;
-                font-weight: 700;
-                color: #2d3436;
-                margin-bottom: 8px;
-                display: -webkit-box;
-                -webkit-line-clamp: 2;
-                -webkit-box-orient: vertical;
-                overflow: hidden;
-                height: 44px;
-                line-height: 1.4;
-            }
-            .grid-reason-bot {
-                background: #fffafa;
-                border-top: 1px solid #ffe3e3;
-                padding: 12px;
-                color: #e17055;
-                font-size: 14px;
-                border-left: 5px solid #fab1a0;
-                height: 100px;
-                overflow-y: auto;
-                font-style: italic;
-                font-weight: 500;
-            }
-        </style>
-        """,
-            unsafe_allow_html=True,
+    # Pass unstyled df_view when show_table_images is True so st.column_config.ImageColumn renders images,
+    # because passing a pandas Styler object converts column cells to text strings.
+    if show_table_images:
+        event = st.dataframe(
+            df_view,
+            **df_kwargs,
+            column_config=_col_cfg,
         )
-
-        cols = st.columns(4)
-        for i, (_, row) in enumerate(grid_data.iterrows()):
-            sid = str(row["PRODUCT_SET_SID"])
-            name = str(row.get("NAME", ""))
-            img_url = row.get("Image Preview")
-            if (
-                pd.isna(img_url)
-                or not str(img_url).strip()
-                or str(img_url).lower() == "none"
-            ):
-                img_url = _NO_IMAGE_SVG
-
-            # Get flag info from final_report
-            fr_row = fr_subset.loc[sid] if sid in fr_subset.index else None
-            ai_reason = _prefetched_reason_for_row(title, row)
-
-            reason_top = ""
-            reason_bot = ""
-            if fr_row is not None:
-                display_comment = (
-                    ai_reason
-                    if (row.get("Is_Zip") and ai_reason != "No reason provided")
-                    else fr_row["Comment"]
-                )
-                # 🚀 Remove prefix, just show the actual reason
-                reason_bot = display_comment
-                if "Brand" in fr_row["FLAG"] or "Restricted" in fr_row["FLAG"]:
-                    reason_top = reason_bot
-
-            with cols[i % 4]:
-                with st.container(border=True):
-                    # Top Label
-                    if reason_top:
-                        st.markdown(
-                            f'<div class="grid-reason">{reason_top}</div>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        st.markdown(
-                            '<div style="height: 70px;"></div>', unsafe_allow_html=True
-                        )  # Spacer
-
-                    # Price Badge
-                    local_price = row.get("Local Price", "")
-                    if local_price:
-                        st.markdown(f'<div class="grid-price-badge">{local_price}</div>', unsafe_allow_html=True)
-
-                    # Image (Streamlit handles ZIP extraction here)
-                    st.image(img_url, width='stretch')
-
-                    # Details
-                    st.markdown(
-                        f"""
-                        <div style="flex-grow: 1; padding: 10px 0;">
-                            <div class="grid-name">{name}</div>
-                            <div style="font-size: 11px; color: #666; margin-bottom: 4px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.2;" title="{row.get('CATEGORY', '')}">Category: {row.get('CATEGORY', 'N/A')}</div>
-                            <div style="font-size: 12px; color: #b2bec3; font-weight: 500;">SID: {sid}</div>
-                        </div>
-                        <div class="grid-reason-bot">{reason_bot}</div>
-                    """,
-                        unsafe_allow_html=True,
-                    )
+    else:
+        df_styled = df_view.style.apply(style_rows, axis=1)
+        event = st.dataframe(
+            df_styled,
+            **df_kwargs,
+            column_config=_col_cfg,
+        )
 
     raw_selected = list(event.selection.rows)
     selected_indices = [i for i in raw_selected if i < len(df_view)]
@@ -1019,56 +1214,24 @@ def render_flag_expander(
 
     _fm = support_files["flags_mapping"]
     _reason_options = [
-        "Wrong Category",
-        "Restricted brands",
-        "Suspected Fake product",
-        "Seller Not approved to sell Refurb",
-        "Product Warranty",
-        "Seller Approve to sell books",
-        "Seller Approved to Sell Perfume",
-        "Counterfeit Sneakers",
-        "Suspected counterfeit Jerseys",
-        "Prohibited products",
-        "Unnecessary words in NAME",
-        "Single-word NAME",
-        "Generic BRAND Issues",
-        "Fashion brand issues",
-        "BRAND name repeated in NAME",
-        "Wrong Variation",
-        "Generic branded products with genuine brands",
-        "Missing COLOR",
-        "Missing Weight/Volume",
-        "Incomplete Smartphone Name",
-        "Duplicate product",
-        "Poor images",
-        "Image Stretched",
-        "Image Blurry",
-        "Image Mismatch",
-        "Image Infringing",
-        "Image Too Many things displayed",
-        "Perfume Tester",
-        "NG - Gift Card Seller",
-        "NG - Books Seller",
-        "NG - TV Brand Seller",
-        "NG - HP Toners Seller",
-        "NG - Apple Seller",
-        "NG - Xmas Tree Seller",
-        "NG - Rice Brand Seller",
-        "NG - Powerbank Capacity",
-        "Discount too high",
-        "Category Max Price Exceeded",
-        "Suspicious Discount",
-        "Color Mismatch",
-        # Prefetch-sourced flags
-        "FDA",
-        "Category Check",
-        "Warranty Check",
-        "Color Check",
-        "Variation Check",
-        "Brand Image Check",
-        "Title Language Check",
-        "Image Quality Check",
-        "Product Name Brand Name",
+        "Wrong Category", "Restricted brands", "Suspected Fake product", "Seller Not approved to sell Refurb",
+        "Product Warranty", "Seller Approve to sell books", "Seller Approved to Sell Perfume", "Counterfeit Sneakers",
+        "Suspected counterfeit Jerseys", "Prohibited products", "Unnecessary words in NAME", "Single-word NAME",
+        "Generic BRAND Issues", "Fashion brand issues", "BRAND name repeated in NAME", "Wrong Variation",
+        "Generic branded products with genuine brands", "Missing COLOR", "Missing Weight/Volume", "Incomplete Smartphone Name",
+        "Duplicate product", "Poor images", "Image Stretched", "Image Blurry", "Image Mismatch",
+        "Image Infringing", "Image Too Many things displayed", "Perfume Tester", "NG - Gift Card Seller",
+        "NG - Books Seller", "NG - TV Brand Seller", "NG - HP Toners Seller", "NG - Apple Seller",
+        "NG - Xmas Tree Seller", "NG - Rice Brand Seller", "NG - Powerbank Capacity", "Discount too high",
+        "Category Max Price Exceeded", "Suspicious Discount", "Color Mismatch", "FDA", "Category Check", "Warranty Check",
+        "Color Check", "Variation Check", "Brand Image Check", "Title Language Check", "Image Quality Check",
+        "Product Name Brand Name – Brand Repeated In Title",
+        "Product Name Brand Name – Inspired/Alternative Perfume Brand",
+        "Product Name Brand Name – Generic/Placeholder Brand",
+        "Product Name Brand Name – High-End Brand Counterfeit Suspected",
+        "Product Name Brand Name – Other",
+        "Title Language Check - Not In English",
+        "Title Language Check - Other",
         "Other Reason (Custom)",
     ]
 
@@ -1246,14 +1409,15 @@ def build_fast_grid_html(
     prefetch_urls=None,
     scroll_to_top=False,
     show_images=True,
-    seller_trust=None,
     support_files=None,
+    curr_sort="",
+    curr_flag="",
+    items_per_page=50,
 ):
-    if seller_trust is None: seller_trust = {}
     if support_files is None: support_files = {}
-    
+
     from translations import get_translation
-    lang = "fr" if country == "Morocco" else "en"
+    lang = st.session_state.get("ui_lang", "en")
 
     def _t(key): return get_translation(lang, key)
 
@@ -1269,22 +1433,61 @@ def build_fast_grid_html(
     html_dir = "rtl" if st.session_state.get("ui_lang") == "ar" else "ltr"
 
     labels_dict = {
-        "poor_img": _t("poor_img"),
-        "wrong_cat": _t("wrong_cat"),
-        "fake_prod": _t("fake_prod"),
-        "restr_brand": _t("restr_brand"),
-        "wrong_brand": _t("wrong_brand"),
-        "prohibited": _t("prohibited"),
-        "missing_color": _t("missing_color"),
-        "more_options": _t("more_options"),
-        "undo": _t("undo"),
-        "approve": _t("approve_btn"),
-        "clear_sel": _t("clear_sel"),
-        "items_pending": _t("items_pending"),
-        "batch_reject": _t("batch_reject"),
-        "select_all": _t("select_all"),
-        "deselect_all": _t("deselect_all"),
-        "rejected": str(_t("rejected") or "REJECTED").upper(),
+        "poor_img":       _t("poor_img"),
+        "img_stretched":  _t("img_stretched"),
+        "img_blurry":     _t("img_blurry"),
+        "img_mismatch":   _t("img_mismatch"),
+        "img_infringing": _t("img_infringing"),
+        "img_too_many":   _t("img_too_many"),
+        "wrong_cat":      _t("wrong_cat"),
+        "fake_prod":      _t("fake_prod"),
+        "restr_brand":    _t("restr_brand"),
+        "wrong_brand":    _t("wrong_brand"),
+        "prohibited":     _t("prohibited"),
+        "missing_color":  _t("missing_color"),
+        "other_custom":   _t("other_custom"),
+        "more_options":   _t("more_options"),
+        "undo":           _t("undo"),
+        "approve":        _t("approve_btn"),
+        "clear_sel":      _t("clear_sel"),
+        "items_pending":  _t("items_pending"),
+        "batch_reject":   _t("batch_reject"),
+        "select_all":     _t("select_all"),
+        "deselect_all":   _t("deselect_all"),
+        "rejected":       str(_t("rejected") or "REJECTED").upper(),
+        "sort_by_issue":      _t("sort_by_issue"),
+        "most_flagged":       _t("most_flagged"),
+        "no_issue_first":     _t("no_issue_first"),
+        "filter_by_flag":     _t("filter_by_flag"),
+        "all_rejected":       _t("all_rejected"),
+        "clean_no_flags":     _t("clean_no_flags"),
+        "grp_image":          _t("grp_image"),
+        "grp_qc_flags":       _t("grp_qc_flags"),
+        "grp_prefetch":       _t("grp_prefetch"),
+        "sort_low_res":       _t("sort_low_res"),
+        "sort_tall":          _t("sort_tall"),
+        "sort_wide":          _t("sort_wide"),
+        "sort_broken":        _t("sort_broken"),
+        "sort_wrong_cat":     _t("sort_wrong_cat"),
+        "sort_restr_brand":   _t("sort_restr_brand"),
+        "sort_fake":          _t("sort_fake"),
+        "sort_missing_color": _t("sort_missing_color"),
+        "sort_warranty":      _t("sort_warranty"),
+        "sort_duplicates":    _t("sort_duplicates"),
+        "filter_brand_ocr":   _t("filter_brand_ocr"),
+        "filter_duplicates":  _t("filter_duplicates"),
+        "filter_manual":      _t("filter_manual"),
+        "filter_color_mis":   _t("filter_color_mis"),
+        "filter_brand_name":  _t("filter_brand_name"),
+        "filter_unneeded":    _t("filter_unneeded"),
+        "filter_prohibited":  _t("filter_prohibited"),
+        "custom_reason_title": _t("custom_reason_title"),
+        "custom_reason_ph":    _t("custom_reason_ph"),
+        "custom_apply":        _t("custom_apply"),
+        "custom_cancel":       _t("custom_cancel"),
+        "search_grid":     _t("search_grid"),
+        "products_label":  _t("products_label"),
+        "dark_mode":       _t("dark_mode"),
     }
     labels_json = _js_json(labels_dict)
 
@@ -1300,10 +1503,32 @@ def build_fast_grid_html(
         "</svg>"
     )
 
-    _zip_img_cache: dict = {}
+    # Persist across reruns/page-turns instead of rebuilding per call —
+    # previously this was a fresh {} every call, so ZIP image lookups for
+    # already-seen (name, brand, img_url) combos were redone on every
+    # page turn / rerun instead of being cached.
+    if "_zip_img_cache" not in st.session_state:
+        st.session_state._zip_img_cache = {}
+    _zip_img_cache: dict = st.session_state._zip_img_cache
+
+    _zip_index_ss = st.session_state.get("_zip_sid_index")
+    _zip_sid_set = set()
+    if _zip_index_ss is not None and not _zip_index_ss.empty:
+        _zip_sid_set = set(_zip_index_ss.index.astype(str).tolist())
+    _fr_ss = st.session_state.get("final_report", pd.DataFrame())
+    if not _zip_sid_set:
+        if not _fr_ss.empty and "Is_Zip" in _fr_ss.columns and "ProductSetSid" in _fr_ss.columns:
+            _zip_sid_set = set(
+                _fr_ss[_fr_ss["Is_Zip"] == True]["ProductSetSid"].astype(str).tolist()
+            )
+
+    _zip_override_map = {}
+    if not _fr_ss.empty and "zip_override" in _fr_ss.columns and "ProductSetSid" in _fr_ss.columns:
+        _zip_override_map = _fr_ss.set_index("ProductSetSid")["zip_override"].fillna("").to_dict()
+
     cards_data = []
-    for _, row in page_data.iterrows():
-        sid = str(row["PRODUCT_SET_SID"])
+    for row in page_data.to_dict("records"):
+        sid = str(row.get("PRODUCT_SET_SID", "")).strip()
         img_url = str(row.get("MAIN_IMAGE", "")).strip()
         if img_url.startswith("http"):
             img_url = img_url.replace("http://", "https://", 1)
@@ -1319,7 +1544,6 @@ def build_fast_grid_html(
             else:
                 img_url = ""
 
-        # 🚀 Fallback to IMAGE1_ZIP
         if (not img_url or img_url == "") and "IMAGE1_ZIP" in row:
             _fallback = str(row.get("IMAGE1_ZIP", "")).strip()
             if _fallback.startswith("http"):
@@ -1328,40 +1552,50 @@ def build_fast_grid_html(
         sale_p = row.get("GLOBAL_SALE_PRICE")
         reg_p = row.get("GLOBAL_PRICE")
         usd_val = sale_p if pd.notna(sale_p) and str(sale_p).strip() != "" else reg_p
-        price_str = (
-            format_local_price(
+        if pd.isna(usd_val) or str(usd_val).strip().lower() in ("", "nan", "none", "null"):
+            price_str = "NaN"
+        else:
+            price_str = format_local_price(
                 usd_val, st.session_state.get("selected_country", "Kenya")
-            )
-            if pd.notna(usd_val)
-            else ""
-        )
+            ) or "NaN"
 
         color_val = str(row.get("COLOR", "")).strip()
         if color_val.lower() in ("nan", "none", "null"):
             color_val = ""
 
-        # Color mismatch: AI-normalized vs declared
         color_ai = str(row.get("Color_AI_Normalized", "")).strip()
         if color_ai.lower() in ("nan", "none", "null", ""):
             color_ai = ""
+        if not color_ai and _zip_index_ss is not None and sid in _zip_index_ss.index:
+            _zr = _zip_index_ss.loc[sid]
+            if hasattr(_zr, "iloc") and len(getattr(_zr, "shape", (1,))) == 2:
+                _zr = _zr.iloc[0]
+            _zai = str(_zr.get("Color_AI_Normalized", "")).strip()
+            if _zai.lower() not in ("nan", "none", "null", ""):
+                color_ai = _zai
         color_mismatch = ""
         if color_ai and color_val:
             _ai_n = color_ai.lower().replace(" ", "")
             _dec_n = color_val.lower().replace(" ", "")
             if _ai_n != _dec_n and _ai_n not in _dec_n and _dec_n not in _ai_n:
-                color_mismatch = f"AI detected '{color_ai}' but declared '{color_val}'"
+                color_mismatch = f"AI: '{color_ai}' vs declared: '{color_val}'"
         elif color_ai and not color_val:
-            color_mismatch = f"AI detected color '{color_ai}' but no color declared"
+            color_mismatch = f"AI detected color: '{color_ai}' (none declared)"
 
-        # Duplicate flag from prefetch CSV
         dup_raw = str(row.get("Duplicate_Flag", "")).strip()
         is_duplicate = dup_raw.lower() not in ("", "nan", "none", "false")
 
-        # Manual review flag
         mr_raw = str(row.get("Manual_Review", "")).strip().lower()
-        is_manual_review = mr_raw in ("true", "1", "yes")
+        qc_skip = str(row.get("QC_Skip_Reason", "")).strip()
+        if qc_skip.lower() in ("nan", "none", "null", ""):
+            qc_skip = ""
 
-        # Category AI reason + suggested category
+        is_manual_review = (
+            mr_raw in ("true", "1", "yes") 
+            or "Manual review" in page_warnings.get(sid, [])
+            or bool(qc_skip)
+        )
+
         cat_reason = str(row.get("Category_Check_Rejection_Reason", "")).strip()
         if cat_reason.lower() in ("nan", "none", "rejected", ""):
             cat_reason = ""
@@ -1371,10 +1605,18 @@ def build_fast_grid_html(
             first_pipe = suggested_cats_raw.split("|")[0]
             suggested_cat = re.sub(r"\s*\(\d+%\)\s*$", "", first_pipe).strip()
 
-        # AI caption
         ai_caption = str(row.get("AI_Product_Caption", "")).strip()
         if ai_caption.lower() in ("nan", "none", ""):
             ai_caption = ""
+
+        # Generic reason snippet for any flag with a Comment (Brand Image
+        # Mismatch, Off-Platform Contact, etc). cat_reason keeps its own
+        # dedicated field/styling for Category Check since it's richer
+        # (includes suggested category); this is the fallback for everything
+        # else so a reviewer isn't left guessing why a card is flagged.
+        flag_comment = str(row.get("Comment", "")).strip()
+        if flag_comment.lower() in ("nan", "none", "", "manual rejection", "rejected"):
+            flag_comment = ""
 
         cards_data.append(
             {
@@ -1382,7 +1624,7 @@ def build_fast_grid_html(
                 "img": img_url if show_images else _PLACEHOLDER_SVG,
                 "name": str(row.get("NAME", "")),
                 "brand": str(row.get("BRAND", "Unknown Brand")),
-                "cat": str(row.get("CATEGORY", "Unknown Category")),
+                "cat": str(row.get("Initial_Category_Path", row.get("CATEGORY", "Unknown Category"))),
                 "seller": str(row.get("SELLER_NAME", "Unknown Seller")),
                 "color": color_val,
                 "brand_detected": str(
@@ -1412,29 +1654,155 @@ def build_fast_grid_html(
                 "data_cat": str(row.get("CATEGORY", "")).replace('"', "&quot;"),
                 "is_duplicate": is_duplicate,
                 "is_manual_review": is_manual_review,
+                "qc_skip_reason": qc_skip,
                 "color_mismatch": color_mismatch,
+                "color_ai": color_ai,
                 "cat_reason": cat_reason,
                 "suggested_cat": suggested_cat,
                 "ai_caption": ai_caption,
+                "flag_comment": flag_comment,
+                "is_zip": sid in _zip_sid_set,
+                "zip_override": str(_zip_override_map.get(sid, "")),
             }
         )
 
     cards_json = orjson.dumps(cards_data).decode("utf-8").replace("</", "<\\/")
 
-    scroll_js = ""
-    if scroll_to_top:
-        scroll_js = "sessionStorage.removeItem('__inner_iframe_scroll__'); window.scrollTo(0, 0);"
-    else:
-        scroll_js = """
-        var savedInnerScroll = sessionStorage.getItem('__inner_iframe_scroll__');
-        if (savedInnerScroll) {
-            setTimeout(function() {
-                window.scrollTo({top: parseInt(savedInnerScroll, 10), behavior: 'instant'});
-            }, 50);
-        }
-        """
+    scroll_js = """
+        window.addEventListener('DOMContentLoaded', function() {
+            var savedInnerScroll = sessionStorage.getItem('__inner_iframe_scroll__');
+            if (savedInnerScroll) {
+                setTimeout(function() {
+                    window.scrollTo({top: parseInt(savedInnerScroll, 10), behavior: 'instant'});
+                }, 50);
+            }
+        });
+    """
 
-    return f"""<!DOCTYPE html>
+
+    def _sel(val, curr): return "selected" if val == curr else ""
+    sort_html = f'''
+  <select class="reason-sel sort-sel" id="sort-sel-top" onchange="sendMsg('grid_sort_issue', this.value)" style="max-width:170px;" title="{labels_dict.get('sort_by_issue', 'Sort')}">
+    <option value="" {_sel('', curr_sort)}>{labels_dict.get('sort_by_issue', 'Sort')}</option>
+    <option value="most_flagged" {_sel('most_flagged', curr_sort)}>{labels_dict.get('most_flagged', 'Most Flagged')}</option>
+    <option value="no_issue" {_sel('no_issue', curr_sort)}>{labels_dict.get('no_issue_first', 'No Issue')}</option>
+    <option disabled>── {labels_dict.get('grp_image', 'Image')} ──</option>
+    <option value="low_res" {_sel('low_res', curr_sort)}>{labels_dict.get('sort_low_res', 'Low Res')}</option>
+    <option value="tall" {_sel('tall', curr_sort)}>{labels_dict.get('sort_tall', 'Tall')}</option>
+    <option value="wide" {_sel('wide', curr_sort)}>{labels_dict.get('sort_wide', 'Wide')}</option>
+    <option value="broken" {_sel('broken', curr_sort)}>{labels_dict.get('sort_broken', 'Broken')}</option>
+    <option disabled>── {labels_dict.get('grp_qc_flags', 'QC')} ──</option>
+    <option value="Wrong Category" {_sel('Wrong Category', curr_sort)}>{labels_dict.get('sort_wrong_cat', 'Wrong Cat')}</option>
+    <option value="Restricted brands" {_sel('Restricted brands', curr_sort)}>{labels_dict.get('sort_restr_brand', 'Restricted')}</option>
+    <option value="Suspected Fake product" {_sel('Suspected Fake product', curr_sort)}>{labels_dict.get('sort_fake', 'Fake')}</option>
+    <option value="Missing COLOR" {_sel('Missing COLOR', curr_sort)}>{labels_dict.get('sort_missing_color', 'Color')}</option>
+    <option value="Product Warranty" {_sel('Product Warranty', curr_sort)}>{labels_dict.get('sort_warranty', 'Warranty')}</option>
+    <option value="Duplicate product" {_sel('Duplicate product', curr_sort)}>{labels_dict.get('sort_duplicates', 'Duplicate')}</option>
+    <option disabled>── {labels_dict.get('grp_prefetch', 'Prefetch')} ──</option>
+    <option value="Category Check" {_sel('Category Check', curr_sort)}>Category Check</option>
+    <option value="Warranty Check" {_sel('Warranty Check', curr_sort)}>Warranty Check</option>
+    <option value="FDA" {_sel('FDA', curr_sort)}>FDA</option>
+    <option value="Color Check" {_sel('Color Check', curr_sort)}>Color Check</option>
+    <option value="Variation Check" {_sel('Variation Check', curr_sort)}>Variation Check</option>
+    <option value="Brand Image Check" {_sel('Brand Image Check', curr_sort)}>Brand Image Check</option>
+    <option value="Title Language Check" {_sel('Title Language Check', curr_sort)}>Title Language Check</option>
+    <option value="Image Quality Check" {_sel('Image Quality Check', curr_sort)}>Image Quality Check</option>
+  </select>
+'''
+    filter_html = f'''
+  <select class="reason-sel sort-sel" id="filter-sel-top" onchange="sendMsg('grid_filter_flag', this.value)" style="max-width:180px;" title="{labels_dict.get('filter_by_flag', 'Filter')}">
+    <option value="" {_sel('', curr_flag)}>{labels_dict.get('filter_by_flag', 'Filter')}</option>
+    <option value="brand_ocr" {_sel('brand_ocr', curr_flag)}>{labels_dict.get('filter_brand_ocr', 'Brand OCR')}</option>
+    <option value="duplicates" {_sel('duplicates', curr_flag)}>{labels_dict.get('filter_duplicates', 'Duplicates')}</option>
+    <option value="manual_review" {_sel('manual_review', curr_flag)}>{labels_dict.get('filter_manual', 'Manual Review')}</option>
+    <option value="color_mismatch" {_sel('color_mismatch', curr_flag)}>{labels_dict.get('filter_color_mis', 'Color Mis')}</option>
+    <option value="committed" {_sel('committed', curr_flag)}>{labels_dict.get('all_rejected', 'All Rejected')}</option>
+    <option value="no_flags" {_sel('no_flags', curr_flag)}>{labels_dict.get('clean_no_flags', 'Clean')}</option>
+    <option disabled>── {labels_dict.get('grp_qc_flags', 'QC')} ──</option>
+    <option value="Wrong Category" {_sel('Wrong Category', curr_flag)}>{labels_dict.get('sort_wrong_cat', 'Wrong Cat')}</option>
+    <option value="Restricted brands" {_sel('Restricted brands', curr_flag)}>{labels_dict.get('sort_restr_brand', 'Restricted')}</option>
+    <option value="Suspected Fake product" {_sel('Suspected Fake product', curr_flag)}>{labels_dict.get('sort_fake', 'Fake')}</option>
+    <option value="Missing COLOR" {_sel('Missing COLOR', curr_flag)}>{labels_dict.get('sort_missing_color', 'Color')}</option>
+    <option value="Product Warranty" {_sel('Product Warranty', curr_flag)}>{labels_dict.get('sort_warranty', 'Warranty')}</option>
+    <option value="Duplicate product" {_sel('Duplicate product', curr_flag)}>{labels_dict.get('sort_duplicates', 'Duplicate')}</option>
+    <option value="BRAND name repeated in NAME" {_sel('BRAND name repeated in NAME', curr_flag)}>{labels_dict.get('filter_brand_name', 'Brand Name')}</option>
+    <option value="Unnecessary words" {_sel('Unnecessary words', curr_flag)}>{labels_dict.get('filter_unneeded', 'Unneeded')}</option>
+    <option value="Prohibited Words" {_sel('Prohibited Words', curr_flag)}>{labels_dict.get('filter_prohibited', 'Prohibited')}</option>
+    <option value="Brand Image Mismatch" {_sel('Brand Image Mismatch', curr_flag)}>Brand Image Mismatch</option>
+    <option value="Off-Platform Contact" {_sel('Off-Platform Contact', curr_flag)}>Off-Platform Contact</option>
+    <option value="Specs Inconsistency" {_sel('Specs Inconsistency', curr_flag)}>Specs Inconsistency</option>
+    <option disabled>── {labels_dict.get('grp_prefetch', 'Prefetch')} ──</option>
+    <option value="Category Check" {_sel('Category Check', curr_flag)}>Category Check</option>
+    <option value="Warranty Check" {_sel('Warranty Check', curr_flag)}>Warranty Check</option>
+    <option value="FDA" {_sel('FDA', curr_flag)}>FDA</option>
+    <option value="Color Check" {_sel('Color Check', curr_flag)}>Color Check</option>
+    <option value="Variation Check" {_sel('Variation Check', curr_flag)}>Variation Check</option>
+    <option value="Brand Image Check" {_sel('Brand Image Check', curr_flag)}>Brand Image Check</option>
+    <option value="Title Language Check" {_sel('Title Language Check', curr_flag)}>Title Language Check</option>
+    <option value="Image Quality Check" {_sel('Image Quality Check', curr_flag)}>Image Quality Check</option>
+    <option value="Product Name Brand Name – Brand Repeated In Title" {_sel('Product Name Brand Name – Brand Repeated In Title', curr_flag)}>Name/Brand: Brand Repeated</option>
+    <option value="Product Name Brand Name – Inspired/Alternative Perfume Brand" {_sel('Product Name Brand Name – Inspired/Alternative Perfume Brand', curr_flag)}>Name/Brand: Perfume Brand</option>
+    <option value="Product Name Brand Name – Generic/Placeholder Brand" {_sel('Product Name Brand Name – Generic/Placeholder Brand', curr_flag)}>Name/Brand: Generic Brand</option>
+    <option value="Product Name Brand Name – High-End Brand Counterfeit Suspected" {_sel('Product Name Brand Name – High-End Brand Counterfeit Suspected', curr_flag)}>Name/Brand: High-End Counterfeit</option>
+    <option value="Product Name Brand Name – Other" {_sel('Product Name Brand Name – Other', curr_flag)}>Name/Brand: Other</option>
+    <option value="Title Language Check - Not In English" {_sel('Title Language Check - Not In English', curr_flag)}>Title: Not in English</option>
+    <option value="Title Language Check - Other" {_sel('Title Language Check - Other', curr_flag)}>Title: Language Other</option>
+  </select>
+'''
+
+    # Additional rejection reasons that already have a reason-code/comment
+    # backing them (REASON_MAP + flags_mapping) but were previously missing
+    # from the manual reject dropdown — reviewers could not select them by
+    # hand even though the app fully supports them end-to-end.
+    extra_reason_options_html = '''
+    <optgroup label="Category / Brand">
+    <option value="REJECT_BRAND_IN_NAME">Brand Repeated In Name</option>
+    <option value="REJECT_GENERIC_BRAND">Generic Brand Issues</option>
+    <option value="REJECT_FASHION_BRAND">Fashion Brand Issues</option>
+    <option value="REJECT_FAKE_PERFUME">Suspected Fake Perfume</option>
+    <option value="REJECT_BRAND_MISMATCH">Brand Image Mismatch</option>
+    </optgroup>
+    <optgroup label="Seller Approval">
+    <option value="REJECT_REFURB">Seller Not Approved (Refurb)</option>
+    <option value="REJECT_BOOKS_SELLER">Seller Not Approved (Books)</option>
+    <option value="REJECT_PERFUME_SELLER">Seller Not Approved (Perfume)</option>
+    <option value="REJECT_PERFUME_TESTER">Perfume Tester</option>
+    <option value="REJECT_SNEAKERS">Counterfeit Sneakers</option>
+    <option value="REJECT_JERSEYS">Counterfeit Jerseys</option>
+    </optgroup>
+    <optgroup label="Content / Title">
+    <option value="REJECT_UNNECESSARY_WORDS">Unnecessary Words in Name</option>
+    <option value="REJECT_SINGLE_WORD">Single-word Name</option>
+    <option value="REJECT_SMARTPHONE_NAME">Incomplete Smartphone Name</option>
+    <option value="REJECT_SPECS_INCONSISTENCY">Specs Inconsistency</option>
+    <option value="REJECT_WEIGHT_VOL">Missing Weight/Volume</option>
+    <option value="REJECT_TITLE_LANG">Title Not in English</option>
+    <option value="REJECT_OFFPLATFORM">Off-Platform Contact</option>
+    </optgroup>
+    <optgroup label="Other">
+    <option value="REJECT_WARRANTY">Product Warranty</option>
+    <option value="REJECT_VARIATION">Wrong Variation</option>
+    <option value="REJECT_SUSPICIOUS_DISCOUNT">Suspicious Discount</option>
+    </optgroup>
+'''
+
+    _cols_btns_parts = []
+    for _n in [5, 6, 7]:
+        _active = _n == cols_per_row
+        _border = "var(--accent)" if _active else "var(--border)"
+        _bg = "var(--accent)" if _active else "transparent"
+        _color = "#fff" if _active else "var(--text)"
+        _title = " title='Wide mode + 500/page'" if _n >= 6 else ""
+        _cols_btns_parts.append(
+            f'<button onclick="sendMsg(\'grid_cols_per_row\', {_n})"{_title} '
+            f'style="padding:1px 7px;font-size:10px;font-weight:700;border-radius:4px;'
+            f'border:1px solid {_border};background:{_bg};color:{_color};'
+            f'cursor:pointer;line-height:1.6;">{_n}</button>'
+        )
+    _cols_btns = "".join(_cols_btns_parts)
+
+    _grid_sync_data = (committed_json, poor_img_sids_json, prefetch_json, cards_json)
+    _html_str = f"""<!DOCTYPE html>
 <html dir="{html_dir}">
 <head>
 <meta charset="utf-8">
@@ -1448,10 +1816,14 @@ def build_fast_grid_html(
     --accent: {O};
   }}
   *{{box-sizing:border-box;margin:0;padding:0;font-family:sans-serif;}}
-  body{{background:var(--bg);color:var(--text);padding:8px;overflow-x:hidden;width:100%;transition:background .2s, color .2s;}}
+  body{{background:var(--bg);color:var(--text);padding:8px 8px 80px 8px;overflow-x:hidden;width:100%;transition:background .2s, color .2s;}}
 
   .ctrl-bar{{position:-webkit-sticky;position:sticky;top:0;z-index:99999;display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 12px;background:var(--card);backdrop-filter:blur(8px);border-bottom:2px solid var(--accent);border-radius:4px;margin-bottom:12px;box-shadow:0 4px 16px rgba(0,0,0,0.15);}}
-  
+  .ctrl-bar.top-bar{{flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin;scrollbar-color:rgba(0,0,0,.35) transparent;}}
+  .ctrl-bar.top-bar::-webkit-scrollbar{{height:8px;}}
+  .ctrl-bar.top-bar::-webkit-scrollbar-thumb{{background:rgba(0,0,0,.28);border-radius:999px;}}
+  .ctrl-bar.top-bar::-webkit-scrollbar-track{{background:transparent;}}
+
   #grid-search {{
     flex: 1;
     min-width: 200px;
@@ -1463,6 +1835,23 @@ def build_fast_grid_html(
     background: var(--bg);
     color: var(--text);
   }}
+  .filter-group{{display:flex;flex-direction:column;gap:4px;min-width:180px;}}
+  .filter-group .group-label{{display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:11px;font-weight:800;color:var(--text);opacity:.86;white-space:nowrap;}}
+  .filter-group .sel-count{{font-size:10px;font-weight:700;color:var(--accent);background:rgba(246,139,30,.12);padding:2px 6px;border-radius:999px;white-space:nowrap;}}
+  .filter-group select[multiple]{{min-height:72px;padding:6px 10px;}}
+  .filter-group select{{width:100%;}}
+  .filter-group .hint{{font-size:10px;color:var(--text);opacity:.62;white-space:nowrap;}}
+  .top-summary{{display:flex;flex-direction:column;gap:2px;min-width:180px;max-width:320px;}}
+  .top-summary .main{{font-size:12px;font-weight:800;color:var(--text);white-space:nowrap;}}
+  .top-summary .sub{{font-size:10px;color:var(--text);opacity:.72;white-space:nowrap;}}
+  .toolbar-btn{{white-space:nowrap;}}
+  .toolbar-btn.small{{padding:7px 10px;}}
+  .page-nav{{display:flex;align-items:center;gap:6px;white-space:nowrap;}}
+  .page-pill{{font-size:11px;font-weight:800;color:var(--text);opacity:.75;padding:0 4px;}}
+  .empty-state{{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 20px;background:linear-gradient(135deg,rgba(246,139,30,.08),rgba(59,130,246,.06));border:1px dashed rgba(246,139,30,.35);border-radius:14px;margin:18px 0;}}
+  .empty-state .title{{font-size:15px;font-weight:800;color:var(--text);margin-bottom:4px;}}
+  .empty-state .desc{{font-size:12px;color:var(--text);opacity:.74;}}
+  .empty-state .actions{{display:flex;gap:8px;flex-wrap:wrap;}}
   #dark-toggle {{
     padding: 6px 12px;
     border-radius: 8px;
@@ -1475,10 +1864,18 @@ def build_fast_grid_html(
   }}
   #dark-toggle:hover {{ background: #f3f4f6; }}
 
-  .bottom-bar {{position: relative; border-bottom: none; border-top: 2px solid {O}; margin-top: 16px; margin-bottom: 0; z-index: 10; box-shadow: 0 -4px 16px rgba(0,0,0,0.05);}}
+  .bottom-bar {{position: fixed; bottom: 26px; left: 0; width: 100%; top: auto; border-bottom: none; border-top: 1px solid rgba(246, 139, 30, 0.2); margin: 0; z-index: 10000; box-shadow: 0 -4px 16px rgba(0,0,0,0.1); background: var(--card); padding: 12px 16px;}}
 
   .sel-count{{font-weight:700;color:{O};font-size:13px;min-width:80px;}}
   .reason-sel{{flex:1;min-width:160px;padding:6px 10px;border:1px solid #ccc;border-radius:4px;font-size:12px;background:#fff;cursor:pointer;}}
+  .rsearch-wrap{{position:relative;flex:1;min-width:200px;max-width:260px;}}
+  .rsearch-input{{width:100%;padding:6px 10px;border:1px solid #ccc;border-radius:4px;font-size:12px;background:#fff;cursor:text;box-sizing:border-box;}}
+  .rsearch-input:focus{{outline:2px solid {O};outline-offset:-1px;}}
+  .rsearch-panel{{position:absolute;top:calc(100% + 4px);left:0;width:280px;max-height:320px;overflow-y:auto;background:#fff;border:1px solid #ccc;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,0.18);z-index:100000;padding:4px 0;}}
+  .rsearch-group-label{{padding:6px 10px 3px;font-size:10px;font-weight:800;color:#9ca3af;text-transform:uppercase;letter-spacing:.03em;}}
+  .rsearch-item{{padding:7px 12px;font-size:12px;color:#1f2937;cursor:pointer;white-space:normal;}}
+  .rsearch-item:hover, .rsearch-item.rsearch-hl{{background:{O};color:#fff;}}
+  .rsearch-empty{{padding:10px 12px;font-size:12px;color:#9ca3af;}}
   .batch-btn{{padding:7px 14px;background:{O};color:#fff;border:none;border-radius:4px;font-weight:700;font-size:12px;cursor:pointer;}}
   .batch-btn:hover{{opacity:.88;}}
   .desel-btn{{padding:7px 12px;background:#fff;color:#555;border:1px solid #ccc;border-radius:4px;font-size:12px;cursor:pointer;}}
@@ -1493,6 +1890,12 @@ def build_fast_grid_html(
   .card.selected{{border-color:{O};box-shadow:0 0 0 5px rgba(255,136,0,.35);background:rgba(255,136,0,.04);}}
   .card.staged-rej{{border-color:{R};box-shadow:0 0 0 4px rgba(231,60,23,.3);background:rgba(231,60,23,.04);}}
   .card.committed-rej{{border-color:#bbb;opacity:.6;}}
+  .card.manual-review{{border-color:#dc2626;box-shadow:0 0 0 3px rgba(220,38,38,0.25);}}
+  .card.zip-card{{border-left:4px solid #3b82f6;box-shadow:-4px 0 8px rgba(59,130,246,0.20);}}
+  .card.zip-card.selected{{border-left:4px solid #3b82f6;box-shadow:-4px 0 8px rgba(59,130,246,0.20),0 0 0 5px rgba(255,136,0,.35);}}
+  .card.zip-card.manual-review{{border-color:#dc2626;border-left:4px solid #3b82f6;box-shadow:-4px 0 8px rgba(59,130,246,0.20), 0 0 0 3px rgba(220,38,38,0.25);}}
+  .ai-color-pill{{display:inline-block;background:#dbeafe;color:#1e40af;font-size:10px;font-weight:700;padding:2px 7px;border-radius:99px;border:1px solid #93c5fd;margin-top:3px;}}
+  .ai-brand-pill{{display:inline-block;background:#fef9c3;color:#854d0e;font-size:10px;font-weight:700;padding:2px 7px;border-radius:99px;border:1px solid #fde68a;margin-top:3px;}}
 
   .card-img-wrap{{position:relative;cursor:pointer;border-radius:8px;background:#fff;display:flex;align-items:center;justify-content:center;height:180px;overflow:hidden; border:1px solid #111;flex-shrink:0;}}
   .card-img-wrap::before{{content:'';position:absolute;inset:0;background:linear-gradient(90deg,#FFF8F2 25%,#FFEFE5 50%,#FFF8F2 75%);background-size:200% 100%;animation:shimmer 1.4s infinite;z-index:1;}}
@@ -1503,17 +1906,29 @@ def build_fast_grid_html(
   .card-img.img-loaded{{opacity:1;}}
   .card.committed-rej .card-img{{filter:grayscale(80%);}}
 
-  .warn-wrap{{position:absolute;top:8px;right:8px;display:flex;flex-direction:column;gap:4px;z-index:10;pointer-events:none;}}
-  .warn-badge{{background:linear-gradient(90deg,#FFC107,#FF9800);color:#313133;font-size:9px;font-weight:800;padding:3px 8px;border-radius:9999px;box-shadow:0 2px 6px rgba(255,152,0,.3);animation:pulse 2s infinite;}}
+  .warn-wrap{{position:absolute;top:8px;right:8px;display:flex;flex-direction:column;gap:6px;z-index:10;pointer-events:none;max-width:calc(100% - 16px);}}
+  .warn-group{{display:flex;flex-direction:column;gap:4px;align-items:flex-end;}}
+  .warn-group.inline{{flex-direction:row;flex-wrap:wrap;justify-content:flex-end;}}
+  .warn-badge{{display:inline-flex;align-items:center;justify-content:center;max-width:100%;background:linear-gradient(90deg,#FFC107,#FF9800);color:#313133;font-size:9px;font-weight:800;padding:3px 8px;border-radius:9999px;box-shadow:0 2px 6px rgba(255,152,0,.3);animation:pulse 2s infinite;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+  .warn-badge.critical{{background:linear-gradient(90deg,#dc2626,#b91c1c);color:#fff;box-shadow:0 2px 6px rgba(220,38,38,.28);}}
+  .warn-badge.advisory{{background:linear-gradient(90deg,#f59e0b,#f97316);color:#fff;box-shadow:0 2px 6px rgba(249,115,22,.22);animation:none;}}
+  .warn-badge.info{{background:linear-gradient(90deg,#3b82f6,#2563eb);color:#fff;box-shadow:0 2px 6px rgba(37,99,235,.22);animation:none;}}
+  .warn-badge.neutral{{background:linear-gradient(90deg,#6b7280,#4b5563);color:#fff;box-shadow:0 2px 6px rgba(75,85,99,.2);animation:none;}}
   @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:0.85}}}}
   .price-badge{{position:absolute;top:8px;left:8px;background:rgba(246,139,30,0.95);color:#fff;font-size:10px;font-weight:800;padding:3px 8px;border-radius:9999px;z-index:10;pointer-events:none;box-shadow:0 2px 6px rgba(0,0,0,.2);}}
 
-  .meta{{font-size:11px;margin-top:8px;line-height:1.4;flex-grow:1;display:flex;flex-direction:column;}}
-  .meta .nm{{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:help;}}
-  .meta .br{{color:{O};font-weight:700;margin:2px 0;}}
-  .meta .ct{{color:#666;font-size:10px;word-break:break-word;}}
-  .meta .sl{{color:#999;font-size:9px;margin-top:4px;border-top:1px dashed #eee;padding-top:4px;cursor:help;}}
+  .meta{{font-size:11px;margin-top:8px;line-height:1.35;flex-grow:1;display:flex;flex-direction:column;gap:4px;}}
+  .meta-core{{display:flex;flex-direction:column;gap:3px;}}
+  .meta .nm{{font-weight:800;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:help;}}
+  .meta .br{{color:{O};font-weight:800;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+  .meta .ct{{color:#666;font-size:10px;word-break:break-word;line-height:1.25;}}
+  .meta .sl{{color:#999;font-size:9px;margin-top:2px;border-top:1px dashed #eee;padding-top:4px;cursor:help;display:flex;align-items:center;gap:6px;min-width:0;}}
   .meta .co{{color:#555;font-size:10px;margin-top:4px;background:#f0f0f0;padding:3px 5px;border-radius:4px;display:inline-block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;font-weight:600;}}
+  .meta-extra{{border-top:1px solid #ececec;padding-top:4px;}}
+  .meta-extra summary{{cursor:pointer;list-style:none;font-size:10px;font-weight:800;color:var(--accent);user-select:none;}}
+  .meta-extra summary::-webkit-details-marker{{display:none;}}
+  .meta-extra-body{{display:flex;flex-direction:column;gap:4px;padding-top:6px;}}
+  .meta-extra .co{{margin-top:0;}}
 
   .acts{{display:flex;gap:4px;margin-top:auto;padding-top:8px;}}
   .act-btn{{flex:1;padding:6px;font-size:11px;border:none;border-radius:4px;cursor:pointer;font-weight:700;color:#fff;background:{O};}}
@@ -1522,6 +1937,11 @@ def build_fast_grid_html(
   .zoom-btn{{position:absolute;bottom:6px;right:6px;width:22px;height:22px;background:rgba(0,0,0,0.4);color:#fff;border-radius:4px;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:25;border:none;transition:background .2s;}}
   .zoom-btn:hover{{background:rgba(0,0,0,0.7);}}
   .zoom-btn svg{{width:12px;height:12px;flex-shrink:0;}}
+
+  .zoom-nav-btn {{ position: absolute; top: 50%; transform: translateY(-50%); background: rgba(0,0,0,0.5); color: white; border: none; font-size: 24px; padding: 10px; cursor: pointer; border-radius: 4px; z-index: 100001; }}
+  .zoom-nav-btn:hover {{ background: rgba(0,0,0,0.8); }}
+  .zoom-nav-btn.prev {{ left: -40px; }}
+  .zoom-nav-btn.next {{ right: -40px; }}
 
   .tick{{position:absolute;bottom:6px;left:6px;width:22px;height:22px;border-radius:50%;background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;color:transparent;font-size:13px;font-weight:900;pointer-events:none;z-index:10;}}
   .card.selected .tick{{background:{O};color:#fff;}}
@@ -1554,18 +1974,10 @@ def build_fast_grid_html(
   .card.committed-rej.brand-image-rej .rej-label {{ color: #2E7D32 !important; }}
   .card.committed-rej.brand-image-rej .rej-overlay {{ background: rgba(232, 245, 233, 0.6) !important; }}
 
-  /* 🧠 Highlights & Trust Badges */
+  /* 🧠 Highlights */
   .hlt {{ background: #fee2e2; color: #b91c1c; font-weight: 800; border-radius: 2px; padding: 0 2px; }}
-  .trust-badge {{
-    position: absolute; top: 10px; left: 10px;
-    background: #ef4444; color: #fff; font-size: 10px; font-weight: 800;
-    padding: 4px 8px; border-radius: 6px; z-index: 100;
-    box-shadow: 0 4px 12px rgba(239, 68, 68, 0.4);
-    cursor: pointer; transition: transform 0.2s;
-  }}
-  .trust-badge:hover {{ transform: scale(1.1); background: #dc2626; }}
-  
-  /* Per-card undo shimmer — only the card being processed gets this */
+
+  /* Per-card undo shimmer */
   .card.undo-processing {{
     pointer-events: none;
   }}
@@ -1584,7 +1996,6 @@ def build_fast_grid_html(
     to   {{ opacity: 0.85; }}
   }}
 
-  /* Floating Tooltip */
   #zoom-tooltip  .ctrl-bar {{
     display: flex;
     align-items: center;
@@ -1598,53 +2009,8 @@ def build_fast_grid_html(
     top: 0;
     z-index: 100;
   }}
-  .bottom-bar {{
-    top: auto;
-    bottom: 0;
-    border-bottom: none;
-    border-top: 1px solid rgba(246, 139, 30, 0.2);
-  }}
 
-  /* 🚀 Floating Bulk Action Bar */
-  #floating-action-bar {{
-    position: fixed;
-    bottom: 40px;
-    left: 50%;
-    transform: translateX(-50%) translateY(100px);
-    background: rgba(16, 20, 26, 0.95);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
-    padding: 24px 48px;
-    border-radius: 80px;
-    display: flex;
-    align-items: center;
-    gap: 32px;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
-    border: 1px solid rgba(255,255,255,0.15);
-    z-index: 99999;
-    transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-    opacity: 0;
-    pointer-events: none;
-  }}
-  #floating-action-bar.visible {{
-    transform: translateX(-50%) translateY(0);
-    opacity: 1;
-    pointer-events: auto;
-  }}
-  #floating-action-bar.collapsed {{
-    padding: 10px 20px;
-    gap: 12px;
-  }}
-  #floating-action-bar.collapsed .fab-actions {{ display: none; }}
-  #floating-action-bar.collapsed .fab-count {{ border-right: none; padding-right: 0; font-size:14px; }}
-  .fab-toggle {{
-    background: none; border: none; color: rgba(255,255,255,0.6); cursor: pointer;
-    font-size: 18px; line-height: 1; padding: 0 0 0 8px; flex-shrink: 0;
-  }}
-  .fab-toggle:hover {{ color: #fff; }}
-  .fab-count {{ color: {O}; font-weight: 800; font-size: 18px; border-right: 1px solid rgba(255,255,255,0.2); padding-right: 25px; }}
 
-  /* 🚀 Skeleton Shimmer */
   @keyframes shimmer {{
     0% {{ background-position: -1000px 0; }}
     100% {{ background-position: 1000px 0; }}
@@ -1672,6 +2038,14 @@ def build_fast_grid_html(
     transform: translateY(-6px) scale(1.01);
     box-shadow: 0 12px 30px rgba(0,0,0,0.12);
     z-index: 10;
+  }}
+  #zoom-backdrop {{
+    display: none;
+    position: fixed;
+    top: 0; left: 0; width: 100vw; height: 100vh;
+    background: rgba(0,0,0,0.6);
+    z-index: 99999;
+    cursor: pointer;
   }}
   #zoom-tooltip {{
     display: none;
@@ -1712,7 +2086,6 @@ def build_fast_grid_html(
   }}
   .tooltip-close:hover {{ background: #000; }}
 
-  /* Custom reason inline panel */
   #custom-reason-panel {{
     display: none;
     position: fixed;
@@ -1745,106 +2118,68 @@ def build_fast_grid_html(
   .custom-panel-confirm:hover {{ opacity: 0.88; }}
   .custom-panel-cancel {{ background: #e0e0e0; color: #333; }}
   .custom-panel-cancel:hover {{ background: #ccc; }}
+
+  input[type="search"]::-webkit-search-cancel-button {{
+    -webkit-appearance: searchfield-cancel-button;
+    cursor: pointer;
+    width: 16px;
+    height: 16px;
+    margin-left: 8px;
+  }}
 </style>
 </head>
 <body>
 
 <div id="custom-reason-panel">
-  <h4>Enter custom rejection reason</h4>
-  <input id="custom-reason-input" type="text" placeholder="Type your reason here…" maxlength="200">
+  <h4>{labels_dict['custom_reason_title']}</h4>
+  <input id="custom-reason-input" type="text" placeholder="{labels_dict['custom_reason_ph']}" maxlength="200">
   <div class="custom-panel-btns">
-    <button class="custom-panel-confirm" onclick="confirmCustomReason()">Apply</button>
-    <button class="custom-panel-cancel" onclick="cancelCustomReason()">Cancel</button>
+    <button class="custom-panel-confirm" onclick="confirmCustomReason()">{labels_dict['custom_apply']}</button>
+    <button class="custom-panel-cancel" onclick="cancelCustomReason()">{labels_dict['custom_cancel']}</button>
   </div>
 </div>
 
-<div class="ctrl-bar">
-  <input id="grid-search" type="search" placeholder="Search by name, brand, SID or category.">
-  <div id="grid-count" style="font-size:11px; color:var(--text); opacity:0.7; margin-right:10px;">{len(page_data)} products</div>
-  <button id="dark-toggle" onclick="toggleDark()">Dark</button>
+<div id="lang-loading" style="display:none;position:fixed;inset:0;background:rgba(255,255,255,0.8);z-index:9999999;align-items:center;justify-content:center;flex-direction:column;">
+  <div style="width:40px;height:40px;border:4px solid #f3f3f3;border-top:4px solid {O};border-radius:50%;animation:spin 1s linear infinite;"></div>
+  <style>@keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}</style>
+  <div style="margin-top:16px;font-weight:700;color:#333;font-size:16px;">Updating Language...</div>
+</div>
+
+<div class="ctrl-bar top-bar">
+
+  <button id="dark-toggle" onclick="toggleDark()">{labels_dict['dark_mode']}</button>
+  <select id="iframe-lang-sel" class="reason-sel" style="max-width:60px;" onchange="document.getElementById('lang-loading').style.display='flex'; sendMsg('change_lang', this.value)" title="Change Language">
+    <option value="en" {"selected" if lang=="en" else ""}>EN</option>
+    <option value="fr" {"selected" if lang=="fr" else ""}>FR</option>
+    <option value="ar" {"selected" if lang=="ar" else ""}>AR</option>
+  </select>
+
   <span class="sel-count-text" style="font-weight:700; color:var(--accent); font-size:13px;">0 {labels_dict["items_pending"]}</span>
   <select class="reason-sel" id="batch-reason-top">
-    <option value="REJECT_POOR_IMAGE">{labels_dict["poor_img"]}</option>
-    <option value="REJECT_IMG_STRETCHED">Image Stretched</option>
-    <option value="REJECT_IMG_BLURRY">Image Blurry</option>
-    <option value="REJECT_IMG_MISMATCH">Image Mismatch</option>
-    <option value="REJECT_IMG_INFRINGING">Image Infringing</option>
-    <option value="REJECT_IMG_TOO_MANY">Image Too Many Things</option>
-    <option value="REJECT_WRONG_CAT">{labels_dict["wrong_cat"]}</option>
-    <option value="REJECT_FAKE">{labels_dict["fake_prod"]}</option>
-    <option value="REJECT_BRAND">{labels_dict["restr_brand"]}</option>
-    <option value="REJECT_WRONG_BRAND">{labels_dict["wrong_brand"]}</option>
-    <option value="REJECT_PROHIBITED">{labels_dict["prohibited"]}</option>
-    <option value="REJECT_COLOR">{labels_dict["missing_color"]}</option>
-    <option value="OTHER_CUSTOM">Other Reason (Custom)</option>
+    <option value="REJECT_POOR_IMAGE">{labels_dict['poor_img']}</option>
+    <option value="REJECT_IMG_STRETCHED">{labels_dict['img_stretched']}</option>
+    <option value="REJECT_IMG_BLURRY">{labels_dict['img_blurry']}</option>
+    <option value="REJECT_IMG_MISMATCH">{labels_dict['img_mismatch']}</option>
+    <option value="REJECT_IMG_INFRINGING">{labels_dict['img_infringing']}</option>
+    <option value="REJECT_IMG_TOO_MANY">{labels_dict['img_too_many']}</option>
+    <option value="REJECT_WRONG_CAT">{labels_dict['wrong_cat']}</option>
+    <option value="REJECT_FAKE">{labels_dict['fake_prod']}</option>
+    <option value="REJECT_BRAND">{labels_dict['restr_brand']}</option>
+    <option value="REJECT_WRONG_BRAND">{labels_dict.get('wrong_brand', 'Wrong Brand')}</option>
+    <option value="REJECT_PROHIBITED">{labels_dict.get('prohibited', 'Prohibited')}</option>
+    <option value="REJECT_COLOR">{labels_dict.get('missing_color', 'Missing Color')}</option>
+    <option value="REJECT_FDA">FDA</option>
+    <option value="REJECT_DUPLICATE">{labels_dict.get('sort_duplicates', 'Duplicate')}</option>
+    {extra_reason_options_html}
+    <option value="OTHER_CUSTOM">{labels_dict.get('other_custom', 'Other (Custom)')}</option>
   </select>
   <button class="batch-btn" onclick="doBatchReject('top')">{labels_dict["batch_reject"]}</button>
   <button class="desel-btn" onclick="doBatchUndo()">{labels_dict["undo"]}</button>
   <button class="desel-btn" onclick="window.doSelectAll()">{labels_dict["select_all"]}</button>
   <button class="desel-btn" onclick="doDeselAll()">{labels_dict["deselect_all"]}</button>
   <button class="batch-btn top-btn" onclick="window.scrollTo(0, document.body.scrollHeight)">{_t("go_bottom")}</button>
-  <select class="reason-sel sort-sel" id="sort-sel-top" onchange="applySort(this.value)" style="max-width:170px;" title="Sort by issue">
-    <option value="">Sort by issue</option>
-    <option value="most_flagged">⚑ Most Flagged First</option>
-    <option value="no_issue">✓ No Issues First</option>
-    <option disabled>── Image ──</option>
-    <option value="low_res">Low Resolution</option>
-    <option value="tall">Tall (Screenshot?)</option>
-    <option value="wide">Wide Aspect</option>
-    <option value="broken">Broken Image</option>
-    <option disabled>── QC Flags ──</option>
-    <option value="Wrong Category">Wrong Category</option>
-    <option value="Restricted brands">Restricted brands</option>
-    <option value="Suspected Fake product">Suspected Fake</option>
-    <option value="Missing COLOR">Missing Color</option>
-    <option value="Product Warranty">Warranty Issues</option>
-    <option value="Duplicate product">Duplicates</option>
-    <option disabled>── Prefetch Flags ──</option>
-    <option value="Category Check">Category Check</option>
-    <option value="Warranty Check">Warranty Check</option>
-    <option value="FDA">FDA</option>
-    <option value="Color Check">Color Check</option>
-    <option value="Variation Check">Variation Check</option>
-    <option value="Brand Image Check">Brand Image Check</option>
-    <option value="Title Language Check">Title Language Check</option>
-    <option value="Image Quality Check">Image Quality Check</option>
-    <option value="Product Name Brand Name">Name/Brand Check</option>
-  </select>
-  <select class="reason-sel sort-sel" id="filter-sel-top" onchange="applyFilter(this.value)" style="max-width:180px;" title="Filter to show only cards matching a flag">
-    <option value="">Filter by flag</option>
-    <option value="brand_ocr">🔍 Brand Image OCR</option>
-    <option value="duplicates">⧉ Duplicates</option>
-    <option value="manual_review">👁 Manual Review</option>
-    <option value="color_mismatch">⚠ Color Mismatch</option>
-    <option value="committed">All Rejected</option>
-    <option value="no_flags">✓ Clean (no flags)</option>
-    <option disabled>── QC Flags ──</option>
-    <option value="Wrong Category">Wrong Category</option>
-    <option value="Restricted brands">Restricted brands</option>
-    <option value="Suspected Fake product">Suspected Fake</option>
-    <option value="Missing COLOR">Missing Color</option>
-    <option value="Product Warranty">Warranty Issues</option>
-    <option value="Duplicate product">Duplicates</option>
-    <option value="BRAND name repeated in NAME">Brand in Name</option>
-    <option value="Unnecessary words">Unnecessary Words</option>
-    <option value="Prohibited Words">Prohibited Words</option>
-    <option disabled>── Prefetch Flags ──</option>
-    <option value="Category Check">Category Check</option>
-    <option value="Warranty Check">Warranty Check</option>
-    <option value="FDA">FDA</option>
-    <option value="Color Check">Color Check</option>
-    <option value="Variation Check">Variation Check</option>
-    <option value="Brand Image Check">Brand Image Check</option>
-    <option value="Title Language Check">Title Language Check</option>
-    <option value="Image Quality Check">Image Quality Check</option>
-    <option value="Product Name Brand Name">Name/Brand Check</option>
-    <option disabled>── Image Flags ──</option>
-    <option value="Poor images">Poor Image</option>
-    <option value="Low Resolution">Low Resolution</option>
-    <option value="Tall (Screenshot?)">Tall/Screenshot</option>
-    <option value="Wide Aspect">Wide Aspect</option>
-    <option value="Broken Image">Broken Image</option>
-  </select>
+  {sort_html}
+  {filter_html}
 </div>
 
 <div id="shortcut-help" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);
@@ -1864,7 +2199,19 @@ def build_fast_grid_html(
   </div>
 </div>
 
-<div class="grid" id="card-grid"></div>
+<div class="grid" id="card-grid">
+  <style>
+    .sk-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;width:100%;}}
+    .sk-card{{border-radius:12px;overflow:hidden;background:#f3f4f6;height:260px;animation:pulse 1.4s ease-in-out infinite}}
+    @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.4}}}}
+  </style>
+  <div style="font-family: sans-serif; color: #f97316; font-size: 14px; font-weight: bold; margin-bottom: 5px; padding-top: 10px;">Loading Page...</div>
+  <div class="sk-grid">
+    <div class="sk-card"></div><div class="sk-card"></div><div class="sk-card"></div><div class="sk-card"></div>
+    <div class="sk-card"></div><div class="sk-card"></div><div class="sk-card"></div><div class="sk-card"></div>
+    <div class="sk-card"></div><div class="sk-card"></div><div class="sk-card"></div><div class="sk-card"></div>
+  </div>
+</div>
 
 <div class="ctrl-bar bottom-bar">
   <span class="sel-count-text" style="font-weight:700; color:var(--accent); font-size:13px;">0 {labels_dict["items_pending"]}</span>
@@ -1881,6 +2228,9 @@ def build_fast_grid_html(
     <option value="REJECT_WRONG_BRAND">{labels_dict["wrong_brand"]}</option>
     <option value="REJECT_PROHIBITED">{labels_dict["prohibited"]}</option>
     <option value="REJECT_COLOR">{labels_dict["missing_color"]}</option>
+    <option value="REJECT_FDA">FDA</option>
+    <option value="REJECT_DUPLICATE">{labels_dict["sort_duplicates"]}</option>
+    {extra_reason_options_html}
     <option value="OTHER_CUSTOM">Other Reason (Custom)</option>
   </select>
   <button class="batch-btn" onclick="doBatchReject('bottom')">{labels_dict["batch_reject"]}</button>
@@ -1890,93 +2240,81 @@ def build_fast_grid_html(
   <button class="desel-btn top-btn" onclick="window.scrollTo(0, 0)">{labels_dict["undo"]}</button>
 </div>
 
+<div id="zoom-backdrop" onclick="closeZoom()"></div>
 <div id="zoom-tooltip">
+  <button class="zoom-nav-btn prev" onclick="event.stopPropagation(); window.zoomMove(-1)" title="Previous">&#10094;</button>
   <img id="tooltip-img" alt="Zoomed product" referrerpolicy="no-referrer">
+  <button class="zoom-nav-btn next" onclick="event.stopPropagation(); window.zoomMove(1)" title="Next">&#10095;</button>
   <button class="tooltip-close" onclick="closeZoom()" title="Close">×</button>
 </div>
 
 <div id="prefetch-status"></div>
 
-<div id="floating-action-bar">
-  <div class="fab-count" id="fab-count-txt">0 {labels_dict["items_pending"].upper()}</div>
-  <button class="fab-toggle" onclick="(function(){{var f=document.getElementById('floating-action-bar');f.classList.toggle('collapsed');}})()" title="Minimize / restore">&#8211;</button>
-  <div class="fab-actions" style="display:flex;align-items:center;gap:32px;">
-    <button class="batch-btn" onclick="window.batchApprove()" style="border-radius:24px; padding:10px 24px; background:#16a34a; font-size:15px; font-weight:600;">Approve All</button>
-    <button class="batch-btn" onclick="doBatchReject('bottom')" style="border-radius:24px; padding:10px 24px; font-size:15px; font-weight:600;">Reject All</button>
-    <button class="desel-btn" onclick="doBatchUndo()" style="border-radius:24px; padding:10px 24px; color:#fff; background:#4b4b4b; border:1px solid #777; font-size:15px; font-weight:600;">{labels_dict["undo"]}</button>
-    <button class="desel-btn" onclick="doDeselAll()" style="border-radius:24px; padding:10px 24px; color:#fff; background:#e73c17; border:1px solid #e73c17; font-size:15px; font-weight:600;">{labels_dict["clear_sel"]}</button>
-  </div>
-</div>
-
 <script>
-// ── Pin this iframe so Streamlit's rerun can't blank it ──────────────────────
-(function pinIframe() {{
-  try {{
-    var par = window.parent;
-    var STYLE_ID = '__cuf_iframe_pin__';
-    if (!par.document.getElementById(STYLE_ID)) {{
-      var s = par.document.createElement('style');
-      s.id = STYLE_ID;
-      s.textContent = [
-        'iframe[title="st.iframe"], iframe[title="streamlit.components.v1.html"] {{',
-        '  visibility: visible !important;',
-        '  opacity: 1 !important;',
-        '  transition: opacity 0.2s ease-in-out;',
-        '}}'
-      ].join('\\n');
-      par.document.head.appendChild(s);
-    }}
-    var OBS_KEY = '__cuf_obs__';
-    if (!par.window[OBS_KEY]) {{
-      var obs = new par.MutationObserver(function(mutations) {{
-        mutations.forEach(function(m) {{
-          if (m.type !== 'attributes' || m.attributeName !== 'style') return;
-          var el = m.target;
-          if (el.tagName !== 'IFRAME') return;
-          if (el.style.visibility === 'hidden') {{
-            el.style.setProperty('visibility', 'visible', 'important');
-            el.style.setProperty('opacity', '1', 'important');
-          }}
-        }});
-      }});
-      obs.observe(par.document.body, {{
-        subtree: true, attributes: true, attributeFilter: ['style']
-      }});
-      par.window[OBS_KEY] = obs;
-    }}
-  }} catch(e) {{ /* cross-origin guard */ }}
-}})();
 
-// INSTANT CLOSE DIALOG LOCK
-try {{
-  var par = window.parent.document;
-  if (!par.window.__stModalLocked) {{
-    par.window.__stModalLocked = true;
-    function blockOutsideClicks(e) {{
-      var dialog = par.querySelector('[data-testid="stDialog"]');
-      if (dialog && !dialog.contains(e.target)) {{
-        e.stopPropagation();
-        e.preventDefault();
-      }}
-    }}
-    par.addEventListener('mousedown', blockOutsideClicks, true);
-    par.addEventListener('mouseup', blockOutsideClicks, true);
-    par.addEventListener('click', blockOutsideClicks, true);
-  }}
-}} catch(e) {{ console.error("Could not lock dialog", e); }}
+// blockOutsideClicks removed — dismissible=False in Python handles this
+// and the capture listeners were preventing Streamlit buttons from firing
 
 function escapeHtml(u){{return(u||"").toString().replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");}}
-var CARDS = {cards_json};
-var COMMITTED = {committed_json};
-var POOR_IMG_SIDS = new Set({poor_img_sids_json});
-var PREFETCH_URLS = {prefetch_json};
+window.__IS_GRID_IFRAME__ = true;
+var CARDS = [];
+var COMMITTED = {{}};
+var POOR_IMG_SIDS = new Set();
+var PREFETCH_URLS = {{}};
 var PLACEHOLDER = "{_PLACEHOLDER_SVG}";
+var _lastCardsSig = null;
+
+window.addEventListener('message', function(e) {{
+  if (e.data && e.data.type === 'SYNC_STATE') {{
+    var cardsChanged = false;
+    if (e.data.cards) {{
+      // A new page/filter/sort of cards arrived over postMessage instead
+      // of via a full srcdoc reload. This is what avoids the multi-flicker
+      // on page turns: the iframe document itself never reloads, so
+      // already-decoded images for repeated URLs aren't re-fetched, and
+      // the browser doesn't tear down/rebuild the whole DOM.
+      var sig = e.data.cards_sig || null;
+      if (sig === null || sig !== _lastCardsSig) {{
+        CARDS = e.data.cards;
+        _lastCardsSig = sig;
+        cardsChanged = true;
+      }}
+    }}
+    if (e.data.committed) COMMITTED = e.data.committed;
+    if (e.data.poor_img_sids) POOR_IMG_SIDS = new Set(e.data.poor_img_sids);
+    if (e.data.prefetch) PREFETCH_URLS = e.data.prefetch;
+    closeGhostOverlay();
+
+    var oldScroll = window.scrollY;
+    renderAll();
+    // Only reset scroll to top on an actual page/filter change (cardsChanged);
+    // for committed/poor_img/prefetch-only syncs, preserve scroll position.
+    if (cardsChanged && e.data.scroll_to_top) {{
+      window.scrollTo(0, 0);
+    }} else {{
+      window.scrollTo(0, oldScroll);
+    }}
+  }}
+}});
 var LABELS = {labels_json};
+var DEFAULT_PAGE_SIZE = {items_per_page};
+var PAGE_SIZE_OPTIONS = [20, 50, 100, 200, 500];
+var PAGE_STATE = {{
+  pageSize: DEFAULT_PAGE_SIZE,
+  page: 1,
+  search: '',
+  sellers: [],
+  categories: []
+}};
 
 window._gridSelected = window._gridSelected || {{}};
 window._stagedRejections = window._stagedRejections || {{}};
 window.currentZoomSid = null;
 window._imageIssues = window._imageIssues || {{}};
+// URLs whose images have already loaded once in this iframe session. Cards with
+// a cached URL are re-rendered fully visible (no shimmer/fade), so page
+// turns don't flicker for images the browser already has.
+window._loadedImgs = window._loadedImgs || new Set();
 CARDS.forEach(c => {{
   if (c.warnings && c.warnings.length) {{
     if (!window._imageIssues[c.sid]) window._imageIssues[c.sid] = [];
@@ -1991,7 +2329,7 @@ window._undoTimer = null;
 var selected = window._gridSelected;
 var staged = window._stagedRejections;
 
-function showGhostOverlay(msgText) {{
+function showGhostOverlay(msgText, autoHideMs) {{
   var ghost = document.createElement('div');
   ghost.id = '__grid_ghost__';
   ghost.style.cssText = 'position:fixed;z-index:99999;inset:0;background:rgba(255,255,255,0.85);display:flex;align-items:center;justify-content:center;font-family:sans-serif;color:#FF8800;transition:opacity 0.4s ease;';
@@ -1999,10 +2337,18 @@ function showGhostOverlay(msgText) {{
   var existing = document.getElementById('__grid_ghost__');
   if (existing) existing.remove();
   document.body.appendChild(ghost);
+  // Default auto-hide: short overlays (notifications) use 4s, long ops use the caller's value.
+  // For batch ops we use a long timeout so the overlay stays until Streamlit reloads the page.
+  var hideDelay = (typeof autoHideMs === 'number') ? autoHideMs : 4000;
   setTimeout(function() {{
     var g = document.getElementById('__grid_ghost__');
     if (g) {{ g.style.opacity = '0'; setTimeout(function() {{ if(g && g.parentNode) g.remove(); }}, 400); }}
-  }}, 4000);
+  }}, hideDelay);
+}}
+
+function closeGhostOverlay() {{
+  var g = document.getElementById('__grid_ghost__');
+  if (g) {{ g.style.opacity = '0'; setTimeout(function() {{ if(g && g.parentNode) g.remove(); }}, 400); }}
 }}
 
 function sendMsg(type, payload) {{
@@ -2010,12 +2356,13 @@ function sendMsg(type, payload) {{
     var par = window.parent;
     var inputs = par.document.querySelectorAll('input[type="text"]');
     var bridge = null;
+    var targetPlaceholder = (type === 'change_lang') ? 'LANG_BRIDGE_DO_NOT_USE' : 'JTBRIDGE_UNIQUE_DO_NOT_USE';
     for (var i = 0; i < inputs.length; i++) {{
-      if (inputs[i].getAttribute('aria-label') === 'jtbridge' || inputs[i].placeholder === 'JTBRIDGE_UNIQUE_DO_NOT_USE') {{
+      if (inputs[i].placeholder === targetPlaceholder || (targetPlaceholder === 'JTBRIDGE_UNIQUE_DO_NOT_USE' && inputs[i].getAttribute('aria-label') === 'jtbridge')) {{
         bridge = inputs[i]; break;
       }}
     }}
-    if (!bridge) return;
+    if (!bridge) {{ console.warn('sendMsg: bridge not found for', type); return; }}
     var msg = JSON.stringify({{action: type, payload: payload}});
     var nativeInputValueSetter = Object.getOwnPropertyDescriptor(par.HTMLInputElement.prototype, 'value').set;
     nativeInputValueSetter.call(bridge, msg);
@@ -2032,54 +2379,16 @@ function scrollToTop() {{
 }}
 
 function updateParentPagination() {{
-  var pending = Object.keys(selected).length + Object.keys(staged).length;
-  try {{
-    var par = window.parent.document;
-    var buttons = par.querySelectorAll('button');
-    buttons.forEach(b => {{
-      var txt = b.innerText || "";
-      if (txt.includes('Close') && !b.dataset.fastCloseBound) {{
-        b.dataset.fastCloseBound = "true";
-        b.addEventListener('click', function() {{
-          var modalContainer = par.querySelector('div[data-testid="stModal"]');
-          if (modalContainer) {{
-            modalContainer.style.transition = 'opacity 0.15s ease-out';
-            modalContainer.style.opacity = '0';
-            setTimeout(() => modalContainer.style.display = 'none', 150);
-          }}
-        }});
-      }}
-      if (txt.includes('Prev Page') || txt.includes('Next Page') || txt.includes('Close')) {{
-        if (pending > 0 && !txt.includes('Close')) {{
-          b.style.pointerEvents = 'none';
-          b.style.opacity = '0.3';
-          b.title = "Confirm or clear your selections before navigating.";
-        }} else {{
-          b.style.pointerEvents = 'auto';
-          b.style.opacity = '1';
-          b.title = "";
-        }}
-      }}
-    }});
-    var inputs = par.querySelectorAll('input[type="number"]');
-    inputs.forEach(inp => {{
-      var wrapper = inp.closest('div[data-testid="stNumberInput"]');
-      if (wrapper && wrapper.innerText.includes('Jump to Page')) {{
-        if (pending > 0) {{
-          wrapper.style.pointerEvents = 'none';
-          wrapper.style.opacity = '0.3';
-          wrapper.title = "Confirm or clear your selections before navigating.";
-        }} else {{
-          wrapper.style.pointerEvents = 'auto';
-          wrapper.style.opacity = '1';
-          wrapper.title = "";
-        }}
-      }}
-    }});
-  }} catch(e) {{}}
+  // Parent pagination control removed — Streamlit handles Prev/Next natively
 }}
 
 function onImgLoad(img, sid) {{
+  // If data-lazy-src is still pending, this onload was for the PLACEHOLDER,
+  // not the real image. Ignore it: marking img-loaded here faded in the gray
+  // placeholder, then the real src swap hard-popped over it (double flash),
+  // and the placeholder's dimensions could add bogus Low-Resolution warnings.
+  if (img.dataset.lazySrc) return;
+  window._loadedImgs.add(img.getAttribute('src'));
   img.classList.remove('skeleton');
   img.classList.add('img-loaded');
   var wrap = img.closest('.card-img-wrap');
@@ -2087,7 +2396,7 @@ function onImgLoad(img, sid) {{
   var w = img.naturalWidth, h = img.naturalHeight;
   var warns = [];
   if (w > 0 && h > 0) {{
-    if (w < 200 || h < 200) warns.push('Low Resolution');
+    if (w < 250 || h < 250) warns.push('Low Resolution');
     var ratio = h / w;
     if (ratio > 1.5) warns.push('Tall (Screenshot?)');
     else if (ratio < 0.6) warns.push('Wide Aspect');
@@ -2116,7 +2425,11 @@ function getLazyObserver() {{
 function activateLazyImages() {{
   var observer = getLazyObserver();
   if (!observer) return;
-  document.querySelectorAll('img.card-img[data-lazy-src]').forEach(function(img) {{
+  // Only observe images we haven't already handed to the observer — this used
+  // to rescan and re-observe the whole document on every render chunk (O(n²)
+  // with 500 cards/page).
+  document.querySelectorAll('img.card-img[data-lazy-src]:not([data-lz-obs])').forEach(function(img) {{
+    img.setAttribute('data-lz-obs', '1');
     observer.observe(img);
   }});
 }}
@@ -2176,11 +2489,34 @@ function buildCardActionsHtml(safeSid, warnings, cardData) {{
     'Product Warranty':       ['REJECT_WARRANTY',       'Product Warranty'],
     'Warranty Check':         ['REJECT_WARRANTY',       'Product Warranty'],
     'FDA':                    ['REJECT_FDA',            'FDA'],
+    'Duplicate product':      ['REJECT_DUPLICATE',      'Duplicate Product'],
     'Wrong Variation':        ['REJECT_VARIATION',      'Wrong Variation'],
     'Variation Check':        ['REJECT_VARIATION',      'Wrong Variation'],
     'BRAND name repeated in NAME': ['REJECT_BRAND_IN_NAME', 'Brand in Name'],
-    'Product Name Brand Name':     ['REJECT_BRAND_IN_NAME', 'Brand in Name'],
-    'Title Language Check':   ['REJECT_TITLE_LANG',    'Title Language'],
+    'Product Name Brand Name – Brand Repeated In Title':                  ['REJECT_BRAND_IN_NAME', 'Brand Repeated In Title'],
+    'Product Name Brand Name – Inspired/Alternative Perfume Brand':       ['REJECT_BRAND_IN_NAME', 'Inspired/Alternative Perfume'],
+    'Product Name Brand Name – Generic/Placeholder Brand':                ['REJECT_BRAND_IN_NAME', 'Generic/Placeholder Brand'],
+    'Product Name Brand Name – High-End Brand Counterfeit Suspected':     ['REJECT_BRAND_IN_NAME', 'High-End Brand Counterfeit'],
+    'Product Name Brand Name – Other':                                    ['REJECT_BRAND_IN_NAME', 'Brand in Name (Other)'],
+    'Title Language Check - Not In English':                              ['REJECT_TITLE_LANG',    'Title Language'],
+    'Title Language Check - Other':                                       ['REJECT_TITLE_LANG',    'Title Language (Other)'],
+    'Suspected Fake Perfume':      ['REJECT_FAKE_PERFUME',   'Suspected Fake Perfume'],
+    'Suspicious Discount':         ['REJECT_SUSPICIOUS_DISCOUNT', 'Suspicious Discount'],
+    'Brand Image Mismatch':        ['REJECT_BRAND_MISMATCH', 'Brand Image Mismatch'],
+    'Off-Platform Contact':        ['REJECT_OFFPLATFORM',    'Off-Platform Contact'],
+    'Seller Not approved to sell Refurb':  ['REJECT_REFURB',         'Seller Not Approved (Refurb)'],
+    'Seller Approve to sell books':        ['REJECT_BOOKS_SELLER',   'Seller Not Approved (Books)'],
+    'Seller Approved to Sell Perfume':     ['REJECT_PERFUME_SELLER', 'Seller Not Approved (Perfume)'],
+    'Perfume Tester':              ['REJECT_PERFUME_TESTER',  'Perfume Tester'],
+    'Counterfeit Sneakers':        ['REJECT_SNEAKERS',        'Counterfeit Sneakers'],
+    'Suspected counterfeit Jerseys': ['REJECT_JERSEYS',       'Counterfeit Jerseys'],
+    'Unnecessary words in NAME':   ['REJECT_UNNECESSARY_WORDS', 'Unnecessary Words in Name'],
+    'Single-word NAME':            ['REJECT_SINGLE_WORD',     'Single-word Name'],
+    'Generic BRAND Issues':        ['REJECT_GENERIC_BRAND',   'Generic Brand Issues'],
+    'Fashion brand issues':        ['REJECT_FASHION_BRAND',   'Fashion Brand Issues'],
+    'Missing Weight/Volume':       ['REJECT_WEIGHT_VOL',      'Missing Weight/Volume'],
+    'Incomplete Smartphone Name':  ['REJECT_SMARTPHONE_NAME', 'Incomplete Smartphone Name'],
+    'Specs Inconsistency':         ['REJECT_SPECS_INCONSISTENCY', 'Specs Inconsistency'],
   }};
   var defaultCode  = 'REJECT_POOR_IMAGE';
   var defaultLabel = LABELS.poor_img;
@@ -2201,12 +2537,35 @@ function buildCardActionsHtml(safeSid, warnings, cardData) {{
     ['REJECT_PROHIBITED',    escapeHtml(LABELS.prohibited)],
     ['REJECT_COLOR',         escapeHtml(LABELS.missing_color)],
     ['REJECT_WRONG_BRAND',   escapeHtml(LABELS.wrong_brand)],
+    ['REJECT_FDA',           'FDA'],
+    ['REJECT_DUPLICATE',     'Duplicate Product'],
+    ['REJECT_BRAND_IN_NAME', 'Brand Repeated In Name'],
+    ['REJECT_FAKE_PERFUME',  'Suspected Fake Perfume'],
+    ['REJECT_BRAND_MISMATCH','Brand Image Mismatch'],
+    ['REJECT_OFFPLATFORM',   'Off-Platform Contact'],
+    ['REJECT_REFURB',        'Seller Not Approved (Refurb)'],
+    ['REJECT_BOOKS_SELLER',  'Seller Not Approved (Books)'],
+    ['REJECT_PERFUME_SELLER','Seller Not Approved (Perfume)'],
+    ['REJECT_PERFUME_TESTER','Perfume Tester'],
+    ['REJECT_SNEAKERS',      'Counterfeit Sneakers'],
+    ['REJECT_JERSEYS',       'Counterfeit Jerseys'],
+    ['REJECT_UNNECESSARY_WORDS', 'Unnecessary Words in Name'],
+    ['REJECT_SINGLE_WORD',   'Single-word Name'],
+    ['REJECT_GENERIC_BRAND', 'Generic Brand Issues'],
+    ['REJECT_FASHION_BRAND', 'Fashion Brand Issues'],
+    ['REJECT_WEIGHT_VOL',    'Missing Weight/Volume'],
+    ['REJECT_SMARTPHONE_NAME','Incomplete Smartphone Name'],
+    ['REJECT_SPECS_INCONSISTENCY', 'Specs Inconsistency'],
+    ['REJECT_WARRANTY',      'Product Warranty'],
+    ['REJECT_VARIATION',     'Wrong Variation'],
+    ['REJECT_TITLE_LANG',    'Title Not in English'],
+    ['REJECT_SUSPICIOUS_DISCOUNT', 'Suspicious Discount'],
     ['OTHER_CUSTOM',         'Other Reason (Custom)'],
   ];
   var optionsHtml = opts.map(function(o) {{
     return `<option value="${{o[0]}}">${{o[1]}}</option>`;
   }}).join('');
-  // Build pre-filled comment for Wrong Category rejections
+
   var autoCommentHtml = '';
   if (defaultCode === 'REJECT_WRONG_CAT' && (card.ai_caption || card.suggested_cat || card.cat_reason)) {{
     var parts = [];
@@ -2231,10 +2590,8 @@ function buildCardActionsHtml(safeSid, warnings, cardData) {{
   );
 }}
 
-// ── Smart Features Utility ──
 var UNNECESSARY_WORDS = {_js_json(support_files.get("unnecessary_words", []))};
 var PROHIBITED_WORDS = {_js_json(support_files.get("prohibited_words", []))};
-var SELLER_TRUST = {_js_json(seller_trust)};
 
 function getHighlightedName(card) {{
   var name = card.name;
@@ -2242,32 +2599,20 @@ function getHighlightedName(card) {{
   var words = [];
   if (warns.includes("Unnecessary words")) words = words.concat(UNNECESSARY_WORDS);
   if (warns.includes("Prohibited Words")) words = words.concat(PROHIBITED_WORDS);
-  
-  // Also highlight specific trigger flags
+
   if (warns.includes("BRAND name repeated in NAME")) words.push(card.brand);
-  
+
   if (words.length === 0) return card.name.length > 38 ? escapeHtml(card.name.slice(0,38)) + '\u2026' : escapeHtml(card.name);
-  
-  // Sort by length descending to avoid partial matches
+
   words.sort((a,b) => b.length - a.length);
   var regex = new RegExp('(' + words.map(w => w.replace(/[.*+?^${{}}()|[\\]\\\\]/g, '\\\\$&')).join('|') + ')', 'gi');
-  var hName = name.replace(regex, '<span class="hlt">$1</span>');
-  
-  // Truncate if still too long (preserving HTML tags is tricky, so we limit characters but skip tags)
+  // Escape the name BEFORE inserting highlight <span> markup \u2014 product names are
+  // seller-supplied data, so without this a name containing raw HTML/script would
+  // execute in the reviewer's browser via innerHTML.
+  var hName = escapeHtml(name).replace(regex, '<span class="hlt">$1</span>');
+
   return hName;
 }}
-
-window.rejectAllFromSeller = function(seller) {{
-  var sids = CARDS.filter(c => c.seller === seller).map(c => c.sid);
-  sids.forEach(sid => {{
-    if (!(sid in staged)) {{
-      if (sid in selected) delete selected[sid];
-      staged[sid] = "Bulk Seller Reject (High Risk)";
-      replaceCard(sid);
-    }}
-  }});
-  updateSelCount();
-}};
 
 function renderCard(card) {{
   var sid = card.sid;
@@ -2277,21 +2622,44 @@ function renderCard(card) {{
   var isSelected = sid in selected;
   var isPoorImgRej = isCommitted && POOR_IMG_SIDS.has(sid);
   var isBrandImgRej = isCommitted && (String(COMMITTED[sid]).includes('Brand Image Check'));
-  var cls = 'card' + (isCommitted ? ' committed-rej' + (isPoorImgRej ? ' poor-img-rej' : '') + (isBrandImgRej ? ' brand-image-rej' : '') : isStaged ? ' staged-rej' : '') + (isSelected ? ' selected' : '');
+  var cls = 'card'
+    + (isCommitted ? ' committed-rej' + (isPoorImgRej ? ' poor-img-rej' : '') + (isBrandImgRej ? ' brand-image-rej' : '') : isStaged ? ' staged-rej' : '')
+    + (card.is_manual_review && !isCommitted && !isStaged && !isSelected ? ' manual-review' : '')
+    + (isSelected ? ' selected' : '')
+    + (card.is_zip ? ' zip-card' : '');
 
   var safeImgSrcForHtml = card.img ? card.img.replace(/'/g, "%27").replace(/"/g, "%22") : PLACEHOLDER;
   var shortName = card.name.length > 38 ? escapeHtml(card.name.slice(0,38)) + '\u2026' : escapeHtml(card.name);
   var warnHtml = (card.warnings || []).map(w => `<span class="warn-badge">${{escapeHtml(w)}}</span>`).join('');
   if (card.is_duplicate) warnHtml += `<span class="warn-badge" style="background:#7c3aed;color:#fff;font-weight:800;">⧉ DUPLICATE</span>`;
-  if (card.is_manual_review) warnHtml += `<span class="warn-badge" style="background:#0369a1;color:#fff;font-weight:800;">👁 MANUAL REVIEW</span>`;
+  if (card.is_manual_review) {{
+    var mrText = card.qc_skip_reason ? `👁 MANUAL REVIEW: ${{escapeHtml(card.qc_skip_reason)}}` : `👁 MANUAL REVIEW`;
+    warnHtml += `<span class="warn-badge" style="background:#dc2626;color:#fff;font-weight:800;" title="${{escapeHtml(card.qc_skip_reason || 'Manual Review')}}">${{mrText}}</span>`;
+  }}
   if (card.color_mismatch) warnHtml += `<span class="warn-badge" style="background:#b45309;color:#fff;" title="${{escapeHtml(card.color_mismatch)}}">⚠ Color Mismatch</span>`;
-  var priceHtml = card.price ? `<div class="price-badge">${{escapeHtml(card.price)}}</div>` : '';
-  var colorHtml = card.color ? `<div class="co" title="Color: ${{escapeHtml(card.color)}}">Color: ${{escapeHtml(card.color)}}</div>` : '';
+  var priceText = String(card.price || '').trim();
+  var priceHtml = priceText ? `<div class="price-badge">${{escapeHtml(priceText)}}</div>` : '';
+
+  var colorLabel = card.is_manual_review ? 'Color-M' : 'Color';
+  var colorHtml = card.color ? `<div class="co" title="${{colorLabel}}: ${{escapeHtml(card.color)}}">${{colorLabel}}: ${{escapeHtml(card.color)}}</div>` : '';
+  var aiColorHtml = (card.color_ai && card.color_ai !== card.color) ? `<div class="ai-color-pill" title="AI detected: ${{escapeHtml(card.color_ai)}}">🎨 AI Color: ${{escapeHtml(card.color_ai)}}</div>` : '';
   var colorMismatchHtml = card.color_mismatch ? `<div class="co" style="color:#b45309;border-color:#fde68a;" title="${{escapeHtml(card.color_mismatch)}}">⚠ ${{escapeHtml(card.color_mismatch)}}</div>` : '';
   var catReasonHtml = (card.cat_reason && (card.warnings||[]).some(w => w.includes('Category'))) ?
     `<div class="co" style="color:#9333ea;font-size:10px;white-space:normal;line-height:1.3;" title="${{escapeHtml(card.cat_reason)}}">${{escapeHtml(card.cat_reason.length > 80 ? card.cat_reason.slice(0,80)+'…' : card.cat_reason)}}</div>` : '';
+  // Generic reason snippet for any other flag that has a Comment (Brand Image
+  // Mismatch, Off-Platform Contact, Restricted Brands, etc) — only shown when
+  // the richer category-specific reason above isn't already covering it, so
+  // reviewers can see WHY a card is flagged without opening the flag table.
+  var flagCommentHtml = (!catReasonHtml && card.flag_comment) ?
+    `<div class="co" style="color:#b91c1c;font-size:10px;white-space:normal;line-height:1.3;" title="${{escapeHtml(card.flag_comment)}}">${{escapeHtml(card.flag_comment.length > 90 ? card.flag_comment.slice(0,90)+'…' : card.flag_comment)}}</div>` : '';
   var suggestedCatHtml = card.suggested_cat ? `<div class="co" style="color:#0369a1;" title="AI suggests: ${{escapeHtml(card.suggested_cat)}}">→ ${{escapeHtml(card.suggested_cat.length > 50 ? card.suggested_cat.slice(0,50)+'…' : card.suggested_cat)}}</div>` : '';
-  var brandDetectedHtml = (isBrandImgRej && card.brand_detected) ? `<div class="co" style="background:#E8F5E9;color:#2E7D32;border:1px solid #C8E6C9;" title="Brand Detected: ${{escapeHtml(card.brand_detected)}}">Detected Brand: ${{escapeHtml(card.brand_detected)}}</div>` : '';
+  var aiBrandHtml = (card.brand_detected && card.brand_detected.toLowerCase() !== card.brand.toLowerCase()) ? `<div class="ai-brand-pill" title="AI detected brand: ${{escapeHtml(card.brand_detected)}}">🏷 AI Brand: ${{escapeHtml(card.brand_detected)}}</div>` : '';
+  var brandDetectedHtml = (isBrandImgRej && card.brand_detected) ? '<div class="co" style="background:#E8F5E9;color:#2E7D32;border:1px solid #C8E6C9;" title="Brand Detected: ' + escapeHtml(card.brand_detected) + '">Detected Brand: ' + escapeHtml(card.brand_detected) + '</div>' : '';
+  var zipBadgeHtml = card.is_zip ? '<span style="background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:#fff;font-size:10px;font-weight:900;padding:2px 8px;border-radius:6px;box-shadow:0 2px 4px rgba(0,0,0,0.15);margin-left:8px;display:inline-block;">ZIP</span>' : '';
+  if (card.zip_override) {{
+    var overrideType = card.zip_override === 'color' ? 'Color' : (card.zip_override === 'volume' ? 'Weight/Volume' : 'Warranty');
+    zipBadgeHtml += '<span style="background:linear-gradient(135deg,#10b981,#059669);color:#fff;font-size:10px;font-weight:900;padding:2px 8px;border-radius:6px;box-shadow:0 2px 4px rgba(0,0,0,0.15);margin-left:4px;display:inline-block;" title="Auto-approved by main ' + overrideType.toLowerCase() + ' check">🔓 ' + overrideType + ' Overridden</span>';
+  }}
 
   var zoomHtml = `<button class="zoom-btn" onclick="event.stopPropagation();showZoom('${{safeSid}}', event)" title="Preview">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -2300,12 +2668,17 @@ function renderCard(card) {{
     </svg></button>`;
 
   var imgIdx = CARDS.indexOf(card);
-  var isEager = imgIdx < {cols_per_row * 2};
+  // Already loaded once this session → render it fully visible immediately:
+  // direct src, no shimmer, no 0.4s fade. This is what stops the whole grid
+  // from flickering on page turns when the browser already has the images.
+  var isCachedImg = window._loadedImgs.has(safeImgSrcForHtml);
+  var isEager = isCachedImg || imgIdx < {cols_per_row * 2};
   var loadingAttr = isEager ? 'eager' : 'lazy';
   var priorityAttr = isEager ? 'fetchpriority="high"' : 'fetchpriority="low"';
   var imgSrcAttr = isEager
     ? `src="${{safeImgSrcForHtml}}"`
     : `src="${{PLACEHOLDER}}" data-lazy-src="${{safeImgSrcForHtml}}"`;
+  var loadedCls = isCachedImg ? ' img-loaded' : '';
 
   var overlayHtml = '', actHtml = '';
     if (isCommitted) {{
@@ -2343,21 +2716,14 @@ function renderCard(card) {{
     actHtml = buildCardActionsHtml(safeSid, card.warnings, card);
   }}
 
-    var trustBadge = '';
-    var score = SELLER_TRUST[card.seller] || 0;
-    if (score > 80) {{
-      trustBadge = `<div class="trust-badge" onclick="event.stopPropagation();window.rejectAllFromSeller('${{card.seller.replace(/'/g,"\\\\'")}}')" title="Seller has ${{score}}% rejection rate. Click to reject all from this seller.">High Risk Seller</div>`;
-    }}
-
   var dataAttrs = 'data-sid="' + escapeHtml(String(card.data_sid||'')) + '" data-name="' + escapeHtml(String(card.data_name||'')) + '" data-brand="' + escapeHtml(String(card.data_brand||'')) + '" data-cat="' + escapeHtml(String(card.data_cat||'')) + '"';
   return `<div class="${{cls}}" id="card-${{escapeHtml(sid)}}" ${{dataAttrs}} tabindex="0" onclick="window.toggleSelect('${{safeSid}}',event)">
-    <div class="card-img-wrap">
-      ${{trustBadge}}
+    <div class="card-img-wrap${{loadedCls}}">
       ${{priceHtml}}
       <div class="warn-wrap">${{warnHtml}}</div>
       <div id="debug-${{escapeHtml(sid)}}" class="debug-hud"></div>
       <img class="card-img-placeholder" src="${{PLACEHOLDER}}" alt="">
-      <img class="card-img" ${{imgSrcAttr}} decoding="async" loading="${{loadingAttr}}" ${{priorityAttr}} referrerpolicy="no-referrer"
+      <img class="card-img${{loadedCls}}" ${{imgSrcAttr}} decoding="async" loading="${{loadingAttr}}" ${{priorityAttr}} referrerpolicy="no-referrer"
             onload="onImgLoad(this,'${{safeSid}}')" onerror="onImgError(this,'${{safeSid}}')">
       ${{zoomHtml}}
       ${{overlayHtml}}
@@ -2365,12 +2731,18 @@ function renderCard(card) {{
     </div>
     <div class="meta">
       <div class="nm" title="${{escapeHtml(card.name)}}">${{getHighlightedName(card)}}</div>
-      <div class="br" title="${{escapeHtml(card.brand)}}">Brand: ${{escapeHtml(card.brand)}}</div>
-      <div class="ct" title="${{escapeHtml(card.cat)}}">Category: ${{escapeHtml(card.cat)}}</div>
-      <div class="sl" title="${{escapeHtml(card.seller)}}">Seller: ${{escapeHtml(card.seller)}}</div>
+      <div class="br" title="${{escapeHtml(card.brand)}}">Brand${{card.is_manual_review ? '-M' : ''}}: ${{escapeHtml(card.brand)}}</div>
+      ${{aiBrandHtml}}
+      <div class="ct" title="${{escapeHtml(card.cat)}}">Category${{card.is_manual_review ? '-M' : ''}}: ${{escapeHtml(card.cat)}}</div>
+      <div class="sl" title="${{escapeHtml(card.seller)}}" style="display:flex;align-items:center;">
+        <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">Seller: ${{escapeHtml(card.seller)}}</span>
+        ${{zipBadgeHtml}}
+      </div>
       ${{colorHtml}}
+      ${{aiColorHtml}}
       ${{colorMismatchHtml}}
       ${{catReasonHtml}}
+      ${{flagCommentHtml}}
       ${{suggestedCatHtml}}
       ${{brandDetectedHtml}}
     </div>
@@ -2389,6 +2761,7 @@ window.showZoom = function(sid, event) {{
   var img = document.getElementById('tooltip-img');
   img.src = card.img || PLACEHOLDER;
   img.onerror = function() {{ img.src = PLACEHOLDER; img.onerror = null; }};
+  document.getElementById('zoom-backdrop').style.display = 'block';
   tooltip.style.display = 'block';
   window.currentZoomSid = sid;
   var tw = 360, th = 360;
@@ -2407,7 +2780,26 @@ window.showZoom = function(sid, event) {{
 
 window.closeZoom = function() {{
   document.getElementById('zoom-tooltip').style.display = 'none';
+  document.getElementById('zoom-backdrop').style.display = 'none';
   window.currentZoomSid = null;
+}};
+
+window.zoomMove = function(dir) {{
+  if (!window.currentZoomSid) return;
+  var displayCards = getDisplayCards();
+  var idx = displayCards.findIndex(c => c.sid === window.currentZoomSid);
+  if (idx < 0) return;
+  var nextIdx = idx + dir;
+  if (nextIdx < 0) nextIdx = displayCards.length - 1;
+  if (nextIdx >= displayCards.length) nextIdx = 0;
+  var nextSid = displayCards[nextIdx].sid;
+
+  var el = document.getElementById('card-' + escapeHtml(nextSid));
+  if (el) el.scrollIntoView({{ block: 'nearest', inline: 'nearest' }});
+
+  var fakeEvent = {{ clientX: window.innerWidth/2, clientY: window.innerHeight/2 }};
+  window.currentZoomSid = null;
+  window.showZoom(nextSid, fakeEvent);
 }};
 
 document.addEventListener('click', function(e) {{
@@ -2421,18 +2813,33 @@ function updateSelCount() {{
   var pendingCount = (Object.keys(selected).length + Object.keys(staged).length);
   var pendingText = pendingCount + ' ' + LABELS.items_pending;
   document.querySelectorAll('.sel-count-text').forEach(el => el.textContent = pendingText);
-
-  var fab = document.getElementById('floating-action-bar');
-  if (fab) {{
-    if (pendingCount > 0) fab.classList.add('visible');
-    else fab.classList.remove('visible');
-    var fabTxt = document.getElementById('fab-count-txt');
-    if (fabTxt) fabTxt.textContent = pendingCount + ' ' + LABELS.items_pending.toUpperCase();
-  }}
   updateParentPagination();
 }}
 
 window._currentFilter = window._currentFilter || '';
+
+function _shortText(text, maxLen) {{
+  var t = String(text || '').trim();
+  if (!t) return '';
+  return t.length > maxLen ? t.slice(0, maxLen) + '\u2026' : t;
+}}
+
+function _readMultiSelectValues(id) {{
+  var el = document.getElementById(id);
+  if (!el) return [];
+  return Array.from(el.selectedOptions || []).map(function(opt) {{ return opt.value; }}).filter(Boolean);
+}}
+
+function _setMultiSelectValues(id, values) {{
+  var el = document.getElementById(id);
+  if (!el) return;
+  var set = new Set(values || []);
+  Array.from(el.options).forEach(function(opt) {{ opt.selected = set.has(opt.value); }});
+}}
+
+function _pageSizeValue() {{
+  return Math.max(1, parseInt(PAGE_STATE.pageSize || DEFAULT_PAGE_SIZE, 10) || DEFAULT_PAGE_SIZE);
+}}
 
 function getSortedCards() {{
   var sort = window._currentSort;
@@ -2450,22 +2857,113 @@ function getSortedCards() {{
   return sorted;
 }}
 
-function getDisplayCards() {{
+function getBaseFilteredCards() {{
   var cards = getSortedCards();
   var f = window._currentFilter;
-  if (!f) return cards;
-  if (f === 'committed') return cards.filter(function(c) {{ return c.sid in COMMITTED; }});
-  if (f === 'brand_ocr') return cards.filter(function(c) {{ return c.sid in COMMITTED && (COMMITTED[c.sid]||'').includes('Brand Image Check'); }});
-  if (f === 'no_flags') return cards.filter(function(c) {{ return !(c.warnings||[]).length && !(c.sid in COMMITTED) && !(c.sid in staged); }});
-  if (f === 'duplicates') return cards.filter(function(c) {{ return c.is_duplicate; }});
-  if (f === 'manual_review') return cards.filter(function(c) {{ return c.is_manual_review; }});
-  if (f === 'color_mismatch') return cards.filter(function(c) {{ return !!c.color_mismatch; }});
-  return cards.filter(function(c) {{
-    var inWarnings = (c.warnings||[]).some(function(w) {{ return w === f; }});
-    var inCommitted = c.sid in COMMITTED && (COMMITTED[c.sid]||'').replace(/_/g,' ').toLowerCase() === f.replace(/_/g,' ').toLowerCase();
-    return inWarnings || inCommitted;
-  }});
+  if (f) {{
+    if (f === 'committed') cards = cards.filter(function(c) {{ return c.sid in COMMITTED; }});
+    else if (f === 'brand_ocr') cards = cards.filter(function(c) {{ return c.sid in COMMITTED && (COMMITTED[c.sid]||'').includes('Brand Image Check'); }});
+    else if (f === 'no_flags') cards = cards.filter(function(c) {{ return !(c.warnings||[]).length && !(c.sid in COMMITTED) && !(c.sid in staged); }});
+    else if (f === 'duplicates') cards = cards.filter(function(c) {{ return c.is_duplicate; }});
+    else if (f === 'manual_review') cards = cards.filter(function(c) {{ return c.is_manual_review; }});
+    else if (f === 'color_mismatch') cards = cards.filter(function(c) {{ return !!c.color_mismatch; }});
+    else cards = cards.filter(function(c) {{
+      var inWarnings = (c.warnings||[]).some(function(w) {{ return w === f; }});
+      var inCommitted = c.sid in COMMITTED && (COMMITTED[c.sid]||'').replace(/_/g,' ').toLowerCase() === f.replace(/_/g,' ').toLowerCase();
+      return inWarnings || inCommitted;
+    }});
+  }}
+  var q = (PAGE_STATE.search || '').toLowerCase().trim();
+  if (q) {{
+    cards = cards.filter(function(c) {{
+      var text = [c.name, c.brand, c.sid, c.cat, c.seller].join(' ').toLowerCase();
+      return text.includes(q);
+    }});
+  }}
+  if (PAGE_STATE.sellers && PAGE_STATE.sellers.length) {{
+    var sellerSet = new Set(PAGE_STATE.sellers);
+    cards = cards.filter(function(c) {{ return sellerSet.has(c.seller); }});
+  }}
+  if (PAGE_STATE.categories && PAGE_STATE.categories.length) {{
+    var catSet = new Set(PAGE_STATE.categories);
+    cards = cards.filter(function(c) {{ return catSet.has(c.cat); }});
+  }}
+  return cards;
 }}
+
+function getDisplayCards() {{
+  var cards = getBaseFilteredCards();
+  var pageSize = _pageSizeValue();
+  var totalPages = Math.max(1, Math.ceil(cards.length / pageSize));
+  if (PAGE_STATE.page > totalPages) PAGE_STATE.page = totalPages;
+  if (PAGE_STATE.page < 1) PAGE_STATE.page = 1;
+  var start = (PAGE_STATE.page - 1) * pageSize;
+  return cards.slice(start, start + pageSize);
+}}
+
+function _updateFilterSummary(filteredCount) {{
+  var sellerCount = (PAGE_STATE.sellers || []).length;
+  var catCount = (PAGE_STATE.categories || []).length;
+  var searchActive = !!(PAGE_STATE.search || '').trim();
+  var searchCount = document.getElementById('search-count');
+  if (searchCount) searchCount.textContent = searchActive ? 'Active' : '0';
+  var sellerCountEl = document.getElementById('seller-selected-count');
+  if (sellerCountEl) sellerCountEl.textContent = 'Selected: ' + sellerCount;
+  var catCountEl = document.getElementById('category-selected-count');
+  if (catCountEl) catCountEl.textContent = 'Selected: ' + catCount;
+  var pageCountEl = document.getElementById('page-count');
+  if (pageCountEl) pageCountEl.textContent = 'Page ' + PAGE_STATE.page;
+  var summaryEl = document.getElementById('filter-summary');
+  if (summaryEl) {{
+    var parts = [];
+    if (searchActive) parts.push('Name: ' + _shortText(PAGE_STATE.search, 24));
+    parts.push('Seller: ' + sellerCount + ' selected');
+    parts.push('Category: ' + catCount + ' selected');
+    summaryEl.textContent = parts.join(' | ');
+  }}
+}}
+
+function _updatePageControls(totalCount) {{
+  var pageSize = _pageSizeValue();
+  var totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  if (PAGE_STATE.page > totalPages) PAGE_STATE.page = totalPages;
+  if (PAGE_STATE.page < 1) PAGE_STATE.page = 1;
+  var pageInfo = document.getElementById('page-info');
+  if (pageInfo) pageInfo.textContent = 'Page ' + PAGE_STATE.page + ' / ' + totalPages;
+  var prev = document.getElementById('page-prev');
+  var next = document.getElementById('page-next');
+  if (prev) prev.disabled = PAGE_STATE.page <= 1;
+  if (next) next.disabled = PAGE_STATE.page >= totalPages;
+}}
+
+window.goPage = function(delta) {{
+  var total = getBaseFilteredCards().length;
+  var totalPages = Math.max(1, Math.ceil(total / _pageSizeValue()));
+  PAGE_STATE.page = Math.max(1, Math.min(totalPages, PAGE_STATE.page + delta));
+  renderAll();
+}};
+
+window.resetAllFilters = function() {{
+  PAGE_STATE.search = '';
+  PAGE_STATE.sellers = [];
+  PAGE_STATE.categories = [];
+  PAGE_STATE.page = 1;
+  _setMultiSelectValues('seller-filter', []);
+  _setMultiSelectValues('category-filter', []);
+  var searchEl = document.getElementById('grid-search');
+  if (searchEl) searchEl.value = '';
+  renderAll();
+}};
+
+window._syncFilterState = function() {{
+  PAGE_STATE.search = (document.getElementById('grid-search') || {{ value: '' }}).value || '';
+  PAGE_STATE.sellers = _readMultiSelectValues('seller-filter');
+  PAGE_STATE.categories = _readMultiSelectValues('category-filter');
+  var pageSizeSel = document.getElementById('page-size-sel');
+  if (pageSizeSel) PAGE_STATE.pageSize = parseInt(pageSizeSel.value, 10) || DEFAULT_PAGE_SIZE;
+  PAGE_STATE.page = 1;
+  renderAll();
+}};
 
 window.applySort = function(val) {{
   window._currentSort = val;
@@ -2479,12 +2977,52 @@ window.applyFilter = function(val) {{
   renderAll();
 }};
 
+var _renderSeq = 0;
 function renderAll() {{
+  var seq = ++_renderSeq;
   var cards = getDisplayCards();
-  document.getElementById('card-grid').innerHTML = cards.map(renderCard).join('');
   var countEl = document.getElementById('grid-count');
   if (countEl) countEl.textContent = cards.length + ' products' + (window._currentFilter ? ' (filtered)' : '');
-  updateSelCount(); activateLazyImages();
+
+  var grid = document.getElementById('card-grid');
+
+  // Drop observations on the nodes we're about to replace so the observer
+  // doesn't accumulate dead entries across page turns.
+  if (_lazyObserver) _lazyObserver.disconnect();
+
+  if (cards.length === 0) {{
+    var hasFilters = !!(PAGE_STATE.search || '').trim() || (PAGE_STATE.sellers||[]).length || (PAGE_STATE.categories||[]).length || window._currentFilter;
+    grid.innerHTML = '<div class="empty-state"><div><div class="title">No products match your filters</div>' +
+      '<div class="desc">' + (hasFilters ? 'Try clearing the search, seller, or category filters.' : 'There are no products to show here.') + '</div></div>' +
+      (hasFilters ? '<div class="actions"><button class="toolbar-btn small" onclick="window.resetAllFilters()">Clear filters</button></div>' : '') +
+      '</div>';
+    return;
+  }}
+
+  // Build the page's HTML in rAF-spaced chunks (keeps the main thread
+  // responsive for 500-card pages) but insert it in ONE swap at the end.
+  // The old approach cleared the grid immediately (blank flash + page height
+  // collapse + scroll jump) and then painted 50 cards per frame — 10 visible
+  // "waves" of cards popping in on every page turn.
+  var chunkSize = 50;
+  var idx = 0;
+  var parts = [];
+
+  function buildChunk() {{
+    if (seq !== _renderSeq) return; // aborted by newer render
+    var chunk = cards.slice(idx, idx + chunkSize);
+    parts.push(chunk.map(renderCard).join(''));
+    idx += chunkSize;
+    if (idx < cards.length) {{
+      requestAnimationFrame(buildChunk);
+    }} else {{
+      grid.innerHTML = parts.join('');
+      activateLazyImages();
+      updateSelCount();
+    }}
+  }}
+
+  buildChunk();
 }}
 
 function replaceCard(sid) {{
@@ -2495,8 +3033,16 @@ function replaceCard(sid) {{
 }}
 
 window.doSelectAll = function() {{
-  CARDS.forEach(c => {{ if (!(c.sid in staged)) selected[c.sid] = true; }});
-  renderAll();
+  // Mark all non-staged cards as selected without a full renderAll().
+  // renderAll() rebuilds ALL card HTML which blocks the main thread for 500+ cards.
+  // Instead we just flip the CSS class on existing DOM nodes — O(n) DOM attr set vs O(n) innerHTML rebuild.
+  var grid = document.getElementById('card-grid');
+  CARDS.forEach(function(c) {{
+    if (c.sid in staged) return;
+    selected[c.sid] = true;
+    var el = grid ? grid.querySelector('#card-' + escapeHtml(c.sid)) : null;
+    if (el && !el.classList.contains('selected')) el.classList.add('selected');
+  }});
   updateSelCount();
 }};
 
@@ -2523,7 +3069,6 @@ window.stageReject = function(sid, r) {{
   var currentCard = CARDS.find(c => c.sid === sid);
   var toStage = [sid];
 
-  // Intelligent Similar Image Detection
   if (currentCard && (r === 'REJECT_POOR_IMAGE' || r.startsWith('REJECT_IMG_'))) {{
       CARDS.forEach(c => {{
           if (c.sid !== sid && (c.img === currentCard.img || (c.hash && c.hash === currentCard.hash))) {{
@@ -2532,9 +3077,8 @@ window.stageReject = function(sid, r) {{
       }});
   }}
 
-  // 🧠 Smart Feature: Linguistic Similarity Pre-flagging for Wrong Category
   if (r === 'REJECT_WRONG_CAT' && currentCard) {{
-      var nameTokens = currentCard.name.toLowerCase().split(/[^\w]+/).filter(w => w.length > 4);
+      var nameTokens = currentCard.name.toLowerCase().split(/[^\\w]+/).filter(w => w.length > 4);
       if (nameTokens.length > 0) {{
           CARDS.forEach(c => {{
               if (c.sid !== sid && !(c.sid in staged)) {{
@@ -2591,7 +3135,6 @@ window.undoReject = function(sid) {{
   window._pendingUndos[sid] = true;
   if (sid in selected) delete selected[sid];
 
-  // 1. Target exactly what to change so the image is NEVER re-drawn or flashed
   var safeSid = sid.replace(/'/g, "\\\\'");
   var cardEl = document.getElementById('card-' + escapeHtml(sid));
 
@@ -2606,13 +3149,11 @@ window.undoReject = function(sid) {{
       var _c = CARDS.find(c=>c.sid===safeSid)||{{}};
       cardEl.insertAdjacentHTML('beforeend', buildCardActionsHtml(safeSid, _c.warnings, _c));
 
-      // Add a slight shimmer to the card without blocking interaction
       cardEl.classList.add('undo-processing');
   }}
 
   updateSelCount();
 
-  // 2. Pin iframe AND wrapper height in parent to absolutely stop scroll jumpiness
   try {{
     var fe = window.frameElement;
     if (fe) {{
@@ -2624,7 +3165,6 @@ window.undoReject = function(sid) {{
     }}
   }} catch(e) {{}}
 
-  // 3. Ultra-fast debounce: 400ms. Still allows multiple swift clicks to process together.
   if (window._undoTimer) clearTimeout(window._undoTimer);
   window._undoTimer = setTimeout(function() {{
     var payload = Object.assign({{}}, window._pendingUndos);
@@ -2647,7 +3187,7 @@ window.undoReject = function(sid) {{
           document.querySelectorAll('.card.undo-processing').forEach(function(c) {{
             c.classList.remove('undo-processing');
           }});
-        }}, 1000); // Shorter cleanup window
+        }}, 1000);
       }});
     }});
   }}, 400);
@@ -2659,9 +3199,10 @@ window.doBatchReject = function(pos) {{
   var br = sel.value;
   if (br === 'OTHER_CUSTOM') {{
     showCustomReasonPanel(function(cmt) {{
-      if (!cmt) {{ sel.value = "REJECT_POOR_IMAGE"; return; }}
+      if (!cmt) {{ sel.value = "REJECT_POOR_IMAGE"; sel.dispatchEvent(new Event('change', {{bubbles: true}})); return; }}
       _applyBatchReject("Other Reason (Custom): " + cmt);
       sel.value = "REJECT_POOR_IMAGE";
+      sel.dispatchEvent(new Event('change', {{bubbles: true}}));
     }});
     return;
   }}
@@ -2673,10 +3214,8 @@ function _applyBatchReject(br) {{
   var autoC = window._autoComments || {{}};
   for (var s in staged) {{ payload[s] = staged[s]; count++; }}
   for (var s in selected) {{
-    // Allow overwriting committed items (e.g. re-reject brand-image-check with a different reason)
     payload[s] = br; count++;
   }}
-  // Attach auto-comments as a separate payload key for Streamlit to pick up
   var commentPayload = {{}};
   for (var s in payload) {{ if (autoC[s]) commentPayload[s] = autoC[s]; }}
   if (Object.keys(commentPayload).length) sendMsg('reject_comments', commentPayload);
@@ -2689,8 +3228,20 @@ function _applyBatchReject(br) {{
   var allSids = Object.assign({{}}, selected, staged);
   for (var s in payload) {{ COMMITTED[s] = payload[s]; }}
   for (var s in allSids) {{ delete selected[s]; delete staged[s]; }}
-  showGhostOverlay('Applying rejections...');
-  renderAll();
+  // Show overlay — keep it up for 90 s so it stays visible while Streamlit processes.
+  // The page will reload (st.rerun) when done, which naturally removes the overlay.
+  showGhostOverlay('Applying rejections…', 90000);
+  // Update card classes directly instead of full renderAll() to avoid blocking the
+  // main thread for 500 cards. Streamlit will do a full page reload after processing.
+  var grid = document.getElementById('card-grid');
+  for (var s in payload) {{
+    var el = grid ? grid.querySelector('#card-' + escapeHtml(s)) : null;
+    if (!el) continue;
+    el.classList.remove('selected', 'staged-rej');
+    el.classList.add('committed-rej');
+    // Dim the card visually so the user gets instant feedback
+    el.style.opacity = '0.55';
+  }}
   updateSelCount();
   sendMsg('reject', payload);
 }}
@@ -2735,7 +3286,6 @@ window.doBatchUndo = function() {{
   for (var s in payload) {{ delete COMMITTED[s]; }}
   for (var s in selected) {{ delete selected[s]; }}
 
-  // No Ghost Overlay here either, keeping batch undo fluid
   renderAll();
   updateSelCount();
   sendMsg('undo', payload);
@@ -2746,32 +3296,22 @@ window.doDeselAll = function() {{ for (var k in selected) delete selected[k]; fo
 (function() {{
   if (!PREFETCH_URLS || !PREFETCH_URLS.length) return;
   var statusEl = document.getElementById('prefetch-status');
-  var POOL_SIZE = 8;
-  var pool = [];
-  for (var p = 0; p < POOL_SIZE; p++) {{
-    var pi = new Image();
-    pi.referrerPolicy = "no-referrer";
-    pi.style.cssText = 'width:1px;height:1px;opacity:0;position:absolute;pointer-events:none;';
-    document.body.appendChild(pi);
-    pool.push(pi);
+  var i = 0, done = 0, total = PREFETCH_URLS.length;
+  function loadNext() {{
+    if (i >= total) return;
+    var url = PREFETCH_URLS[i++];
+    var img = new Image();
+    img.referrerPolicy = "no-referrer";
+    img.onload = img.onerror = function() {{
+      done++;
+      if (statusEl) statusEl.textContent = 'Prefetched ' + done + '/' + total;
+      loadNext();
+    }};
+    img.src = url;
   }}
-  var i = 0, done = 0, total = PREFETCH_URLS.length, slot = 0;
-  var runner = window.requestIdleCallback || function(fn){{setTimeout(fn,300);}};
-  function prefetchBatch() {{
-    var limit = POOL_SIZE, processed = 0;
-    while (i < total && processed < limit) {{
-      var url = PREFETCH_URLS[i++]; processed++;
-      var img = pool[slot % POOL_SIZE]; slot++;
-      img.onload = (function(u) {{ return function() {{
-        done++;
-        if (statusEl) statusEl.textContent = 'Prefetched ' + done + '/' + total;
-      }}; }})(url);
-      img.onerror = img.onload;
-      img.src = url;
-    }}
-    if (i < total) runner(prefetchBatch);
+  for (var j = 0; j < 8; j++) {{
+    loadNext();
   }}
-  setTimeout(prefetchBatch, 800);
 }})();
 
 window.addEventListener("scroll", function() {{
@@ -2780,7 +3320,6 @@ window.addEventListener("scroll", function() {{
 
 {scroll_js}
 
-// ── Keyboard shortcuts ────────────────────────────────────────────────────
 var _focusedSid = null;
 var _lastReason = 'REJECT_POOR_IMAGE';
 
@@ -2794,10 +3333,10 @@ function _moveFocus(dir) {{
   var idx = _focusedSid ? sids.indexOf(_focusedSid) : -1;
   idx = Math.max(0, Math.min(sids.length - 1, idx + dir));
   _focusedSid = sids[idx];
-  document.querySelectorAll('.card').forEach(function(c) {{ c.style.outline = ''; }});
+  document.querySelectorAll('.card').forEach(function(c) {{ c.style.borderLeft = ''; }});
   var el = document.getElementById('card-' + escapeHtml(_focusedSid));
   if (el) {{
-    el.style.outline = '3px solid #2196F3';
+    el.style.borderLeft = '4px solid #2196F3';
     el.scrollIntoView({{ block: 'nearest', inline: 'nearest' }});
   }}
 }}
@@ -2836,7 +3375,155 @@ document.addEventListener('keydown', function(e) {{
   if (el) el.addEventListener('change', function() {{ _lastReason = this.value; }});
 }});
 
-// 🚀 Live Search
+// Searchable reject-reason dropdown. The dropdown grew past 30 options once
+// every check got a manual reason — scrolling a native <select> that long is
+// real friction for a reviewer doing hundreds of rejects a day. This layers a
+// search box + "Recently used" section on top of the existing <select>
+// without touching how selections are read: the underlying <select>'s value
+// is still what doBatchReject() reads, so nothing downstream had to change.
+var RECENT_REASONS_KEY = 'pimqc_recent_reasons';
+function _getRecentReasons() {{
+  try {{ return JSON.parse(sessionStorage.getItem(RECENT_REASONS_KEY) || '[]'); }}
+  catch(e) {{ return []; }}
+}}
+function _pushRecentReason(value, label) {{
+  var recent = _getRecentReasons().filter(function(r) {{ return r.value !== value; }});
+  recent.unshift({{value: value, label: label}});
+  recent = recent.slice(0, 5);
+  try {{ sessionStorage.setItem(RECENT_REASONS_KEY, JSON.stringify(recent)); }} catch(e) {{}}
+}}
+
+function enhanceReasonSelect(selectId) {{
+  var sel = document.getElementById(selectId);
+  if (!sel || sel.dataset.rsearchEnhanced) return;
+  sel.dataset.rsearchEnhanced = '1';
+
+  // Flatten <option>/<optgroup> into {{value, label, group}} once, in DOM order.
+  var items = [];
+  Array.prototype.forEach.call(sel.children, function(node) {{
+    if (node.tagName === 'OPTGROUP') {{
+      Array.prototype.forEach.call(node.children, function(opt) {{
+        items.push({{value: opt.value, label: opt.textContent, group: node.label}});
+      }});
+    }} else if (node.tagName === 'OPTION') {{
+      items.push({{value: node.value, label: node.textContent, group: null}});
+    }}
+  }});
+  var byValue = {{}};
+  items.forEach(function(it) {{ byValue[it.value] = it; }});
+
+  sel.style.display = 'none';
+  var wrap = document.createElement('div');
+  wrap.className = 'rsearch-wrap';
+  var input = document.createElement('input');
+  input.className = 'rsearch-input';
+  input.type = 'text';
+  input.placeholder = 'Search reasons…';
+  input.autocomplete = 'off';
+  var panel = document.createElement('div');
+  panel.className = 'rsearch-panel';
+  panel.style.display = 'none';
+  wrap.appendChild(input);
+  wrap.appendChild(panel);
+  sel.parentNode.insertBefore(wrap, sel.nextSibling);
+
+  var initial = byValue[sel.value];
+  if (initial) input.value = initial.label;
+
+  var hlIndex = -1;
+  var visibleItems = [];
+
+  function renderPanel() {{
+    var q = input.value.trim().toLowerCase();
+    var recent = q ? [] : _getRecentReasons().filter(function(r) {{ return byValue[r.value]; }});
+    var filtered = items.filter(function(it) {{
+      return !q || it.label.toLowerCase().indexOf(q) !== -1;
+    }});
+    visibleItems = [];
+    var html = '';
+    if (recent.length) {{
+      html += '<div class="rsearch-group-label">Recently used</div>';
+      recent.forEach(function(it) {{ visibleItems.push(it); }});
+    }}
+    var lastGroup = recent.length ? '\\u0000' : null;
+    filtered.forEach(function(it) {{
+      if (it.group !== lastGroup) {{ lastGroup = it.group; }}
+      visibleItems.push(it);
+    }});
+    if (!visibleItems.length) {{
+      panel.innerHTML = '<div class="rsearch-empty">No matching reasons</div>';
+      return;
+    }}
+    var seenGroup = null;
+    var idx = 0;
+    visibleItems.forEach(function(it, i) {{
+      var isRecent = recent.indexOf(it) !== -1;
+      var group = isRecent ? 'Recently used' : it.group;
+      if (group !== seenGroup && !isRecent) {{
+        html += '<div class="rsearch-group-label">' + escapeHtml(group || 'Other') + '</div>';
+      }}
+      seenGroup = isRecent ? seenGroup : group;
+      html += '<div class="rsearch-item" data-idx="' + i + '">' + escapeHtml(it.label) + '</div>';
+    }});
+    panel.innerHTML = html;
+    hlIndex = -1;
+  }}
+
+  function openPanel() {{ renderPanel(); panel.style.display = 'block'; }}
+  function closePanel() {{
+    panel.style.display = 'none';
+    var curr = byValue[sel.value];
+    input.value = curr ? curr.label : '';
+  }}
+  function selectItem(it) {{
+    sel.value = it.value;
+    sel.dispatchEvent(new Event('change', {{bubbles: true}}));
+    input.value = it.label;
+    _pushRecentReason(it.value, it.label);
+    panel.style.display = 'none';
+  }}
+  function setHighlight(i) {{
+    var nodes = panel.querySelectorAll('.rsearch-item');
+    nodes.forEach(function(n) {{ n.classList.remove('rsearch-hl'); }});
+    if (i >= 0 && i < nodes.length) {{
+      nodes[i].classList.add('rsearch-hl');
+      nodes[i].scrollIntoView({{block: 'nearest'}});
+    }}
+    hlIndex = i;
+  }}
+
+  // Keep the visible search box in sync whenever the underlying select's
+  // value changes from elsewhere (e.g. doBatchReject resetting it after the
+  // custom-reason panel closes) — selectItem() also fires 'change', so this
+  // is the single source of truth for the display text.
+  sel.addEventListener('change', function() {{
+    if (panel.style.display !== 'none') return; // avoid fighting live typing
+    var curr = byValue[sel.value];
+    input.value = curr ? curr.label : '';
+  }});
+
+  input.addEventListener('focus', openPanel);
+  input.addEventListener('input', openPanel);
+  input.addEventListener('keydown', function(e) {{
+    if (e.key === 'ArrowDown') {{ e.preventDefault(); if (panel.style.display === 'none') openPanel(); setHighlight(Math.min(hlIndex + 1, visibleItems.length - 1)); }}
+    else if (e.key === 'ArrowUp') {{ e.preventDefault(); setHighlight(Math.max(hlIndex - 1, 0)); }}
+    else if (e.key === 'Enter') {{ e.preventDefault(); if (hlIndex >= 0 && visibleItems[hlIndex]) selectItem(visibleItems[hlIndex]); else if (visibleItems.length === 1) selectItem(visibleItems[0]); }}
+    else if (e.key === 'Escape') {{ closePanel(); input.blur(); }}
+  }});
+  panel.addEventListener('mousedown', function(e) {{
+    var itemEl = e.target.closest('.rsearch-item');
+    if (!itemEl) return;
+    e.preventDefault();
+    var it = visibleItems[parseInt(itemEl.dataset.idx, 10)];
+    if (it) selectItem(it);
+  }});
+  document.addEventListener('click', function(e) {{
+    if (!wrap.contains(e.target)) closePanel();
+  }});
+}}
+enhanceReasonSelect('batch-reason-top');
+enhanceReasonSelect('batch-reason-bottom');
+
 (function() {{
   var _gs = document.getElementById('grid-search');
   if (_gs) _gs.addEventListener('input', function() {{
@@ -2852,7 +3539,6 @@ document.addEventListener('keydown', function(e) {{
   }});
 }})();
 
-// 🚀 Dark Mode
 var _dark = false;
 try {{ if (typeof localStorage !== 'undefined') {{ _dark = localStorage.getItem('gridDark') === '1'; }} }} catch(e) {{}}
 window.applyDark = function(on) {{
@@ -2867,14 +3553,11 @@ window.applyDark = function(on) {{
 window.toggleDark = function() {{ _dark = !_dark; applyDark(_dark); }}
 try {{ applyDark(_dark); }} catch(e) {{}}
 
-// (keyboard navigation handled by the listener above)
-
 window.batchApproveSingle = function(sid) {{
   window.parent.postMessage({{type:'staged_reject', sid:sid, reason:'Approved'}}, '*');
 }}
 
 window.batchApprove = function() {{
-  // Exclude already-committed items — approve only genuinely unreviewed selected items
   var sids = Object.keys(selected).filter(s => !(s in COMMITTED));
   if (sids.length === 0) return;
   if (confirm('Approve ' + sids.length + ' selected items?')) {{
@@ -2888,27 +3571,49 @@ try {{
 }} catch(e) {{
   document.getElementById('card-grid').innerHTML = '<div style="color:red;padding:20px;font-size:14px;font-family:monospace;white-space:pre-wrap;background:#fff3f3;border:2px solid red;border-radius:8px;margin:20px;">&#x26A0; JS ERROR in renderAll():<br>' + String(e) + '<br><br>Stack:<br>' + (e.stack||'') + '</div>';
 }}
+
 </script>
+
+<div id="cols-strip" style="position:fixed;bottom:0;left:0;width:100%;z-index:9999;background:var(--card);border-top:1px solid var(--border);display:flex;align-items:center;gap:6px;padding:3px 12px;height:26px;opacity:0.55;transition:opacity .2s;" onmouseenter="this.style.opacity='1'" onmouseleave="this.style.opacity='0.55'">
+  <span style="font-size:10px;font-weight:700;color:var(--text);opacity:.6;white-space:nowrap;letter-spacing:.5px;">⊞ COLS</span>
+  {_cols_btns}
+</div>
+
 </body>
 </html>"""
+    return _html_str, *_grid_sync_data
 
 
 @st.dialog(
     "Visual Review Mode", width="large", icon=":material/pageview:", dismissible=False
 )
 def visual_review_modal(support_files):
-
     scroll_top_flag = st.session_state.get("do_scroll_top", False)
     st.session_state.do_scroll_top = False
+    _wide_cols = st.session_state.get("grid_cols_per_row", 5) >= 6
+    if _wide_cols:
+        st.markdown("""
+        <style>
+        [data-testid="stDialog"] > div > div[role="dialog"] {
+            max-width: 96vw !important;
+            width: 96vw !important;
+        }
+        </style>""", unsafe_allow_html=True)
+    def _clear_grid_search_n():
+        st.session_state["grid_search_n"] = ""
+    def _clear_grid_filter_sellers():
+        st.session_state["grid_filter_sellers"] = []
+    def _clear_grid_filter_categories():
+        st.session_state["grid_filter_categories"] = []
+    def _clear_grid_filter_flag():
+        st.session_state["grid_filter_flag"] = ""
+    def _clear_grid_sort_issue():
+        st.session_state["grid_sort_issue"] = ""
 
     fr = st.session_state.final_report
     data = st.session_state.all_data_map
     all_rows = st.session_state.get("all_data_rows", data)
-    committed_rej_sids = {
-        k.replace("quick_rej_", "")
-        for k in st.session_state.keys()
-        if k.startswith("quick_rej_") and "reason" not in k
-    }
+    committed_rej_sids = set(st.session_state.get("quick_rejects", {}).keys())
 
     poor_img_rej_sids = set(
         fr[
@@ -2928,32 +3633,6 @@ def visual_review_modal(support_files):
         | (fr["ProductSetSid"].isin(committed_rej_sids))
         | (fr["ProductSetSid"].isin(poor_img_rej_sids))
     ]
-
-    c1, c2, c3, c4 = st.columns(
-        [1.5, 1.5, 1.5, 0.8], gap="large", vertical_alignment="bottom"
-    )
-    with c1:
-        search_n = st.text_input(
-            "Search by Name", placeholder="Product name…", icon=":material/search:",
-            key="grid_search_n",
-        )
-    with c2:
-        search_sc = st.text_input(
-            "Search by Seller/Category",
-            placeholder="Seller or Category…",
-            icon=":material/store:",
-            key="grid_search_sc",
-        )
-    with c3:
-        st.session_state.grid_items_per_page = st.select_slider(
-            "Items per page",
-            options=[20, 50, 100, 200],
-            value=st.session_state.get("grid_items_per_page", 50),
-        )
-    with c4:
-        if st.button("Close", width='stretch', type="secondary"):
-            st.session_state.show_review_modal = False
-            st.rerun()
 
     if "MAIN_IMAGE" not in data.columns:
         data["MAIN_IMAGE"] = ""
@@ -2991,292 +3670,584 @@ def visual_review_modal(support_files):
                 )
             )
 
-    # ── Save/restore grid page per search context ─────────────────────────────
-    # When the user types a search term, save the current page for the old context
-    # and restore the saved page for the new context (default 0).
-    # This means clearing the search always returns to the exact page they were on.
+    curr_search_n = st.session_state.get("grid_search_n", "")
+    curr_sellers = st.session_state.get("grid_filter_sellers", [])
+    curr_categories = st.session_state.get("grid_filter_categories", [])
+
+    seller_base_df = review_data
+    if curr_categories and "CATEGORY" in seller_base_df.columns:
+        seller_base_df = seller_base_df[seller_base_df["CATEGORY"].astype(str).isin(curr_categories)]
+    
+    seller_opts = sorted(
+        {
+            str(v).strip()
+            for v in seller_base_df.get("SELLER_NAME", pd.Series(dtype=str)).dropna().astype(str)
+            if str(v).strip() and str(v).strip().lower() != "nan"
+        }
+    )
+
+    category_base_df = review_data
+    if curr_sellers and "SELLER_NAME" in category_base_df.columns:
+        category_base_df = category_base_df[category_base_df["SELLER_NAME"].astype(str).isin(curr_sellers)]
+    
+    category_opts = sorted(
+        {
+            str(v).strip()
+            for v in category_base_df.get("CATEGORY", pd.Series(dtype=str)).dropna().astype(str)
+            if str(v).strip() and str(v).strip().lower() != "nan"
+        }
+    )
+
+    for s in curr_sellers:
+        if s not in seller_opts: seller_opts.append(s)
+    for c in curr_categories:
+        if c not in category_opts: category_opts.append(c)
+    seller_opts.sort()
+    category_opts.sort()
+
+    c1, c2, c3, c4 = st.columns(
+        [1.5, 1.5, 1.5, 0.8], gap="large", vertical_alignment="bottom"
+    )
+    with c1:
+        c1a, c1b = st.columns([6, 1], vertical_alignment="bottom", gap="small")
+        with c1a:
+            search_n = st.text_input(
+                "Search by Name, Brand, or SID", placeholder="Product name, brand, SID…", icon=":material/search:",
+                key="grid_search_n",
+            )
+        with c1b:
+            st.button("✖", key="clr_n", help="Clear search", on_click=_clear_grid_search_n, disabled=not bool(curr_search_n))
+    with c2:
+        c2a, c2b = st.columns([6, 1], vertical_alignment="bottom", gap="small")
+        with c2a:
+            search_sellers = st.multiselect(
+                "Filter by Seller",
+                options=seller_opts,
+                default=curr_sellers,
+                key="grid_filter_sellers",
+            )
+        with c2b:
+            st.button("✖", key="clr_sellers", help="Clear seller filter", on_click=_clear_grid_filter_sellers, disabled=not bool(curr_sellers))
+    with c3:
+        c3a, c3b = st.columns([6, 1], vertical_alignment="bottom", gap="small")
+        with c3a:
+            search_categories = st.multiselect(
+                "Filter by Category",
+                options=category_opts,
+                default=curr_categories,
+                key="grid_filter_categories",
+            )
+        with c3b:
+            st.button("✖", key="clr_categories", help="Clear category filter", on_click=_clear_grid_filter_categories, disabled=not bool(curr_categories))
+
+    curr_flag = st.session_state.get("grid_filter_flag", "")
+    curr_sort = st.session_state.get("grid_sort_issue", "")
+
+    with c4:
+        if st.button("✕ Close", key="close_modal_top", type="secondary", use_container_width=True):
+            st.session_state.show_review_modal = False
+            st.rerun()
+        _ipp_opts = [20, 50, 100, 200, 500]
+        _current_ipp = st.session_state.get("grid_items_per_page", 50)
+        
+        if _current_ipp not in _ipp_opts:
+            _current_ipp = 500 if 500 in _ipp_opts else _ipp_opts[-1]
+            st.session_state.grid_items_per_page = _current_ipp
+            
+        _slider_key = "grid_ipp_slider"
+        
+        if _slider_key not in st.session_state:
+            st.session_state[_slider_key] = _current_ipp
+
+        def _on_ipp_change():
+            st.session_state.grid_items_per_page = st.session_state[_slider_key]
+
+        st.select_slider(
+            "Items per page",
+            options=_ipp_opts,
+            key=_slider_key,
+            on_change=_on_ipp_change,
+        )
+        st.session_state.grid_items_per_page = st.session_state[_slider_key]
+
     if "_grid_page_contexts" not in st.session_state:
         st.session_state._grid_page_contexts = {}
-    _curr_ctx = (search_n or "", search_sc or "")
-    _prev_ctx = st.session_state.get("_grid_last_ctx", ("", ""))
+    _curr_ctx = (
+        search_n or "",
+        tuple(sorted(search_sellers)) if search_sellers else (),
+        tuple(sorted(search_categories)) if search_categories else (),
+        curr_flag,
+        curr_sort,
+    )
+    _prev_ctx = st.session_state.get("_grid_last_ctx", ("", "", "", "", ""))
     if _curr_ctx != _prev_ctx:
         st.session_state._grid_page_contexts[_prev_ctx] = st.session_state.get("grid_page", 0)
         st.session_state.grid_page = st.session_state._grid_page_contexts.get(_curr_ctx, 0)
         st.session_state["_grid_last_ctx"] = _curr_ctx
-    # ──────────────────────────────────────────────────────────────────────────
 
     if search_n:
+        n_mask = review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)
+        b_mask = review_data.get("BRAND", pd.Series(dtype=str, index=review_data.index)).astype(str).str.contains(search_n, case=False, na=False)
+        s_mask = review_data.get("ProductSetSid", pd.Series(dtype=str, index=review_data.index)).astype(str).str.contains(search_n, case=False, na=False)
+        review_data = review_data[n_mask | b_mask | s_mask]
+    if search_sellers:
         review_data = review_data[
-            review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)
+            review_data["SELLER_NAME"].astype(str).isin(search_sellers)
         ]
-    if search_sc:
-        mc = (
-            review_data["CATEGORY"]
-            .astype(str)
-            .str.contains(search_sc, case=False, na=False)
-            if "CATEGORY" in review_data.columns
-            else pd.Series(False, index=review_data.index)
-        )
-        ms = (
-            review_data["SELLER_NAME"]
-            .astype(str)
-            .str.contains(search_sc, case=False, na=False)
-        )
-        review_data = review_data[mc | ms]
+    if search_categories and "CATEGORY" in review_data.columns:
+        review_data = review_data[
+            review_data["CATEGORY"].astype(str).isin(search_categories)
+        ]
 
-    # ========== GROUP BY SELLER ==========
-    review_data = review_data.sort_values(
-        by=["SELLER_NAME", "NAME"], na_position="last"
-    ).reset_index(drop=True)
-    # =====================================
+    # --- Shared warning computation -------------------------------------
+    # Single source of truth for per-SID warnings, used both for the
+    # flag/sort filter pass (over review_data, potentially many rows) and
+    # for the per-page display pass (over just page_data, ~ipp rows).
+    # Previously these were two separately-written implementations that
+    # could silently drift out of sync, and the page-display version did
+    # an O(n) DataFrame scan (`fr[fr["ProductSetSid"] == sid]`) per row
+    # instead of a dict lookup.
+    _fr_flag_map = dict(zip(fr["ProductSetSid"].astype(str), fr["FLAG"])) if "FLAG" in fr.columns else {}
+    _fr_comment_map = dict(zip(fr["ProductSetSid"].astype(str), fr["Comment"])) if "Comment" in fr.columns else {}
+    # Carry the flag's specific Comment (e.g. "Restricted brand 'Nike' detected
+    # on product image..." from Brand Image Mismatch, or the matched phone/URL
+    # from Off-Platform Contact) through to the card so reviewers see WHY a
+    # product was flagged without leaving the grid — previously only the
+    # Category Check reason had a dedicated slot on the card.
+    if _fr_comment_map:
+        review_data["Comment"] = review_data["ProductSetSid"].astype(str).map(_fr_comment_map)
+    _zip_index = st.session_state.get("_zip_sid_index")
+    _zip_status_cols = st.session_state.get("_zip_status_cols", [])
+    _zip_prefetch_map = st.session_state.get("_zip_prefetch_map", {})
+    _staged_sids = set(st.session_state.get("_stagedRejections", {}).keys())
+
+    def _compute_warnings(sid):
+        w = []
+        comment = str(_fr_comment_map.get(sid, "")).lower()
+        if "stretched" in comment or "tall" in comment: w.append("Tall (Screenshot?)")
+        if "stretched" in comment or "wide" in comment: w.append("Wide Aspect")
+        if "blurry" in comment or "low res" in comment or "resolution" in comment or "small" in comment: w.append("Low Resolution")
+
+        flag = _fr_flag_map.get(sid)
+        if pd.notna(flag) and flag not in ("Approved", "Manual review", "Approved by User"):
+            w.append(flag)
+
+        if _zip_index is not None and sid in _zip_index.index:
+            zrow = _zip_index.loc[sid]
+            if hasattr(zrow, "iloc") and hasattr(zrow, "shape") and len(zrow.shape) == 2:
+                zrow = zrow.iloc[0]
+            for zcol in _zip_status_cols:
+                if str(zrow.get(zcol, "")).lower() == "rejected":
+                    zflag = _zip_prefetch_map.get(zcol, zcol.replace("_Status", "").replace("_", " ").title())
+                    if zflag not in w: w.append(zflag)
+        
+        # Robust deduplication (ignoring trailing spaces)
+        unique_w = []
+        seen = set()
+        for flag in w:
+            cleaned = str(flag).strip()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                unique_w.append(cleaned)
+        return unique_w
+
+    if curr_flag or curr_sort:
+        review_data["_warnings"] = review_data["ProductSetSid"].apply(_compute_warnings)
+
+    if curr_flag:
+        if curr_flag == "committed":
+            review_data = review_data[review_data["ProductSetSid"].isin(committed_rej_sids)]
+        elif curr_flag == "brand_ocr":
+            review_data = review_data[review_data["ProductSetSid"].isin(committed_rej_sids) & review_data["_warnings"].apply(lambda w: "Brand Image Check" in w)]
+        elif curr_flag == "no_flags":
+            review_data = review_data[(~review_data["ProductSetSid"].isin(committed_rej_sids)) & (~review_data["ProductSetSid"].isin(_staged_sids)) & review_data["_warnings"].apply(lambda w: len(w) == 0)]
+        elif curr_flag == "duplicates":
+            review_data = review_data[review_data.get("is_duplicate", pd.Series(False, index=review_data.index)).astype(bool)]
+        elif curr_flag == "manual_review":
+            review_data = review_data[review_data.get("is_manual_review", pd.Series(False, index=review_data.index)).astype(bool)]
+        elif curr_flag == "color_mismatch":
+            review_data = review_data[review_data.get("color_mismatch", pd.Series(False, index=review_data.index)).astype(bool)]
+        else:
+            def has_flag(sid, w):
+                qrs = st.session_state.get("quick_rejects", {})
+                return curr_flag in w or (sid in qrs and str(qrs.get(sid, "")).replace("_", " ").lower() == curr_flag.replace("_", " ").lower())
+            review_data = review_data[review_data.apply(lambda r: has_flag(r["ProductSetSid"], r["_warnings"]), axis=1)]
+
+    if curr_sort:
+        if curr_sort == "most_flagged":
+            review_data["_w_count"] = review_data["_warnings"].apply(len)
+            review_data = review_data.sort_values(by=["_w_count"], ascending=False).drop(columns=["_w_count"])
+        elif curr_sort == "no_issue":
+            review_data["_has_issue"] = review_data["_warnings"].apply(lambda w: 1 if len(w) > 0 else 0)
+            review_data = review_data.sort_values(by=["_has_issue"], ascending=True).drop(columns=["_has_issue"])
+        else:
+            issue_map = {'low_res':'Low Resolution','tall':'Tall (Screenshot?)','wide':'Wide Aspect','broken':'Broken Image'}
+            target = issue_map.get(curr_sort, curr_sort)
+            review_data["_has_target"] = review_data["_warnings"].apply(lambda w: 0 if target in w else 1)
+            review_data = review_data.sort_values(by=["_has_target"], ascending=True).drop(columns=["_has_target"])
+    else:
+        review_data = review_data.sort_values(
+            by=["SELLER_NAME", "NAME"], na_position="last"
+        ).reset_index(drop=True)
 
     ipp = st.session_state.get("grid_items_per_page", 50)
     total_pages = max(1, (len(review_data) + ipp - 1) // ipp)
     if st.session_state.get("grid_page", 0) >= total_pages:
-        st.session_state.grid_page = 0
+        # Clamp to the nearest valid page instead of bouncing all the way
+        # back to page 0 — e.g. a user on page 9 who applies a filter that
+        # shrinks the result set to 7 pages should land on page 7, not 1.
+        st.session_state.grid_page = total_pages - 1
 
-    pg_cols = st.columns([1, 2, 1], vertical_alignment="center", gap="small")
+    st.markdown(f"<div style='margin-bottom:-10px;color:#6b7280;font-size:12px;'>Total items: {len(review_data)}</div>", unsafe_allow_html=True)
+
+    # ------------------------------------------------------------------
+    # Pagination controls
+    #
+    # IMPORTANT: `jump_top` and `jump_bot` are widget-backed session_state
+    # keys (they belong to the two st.number_input widgets below). Once a
+    # widget with a given key has been instantiated in a run, Streamlit
+    # forbids writing to that key again in the *same* run (it raises
+    # StreamlitAPIException). The old code tried to do exactly that from
+    # the "Prev"/"Next" button branches (`if st.button(...): st.session_state.jump_top = ...`)
+    # which broke as soon as both widgets existed on the page.
+    #
+    # The fix: drive all page changes through on_click / on_change
+    # callbacks. Callbacks run *before* the script body (and therefore
+    # before any widget is instantiated for that run), so it's always
+    # safe to set jump_top / jump_bot / grid_page there. Streamlit
+    # automatically reruns the script after a callback fires, so no
+    # manual st.rerun() is needed either.
+    # ------------------------------------------------------------------
+
+    def _goto_page(new_page_0idx):
+        new_page_0idx = max(0, min(total_pages - 1, new_page_0idx))
+        st.session_state.grid_page = new_page_0idx
+        st.session_state.jump_top = new_page_0idx + 1
+        st.session_state.jump_bot = new_page_0idx + 1
+        st.session_state.do_scroll_top = True
+
+    def _prev_page():
+        _goto_page(st.session_state.get("grid_page", 0) - 1)
+
+    def _next_page():
+        _goto_page(st.session_state.get("grid_page", 0) + 1)
+
+    def _jump_from_widget(source_key):
+        # Called on_change of whichever number_input the user actually typed into.
+        new_page_0idx = st.session_state[source_key] - 1
+        _goto_page(new_page_0idx)
+
+    # Keep jump_top/jump_bot initialized (only before their widgets exist,
+    # i.e. only if this is the very first time we see these keys).
+    if "jump_top" not in st.session_state:
+        st.session_state.jump_top = st.session_state.get("grid_page", 0) + 1
+    if "jump_bot" not in st.session_state:
+        st.session_state.jump_bot = st.session_state.get("grid_page", 0) + 1
+
+    pg_cols = st.columns([1, 2, 1], vertical_alignment="bottom", gap="small")
     with pg_cols[0]:
-        if st.button(
-            "Prev Page",
+        st.button(
+            "⬅ Prev",
             key="prev_top",
-            icon=":material/arrow_back:",
-            icon_position="left",
-            width='stretch',
+            use_container_width=True,
             disabled=st.session_state.get("grid_page", 0) == 0,
-        ):
-            st.session_state.grid_page = max(
-                0, st.session_state.get("grid_page", 0) - 1
-            )
-            st.session_state.do_scroll_top = True
-            st.rerun(scope="fragment")
+            on_click=_prev_page,
+        )
     with pg_cols[1]:
-        new_page = st.number_input(
-            f"Jump to Page (Total: {total_pages} | {len(review_data)} items)",
+        st.number_input(
+            f"Page (of {total_pages})",
             min_value=1,
             max_value=max(1, total_pages),
-            value=st.session_state.grid_page + 1,
-            step=1,
             key="jump_top",
+            on_change=_jump_from_widget,
+            args=("jump_top",),
         )
-        if new_page - 1 != st.session_state.grid_page:
-            st.session_state.grid_page = new_page - 1
-            st.session_state.do_scroll_top = True
-            st.rerun(scope="fragment")
     with pg_cols[2]:
-        if st.button(
-            "Next Page",
+        st.button(
+            "Next ➡",
             key="next_top",
-            icon=":material/arrow_forward:",
-            icon_position="right",
-            width='stretch',
+            use_container_width=True,
             disabled=st.session_state.grid_page >= total_pages - 1,
-        ):
-            st.session_state.grid_page += 1
-            st.session_state.do_scroll_top = True
-            st.rerun(scope="fragment")
+            on_click=_next_page,
+        )
 
-    page_start = st.session_state.grid_page * ipp
-    page_data = review_data.iloc[page_start : page_start + ipp]
+    st.progress(min(1.0, (st.session_state.grid_page + 1) / total_pages))
 
-    _poor_img_comments = (
-        fr[fr["FLAG"].isin(["Image Stretched", "Image Blurry", "Poor images"])]
-        .set_index("ProductSetSid")["Comment"]
-        .to_dict()
-    )
-    page_warnings = {}
-    for _sid in page_data["PRODUCT_SET_SID"].astype(str):
-        _comment = _poor_img_comments.get(_sid, "")
-        _warns = []
-        if _comment:
-            _cl = _comment.lower()
-            if "stretched" in _cl or "tall" in _cl:
-                _warns.append("Tall (Screenshot?)")
-            if "stretched" in _cl or "wide" in _cl:
-                _warns.append("Wide Aspect")
-            if (
-                "blurry" in _cl
-                or "low res" in _cl
-                or "resolution" in _cl
-                or "small" in _cl
-            ):
-                _warns.append("Low Resolution")
+    with st.spinner("Loading new page..."):
+        page_start = st.session_state.grid_page * ipp
+        page_data = review_data.iloc[page_start : page_start + ipp]
 
-        # 🚀 ADD ALL FLAGS FROM FINAL REPORT AS WARNINGS
-        _row_fr = fr[fr["ProductSetSid"].astype(str) == _sid]
-        if not _row_fr.empty:
-            _flag = _row_fr.iloc[0]["FLAG"]
-            if _flag and _flag not in ("Approved", "Manual review"):
-                _warns.append(_flag)
-            elif _flag == "Manual review":
-                _warns.append("Manual review")
+        # Reuse the same _compute_warnings() used for the flag/sort filter
+        # pass above, instead of a second, slightly-different
+        # implementation. This also replaces an O(n) DataFrame scan per
+        # row (`fr[fr["ProductSetSid"] == sid]`) with the dict lookups
+        # already built in _compute_warnings/_fr_flag_map.
+        page_warnings = {}
+        for _sid in page_data["PRODUCT_SET_SID"].astype(str):
+            _warns = _compute_warnings(_sid)
+            if _warns:
+                page_warnings[_sid] = _warns
 
-        # ADD PREFETCH ZIP FLAGS AS WARNINGS (warranty, FDA, color, category etc.)
-        _zip_index = st.session_state.get("_zip_sid_index")
-        if _zip_index is not None and _sid in _zip_index.index:
-            _zrow = _zip_index.loc[_sid]
-            if hasattr(_zrow, "iloc") and hasattr(_zrow, "shape") and len(_zrow.shape) == 2:
-                _zrow = _zrow.iloc[0]
-            _zip_status_cols = st.session_state.get("_zip_status_cols", [])
-            _zip_prefetch_map = st.session_state.get("_zip_prefetch_map", {})
-            for _zcol in _zip_status_cols:
-                if str(_zrow.get(_zcol, "")).lower() == "rejected":
-                    _zflag = _zip_prefetch_map.get(_zcol, _zcol.replace("_Status", "").replace("_", " ").title())
-                    if _zflag not in _warns:
-                        _warns.append(_zflag)
+        # Bounded prefetch cache: previously each distinct
+        # (page, len(review_data), ipp) combo added a brand-new permanent
+        # top-level session_state key that was never evicted, so a long
+        # session paging/filtering around would leak session_state
+        # entries indefinitely. Store all entries under one dict with a
+        # simple FIFO cap instead.
+        _PREFETCH_CACHE_MAX_ENTRIES = 30
+        if "_prefetch_cache" not in st.session_state:
+            st.session_state._prefetch_cache = OrderedDict()
+        _prefetch_cache = st.session_state._prefetch_cache
 
-        if _warns:
-            page_warnings[_sid] = list(dict.fromkeys(_warns)) # Remove duplicates
+        _prefetch_cache_key = f"{st.session_state.grid_page}_{len(review_data)}_{ipp}"
+        if _prefetch_cache_key not in _prefetch_cache:
+            prefetch_urls = []
+            _already_warm = set(st.session_state.get("_grid_warm_urls", []))
+            seen_urls = set(_already_warm)
+            for prefetch_page in [
+                st.session_state.grid_page + 1,
+                st.session_state.grid_page + 2,
+                st.session_state.grid_page + 3,
+            ]:
+                if prefetch_page >= total_pages:
+                    break
+                p_start = prefetch_page * ipp
+                for url in review_data.iloc[p_start : p_start + ipp]["MAIN_IMAGE"].astype(
+                    str
+                ):
+                    url = url.strip().replace("http://", "https://", 1)
+                    if url.startswith("https") and url not in seen_urls:
+                        seen_urls.add(url)
+                        prefetch_urls.append(url)
+            _prefetch_cache[_prefetch_cache_key] = prefetch_urls
+            _prefetch_cache.move_to_end(_prefetch_cache_key)
+            while len(_prefetch_cache) > _PREFETCH_CACHE_MAX_ENTRIES:
+                _prefetch_cache.popitem(last=False)
+        else:
+            _prefetch_cache.move_to_end(_prefetch_cache_key)
+            prefetch_urls = _prefetch_cache[_prefetch_cache_key]
 
-    # 🧠 Calculate Seller Trust Scoring
-    seller_trust = {}
-    if not fr.empty and "SELLER_NAME" in fr.columns:
-        _stats = fr.groupby("SELLER_NAME")["Status"].value_counts(normalize=True).unstack().fillna(0)
-        if "Rejected" in _stats.columns:
-            seller_trust = (_stats["Rejected"] * 100).round(1).to_dict()
+        qrs = st.session_state.get("quick_rejects", {})
+        rejected_state = {
+            sid.strip(): qrs[sid.strip()]
+            for sid in page_data["PRODUCT_SET_SID"].astype(str)
+            if sid.strip() in qrs
+        }
 
-    _prefetch_cache_key = f"prefetch_{st.session_state.grid_page}_{len(review_data)}"
-    if _prefetch_cache_key not in st.session_state:
-        prefetch_urls = []
-        _already_warm = set(st.session_state.get("_grid_warm_urls", []))
-        seen_urls = set(_already_warm)
-        for prefetch_page in [
-            st.session_state.grid_page + 1,
-            st.session_state.grid_page + 2,
-            st.session_state.grid_page + 3,
-        ]:
-            if prefetch_page >= total_pages:
-                break
-            p_start = prefetch_page * ipp
-            for url in review_data.iloc[p_start : p_start + ipp]["MAIN_IMAGE"].astype(
-                str
-            ):
-                url = url.strip().replace("http://", "https://", 1)
-                if url.startswith("https") and url not in seen_urls:
-                    seen_urls.add(url)
-                    prefetch_urls.append(url)
-        st.session_state[_prefetch_cache_key] = prefetch_urls
-    else:
-        prefetch_urls = st.session_state[_prefetch_cache_key]
+        _page_sids = page_data.get(
+            "PRODUCT_SET_SID", page_data.get("ProductSetSid", pd.Series())
+        ).astype(str)
+        _needs_poor_img_lookup = any(
+            s.strip() in poor_img_rej_sids and s.strip() not in rejected_state for s in _page_sids
+        )
+        if _needs_poor_img_lookup:
+            # Single stripped-key dict built once for this page instead of a full
+            # fr[...] scan repeated per row (was O(page_size * len(fr))).
+            _fr_flag_map_stripped = dict(zip(fr["ProductSetSid"].astype(str).str.strip(), fr["FLAG"])) if "FLAG" in fr.columns else {}
+            _fr_comment_map_stripped = dict(zip(fr["ProductSetSid"].astype(str).str.strip(), fr["Comment"])) if "Comment" in fr.columns else {}
+        else:
+            _fr_flag_map_stripped = {}
+            _fr_comment_map_stripped = {}
 
-    rejected_state = {
-        sid: st.session_state[f"quick_rej_reason_{sid}"]
-        for sid in page_data["PRODUCT_SET_SID"].astype(str)
-        if st.session_state.get(f"quick_rej_{sid}")
-    }
-
-    # 🚀 Build rejected_state for JS with stripped SIDs
-    for _sid_raw in page_data.get(
-        "PRODUCT_SET_SID", page_data.get("ProductSetSid", pd.Series())
-    ).astype(str):
-        _sid = _sid_raw.strip()
-        if _sid in poor_img_rej_sids and _sid not in rejected_state:
-            _row_fr = fr[fr["ProductSetSid"].astype(str).str.strip() == _sid]
-            if not _row_fr.empty:
-                _flag = str(_row_fr.iloc[0]["FLAG"])
-                _comment = str(_row_fr.iloc[0]["Comment"])
+        for _sid_raw in _page_sids:
+            _sid = _sid_raw.strip()
+            if _sid in poor_img_rej_sids and _sid not in rejected_state:
+                _flag = str(_fr_flag_map_stripped.get(_sid, ""))
+                _comment = str(_fr_comment_map_stripped.get(_sid, ""))
                 if "Brand Image Check" in _flag or "Brand Image Check" in _comment:
                     rejected_state[_sid] = "Brand Image Check"
                 else:
                     rejected_state[_sid] = "Poor images"
-            else:
-                rejected_state[_sid] = "Poor images"
 
-    cols_per_row = 5
-    skeleton_html = (
+        cols_per_row = st.session_state.get("grid_cols_per_row", 5)
+
+        grid_html = build_fast_grid_html(
+            page_data=page_data,
+            flags_mapping=support_files.get("flags_mapping", {}),
+            country=st.session_state.get("selected_country", "Kenya"),
+            page_warnings=page_warnings,
+            rejected_state=rejected_state,
+            cols_per_row=cols_per_row,
+            poor_img_sids=poor_img_rej_sids,
+            prefetch_urls=prefetch_urls,
+            scroll_to_top=scroll_top_flag,
+            show_images=st.session_state.get("show_images", True),
+            support_files=support_files,
+            curr_sort=curr_sort,
+            curr_flag=curr_flag,
+            items_per_page=ipp,
+        )
+
+    # Unpack the grid html and its sync data
+    _grid_html_str, _committed_json, _poor_img_sids_json, _prefetch_json, _cards_json = grid_html
+
+    st.markdown("""
+    <style>
+    div[data-testid="stElementContainer"]:has(iframe),
+    div[data-element-key="grid_iframe_container"],
+    div[data-element-key="grid_iframe_container"] iframe {
+        width: 100% !important;
+        max-width: 100% !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    with st.container(key="grid_iframe_container"):
+        _num_cards = len(page_data) if ('page_data' in locals() and isinstance(page_data, pd.DataFrame) and not page_data.empty) else 50
+        _cols_n = max(1, st.session_state.get("grid_cols_per_row", 5))
+        _num_rows = max(1, (_num_cards + _cols_n - 1) // _cols_n)
+        _card_h = 360 if st.session_state.get("show_images", True) else 180
+        _dynamic_iframe_h = max(750, _num_rows * _card_h + 150)
+        st.iframe(_grid_html_str, height=_dynamic_iframe_h)
+        # Inject a zero-height broadcaster that pushes state into the iframe via postMessage.
+        # Sending cards via postMessage prevents the entire iframe DOM from being torn down
+        # and rebuilt (which causes severe flickering) when changing pages.
+        _sync_html = f"""
+        <script>
+        (function() {{
+          function trySend(attemptsLeft) {{
+            try {{
+              for (var i = 0; i < window.parent.frames.length; i++) {{
+                try {{
+                  window.parent.frames[i].postMessage({{
+                    type: 'SYNC_STATE',
+                    committed: {_committed_json},
+                    poor_img_sids: {_poor_img_sids_json},
+                    prefetch: {_prefetch_json},
+                    cards: {_cards_json},
+                    scroll_to_top: {'true' if scroll_top_flag else 'false'}
+                  }}, '*');
+                }} catch(e2) {{}}
+              }}
+            }} catch(e) {{}}
+            if (attemptsLeft > 0) {{
+              setTimeout(function() {{ trySend(attemptsLeft - 1); }}, 200);
+            }}
+          }}
+          trySend(3);
+        }})();
+        </script>
         """
-<style>
-  .sk-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}
-  .sk-card{border-radius:12px;overflow:hidden;background:#f3f4f6;height:260px;
-           animation:pulse 1.4s ease-in-out infinite}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-</style>
-<div class="sk-grid">
-"""
-        + "".join(['<div class="sk-card"></div>'] * 12)
-        + "</div>"
+        st.iframe(_sync_html, height=1)
+    st.markdown("---")
+
+    pg_cols_bot = st.columns([1, 2, 1], vertical_alignment="bottom", gap="small")
+    with pg_cols_bot[0]:
+        st.button(
+            "⬅ Prev",
+            key="prev_bot",
+            use_container_width=True,
+            disabled=st.session_state.get("grid_page", 0) == 0,
+            on_click=_prev_page,
+        )
+    with pg_cols_bot[1]:
+        st.number_input(
+            f"Page (of {total_pages})",
+            min_value=1,
+            max_value=max(1, total_pages),
+            key="jump_bot",
+            on_change=_jump_from_widget,
+            args=("jump_bot",),
+        )
+    with pg_cols_bot[2]:
+        st.button(
+            "Next ➡",
+            key="next_bot",
+            use_container_width=True,
+            disabled=st.session_state.grid_page >= total_pages - 1,
+            on_click=_next_page,
+        )
+
+    st.progress(min(1.0, (st.session_state.grid_page + 1) / total_pages))
+
+    if st.button("✖ Close Review", key="close_bot_fallback", use_container_width=True, type="secondary"):
+        st.session_state.show_review_modal = False
+        st.rerun()
+
+
+@st.fragment
+def render_manual_review_buttons(support_files):
+    _fr = st.session_state.get("final_report", pd.DataFrame())
+    if _fr.empty or st.session_state.get("file_mode") == "post_qc":
+        return
+
+    if not _fr.empty and "Status" in _fr.columns and "FLAG" in _fr.columns:
+        _rej_count = int((
+            (_fr["Status"] == "Rejected") &
+            (_fr["FLAG"].astype(str).str.contains(r"\(Prefetched\)", na=False, case=False))
+        ).sum())
+    else:
+        _rej_count = 0
+
+    _audit_label = (
+        f"Targeted Audit  ({_rej_count:,} rejected)"
+        if _rej_count
+        else "Targeted Audit"
     )
 
-    placeholder = st.empty()
-    placeholder.html(skeleton_html)
-
-    grid_html = build_fast_grid_html(
-        page_data=page_data,
-        flags_mapping=support_files.get("flags_mapping", {}),
-        country=st.session_state.get("selected_country", "Kenya"),
-        page_warnings=page_warnings,
-        rejected_state=rejected_state,
-        cols_per_row=cols_per_row,
-        poor_img_sids=poor_img_rej_sids,
-        prefetch_urls=prefetch_urls,
-        scroll_to_top=scroll_top_flag,
-        show_images=st.session_state.get("show_images", True),
-        seller_trust=seller_trust,
-        support_files=support_files,
-    )
-
-    placeholder.empty()
-    st.iframe(grid_html, height=750)
+    has_zip_in_fr = not _fr.empty and "Is_Zip" in _fr.columns and _fr["Is_Zip"].any()
+    has_zip = has_zip_in_fr or st.session_state.get("no_computation_zip", False) or not st.session_state.get("zip_qc_results", pd.DataFrame()).empty
 
     st.markdown("---")
 
-    pg_cols_bot = st.columns([1, 2, 1, 1], vertical_alignment="center", gap="small")
-    with pg_cols_bot[0]:
-        if st.button(
-            "Prev Page",
-            key="prev_bot",
-            icon=":material/arrow_back:",
-            icon_position="left",
-            width='stretch',
-            disabled=st.session_state.get("grid_page", 0) == 0,
-        ):
-            st.session_state.grid_page = max(
-                0, st.session_state.get("grid_page", 0) - 1
+    if has_zip:
+        c1, c2, c3 = st.columns([2, 1, 1], gap="medium")
+        with c1:
+            st.header(_t("manual_review"), anchor=False)
+            st.caption(
+                "Use **Start Visual Review** to manually flip through products one by one, "
+                "or **Targeted Audit** to review all rejections grouped by flag type."
             )
-            st.session_state.do_scroll_top = True
-            st.rerun(scope="fragment")
-    with pg_cols_bot[1]:
-        new_page_bot = st.number_input(
-            f"Jump to Page (Total: {total_pages} | {len(review_data)} items)",
-            min_value=1,
-            max_value=max(1, total_pages),
-            value=st.session_state.grid_page + 1,
-            step=1,
-            key="jump_bot",
-        )
-        if new_page_bot - 1 != st.session_state.grid_page:
-            st.session_state.grid_page = new_page_bot - 1
-            st.session_state.do_scroll_top = True
-            st.rerun(scope="fragment")
-    with pg_cols_bot[2]:
-        if st.button(
-            "Next Page",
-            key="next_bot",
-            icon=":material/arrow_forward:",
-            icon_position="right",
-            width='stretch',
-            disabled=st.session_state.grid_page >= total_pages - 1,
-        ):
-            st.session_state.grid_page += 1
-            st.session_state.do_scroll_top = True
-            st.rerun(scope="fragment")
-    with pg_cols_bot[3]:
-        if st.button(
-            "Close Review", key="close_bot", width='stretch', type="secondary"
-        ):
-            st.session_state.show_review_modal = False
-            st.rerun()
+        with c2:
+            if st.button(
+                "Start Visual Review",
+                type="primary",
+                width='stretch',
+                icon=":material/pageview:",
+                key="btn_visual_review_main",
+            ):
+                st.session_state.show_review_modal = True
+                st.session_state.show_targeted_audit_modal = False
+        with c3:
+            if st.button(
+                _audit_label,
+                type="secondary",
+                width='stretch',
+                icon=":material/ads_click:",
+                key="btn_targeted_audit_main",
+            ):
+                st.session_state.show_targeted_audit_modal = True
+                st.session_state.show_review_modal = False
+    else:
+        c1, c2 = st.columns([3, 1], gap="medium")
+        with c1:
+            st.header(_t("manual_review"), anchor=False)
+            st.caption(
+                "Use **Start Visual Review** to manually flip through products one by one."
+            )
+        with c2:
+            if st.button(
+                "Start Visual Review",
+                type="primary",
+                width='stretch',
+                icon=":material/pageview:",
+                key="btn_visual_review_main",
+            ):
+                st.session_state.show_review_modal = True
+                st.session_state.show_targeted_audit_modal = False
+
+    if st.session_state.get("show_targeted_audit_modal", False):
+        targeted_audit_modal(support_files)
+    elif st.session_state.get("show_review_modal", False):
+        visual_review_modal(support_files)
 
 
 @st.fragment
 def render_image_grid(support_files):
     if (
-        st.session_state.final_report.empty
+        st.session_state.get("final_report", pd.DataFrame()).empty
         or st.session_state.get("file_mode") == "post_qc"
     ):
         return
-
-    st.markdown("---")
 
     _warm_urls = st.session_state.get("_grid_warm_urls", [])
     if _warm_urls:
@@ -3287,17 +4258,6 @@ def render_image_grid(support_files):
         st.markdown(
             f"<div style='display:none'>{_preload_tags}</div>", unsafe_allow_html=True
         )
-
-    c1, c2 = st.columns([3, 1], gap="medium")
-    with c1:
-        st.header(_t("manual_review"), anchor=False)
-        st.caption("Open Focus Mode to rapidly visually review and reject products.")
-    with c2:
-        if st.button("Start Visual Review", type="primary", width='stretch'):
-            st.session_state.show_review_modal = True
-
-    if st.session_state.get("show_review_modal", False):
-        visual_review_modal(support_files)
 
 
 def _render_export_card(title, df, desc, func, exports_config):
@@ -3357,26 +4317,34 @@ def render_exports_section(support_files, country_validator):
     fr = st.session_state.final_report
     data = st.session_state.all_data_map
 
-    # 🚀 Lazy Load All Data Rows if needed for exports
     if st.session_state.get("all_data_rows") is None:
         if "_data_filtered_ref" in st.session_state:
-            # First try the memory reference (only exists for current session if not garbage collected)
             st.session_state.all_data_rows = st.session_state._data_filtered_ref
         elif "current_sig_hash" in st.session_state:
-            # Fallback to loading from disk
             _fname = f"{st.session_state.current_sig_hash}_data_rows.parquet"
             st.session_state.all_data_rows = load_df_parquet(_fname)
 
     all_rows = st.session_state.get("all_data_rows", data)
     app_df = fr[fr["Status"] == "Approved"]
     rej_df = fr[fr["Status"] == "Rejected"]
-    c_code = st.session_state.get("selected_country", "Kenya")[:2].upper()
+    c_code = country_validator.code
     date_str = datetime.now().strftime("%Y-%m-%d")
     reasons_df = support_files.get("reasons", pd.DataFrame())
 
     st.markdown("---")
     st.header(_t("download_reports"), anchor=False)
     st.caption("Export QC results in Excel or ZIP format")
+
+    def _gen_override_report(log):
+        import io
+        df = pd.DataFrame(log) if log else pd.DataFrame(
+            columns=["Timestamp", "SID", "Product Name", "Rejection Flag",
+                     "Seller", "AI Reason", "Action"]
+        )
+        buf = io.BytesIO()
+        df.to_csv(buf, index=False)
+        buf.seek(0)
+        return buf, f"{c_code}_Audit_Overrides_{date_str}.csv", "text/csv"
 
     exports_config = [
         (

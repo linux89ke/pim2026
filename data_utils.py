@@ -2,10 +2,13 @@
 data_utils.py - Data loading, cleaning, transformation and validation helpers
 """
 
+import json
 import re
 import hashlib
 import logging
 import os
+import unicodedata
+import uuid
 import pandas as pd
 from io import BytesIO
 from typing import Dict, List, Set, Tuple, Optional
@@ -13,12 +16,28 @@ from dataclasses import dataclass
 
 from constants import NEW_FILE_MAPPING, COLOR_VARIANT_TO_BASE, MULTI_COUNTRY_VALUES, PARQUET_CACHE_DIR
 
+# ---------------------------------------------------------------------------
+# Load mojibake substitution map once at import time
+# ---------------------------------------------------------------------------
+_MOJIBAKE_MAP: Dict[str, str] = {}
+try:
+    _mj_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mojibake_map.json")
+    if os.path.exists(_mj_path):
+        with open(_mj_path, "r", encoding="utf-8") as _f:
+            _MOJIBAKE_MAP = json.load(_f)
+except Exception:
+    pass
+
 logger = logging.getLogger(__name__)
 
 def save_df_parquet(df, filename):
     try:
         os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
-        df.to_parquet(os.path.join(PARQUET_CACHE_DIR, filename))
+        pq_path = os.path.join(PARQUET_CACHE_DIR, filename)
+        # Write to a temp file then rename, so concurrent readers/writers never see a partial file.
+        tmp_path = f"{pq_path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        df.to_parquet(tmp_path)
+        os.replace(tmp_path, pq_path)
     except Exception as e:
         logger.warning(f"Failed to save parquet {filename}: {e}")
 
@@ -31,6 +50,116 @@ def load_df_parquet(filename):
         except Exception as e:
             logger.warning(f"Failed to load parquet {filename}: {e}")
     return None
+
+def list_cached_sessions():
+    sessions = []
+    if not os.path.exists(PARQUET_CACHE_DIR):
+        return sessions
+    for f in os.listdir(PARQUET_CACHE_DIR):
+        if f.endswith("_report.parquet"):
+            sig_hash = f.replace("_report.parquet", "")
+            path = os.path.join(PARQUET_CACHE_DIR, f)
+            mtime = os.path.getmtime(path)
+            try:
+                # Just get shape without full load if possible, or load it
+                df = load_df_parquet(f)
+                if df is not None:
+                    total = len(df)
+                    rej = len(df[df["Status"] == "Rejected"])
+                    sessions.append({
+                        "sig_hash": sig_hash,
+                        "mtime": mtime,
+                        "total": total,
+                        "rejected": rej
+                    })
+            except:
+                pass
+    sessions.sort(key=lambda x: x["mtime"], reverse=True)
+    return sessions
+
+
+# -------------------------------------------------
+# MANUAL DECISION JOURNAL
+# -------------------------------------------------
+# Manual approve/reject decisions are the only part of a review that cannot be
+# recomputed, so they are persisted twice:
+#   • inside {sig_hash}_report.parquet, which the startup fast path reloads, and
+#   • in the journal below, keyed on the uploaded FILE CONTENT alone.
+# The second key is what makes recovery reliable. sig_hash also folds in the
+# category-learning row count and PROCESSING_CACHE_VERSION, and either can
+# change between sessions; when that happens the checkpointed report is
+# orphaned under a hash nothing looks up again, and the decisions are lost even
+# though they sit on disk. The journal survives it: same files in ⇒ same key ⇒
+# decisions re-applied on top of a freshly validated report.
+
+MANUAL_DECISION_COLS = [
+    "ProductSetSid", "Status", "Reason", "Comment", "FLAG", "Is_Manual", "Is_Zip",
+]
+MANUAL_DECISION_PREFIX = "manual_"
+
+
+def manual_decisions_filename(process_signature: str) -> str:
+    """Journal filename for an uploaded file set (content-addressed, stable)."""
+    return f"{MANUAL_DECISION_PREFIX}{hashlib.md5(str(process_signature).encode()).hexdigest()}.parquet"
+
+
+def save_manual_decisions(process_signature: str, final_report) -> int:
+    """Persist every manually-decided row. Returns how many were written."""
+    if not process_signature or process_signature == "empty":
+        return 0
+    if not isinstance(final_report, pd.DataFrame) or final_report.empty:
+        return 0
+    if not {"Is_Manual", "ProductSetSid"}.issubset(final_report.columns):
+        return 0
+
+    fname = manual_decisions_filename(process_signature)
+    decided = final_report[final_report["Is_Manual"] == True]  # noqa: E712
+    cols = [c for c in MANUAL_DECISION_COLS if c in decided.columns]
+    decided = decided[cols].drop_duplicates(subset=["ProductSetSid"], keep="last")
+
+    if decided.empty:
+        # Undoing back to zero must clear the journal, or the next load would
+        # resurrect decisions the user deliberately removed.
+        try:
+            os.remove(os.path.join(PARQUET_CACHE_DIR, fname))
+        except OSError:
+            pass
+        return 0
+
+    save_df_parquet(decided, fname)
+    return len(decided)
+
+
+def load_manual_decisions(process_signature: str):
+    """Return the journalled decisions for an uploaded file set, or None."""
+    if not process_signature or process_signature == "empty":
+        return None
+    return load_df_parquet(manual_decisions_filename(process_signature))
+
+
+def apply_manual_decisions(final_report, decisions) -> int:
+    """Re-apply journalled decisions onto a report in place. Returns rows changed."""
+    if not isinstance(final_report, pd.DataFrame) or final_report.empty:
+        return 0
+    if not isinstance(decisions, pd.DataFrame) or decisions.empty:
+        return 0
+    if "ProductSetSid" not in final_report.columns or "ProductSetSid" not in decisions.columns:
+        return 0
+
+    fr_sids = final_report["ProductSetSid"].astype(str).str.strip()
+    dec = decisions.copy()
+    dec["ProductSetSid"] = dec["ProductSetSid"].astype(str).str.strip()
+    dec = dec.drop_duplicates(subset=["ProductSetSid"], keep="last").set_index("ProductSetSid")
+
+    mask = fr_sids.isin(dec.index)
+    if not mask.any():
+        return 0
+
+    target = fr_sids[mask]
+    for col in ("Status", "Reason", "Comment", "FLAG", "Is_Manual", "Is_Zip"):
+        if col in dec.columns and col in final_report.columns:
+            final_report.loc[mask, col] = target.map(dec[col])
+    return int(mask.sum())
 
 
 # -------------------------------------------------
@@ -52,7 +181,11 @@ def clean_category_code(code) -> str:
 def normalize_text(text: str) -> str:
     if pd.isna(text):
         return ""
-    text = str(text).lower().strip()
+    if str(text).strip().lower() in ("nan", "none"):
+        return ""
+    text = unicodedata.normalize("NFKD", str(text))
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = text.lower().strip()
     noise = r'\b(new|sale|original|genuine|authentic|official|premium|quality|best|hot|2024|2025)\b'
     text = re.sub(noise, '', text)
     text = re.sub(r'[^\w\s]', '', text)
@@ -67,11 +200,19 @@ def create_match_key(row: pd.Series) -> str:
     return f"{brand}|{name}|{color}"
 
 
+# Pre-compiled noise pattern shared by normalize_text and _normalize_series
+_NOISE_PATTERN = re.compile(
+    r'\b(new|sale|original|genuine|authentic|official|premium|quality|best|hot|2024|2025)\b',
+    re.IGNORECASE,
+)
+
+
 def _normalize_series(s: pd.Series) -> pd.Series:
-    _noise = r'\b(new|sale|original|genuine|authentic|official|premium|quality|best|hot|2024|2025)\b'
     return (
-        s.astype(str).str.lower().str.strip()
-        .str.replace(_noise, '', regex=True)
+        s.astype(str)
+        .map(lambda x: unicodedata.normalize("NFKD", x).encode("ascii", "ignore").decode("ascii") if x and x.lower() not in ("nan", "none") else "")
+        .str.lower().str.strip()
+        .str.replace(_NOISE_PATTERN, '', regex=True)
         .str.replace(r'[^\w\s]', '', regex=True)
         .str.replace(r'\s+', '', regex=True)
     )
@@ -86,22 +227,35 @@ def create_match_key_vectorized(df: pd.DataFrame) -> pd.Series:
 
 
 def df_hash(df: pd.DataFrame) -> str:
-    """Fast fingerprint: full content hash. Result is cached in df.attrs to avoid recomputation."""
+    """Fast fingerprint: full content hash. Result is memoised in df.attrs.
+
+    The memo is validated against the frame's shape and column list before it is
+    trusted. DataFrame.copy() propagates .attrs, so without that check a frame
+    copied from an already-hashed one — then given extra columns, which is
+    exactly what validate_products() does — kept reporting the ORIGINAL frame's
+    hash, silently serving caches keyed on the wrong content.
+
+    Note this still cannot detect an in-place edit that leaves shape and columns
+    unchanged (e.g. df.loc[0, "COLOR"] = "teal"). Callers that must be exact
+    about value-level changes should hash the columns they care about directly;
+    see _ColumnDigests in streamlit_app.py.
+    """
+    _stamp = (df.shape, tuple(df.columns))
     cached = df.attrs.get('__pim_hash__')
-    if cached is not None:
+    if cached is not None and df.attrs.get('__pim_hash_stamp__') == _stamp:
         return cached
     try:
         if df.empty:
             result = "empty"
         else:
             # Use pandas built-in hashing for fast, accurate full-content hashing
-            import hashlib
             result = hashlib.md5(pd.util.hash_pandas_object(df, index=False).values.tobytes()).hexdigest()
     except Exception as e:
         logger.warning(f"df_hash primary failed, using fallback: {e}")
         fallback_str = str(df.shape) + str(df.columns.tolist())
         result = hashlib.md5(fallback_str.encode()).hexdigest()
     df.attrs['__pim_hash__'] = result
+    df.attrs['__pim_hash_stamp__'] = _stamp
     return result
 
 
@@ -131,13 +285,23 @@ def extract_colors(text: str, explicit_color: Optional[str] = None) -> Set[str]:
     return colors
 
 
+# Pre-compiled patterns for remove_attributes — eliminates 12 separate re.sub calls per invocation
+_ATTR_NOISE_RE = re.compile(
+    r'\b(new|original|genuine|authentic|official|premium|quality|best|hot|sale|promo|deal)\b',
+    re.IGNORECASE,
+)
+_SIZE_RE = re.compile(r'\b(?:xxs|xs|small|medium|large|xl|xxl|xxxl)\b', re.IGNORECASE)
+_SPEC_RE = re.compile(
+    r'\b\d+\s*(?:gb|tb|inch|inches|"|ram|memory|ddr|pack|piece|pcs)\b', re.IGNORECASE
+)
+
+
 def remove_attributes(text: str) -> str:
     base = str(text).lower() if text else ""
     base = _COLOR_PATTERN.sub('', base)
-    base = re.sub(r'\b(?:xxs|xs|small|medium|large|xl|xxl|xxxl)\b', '', base)
-    base = re.sub(r'\b\d+\s*(?:gb|tb|inch|inches|"|ram|memory|ddr|pack|piece|pcs)\b', '', base)
-    for word in ['new', 'original', 'genuine', 'authentic', 'official', 'premium', 'quality', 'best', 'hot', 'sale', 'promo', 'deal']:
-        base = re.sub(r'\b' + word + r'\b', '', base)
+    base = _SIZE_RE.sub('', base)
+    base = _SPEC_RE.sub('', base)
+    base = _ATTR_NOISE_RE.sub('', base)
     return re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', ' ', base)).strip()
 
 
@@ -176,23 +340,61 @@ def extract_product_attributes(name: str, explicit_color: Optional[str] = None, 
 def _detect_and_read_csv(buf) -> pd.DataFrame:
     _ENCODINGS = ['utf-8-sig', 'utf-8', 'cp1252', 'iso-8859-1']
     raw_bytes = buf.read()
+    
+    # 1. Fast detection using a small chunk
+    best_enc = 'utf-8'
+    best_sep = ','
+    found = False
+    
     for enc in _ENCODINGS:
         for sep in [',', ';', '\t']:
             try:
-                df = pd.read_csv(BytesIO(raw_bytes), sep=sep, encoding=enc, dtype=str)
-                if len(df.columns) > 1:
-                    return df
+                df_chunk = pd.read_csv(BytesIO(raw_bytes), sep=sep, encoding=enc, dtype=str, nrows=10)
+                if len(df_chunk.columns) > 1:
+                    best_enc = enc
+                    best_sep = sep
+                    found = True
+                    break
             except Exception:
                 continue
+        if found:
+            break
+            
+    # 2. Read the full file exactly once with detected parameters
+    if found:
+        return pd.read_csv(BytesIO(raw_bytes), sep=best_sep, encoding=best_enc, dtype=str)
+    
+    # 3. Fallback
     return pd.read_csv(BytesIO(raw_bytes), sep=None, engine='python', encoding='utf-8', dtype=str)
 
 
-def _repair_mojibake(df: pd.DataFrame) -> pd.DataFrame:
-    _ILLEGAL_XML = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+_ILLEGAL_XML_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
 
-    def _fix(val):
+
+def _repair_mojibake(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fix mojibake (double-encoded UTF-8) and known substitution sequences.
+
+    Strategy (per column, vectorized):
+      1. Apply _MOJIBAKE_MAP literal substitutions first — handles known
+         sequences like 'â€"' -> '-' and 'â€™' -> "'" without any encoding
+         round-trips.
+      2. Attempt a vectorized latin-1 -> utf-8 heuristic decode using
+         errors='ignore' so characters outside latin-1 (en-dashes U+2013,
+         em-dashes U+2014, smart quotes U+2018/9, etc.) are silently
+         preserved rather than converted to '?' (the previous bug with
+         errors='replace').
+      3. Strip illegal XML control characters.
+      4. Per-row fallback for any column where vectorization fails.
+    """
+
+    def _fix_row(val: str) -> str:
         if not isinstance(val, str):
             return val
+        # Step 1: literal map
+        for bad, good in _MOJIBAKE_MAP.items():
+            val = val.replace(bad, good)
+        # Step 2: encoding heuristic
         for enc in ('cp1252', 'latin-1'):
             try:
                 fixed = val.encode(enc).decode('utf-8')
@@ -201,26 +403,24 @@ def _repair_mojibake(df: pd.DataFrame) -> pd.DataFrame:
                     break
             except (UnicodeDecodeError, UnicodeEncodeError):
                 continue
-        return _ILLEGAL_XML.sub('', val)
+        # Step 3: strip illegal XML control chars
+        return _ILLEGAL_XML_RE.sub('', val)
 
     for col in df.select_dtypes(include='object').columns:
-        try:
-            # Vectorized path: encode as latin-1 bytes then decode as utf-8
-            repaired = (
-                df[col].astype(str)
-                .str.encode('latin-1', errors='replace')
-                .str.decode('utf-8', errors='replace')
-            )
-            # Only accept the vectorized result where it actually changed something
-            # and didn't introduce replacement chars where original had none
-            mask = repaired != df[col].astype(str)
-            no_replacement = ~repaired.str.contains('\ufffd', na=False)
-            df[col] = df[col].astype(str).where(~(mask & no_replacement), repaired)
-            # Strip illegal XML control chars vectorized
-            df[col] = df[col].str.replace(_ILLEGAL_XML.pattern, '', regex=True)
-        except Exception:
-            # Fallback to row-by-row for any column that fails vectorization
-            df[col] = df[col].apply(_fix)
+        s = df[col].astype(str)
+        # Mojibake only exists in values containing non-ASCII characters, and
+        # the XML-control-char strip only matters for values containing them.
+        # One vectorized regex scan per column finds both, so the per-cell
+        # Python repair runs only on the (usually tiny) subset of rows that
+        # actually need it instead of every cell of every column.
+        non_ascii = s.str.contains(r'[^\x00-\x7F]', regex=True, na=False)
+        has_ctrl = s.str.contains(_ILLEGAL_XML_RE, na=False)
+        if non_ascii.any():
+            s.loc[non_ascii] = s.loc[non_ascii].map(_fix_row)
+        ctrl_only = has_ctrl & ~non_ascii
+        if ctrl_only.any():
+            s.loc[ctrl_only] = s.loc[ctrl_only].str.replace(_ILLEGAL_XML_RE, '', regex=True)
+        df[col] = s
     return df
 
 
@@ -237,11 +437,50 @@ def standardize_input_data(df: pd.DataFrame) -> pd.DataFrame:
         col_lower = col.lower()
         renamed[col] = map_lower[col_lower] if col_lower in map_lower else col.upper()
     df = df.rename(columns=renamed)
+    
+    # 👇 FIX ADDED HERE: Drop any duplicate columns created by the rename step 👇
+    df = df.loc[:, ~df.columns.duplicated(keep='first')]
+
     # dtype=str is already set at read time in _detect_and_read_csv; .astype(str) is
     # still applied here as a safety net for DataFrames produced by other paths
     for col in ['ACTIVE_STATUS_COUNTRY', 'CATEGORY_CODE', 'BRAND', 'TAX_CLASS', 'NAME', 'SELLER_NAME']:
         if col in df.columns and df[col].dtype != object:
             df[col] = df[col].astype(str)
+    if 'MAIN_IMAGE' not in df.columns:
+        df['MAIN_IMAGE'] = ''
+
+    # Restore leading zeros in PARENTSKU from PRODUCT_SET_SID when they represent
+    # the same integer but SID has more leading zeros (e.g. '7' -> '00007').
+    # Fully vectorized — eliminates the df.apply(axis=1) row loop.
+    if 'PARENTSKU' in df.columns and 'PRODUCT_SET_SID' in df.columns:
+        psku = df['PARENTSKU'].fillna('').astype(str).str.strip()
+        sid  = df['PRODUCT_SET_SID'].fillna('').astype(str).str.strip()
+
+        # Treat explicit 'nan' strings as empty
+        psku = psku.where(~psku.str.lower().isin({'nan', ''}), '')
+        sid  = sid.where(~sid.str.lower().isin({'nan', ''}), '')
+
+        # Extract leading digit group and suffix from each column
+        p_extract = psku.str.extract(r'^(\d+)(.*)', expand=True)
+        p_digits = p_extract[0]
+        p_suffix = p_extract[1].fillna('')
+        
+        s_digits = sid.str.extract(r'^(\d+)', expand=False)
+
+        # Eligible rows: both have leading digits, SID is longer (more zeros),
+        # and they represent the same integer (lstrip '0' to compare numerically)
+        both_have = p_digits.notna() & s_digits.notna() & psku.ne('') & sid.ne('')
+        sid_longer = s_digits.str.len() > p_digits.str.len()
+        same_int   = (
+            p_digits.str.lstrip('0').fillna('') ==
+            s_digits.str.lstrip('0').fillna('')
+        )
+        mask = both_have & sid_longer & same_int
+
+        df['PARENTSKU'] = psku  # normalise to stripped string
+        if mask.any():
+            df.loc[mask, 'PARENTSKU'] = s_digits[mask] + p_suffix[mask]
+
     if 'MAIN_IMAGE' not in df.columns:
         df['MAIN_IMAGE'] = ''
     return df
@@ -267,7 +506,7 @@ def filter_by_country(df: pd.DataFrame, country_validator) -> Tuple[pd.DataFrame
         filtered = df[df['ACTIVE_STATUS_COUNTRY'] == country_validator.code].copy()
         filtered['_IS_MULTI_COUNTRY'] = False
     # Detect all countries present in the file
-    prefix_map = {"KE": "Kenya", "UG": "Uganda", "NG": "Nigeria", "GH": "Ghana", "MA": "Morocco"}
+    prefix_map = {"KE": "Kenya", "UG": "Uganda", "NG": "Nigeria", "GH": "Ghana", "MA": "Morocco", "EG": "Egypt", "SN": "Senegal", "CI": "Ivory Coast"}
 
     detected_codes = set()
     if 'ACTIVE_STATUS_COUNTRY' in df.columns:
@@ -283,7 +522,7 @@ def filter_by_country(df: pd.DataFrame, country_validator) -> Tuple[pd.DataFrame
                 if vals.str.startswith(prefix).any():
                     detected_codes.add(prefix)
     
-    emoji_map = {"KE": "Kenya", "UG": "Uganda", "NG": "Nigeria", "GH": "Ghana", "MA": "Morocco"}
+    emoji_map = {"KE": "Kenya", "UG": "Uganda", "NG": "Nigeria", "GH": "Ghana", "MA": "Morocco", "EG": "Egypt", "SN": "Senegal", "CI": "Ivory Coast"}
     detected_names = sorted(list(set(emoji_map.get(c, str(c)) for c in detected_codes if str(c).strip() and str(c).strip().lower() != 'nan')))
     
     return filtered, detected_names
@@ -297,9 +536,10 @@ def propagate_metadata(df: pd.DataFrame) -> pd.DataFrame:
     for col in meta_cols:
         if col not in df.columns:
             df[col] = pd.NA
-    grouped = df.groupby('PRODUCT_SET_SID')
-    for col in meta_cols:
-        df[col] = grouped[col].transform(lambda x: x.ffill().bfill())
+            
+    # Vectorized group forward/backward fill (orders of magnitude faster than lambda)
+    df[meta_cols] = df.groupby('PRODUCT_SET_SID')[meta_cols].ffill()
+    df[meta_cols] = df.groupby('PRODUCT_SET_SID')[meta_cols].bfill()
     return df
 
 
@@ -329,12 +569,14 @@ def fetch_exchange_rate(country: str) -> float:
 def format_local_price(usd_price, country: str) -> str:
     from constants import COUNTRY_CURRENCY
     try:
-        price = float(usd_price)
-        if price <= 0:
+        price = pd.to_numeric(usd_price, errors="coerce")
+        if pd.isna(price) or price <= 0:
             return ""
         cfg = COUNTRY_CURRENCY.get(country, {})
         rate = fetch_exchange_rate(country)
-        local = price * rate
+        local = float(price) * rate
+        if pd.isna(local):
+            return ""
         symbol = cfg.get("symbol", "$")
         if cfg.get("code") in ("KES", "UGX", "NGN"):
             return f"{symbol} {local:,.0f}"
@@ -346,6 +588,8 @@ def format_local_price(usd_price, country: str) -> str:
 # -------------------------------------------------
 # ZIP IMAGE LAZY LOADING (CACHED BASE64)
 # -------------------------------------------------
+_ZIP_FILE_CACHE = None
+_ZIP_FILE_BYTES_ID = None
 
 def _basename_lower(value) -> str:
     name = str(value).strip().replace("\\", "/").split("/")[-1].lower()
@@ -367,16 +611,19 @@ def _load_zip_image_by_key(key: str) -> Optional[str]:
     if not member or not source_bytes:
         return None
     try:
-        with zipfile.ZipFile(BytesIO(source_bytes)) as zf:
-            img_bytes = zf.read(member)
-            encoded = base64.b64encode(img_bytes).decode('utf-8')
-            mime = "image/jpeg"
-            if key.endswith(".png"): mime = "image/png"
-            elif key.endswith(".webp"): mime = "image/webp"
-            elif key.endswith(".gif"): mime = "image/gif"
-            data_uri = f"data:{mime};base64,{encoded}"
-            store[key] = data_uri
-            return data_uri
+        global _ZIP_FILE_CACHE, _ZIP_FILE_BYTES_ID
+        if _ZIP_FILE_CACHE is None or _ZIP_FILE_BYTES_ID != id(source_bytes):
+            _ZIP_FILE_CACHE = zipfile.ZipFile(BytesIO(source_bytes))
+            _ZIP_FILE_BYTES_ID = id(source_bytes)
+        img_bytes = _ZIP_FILE_CACHE.read(member)
+        encoded = base64.b64encode(img_bytes).decode('utf-8')
+        mime = "image/jpeg"
+        if key.endswith(".png"): mime = "image/png"
+        elif key.endswith(".webp"): mime = "image/webp"
+        elif key.endswith(".gif"): mime = "image/gif"
+        data_uri = f"data:{mime};base64,{encoded}"
+        store[key] = data_uri
+        return data_uri
     except Exception as e:
         logger.warning(f"Failed lazy-loading ZIP image {member}: {e}")
         return None
