@@ -513,7 +513,9 @@ def _verify_false_approval(check_key: str, rec: dict, rule: dict, weights: set, 
             if not _color_recognised(color_val, valid_colors):
                 if _ai_rescued():
                     return ""
-                return "Color Invalid (Not In colors.txt)"
+                # Plain wording: the reader does not care which file the
+                # list of valid colors lives in.
+                return "Color Not Recognised"
     elif check_key == "warranty":
         if _clean(rule.get("Warranty", "")).lower() == "mandatory" and not _clean(rec.get("PRODUCT_WARRANTY")):
             return "Warranty Field Empty"
