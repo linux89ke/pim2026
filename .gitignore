@@ -179,3 +179,11 @@ app_cache_parquet/
 # tracked (539 cache files, ~360MB .git). These patterns only stop new ones.
 # To untrack the existing ones:
 #   git rm -r --cached app_cache_flags app_cache_parquet
+
+# ── Secrets ──
+# API keys read by targeted_audit_filters._load_category_ai_keys().
+# These were present and NOT ignored: a single `git add .` would have
+# published them, and this repo is headed for GitHub / Streamlit Cloud.
+keys.txt
+**/keys.txt
+.streamlit/secrets.toml
