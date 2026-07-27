@@ -1322,11 +1322,69 @@ def check_restricted_brands(
     return result.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
+# The bare words below exist in the rules file to catch skin bleaching, and are
+# scoped to ~1,928 categories — which includes 107 oral-care and deodorant
+# categories. That made "Colgate Advanced Whitening Toothpaste" and
+# "whitening roll-on deodorant" read as prohibited products.
+#
+# ONLY these three single words get the exemption. The explicit rules
+# ("whitening cream", "skin whitening", "brightening serum", "whitening soap",
+# "lightening lotion") name a skin product outright and stay prohibited
+# everywhere, so a bleaching cream mis-filed under Oral Care is still caught.
+_LIGHTENING_GENERIC_KWS = {"whitening", "brightening", "lightening"}
+
+# Contexts where whitening/brightening is an ordinary product claim.
+_LIGHTENING_OK_NAME_RE = re.compile(
+    r"\b(?:toothpaste|tooth\s*paste|toothbrush|tooth\s*brush|mouth\s*wash|"
+    r"mouth\s*rinse|oral|dental|denture|teeth|tooth|floss|gum\s*care|"
+    r"deodorant|anti[\s\-]?perspirant|roll[\s\-]?on)\b",
+    re.IGNORECASE,
+)
+_LIGHTENING_OK_CATEGORY_RE = re.compile(
+    r"oral\s*care|oral\s*hygiene|dental|denture|toothbrush|toothpaste|"
+    r"mouthwash|deodorant|antiperspirant",
+    re.IGNORECASE,
+)
+
+
 def check_prohibited_products(
-    data: pd.DataFrame, prohibited_rules: List[Dict]
+    data: pd.DataFrame, prohibited_rules: List[Dict], code_to_path: dict = None
 ) -> pd.DataFrame:
     if not {"NAME", "CATEGORY_CODE"}.issubset(data.columns) or not prohibited_rules:
         return pd.DataFrame(columns=data.columns)
+
+    # Drop rules whose category list is a placeholder rather than real codes.
+    #
+    # A blank category cell in Prohibbited.xlsx parses to {'None'} — a non-empty
+    # set holding the string "None" — instead of an empty set. The lookup below
+    # then asks "is this product's category in {'None'}?", which is never true,
+    # so the rule matches nothing. Worse, its keyword still goes into the
+    # combined regex, and because the alternation is sorted longest-first a dead
+    # "whitening soap" SHADOWS the working "whitening": findall returns the
+    # longer match, that match is discarded on the category test, and the
+    # product escapes entirely. Skin-whitening soaps and serums were passing for
+    # exactly this reason.
+    #
+    # Dropping them restores the broad rules. It deliberately does NOT treat a
+    # blank category as "applies everywhere": keywords like "105" and "100inch"
+    # in the NG sheet are plainly meant to be category-scoped, and firing them
+    # globally would flag every TV with 105 in its name.
+    def _is_placeholder(cats) -> bool:
+        return bool(cats) and all(
+            str(c).strip().lower() in ("none", "nan", "") for c in cats
+        )
+
+    usable_rules = [r for r in prohibited_rules if not _is_placeholder(r.get("categories"))]
+    _n_dead = len(prohibited_rules) - len(usable_rules)
+    if _n_dead:
+        logger.warning(
+            "[Prohibited] %d of %d rules have no usable category codes and are "
+            "ignored. Fill the 'categories' column in Prohibbited.xlsx to enable "
+            "them.", _n_dead, len(prohibited_rules),
+        )
+    if not usable_rules:
+        return pd.DataFrame(columns=data.columns)
+    prohibited_rules = usable_rules
 
     all_kws = sorted(
         set(rule["keyword"] for rule in prohibited_rules), key=len, reverse=True
@@ -1354,11 +1412,22 @@ def check_prohibited_products(
         matches = combined_pattern.findall(name_lower)
         if not matches:
             continue
+        cat_path = (code_to_path or {}).get(cat_clean, "")
+        # Resolved once per row, not per matched keyword.
+        _is_oral_or_deo = bool(
+            _LIGHTENING_OK_NAME_RE.search(name_lower)
+            or (cat_path and _LIGHTENING_OK_CATEGORY_RE.search(cat_path))
+        )
+
         matched_kws = []
         for m in set(matches):
             m_lower = m.lower()
             cats = kw_to_cats.get(m_lower, set())
             if cats and cat_clean not in cats:
+                continue
+            # A generic "whitening"/"brightening"/"lightening" on a toothpaste,
+            # mouthwash or deodorant is a normal product claim, not skin bleaching.
+            if m_lower in _LIGHTENING_GENERIC_KWS and _is_oral_or_deo:
                 continue
             matched_kws.append(m_lower)
         if matched_kws:
@@ -1917,18 +1986,80 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 # it's ambiguous on its own (a smartwatch/earbuds listing legitimately says
 # "WhatsApp notification support"), so it doesn't belong in this always-hard
 # bucket.
-_OFFPLATFORM_HARD_RE = re.compile(
+# Hard evidence is split by KIND — phone / website / email / location — so a
+# flag can only ever be raised on a concrete contact detail, and the comment can
+# name which kind was found. Wording alone ("contact us") is no longer enough:
+# it produced flags on listings that contained no way to contact anyone.
+
+# Phone numbers. Country prefixes cover all eight markets the app supports;
+# previously only Kenya and Nigeria were matched, so an off-platform number in
+# Uganda, Ghana, Morocco, Egypt, Senegal or Ivory Coast went straight through.
+# Bare digit runs are deliberately NOT matched — model numbers, EANs and
+# capacities would swamp the check with false positives.
+_PHONE_RE = re.compile(
     r"(?:"
-    r"\+?254[\s\-]?[17]\d{2}[\s\-]?\d{3}[\s\-]?\d{3}"          # Kenya intl
-    r"|\b07[\s\-]?\d{2}[\s\-]?\d{3}[\s\-]?\d{3}\b"             # Kenya local 07xx xxx xxx
-    r"|\+?234[\s\-]?[789]\d{2}[\s\-]?\d{3}[\s\-]?\d{4}"        # Nigeria intl
-    r"|\b0[789][01]\d[\s\-]?\d{3}[\s\-]?\d{4}\b"               # Nigeria local 080x xxx xxxx
-    r"|\+\d{10,14}\b"                                          # generic international
-    r"|wa\.me/\S+"
-    r"|https?://\S+"
-    r"|\bwww\.\S+"
+    # International for the eight markets. Digit GROUPING is deliberately not
+    # pinned down — the same Senegalese number gets written "+221 77 123 4567"
+    # and "+221 77 123 45 67", and fixed 3-3-3 grouping missed both.
+    r"\+?(?:254|256|234|233|212|221|225)[\s\-]?(?:\d[\s\-]?){7,11}\d"
+    # Egypt's country code is only two digits, so require the leading + to stop
+    # ordinary numbers in text ("20 000 mAh") from matching.
+    r"|\+20[\s\-]?(?:\d[\s\-]?){8,10}\d"
+    r"|\+\d{1,3}[\s\-]?(?:\d[\s\-]?){7,13}\d"                  # any other international
+    # Local formats, also grouping-tolerant: "0712 345 678", "0712345678" and
+    # "0712-345-678" are the same number written three ways.
+    r"|\b0[17](?:[\s\-]?\d){8}\b"                              # 10-digit 07../01.. (KE, UG)
+    r"|\b0[789][01](?:[\s\-]?\d){8}\b"                         # 11-digit 080x.... (NG)
+    r"|\b0[1-9](?:[\s\-]\d{2}){4}\b"                           # 0X XX XX XX XX (MA, CI, SN)
     r")",
     re.IGNORECASE,
+)
+
+# Websites. Explicit schemes and www. plus a conservative bare-domain form —
+# restricted to a known TLD list so strings like "3.5mm" or "image.png" cannot
+# match.
+_WEBSITE_RE = re.compile(
+    r"(?:"
+    r"https?://\S+"
+    r"|\bwww\.\S+"
+    r"|wa\.me/\S+"
+    r"|\b[a-z0-9][a-z0-9\-]{1,30}\.(?:com|net|org|shop|store|biz|info|"
+    r"co\.ke|co\.ug|com\.ng|com\.gh|co\.za|ma|eg|sn|ci)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# Email addresses — previously not detected at all, despite being one of the
+# most direct ways to take a buyer off-platform.
+_EMAIL_RE = re.compile(
+    r"\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b"
+    r"|\b[a-z0-9._%+\-]+\s*(?:\(at\)|\[at\]|\sat\s)\s*[a-z0-9.\-]+\s*"
+    r"(?:\(dot\)|\[dot\]|\sdot\s)\s*[a-z]{2,}\b",                # obfuscated
+    re.IGNORECASE,
+)
+
+# Physical locations. Kept to explicit address markers — a generic
+# "<word> road" rule would flag product names like "Silk Road" or "Abbey Road".
+_LOCATION_RE = re.compile(
+    r"(?:"
+    r"\bp\.?\s*o\.?\s*box\s*\d+"                                # P.O. Box 123
+    r"|\b(?:shop|stall|suite|kiosk|office)\s*(?:no\.?|number|#)?\s*\d+"
+    r"|\b\d+\s*(?:st|nd|rd|th)?\s*floor\b"
+    r"|\balong\s+[a-z]+\s+(?:road|rd|street|st|avenue|ave)\b"
+    r"|\bopposite\s+(?:the\s+)?[a-z]+"
+    r"|\bnext\s+to\s+(?:the\s+)?[a-z]+\s+(?:building|mall|plaza|arcade|market|stage)"
+    r"|\b(?:visit|come\s+to|located\s+at|find\s+us\s+at)\s+(?:our\s+)?"
+    r"(?:shop|store|office|showroom)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# Ordered so the comment names the most actionable kind first.
+_CONTACT_KINDS = (
+    ("phone number", _PHONE_RE),
+    ("website", _WEBSITE_RE),
+    ("email", _EMAIL_RE),
+    ("location", _LOCATION_RE),
 )
 # Soft signals: divert-the-buyer wording without a number/link. Deliberately
 # phrase-based ("follow us on", not bare "tiktok") so products like ring
@@ -1993,48 +2124,58 @@ def check_offplatform_contact(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
         for c in text_cols
     }
 
-    # Cheap vectorized pre-filter: which rows have a hit in ANY column.
+    # Cheap vectorized pre-filter: only rows carrying an actual contact detail
+    # reach the per-row loop. Divert-the-buyer wording is NOT part of this —
+    # on its own it is not evidence that anyone can be contacted off-platform.
     pre_mask = pd.Series(False, index=data.index)
     for c in text_cols:
-        pre_mask |= (
-            col_text[c].str.contains(_OFFPLATFORM_HARD_RE, na=False)
-            | col_text[c].str.contains(_OFFPLATFORM_SOFT_RE, na=False)
-            | col_text[c].str.contains(_WHATSAPP_ANY_RE, na=False)
-        )
+        for _, _kind_re in _CONTACT_KINDS:
+            pre_mask |= col_text[c].str.contains(_kind_re, na=False)
+        pre_mask |= col_text[c].str.contains(_WHATSAPP_CONTACT_RE, na=False)
     if not pre_mask.any():
         return pd.DataFrame(columns=data.columns)
 
+    def _is_platform_url(term: str) -> bool:
+        """Jumia's own domains and image CDNs are not off-platform contact."""
+        t = term.lower()
+        return "jumia" in t or "wsrv.nl" in t or "cloudfront" in t
+
     comments: dict = {}
     for idx in data.index[pre_mask]:
-        hard_by_col: list = []  # [(column, [matched terms])]
-        soft_by_col: list = []
+        found_by_col: list = []   # [(column, ["phone number: 0712…", …])]
+        soft_terms: set = set()
         for c in text_cols:
             text = col_text[c].loc[idx]
-            # Allowlist the platform's own domains/CDNs so legit image URLs pass.
-            hard = sorted({m.strip() for m in _OFFPLATFORM_HARD_RE.findall(text)
-                           if "jumia" not in m.lower() and "wsrv.nl" not in m.lower()})
-            soft = sorted({m.strip() for m in _OFFPLATFORM_SOFT_RE.findall(text)})
+            hits: list = []
+            for kind_label, kind_re in _CONTACT_KINDS:
+                terms = sorted({
+                    m.strip() for m in kind_re.findall(text)
+                    if m and m.strip() and not _is_platform_url(m)
+                })
+                if terms:
+                    hits.append(f"{kind_label}: {', '.join(terms[:2])}")
 
-            # WhatsApp: classify separately (see comment on the regexes above)
-            # instead of treating every bare mention as automatic hard evidence.
+            # A WhatsApp mention only counts when it comes with a number or a
+            # wa.me link. A bare mention, or a device-feature mention such as
+            # "WhatsApp notification support", is not contact information.
             if _WHATSAPP_CONTACT_RE.search(text):
-                hard.append("whatsapp")
-            elif _WHATSAPP_ANY_RE.search(text) and not _WHATSAPP_FEATURE_CTX_RE.search(text):
-                soft.append("whatsapp mention")
-            # else: bare feature-context mention ("WhatsApp notification
-            # support") — not evidence of anything, deliberately not flagged.
+                hits.append("whatsapp contact")
 
-            if hard:
-                hard_by_col.append((c, sorted(set(hard))))
-            if soft:
-                soft_by_col.append((c, soft))
+            if hits:
+                found_by_col.append((c, hits))
 
-        if hard_by_col:
-            where = " | ".join(f"{c}: '{', '.join(terms[:3])}'" for c, terms in hard_by_col)
-            comments[idx] = f"Off-platform contact detected — {where}"
-        elif soft_by_col:
-            where = " | ".join(f"{c}: '{', '.join(terms[:3])}'" for c, terms in soft_by_col)
-            comments[idx] = f"Possible off-platform wording — {where}"
+            # Wording is recorded only to enrich the comment on rows that
+            # already have real evidence — it can no longer raise a flag alone.
+            soft_terms.update(m.strip() for m in _OFFPLATFORM_SOFT_RE.findall(text))
+
+        if not found_by_col:
+            continue
+
+        where = " | ".join(f"{c} — {'; '.join(h)}" for c, h in found_by_col)
+        comment = f"Off-platform contact detected — {where}"
+        if soft_terms:
+            comment += f" (wording: {', '.join(sorted(soft_terms)[:2])})"
+        comments[idx] = comment
 
     if not comments:
         return pd.DataFrame(columns=data.columns)
@@ -3008,7 +3149,8 @@ def validate_products(
         (
             "Prohibited products",
             check_prohibited_products,
-            {"prohibited_rules": support_files.get("prohibited_words_all", {}).get(country_validator.code, [])},
+            {"prohibited_rules": support_files.get("prohibited_words_all", {}).get(country_validator.code, []),
+             "code_to_path": support_files.get("code_to_path", {})},
         ),
         (
             "Unnecessary words in NAME",
@@ -3141,7 +3283,9 @@ def validate_products(
         validations.insert(1, ("Restricted brands", check_restricted_brands, {"country_rules": _ma.get("restricted", [])}))
         ma_prohibited_rules = [{"keyword": kw, "categories": set()} for kw in _ma.get("prohibited_keywords", [])]
         validations = [v for v in validations if v[0] != "Prohibited products"]
-        validations.append(("Prohibited products", check_prohibited_products, {"prohibited_rules": ma_prohibited_rules}))
+        validations.append(("Prohibited products", check_prohibited_products,
+                            {"prohibited_rules": ma_prohibited_rules,
+                             "code_to_path": support_files.get("code_to_path", {})}))
         validations.append(("MA - Marque Interdite", check_morocco_prohibited_brands, {"ma_rules": _ma}))
     if country_validator.code == "GH":
         _gh = load_ghana_qc_rules()

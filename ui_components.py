@@ -3824,16 +3824,25 @@ def visual_review_modal(support_files):
         if st.button("✕ Close", key="close_modal_top", type="secondary", use_container_width=True):
             st.session_state.show_review_modal = False
             st.rerun()
-        _ipp_opts = [20, 50, 100, 200, 500]
-        _current_ipp = st.session_state.get("grid_items_per_page", 50)
-        
-        if _current_ipp not in _ipp_opts:
-            _current_ipp = 500 if 500 in _ipp_opts else _ipp_opts[-1]
-            st.session_state.grid_items_per_page = _current_ipp
-            
+        # 500 per page is only offered in wide mode (6 or 7 columns). More
+        # columns means smaller cards, so 500 of them stays a sensible page; at
+        # 5 columns the same 500 cards make the grid iframe roughly 36,000px
+        # tall, which is where the browser starts to struggle.
+        _cols_now = st.session_state.get("grid_cols_per_row", 5)
+        _allow_500 = _cols_now in (6, 7)
+        _ipp_opts = [20, 50, 100, 200] + ([500] if _allow_500 else [])
+
         _slider_key = "grid_ipp_slider"
-        
-        if _slider_key not in st.session_state:
+
+        # Anything already selected that this column count no longer allows has
+        # to be clamped BEFORE the widget is created — select_slider raises if
+        # its stored value is not one of the options.
+        _current_ipp = st.session_state.get("grid_items_per_page", 50)
+        if _current_ipp not in _ipp_opts:
+            _current_ipp = _ipp_opts[-1]
+            st.session_state.grid_items_per_page = _current_ipp
+            st.session_state.grid_page = 0
+        if st.session_state.get(_slider_key) not in _ipp_opts:
             st.session_state[_slider_key] = _current_ipp
 
         def _on_ipp_change():
@@ -3844,6 +3853,9 @@ def visual_review_modal(support_files):
             options=_ipp_opts,
             key=_slider_key,
             on_change=_on_ipp_change,
+            help=("500 per page is available in wide mode (6 or 7 columns)."
+                  if _allow_500 else
+                  "Switch to 6 or 7 columns to unlock 500 per page."),
         )
         st.session_state.grid_items_per_page = st.session_state[_slider_key]
 
