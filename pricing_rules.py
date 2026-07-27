@@ -288,39 +288,55 @@ def check_category_max_price(
     # Use the higher of the two local prices as the "listed price" to check
     d["max_listed_local"] = d[["price_local", "sale_price_local"]].max(axis=1)
 
-    flagged_indices = []
-    comment_map     = {}
-    cap_map         = {}
-
-    for idx, row in d.iterrows():
-        listed_local = row["max_listed_local"]
-        if listed_local <= 0:
-            continue
-
-        cat_code = str(row.get("CATEGORY_CODE", "")).strip().split(".")[0]
-        cap_local, cap_source = _resolve_price_cap(
-            cat_code, country_code, price_map, code_to_path, max_price_map
-        )
-
-        if listed_local > cap_local:
-            flagged_indices.append(idx)
-            usd_price = row["price_usd"] if row["price_usd"] >= row["sale_price_usd"] else row["sale_price_usd"]
-            comment_map[idx] = (
-                f"Price (USD {usd_price:,.2f} → {sym}{listed_local:,.0f}) "
-                f"exceeds category max ({sym}{cap_local:,.0f}) [{cap_source}]"
-            )
-            cap_map[idx] = f"{sym}{cap_local:,.0f}"
-
-    if not flagged_indices:
+    # Filter down to rows with a positive listed price
+    d = d[d["max_listed_local"] > 0].copy()
+    if d.empty:
         return pd.DataFrame(columns=data.columns)
 
-    result = d.loc[flagged_indices].copy()
-    result["Comment_Detail"] = result.index.map(comment_map)
-    result["CAT_MAX_PRICE"]  = result.index.map(cap_map)
+    # Clean category codes
+    d["_cat_code_clean"] = d["CATEGORY_CODE"].astype(str).str.strip().str.split(".").str[0]
+    
+    # Resolve price caps for UNIQUE categories only (much faster than per-row)
+    unique_codes = d["_cat_code_clean"].unique()
+    cap_dict = {}
+    source_dict = {}
+    for code in unique_codes:
+        cap, src = _resolve_price_cap(code, country_code, price_map, code_to_path, max_price_map)
+        cap_dict[code] = cap
+        source_dict[code] = src
+        
+    d["_cap_local"] = d["_cat_code_clean"].map(cap_dict)
+    d["_cap_source"] = d["_cat_code_clean"].map(source_dict)
+    
+    # Find violations
+    mask = d["max_listed_local"] > d["_cap_local"]
+    result = d[mask].copy()
+    
+    if result.empty:
+        return pd.DataFrame(columns=data.columns)
+        
+    # Build comments for flagged rows
+    import numpy as np
+    result["usd_price"] = np.where(
+        result["price_usd"] >= result["sale_price_usd"], 
+        result["price_usd"], 
+        result["sale_price_usd"]
+    )
+    
+    # Vectorized string formatting for the comments
+    result["Comment_Detail"] = (
+        "Price (USD " + result["usd_price"].map("{:,.2f}".format) + 
+        " → " + sym + result["max_listed_local"].map("{:,.0f}".format) + ") " +
+        "exceeds category max (" + sym + result["_cap_local"].map("{:,.0f}".format) + 
+        ") [" + result["_cap_source"].astype(str) + "]"
+    )
+    result["CAT_MAX_PRICE"] = sym + result["_cap_local"].map("{:,.0f}".format)
+
     return (
         result
         .drop(columns=["price_usd", "sale_price_usd", "price_local",
-                        "sale_price_local", "max_listed_local"], errors="ignore")
+                       "sale_price_local", "max_listed_local", "_cat_code_clean", 
+                       "_cap_local", "_cap_source", "usd_price"], errors="ignore")
         .drop_duplicates(subset=["PRODUCT_SET_SID"])
     )
 

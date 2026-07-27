@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import pickle
 import time
 from io import BytesIO
 from typing import Any
@@ -57,6 +58,10 @@ def poll_until_done(job_id: str) -> dict[str, Any]:
 
     while time.time() < deadline:
         resp = _SESSION.get(f"{API_BASE}/status/{job_id}", timeout=10)
+        if resp.status_code == 404:
+            progress_bar.empty()
+            placeholder.empty()
+            raise RuntimeError("Validation job status not found — it may have expired or the server restarted.")
         resp.raise_for_status()
         status = resp.json()
 
@@ -87,17 +92,22 @@ def fetch_summary(country: str, file_hash: str) -> dict[str, Any]:
 
 
 def fetch_report(country: str, file_hash: str) -> pd.DataFrame:
-    """Returns the final_report DataFrame."""
+    """Returns the final_report DataFrame.
+
+    The endpoint returns the raw pickled DataFrame straight out of Redis
+    (skipping a decode/re-encode round-trip server-side), so unpickle it here
+    instead of resp.json().
+    """
     resp = _SESSION.get(f"{API_BASE}/result/report/{country}/{file_hash}", timeout=60)
     resp.raise_for_status()
-    return pd.DataFrame(resp.json())
+    return pickle.loads(resp.content)
 
 
 def fetch_data(country: str, file_hash: str) -> pd.DataFrame:
-    """Returns the all_data_map DataFrame."""
+    """Returns the all_data_map DataFrame (raw pickle from Redis — see fetch_report)."""
     resp = _SESSION.get(f"{API_BASE}/result/data/{country}/{file_hash}", timeout=60)
     resp.raise_for_status()
-    return pd.DataFrame(resp.json())
+    return pickle.loads(resp.content)
 
 
 def invalidate(country: str, file_hash: str) -> None:

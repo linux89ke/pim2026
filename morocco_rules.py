@@ -94,12 +94,12 @@ def check_morocco_prohibited_brands(data: pd.DataFrame, ma_rules: Dict) -> pd.Da
 
     sorted_brands = sorted(prohibited, key=len, reverse=True)
     pattern = re.compile(
-        r"(?<!\w)(" + "|".join(re.escape(b) for b in sorted_brands) + r")(?!\w)",
+        r"(?<!\w)(?:" + "|".join(re.escape(b) for b in sorted_brands) + r")(?!\w)",
         re.IGNORECASE,
     )
 
     brand_match = d["_brand_l"].isin(prohibited)
-    name_match  = (~brand_match) & d["_name_l"].str.contains(pattern, na=False)
+    name_match  = (~brand_match) & d["_name_l"].str.contains(pattern, regex=True, na=False)
     flagged     = d[brand_match | name_match].copy()
 
     if not flagged.empty:

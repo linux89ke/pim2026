@@ -57,6 +57,13 @@ def to_excel_base(df: pd.DataFrame, sheet: str, cols: list, writer, format_rules
             df_p[c] = pd.NA
     df_to_write = df_p[[c for c in cols if c in df_p.columns]]
     df_to_write = _repair_mojibake(df_to_write.copy())
+
+    # Force SKU/ParentSKU columns to string so xlsxwriter doesn't coerce
+    # zero-padded values like '000669' → 669
+    _sku_cols = [c for c in df_to_write.columns if c.upper().replace(' ', '').replace('_', '') in ('PARENTSKU', 'SELLERSKU', 'PRODUCTSETID', 'PRODUCTSETSID', 'SID')]
+    for c in _sku_cols:
+        df_to_write[c] = df_to_write[c].astype(str).where(df_to_write[c].notna(), other='')
+
     df_to_write.to_excel(writer, index=False, sheet_name=sheet)
     if format_rules and 'Status' in df_to_write.columns:
         wb = writer.book
@@ -80,7 +87,7 @@ def write_excel_single(
 ) -> BytesIO:
     """Write one or two DataFrames into a single Excel workbook."""
     output = BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+    with pd.ExcelWriter(output, engine='xlsxwriter', engine_kwargs={'options': {'strings_to_numbers': False}}) as writer:
         to_excel_base(df, sheet_name, cols, writer, format_rules=format_status)
         if auxiliary_df is not None and not auxiliary_df.empty:
             to_excel_base(auxiliary_df, aux_sheet_name, aux_cols, writer)
@@ -114,8 +121,15 @@ def generate_smart_export(
     Returns (data, filename, mimetype).
     """
     df = _normalize_export_df(df, export_type)
+    # Rename internal 'Reason' column to 'ReasonOne' for the export file
+    df = df.rename(columns={"Reason": "ReasonOne"}, errors="ignore")
+    if 'Status' in df.columns:
+        approved_mask = df['Status'].astype(str).str.strip().eq('Approved')
+        for _col in ('ReasonOne', 'Comment'):
+            if _col in df.columns:
+                df.loc[approved_mask, _col] = ''
     cols = (
-        FULL_DATA_COLS + [c for c in ["Status", "Reason", "Comment", "FLAG", "SellerName"] if c not in FULL_DATA_COLS]
+        FULL_DATA_COLS + [c for c in ["Status", "ReasonOne", "Comment", "FLAG", "SellerName"] if c not in FULL_DATA_COLS]
         if export_type == 'full'
         else PRODUCTSETS_COLS
     )
@@ -171,6 +185,8 @@ def prepare_full_data_merged(data_df: pd.DataFrame, final_report_df: pd.DataFram
             if col not in merged.columns:
                 merged[col] = ""
             merged[col] = merged[col].fillna("")
+        # Expose ReasonOne as alias so full-data exports pick it up via FULL_DATA_COLS fallback
+        merged["ReasonOne"] = merged["Reason"]
         return merged
     except Exception as e:
         logger.error(f"prepare_full_data_merged: {e}")

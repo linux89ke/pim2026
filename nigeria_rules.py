@@ -192,6 +192,15 @@ def check_nigeria_books(data: pd.DataFrame, ng_rules: Dict) -> pd.DataFrame:
     d = data.copy()
     d["_name_l"]   = d["NAME"].astype(str).str.strip().str.lower()
     d["_seller_l"] = d["SELLER_NAME"].astype(str).str.strip().str.lower()
+    # Vectorized pre-filter: one combined-regex scan (C speed) finds the rows
+    # whose NAME contains ANY book title, so the per-row × per-title Python
+    # loop below only runs on that (usually tiny) subset instead of the whole
+    # catalog. The inner loop is unchanged, preserving the original
+    # first-match-in-rules-order semantics.
+    _any_book_pattern = "|".join(re.escape(b) for b in book_rules if b)
+    if not _any_book_pattern: return pd.DataFrame(columns=data.columns)
+    d = d[d["_name_l"].str.contains(_any_book_pattern, regex=True, na=False)]
+    if d.empty: return pd.DataFrame(columns=data.columns)
     flagged_idx, comment_map = [], {}
     for idx, row in d.iterrows():
         name_l, seller_l = row["_name_l"], row["_seller_l"]
@@ -371,3 +380,66 @@ def check_nigeria_powerbanks(data: pd.DataFrame, ng_rules: Dict) -> pd.DataFrame
     result = pd.concat(chunks)
     keep_cols = [c for c in data.columns if c in result.columns] + ["FLAG", "Reason", "Comment_Detail"]
     return result[keep_cols].drop_duplicates(subset=["PRODUCT_SET_SID"])
+
+
+# ── Generic-brand powerbank check (non-Nigeria countries) ───────────────────
+# Only rejects high-capacity powerbanks (> 10,000 mAh stated in name) whose
+# brand is a known pseudo/generic placeholder (e.g. "Generic", "Fashion").
+# All other brands pass regardless of capacity.
+
+def check_generic_powerbanks(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    _PSEUDO_BRANDS = {
+        "generic", "fashion", "unbranded", "no brand", "original", "new",
+        "unknown", "brand", "oem", "n/a", "na",
+    }
+    MIN_MAH = 10_000
+
+    _pb_name_pat = re.compile(r'\bpower\s*bank\b', re.IGNORECASE)
+    _mah_pat     = re.compile(r'\b(\d[\d,]*)\s*mah\b', re.IGNORECASE)
+
+    if not {"NAME", "BRAND", "CATEGORY_CODE"}.issubset(data.columns):
+        return pd.DataFrame(columns=data.columns)
+
+    def _exceeds_threshold(name: str) -> bool:
+        for m in _mah_pat.finditer(str(name)):
+            try:
+                if int(m.group(1).replace(',', '')) > MIN_MAH:
+                    return True
+            except ValueError:
+                pass
+        return False
+
+    d = data.copy()
+    d["_name"]    = d["NAME"].astype(str)
+    d["_brand_l"] = d["BRAND"].astype(str).str.strip().str.lower()
+
+    # Only products that mention powerbank in name
+    pb_rows = d[d["_name"].str.contains(_pb_name_pat, na=False)].copy()
+    if pb_rows.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    # Only high-capacity ones (> 10,000 mAh)
+    high_cap = pb_rows[pb_rows["_name"].apply(_exceeds_threshold)].copy()
+    if high_cap.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    # Only flag if brand is generic/pseudo
+    flagged = high_cap[high_cap["_brand_l"].isin(_PSEUDO_BRANDS)].copy()
+    if flagged.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    def _comment(row):
+        m = _mah_pat.search(row["_name"])
+        mah_str = m.group(0) if m else ">10,000mAh"
+        return (
+            f"Brand '{row['BRAND']}' is not a recognized brand for a {mah_str} powerbank. "
+            "Please list this product under a genuine, specific brand name."
+        )
+
+    flagged["FLAG"]           = "Powerbank Not Authorized"
+    flagged["Reason"]         = "1000007 - Other Reason"
+    flagged["Comment_Detail"] = flagged.apply(_comment, axis=1)
+
+    keep_cols = [c for c in data.columns if c in flagged.columns] + ["FLAG", "Reason", "Comment_Detail"]
+    return flagged[keep_cols].drop_duplicates(subset=["PRODUCT_SET_SID"])
+

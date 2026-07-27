@@ -16,7 +16,7 @@ JUMIA_COLORS = {
     'black': '#000000'
 }
 
-PRODUCTSETS_COLS = ["ProductSetSid", "ParentSKU", "Status", "Reason", "Comment", "FLAG", "SellerName"]
+PRODUCTSETS_COLS = ["ProductSetSid", "ParentSKU", "Status", "ReasonOne", "Comment", "FLAG", "SellerName"]
 REJECTION_REASONS_COLS = ['CODE - REJECTION_REASON', 'COMMENT']
 
 FULL_DATA_COLS = [
@@ -31,11 +31,14 @@ FULL_DATA_COLS = [
 GRID_COLS = ['PRODUCT_SET_SID', 'NAME', 'BRAND', 'CATEGORY', 'SELLER_NAME', 'MAIN_IMAGE', 'GLOBAL_SALE_PRICE', 'GLOBAL_PRICE', 'COLOR']
 
 COUNTRY_CURRENCY = {
-    "Kenya":   {"code": "KES", "symbol": "KSh", "pair": "USD/KES"},
-    "Uganda":  {"code": "UGX", "symbol": "USh", "pair": "USD/UGX"},
-    "Nigeria": {"code": "NGN", "symbol": "₦",   "pair": "USD/NGN"},
-    "Ghana":   {"code": "GHS", "symbol": "GH₵", "pair": "USD/GHS"},
-    "Morocco": {"code": "MAD", "symbol": "MAD", "pair": "USD/MAD"},
+    "Kenya":       {"code": "KES", "symbol": "KSh", "pair": "USD/KES"},
+    "Uganda":      {"code": "UGX", "symbol": "USh", "pair": "USD/UGX"},
+    "Nigeria":     {"code": "NGN", "symbol": "₦",   "pair": "USD/NGN"},
+    "Ghana":       {"code": "GHS", "symbol": "GH₵", "pair": "USD/GHS"},
+    "Morocco":     {"code": "MAD", "symbol": "MAD", "pair": "USD/MAD"},
+    "Egypt":       {"code": "EGP", "symbol": "EGP", "pair": "USD/EGP"},
+    "Senegal":     {"code": "XOF", "symbol": "XOF", "pair": "USD/XOF"},
+    "Ivory Coast": {"code": "XOF", "symbol": "XOF", "pair": "USD/XOF"},
 }
 
 NEW_FILE_MAPPING = {
@@ -48,6 +51,9 @@ NEW_FILE_MAPPING = {
     'dsc_shop_seller_name': 'SELLER_NAME',
     'dsc_shop_active_country': 'ACTIVE_STATUS_COUNTRY',
     'cod_parent_sku': 'PARENTSKU',
+    'parentsku': 'PARENTSKU',
+    'parent_sku': 'PARENTSKU',
+    'parent sku': 'PARENTSKU',
     'color': 'COLOR',
     'colour': 'COLOR',
     'color_family': 'COLOR_FAMILY',
@@ -97,11 +103,14 @@ COUNTRY_VALIDATOR_CONFIG = {
     "Kenya": {"code": "KE", "skip_validations": []},
     "Uganda": {
         "code": "UG",
-        "skip_validations": ["Counterfeit Sneakers", "Product Warranty"],
+        "skip_validations": [],
     },
-    "Nigeria": {"code": "NG", "skip_validations": []},
-    "Ghana": {"code": "GH", "skip_validations": []},
-    "Morocco": {"code": "MA", "skip_validations": ["Generic BRAND Issues"]},
+    "Nigeria":     {"code": "NG", "skip_validations": []},
+    "Ghana":       {"code": "GH", "skip_validations": []},
+    "Morocco":     {"code": "MA", "skip_validations": ["Generic BRAND Issues"]},
+    "Egypt":       {"code": "EG", "skip_validations": []},
+    "Senegal":     {"code": "SN", "skip_validations": []},
+    "Ivory Coast": {"code": "CI", "skip_validations": []},
 }
 
 
@@ -125,6 +134,30 @@ REASON_MAP = {
     "REJECT_COLOR":          "Missing COLOR",
     "REJECT_WRONG_BRAND":    "Generic branded products with genuine brands",
     "REJECT_SUSP_DISCOUNT":  "Discount too high",
+    "REJECT_DUPLICATE":      "Duplicate product",
+    "REJECT_WEIGHT_VOL":     "Missing Weight/Volume",
+    "REJECT_BRAND_REPEAT":   "BRAND name repeated in NAME",
+    "REJECT_BRAND_IN_NAME":  "BRAND name repeated in NAME",
+    "REJECT_WARRANTY":       "Product Warranty",
+    "REJECT_VARIATION":      "Wrong Variation",
+    "REJECT_FDA":            "FDA",
+    "REJECT_TITLE_LANG":     "Title Language Check",
+    "REJECT_FAKE_PERFUME":   "Suspected Fake Perfume",
+    "REJECT_SUSPICIOUS_DISCOUNT": "Suspicious Discount",
+    "REJECT_REFURB":         "Seller Not approved to sell Refurb",
+    "REJECT_BOOKS_SELLER":   "Seller Approve to sell books",
+    "REJECT_PERFUME_SELLER": "Seller Approved to Sell Perfume",
+    "REJECT_PERFUME_TESTER": "Perfume Tester",
+    "REJECT_SNEAKERS":       "Counterfeit Sneakers",
+    "REJECT_JERSEYS":        "Suspected counterfeit Jerseys",
+    "REJECT_UNNECESSARY_WORDS": "Unnecessary words in NAME",
+    "REJECT_SINGLE_WORD":    "Single-word NAME",
+    "REJECT_GENERIC_BRAND":  "Generic BRAND Issues",
+    "REJECT_FASHION_BRAND":  "Fashion brand issues",
+    "REJECT_SMARTPHONE_NAME": "Incomplete Smartphone Name",
+    "REJECT_BRAND_MISMATCH": "Brand Image Mismatch",
+    "REJECT_OFFPLATFORM":    "Off-Platform Contact",
+    "REJECT_SPECS_INCONSISTENCY": "Specs Inconsistency",
     "OTHER_CUSTOM":          "Other Reason (Custom)"
 }
 

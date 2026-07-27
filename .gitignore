@@ -187,3 +187,15 @@ app_cache_parquet/
 keys.txt
 **/keys.txt
 .streamlit/secrets.toml
+
+# ── Local debug / scratch output (not part of the app) ──
+debug_*.txt
+cats_out.txt
+parents_out.txt
+reasons_output.txt
+inspect_result.txt
+captured_payloads.json
+.country_pref
+.superpowers/
+~$*.xlsx
+pages/verdict_cache.sqlite

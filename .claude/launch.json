@@ -1,0 +1,32 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "streamlit-ui",
+      "runtimeExecutable": "py",
+      "runtimeArgs": [
+        "-3.11",
+        "-m",
+        "streamlit",
+        "run",
+        "streamlit_app.py",
+        "--server.port",
+        "8505",
+        "--server.maxUploadSize",
+        "500",
+        "--server.headless",
+        "true"
+      ],
+      "port": 8505
+    },
+    {
+      "name": "validation-api",
+      "runtimeExecutable": "py",
+      "runtimeArgs": [
+        "-3.11",
+        "run_api.py"
+      ],
+      "port": 8000
+    }
+  ]
+}

@@ -1190,7 +1190,6 @@ Cliptec
 Clonovate
 Clorox
 Cloudoon
-Clove
 Clover
 Clovers
 Cluedo
@@ -2298,10 +2297,6 @@ Kaffe Cafe
 Kaffee Haus
 Kaffs
 Kafine
-Kaftan
-Kaftan Abaya
-Kaftan Corture
-Kaftan Terengganu
 Kafucard
 KAG LENS
 Kagan
@@ -3359,15 +3354,12 @@ Kenvert
 Kenway
 Kenwingston Hotel
 Kenwood
-Kenya
 Kenya Aa Coffee Bean
 Kenya arts Diary
 Kenya Faith Writers Network
 Kenya Highland
 Kenya King
 Kenya Wine Agencies
-Kenyan Alliance Insurance Company
-Kenyan Rural Women
 Kenyo
 Kenz Fs
 Kenzat
@@ -5363,6 +5355,7 @@ Rattan
 Rave
 RBT
 Rdl
+Amazfit
 Reactor
 Real Skin
 Real Thai
