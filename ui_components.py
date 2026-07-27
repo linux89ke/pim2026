@@ -802,6 +802,57 @@ def bulk_approve_dialog(
         st.rerun()
 
 
+# Columns that may hold a product image, best first. Used when resolving
+# previews for the flag tables.
+_PREVIEW_IMG_COLS = [
+    "image1", "MAIN_IMAGE_URL", "MAIN_IMAGE", "IMAGE_URL", "IMAGE1_ZIP",
+    "MainImage", "Image", "IMAGE", "url", "Url", "IMAGE_URL_1", "Image1",
+    "main_image",
+]
+
+
+def _resolve_preview_urls(df: pd.DataFrame) -> list:
+    """Best image source per row, or None where there is nothing usable.
+
+    Called only for rows actually being displayed, and only when previews are
+    switched on. It used to run eagerly over every row of every flag bucket
+    while building the display cache — base64-encoding every ZIP image up front
+    — even though the toggle defaults to off and most buckets are never opened.
+    """
+    if df.empty:
+        return []
+    img_s = pd.Series("", index=df.index, dtype=object)
+    for col in _PREVIEW_IMG_COLS:
+        if col not in df.columns:
+            continue
+        empty = img_s.astype(str).str.strip() == ""
+        if not empty.any():
+            break
+        candidate = df[col]
+        usable = empty & candidate.notna() & (candidate.astype(str).str.strip() != "")
+        img_s.loc[usable] = candidate[usable]
+
+    names = df.get("NAME", pd.Series([""] * len(df), index=df.index)).fillna("").astype(str).values
+    brands = df.get("BRAND", pd.Series([""] * len(df), index=df.index)).fillna("").astype(str).values
+
+    out = []
+    for name, brand, raw in zip(names, brands, img_s.fillna("").astype(str).values):
+        zip_img = _get_image_from_zip(name, brand, raw)
+        if zip_img:
+            out.append(zip_img)
+            continue
+        u = str(raw).strip()
+        if u.lower().startswith("http") or u.startswith("//") or u.startswith("data:image/"):
+            if u.startswith("//"):
+                u = "https:" + u
+            elif u.lower().startswith("http://"):
+                u = "https://" + u[7:]
+            out.append(u)
+        else:
+            out.append(None)
+    return out
+
+
 @st.fragment
 def render_flag_expander(
     title,
@@ -969,75 +1020,27 @@ def render_flag_expander(
                 df_display.apply(_local_p, axis=1),
             )
             
-        img_candidate = img_col or next((c for c in possible_img_cols if c in df_display.columns), None)
-        img_s = df_display[img_candidate].copy() if (img_candidate and img_candidate in df_display.columns) else pd.Series("", index=df_display.index)
-        mask_empty = img_s.isna() | (img_s.astype(str).str.strip() == "")
-        for fallback in ["MainImage", "Image", "IMAGE1_ZIP", "Url", "url", "main_image", "MAIN_IMAGE", "IMAGE_URL", "image1"]:
-            if not mask_empty.any(): break
-            if fallback in df_display.columns:
-                fallback_s = df_display[fallback]
-                valid_fallback = fallback_s.notna() & (fallback_s.astype(str).str.strip() != "")
-                update_mask = mask_empty & valid_fallback
-                img_s.loc[update_mask] = fallback_s[update_mask]
-                mask_empty = img_s.isna() | (img_s.astype(str).str.strip() == "")
-        names = df_display.get("NAME", pd.Series([""] * len(df_display))).fillna("").astype(str).values
-        brands = df_display.get("BRAND", pd.Series([""] * len(df_display))).fillna("").astype(str).values
-        imgs = img_s.fillna("").astype(str).values
-        res = []
-        for n, b, i in zip(names, brands, imgs):
-            zip_img = _get_image_from_zip(n, b, i)
-            if zip_img:
-                res.append(zip_img)
-            else:
-                u = str(i).strip()
-                if u.lower().startswith("http") or u.startswith("//") or u.startswith("data:image/"):
-                    if u.startswith("//"):
-                        u = "https:" + u
-                    elif u.lower().startswith("http://"):
-                        u = "https://" + u[7:]
-                    res.append(u)
-                else:
-                    res.append(None)
-        if "_Image_Preview_Cached" in df_display.columns:
-            df_display["_Image_Preview_Cached"] = res
-        else:
-            df_display.insert(0, "_Image_Preview_Cached", res)
-
+        # Image previews are resolved lazily at render time (see
+        # _resolve_preview_urls) so the display cache never carries base64
+        # blobs for a toggle that is off by default.
         st.session_state.display_df_cache[cache_key] = df_display
     else:
         df_display = st.session_state.display_df_cache[cache_key]
-        if "_Image_Preview_Cached" not in df_display.columns:
-            names = df_display.get("NAME", pd.Series([""] * len(df_display))).fillna("").astype(str).values
-            brands = df_display.get("BRAND", pd.Series([""] * len(df_display))).fillna("").astype(str).values
-            img_s = pd.Series("", index=df_display.index)
-            for c in possible_img_cols + ["MainImage", "Image", "IMAGE1_ZIP", "Url", "url", "main_image", "MAIN_IMAGE"]:
-                if c in df_display.columns:
-                    valid_mask = (img_s == "") & df_display[c].notna() & (df_display[c].astype(str).str.strip() != "")
-                    img_s.loc[valid_mask] = df_display[c][valid_mask]
-            imgs = img_s.fillna("").astype(str).values
-            res = []
-            for n, b, i in zip(names, brands, imgs):
-                zip_img = _get_image_from_zip(n, b, i)
-                if zip_img:
-                    res.append(zip_img)
-                else:
-                    u = str(i).strip()
-                    if u.lower().startswith("http") or u.startswith("//") or u.startswith("data:image/"):
-                        if u.startswith("//"):
-                            u = "https:" + u
-                        elif u.lower().startswith("http://"):
-                            u = "https://" + u[7:]
-                        res.append(u)
-                    else:
-                        res.append(None)
-            df_display.insert(0, "_Image_Preview_Cached", res)
 
+    # Each flag's toggle owns its own state, keyed by flag.
+    #
+    # It previously passed `value=` from a single shared `show_table_images`
+    # while keying the widget per flag. Those fight each other: a keyed widget's
+    # own state wins after its first render, so `value=` never propagated — and
+    # because every expander then wrote the shared variable back, whichever flag
+    # rendered LAST silently overwrote it. Combined with render_flag_expander
+    # being a fragment (toggling one flag reruns only that flag), the setting
+    # appeared to work and then reverted on the next full rerun.
     show_table_images = st.toggle(
         "Show Image Previews",
-        value=st.session_state.get("show_table_images", False),
         key=f"tg_img_{title}",
+        help="Show a thumbnail for each row in this table.",
     )
-    st.session_state.show_table_images = show_table_images
 
     c1, c2, c3 = st.columns([1, 1, 1], gap="large")
     with c1:
@@ -1175,18 +1178,28 @@ def render_flag_expander(
             "Is_Zip": None,
         }
 
-    # Wire up the Show Image Previews toggle
-    if show_table_images and "_Image_Preview_Cached" in df_view.columns:
-        df_view.insert(0, "_Image_Preview", df_view["_Image_Preview_Cached"])
-        _col_cfg["_Image_Preview"] = st.column_config.ImageColumn(
-            "Preview", help="Main Image Preview"
-        )
-        
-    if "_Image_Preview_Cached" in df_view.columns:
-        df_view = df_view.drop(columns=["_Image_Preview_Cached"])
+    # Resolve previews only now: previews are on, and df_view is already the
+    # filtered, paginated slice, so this touches at most one page of rows
+    # instead of every row in the bucket.
+    if show_table_images:
+        _preview_urls = _resolve_preview_urls(df_view)
+        if any(u for u in _preview_urls):
+            df_view = df_view.copy()
+            df_view.insert(0, "_Image_Preview", _preview_urls)
+            _col_cfg["_Image_Preview"] = st.column_config.ImageColumn(
+                "Preview", help="Main image for this product"
+            )
+        else:
+            st.caption(
+                "No images available for these rows — the file has no usable "
+                "image URL, and no matching image was found in the uploaded ZIP."
+            )
 
-    # Pass unstyled df_view when show_table_images is True so st.column_config.ImageColumn renders images,
-    # because passing a pandas Styler object converts column cells to text strings.
+    # A pandas Styler renders every cell as text, which stops ImageColumn from
+    # drawing anything — so with previews on, the table goes through unstyled
+    # and loses style_rows' red tint for ZIP rows. That costs nothing: the tint
+    # only ever encoded Is_Zip, and the "Source" column already states "⚡ ZIP"
+    # in text, which is also the accessible way to carry it.
     if show_table_images:
         event = st.dataframe(
             df_view,
