@@ -163,10 +163,13 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 # ── Derived caches (safe to delete; regenerated on demand) ──
-# The trained category-correction model, rebuilt automatically whenever the
-# corrections table changes. ~28MB — never commit it.
-*.clf.v*.pkl
-cat_learning.db.clf.*
+#
+# NOTE: cat_learning.db.clf.v*.pkl (the trained category-correction model) is
+# deliberately NOT ignored. It is derived data, but Streamlit Cloud has an
+# ephemeral filesystem: anything written at runtime is lost on restart, so
+# without the model in the repo every cold boot there refits from scratch —
+# minutes of CPU, repeated on every wake. Commit it together with
+# cat_learning.db so the two match; the app checks and refits if they drift.
 
 # On-disk validation caches
 app_cache_flags/

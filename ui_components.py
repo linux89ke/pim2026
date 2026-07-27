@@ -5,6 +5,7 @@ ui_components.py - All Streamlit UI rendering components, dialogs, and the image
 import base64
 import concurrent.futures
 import gc
+import hashlib
 import html as html_lib
 import json
 import logging
@@ -1507,9 +1508,15 @@ def build_fast_grid_html(
     # previously this was a fresh {} every call, so ZIP image lookups for
     # already-seen (name, brand, img_url) combos were redone on every
     # page turn / rerun instead of being cached.
+    #
+    # Bounded: entries are base64 data URIs (~1.33x the source image) and this
+    # is a SECOND copy of what zip_image_store already holds, so leaving it
+    # unbounded meant a long paging session carried two full unbounded copies of
+    # every image it had ever displayed.
     if "_zip_img_cache" not in st.session_state:
         st.session_state._zip_img_cache = {}
     _zip_img_cache: dict = st.session_state._zip_img_cache
+    _ZIP_IMG_CACHE_MAX = 300
 
     _zip_index_ss = st.session_state.get("_zip_sid_index")
     _zip_sid_set = set()
@@ -1538,6 +1545,11 @@ def build_fast_grid_html(
             _zip_cache_key = (name, brand, img_url)
             if _zip_cache_key not in _zip_img_cache:
                 _zip_img_cache[_zip_cache_key] = _get_image_from_zip(name, brand, img_url)
+                if len(_zip_img_cache) > _ZIP_IMG_CACHE_MAX:
+                    for _stale in list(_zip_img_cache.keys())[
+                        : len(_zip_img_cache) - _ZIP_IMG_CACHE_MAX
+                    ]:
+                        _zip_img_cache.pop(_stale, None)
             img_data = _zip_img_cache[_zip_cache_key]
             if img_data:
                 img_url = img_data
@@ -1666,7 +1678,27 @@ def build_fast_grid_html(
             }
         )
 
+    # Split embedded ZIP images out of the card records.
+    #
+    # ZIP-sourced images are base64 data URIs: an 80KB photo becomes ~107KB of
+    # text. Left inside `cards`, a 500-card page is a ~52MB payload that was
+    # re-sent on every rerun and duplicated by the retry loop — the direct cause
+    # of the browser hanging and the websocket dropping. The heavy bytes now
+    # travel in their own map, sent only when the card set actually changes,
+    # while `cards` itself stays small enough to resend freely.
+    images_map = {}
+    for _c in cards_data:
+        _img = _c.get("img") or ""
+        if _img.startswith("data:"):
+            images_map[_c["sid"]] = _img
+            _c["img"] = ""  # the iframe resolves it from IMAGES[sid]
+
     cards_json = orjson.dumps(cards_data).decode("utf-8").replace("</", "<\\/")
+    images_json = orjson.dumps(images_map).decode("utf-8").replace("</", "<\\/")
+    # Identifies this exact card set. The iframe already knew how to skip a
+    # re-render when the signature is unchanged (_lastCardsSig), but Python
+    # never sent one, so every sync forced a full re-render.
+    cards_sig = hashlib.md5(cards_json.encode("utf-8")).hexdigest()
 
     scroll_js = """
         window.addEventListener('DOMContentLoaded', function() {
@@ -1801,7 +1833,10 @@ def build_fast_grid_html(
         )
     _cols_btns = "".join(_cols_btns_parts)
 
-    _grid_sync_data = (committed_json, poor_img_sids_json, prefetch_json, cards_json)
+    _grid_sync_data = (
+        committed_json, poor_img_sids_json, prefetch_json, cards_json,
+        images_json, cards_sig,
+    )
     _html_str = f"""<!DOCTYPE html>
 <html dir="{html_dir}">
 <head>
@@ -2263,10 +2298,38 @@ var POOR_IMG_SIDS = new Set();
 var PREFETCH_URLS = {{}};
 var PLACEHOLDER = "{_PLACEHOLDER_SVG}";
 var _lastCardsSig = null;
+// Base64 ZIP images, keyed by SID and kept out of the card records so the card
+// payload stays small. Retained across syncs: paging back to a visited page
+// costs nothing because the bytes are already here.
+var IMAGES = {{}};
+// Single resolution point for a card's image source, so callers never have to
+// know whether it came inline (http URL) or from the IMAGES store (ZIP).
+function imgFor(card) {{
+  if (!card) return PLACEHOLDER;
+  return card.img || IMAGES[card.sid] || PLACEHOLDER;
+}}
 
 window.addEventListener('message', function(e) {{
   if (e.data && e.data.type === 'SYNC_STATE') {{
     var cardsChanged = false;
+    if (e.data.images) {{
+      for (var _s in e.data.images) {{ IMAGES[_s] = e.data.images[_s]; }}
+      // Hard ceiling. Each entry is a base64 data URI, so without this a long
+      // paging session would grow the tab's memory without bound until it hung.
+      var _keys = Object.keys(IMAGES);
+      if (_keys.length > 600) {{
+        for (var _k = 0; _k < _keys.length - 600; _k++) {{ delete IMAGES[_keys[_k]]; }}
+      }}
+    }}
+    // Tell the sender it landed so it stops retrying. The old code fired the
+    // full payload four times at every frame regardless of success.
+    try {{
+      var _ack = {{type: 'SYNC_ACK', sig: e.data.cards_sig || null}};
+      window.parent.postMessage(_ack, '*');
+      for (var _i = 0; _i < window.parent.frames.length; _i++) {{
+        try {{ window.parent.frames[_i].postMessage(_ack, '*'); }} catch(_e) {{}}
+      }}
+    }} catch(_e) {{}}
     if (e.data.cards) {{
       // A new page/filter/sort of cards arrived over postMessage instead
       // of via a full srcdoc reload. This is what avoids the multi-flicker
@@ -2436,7 +2499,7 @@ function activateLazyImages() {{
 
 function onImgError(img, sid) {{
   var card = CARDS.find(c => c.sid === sid);
-  var realSrc = img.dataset.lazySrc || (card ? card.img : '');
+  var realSrc = img.dataset.lazySrc || imgFor(card);
   if (!img.dataset.triedProxy && realSrc && realSrc.startsWith('http')) {{
     img.dataset.triedProxy = 'true';
     delete img.dataset.lazySrc;
@@ -2628,7 +2691,8 @@ function renderCard(card) {{
     + (isSelected ? ' selected' : '')
     + (card.is_zip ? ' zip-card' : '');
 
-  var safeImgSrcForHtml = card.img ? card.img.replace(/'/g, "%27").replace(/"/g, "%22") : PLACEHOLDER;
+  var _src = imgFor(card);
+  var safeImgSrcForHtml = _src ? _src.replace(/'/g, "%27").replace(/"/g, "%22") : PLACEHOLDER;
   var shortName = card.name.length > 38 ? escapeHtml(card.name.slice(0,38)) + '\u2026' : escapeHtml(card.name);
   var warnHtml = (card.warnings || []).map(w => `<span class="warn-badge">${{escapeHtml(w)}}</span>`).join('');
   if (card.is_duplicate) warnHtml += `<span class="warn-badge" style="background:#7c3aed;color:#fff;font-weight:800;">⧉ DUPLICATE</span>`;
@@ -2759,7 +2823,7 @@ window.showZoom = function(sid, event) {{
   var card = CARDS.find(c => c.sid === sid);
   if (!card) return;
   var img = document.getElementById('tooltip-img');
-  img.src = card.img || PLACEHOLDER;
+  img.src = imgFor(card);
   img.onerror = function() {{ img.src = PLACEHOLDER; img.onerror = null; }};
   document.getElementById('zoom-backdrop').style.display = 'block';
   tooltip.style.display = 'block';
@@ -3071,7 +3135,7 @@ window.stageReject = function(sid, r) {{
 
   if (currentCard && (r === 'REJECT_POOR_IMAGE' || r.startsWith('REJECT_IMG_'))) {{
       CARDS.forEach(c => {{
-          if (c.sid !== sid && (c.img === currentCard.img || (c.hash && c.hash === currentCard.hash))) {{
+          if (c.sid !== sid && (imgFor(c) === imgFor(currentCard) || (c.hash && c.hash === currentCard.hash))) {{
               toStage.push(c.sid);
           }}
       }});
@@ -4079,7 +4143,35 @@ def visual_review_modal(support_files):
         )
 
     # Unpack the grid html and its sync data
-    _grid_html_str, _committed_json, _poor_img_sids_json, _prefetch_json, _cards_json = grid_html
+    (_grid_html_str, _committed_json, _poor_img_sids_json, _prefetch_json,
+     _cards_json, _images_json, _cards_sig) = grid_html
+
+    # Only ship the bulky halves when they are actually needed. Committed state
+    # and poor-image flags are tiny and always sent; cards and the base64 image
+    # map are not. A rerun from an unrelated widget now costs a few hundred
+    # bytes instead of the whole page of cards and images.
+    #
+    # Two things force a resend. The obvious one is a changed card set. The
+    # other is a changed grid document: Streamlit re-creates the iframe when its
+    # srcdoc changes (e.g. only the columns-per-row buttons differ), and a fresh
+    # iframe has empty CARDS/IMAGES. Keying off the card set alone would leave
+    # that reloaded iframe with nothing to draw.
+    _grid_html_sig = hashlib.md5(_grid_html_str.encode("utf-8")).hexdigest()
+    _iframe_reloaded = st.session_state.get("_grid_last_html_sig") != _grid_html_sig
+    _send_bulk = (
+        st.session_state.get("_grid_last_sent_sig") != _cards_sig or _iframe_reloaded
+    )
+    st.session_state._grid_last_sent_sig = _cards_sig
+    st.session_state._grid_last_html_sig = _grid_html_sig
+
+    # Images for the current page are sent whenever the card set changes, and
+    # the iframe holds them in a size-capped store. Tracking what the browser
+    # already has and sending only the difference would save bytes, but it means
+    # the browser accumulates every image the session ever displayed — trading a
+    # server-side memory leak for a client-side one. A predictable ceiling
+    # matters more here than avoiding a resend on revisit.
+    _cards_field = f"cards: {_cards_json}," if _send_bulk else ""
+    _images_field = f"images: {_images_json}," if _send_bulk else ""
 
     st.markdown("""
     <style>
@@ -4101,29 +4193,46 @@ def visual_review_modal(support_files):
         # Inject a zero-height broadcaster that pushes state into the iframe via postMessage.
         # Sending cards via postMessage prevents the entire iframe DOM from being torn down
         # and rebuilt (which causes severe flickering) when changing pages.
+        # The payload is built ONCE and reused by any retry. The old version
+        # rebuilt this object literal on each of four attempts and posted it to
+        # every frame with no success check — at 500 ZIP-image cards that was
+        # hundreds of MB of structured-clone per render, which is what hung the
+        # browser and dropped the websocket. Now: send, wait for the grid's
+        # SYNC_ACK, and stop. Retries only happen if nothing acknowledged, which
+        # covers the genuine race where the grid iframe has not booted yet.
         _sync_html = f"""
         <script>
         (function() {{
-          function trySend(attemptsLeft) {{
+          var PAYLOAD = {{
+            type: 'SYNC_STATE',
+            committed: {_committed_json},
+            poor_img_sids: {_poor_img_sids_json},
+            prefetch: {_prefetch_json},
+            {_cards_field}
+            {_images_field}
+            cards_sig: {json.dumps(_cards_sig)},
+            scroll_to_top: {'true' if scroll_top_flag else 'false'}
+          }};
+          var acked = false;
+          var timer = null;
+          window.addEventListener('message', function(ev) {{
+            if (ev.data && ev.data.type === 'SYNC_ACK') {{
+              acked = true;
+              if (timer) {{ clearTimeout(timer); timer = null; }}
+            }}
+          }});
+          function send(attemptsLeft) {{
+            if (acked) return;
             try {{
               for (var i = 0; i < window.parent.frames.length; i++) {{
-                try {{
-                  window.parent.frames[i].postMessage({{
-                    type: 'SYNC_STATE',
-                    committed: {_committed_json},
-                    poor_img_sids: {_poor_img_sids_json},
-                    prefetch: {_prefetch_json},
-                    cards: {_cards_json},
-                    scroll_to_top: {'true' if scroll_top_flag else 'false'}
-                  }}, '*');
-                }} catch(e2) {{}}
+                try {{ window.parent.frames[i].postMessage(PAYLOAD, '*'); }} catch(e2) {{}}
               }}
             }} catch(e) {{}}
             if (attemptsLeft > 0) {{
-              setTimeout(function() {{ trySend(attemptsLeft - 1); }}, 200);
+              timer = setTimeout(function() {{ send(attemptsLeft - 1); }}, 250);
             }}
           }}
-          trySend(3);
+          send(3);
         }})();
         </script>
         """

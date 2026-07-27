@@ -466,13 +466,24 @@ class CategoryMatcherEngine:
             logger.warning(f"Could not fingerprint corrections table: {e}")
             return ""
 
-    def _load_cached_model(self, fingerprint: str):
-        if not fingerprint or not os.path.exists(self._model_cache_path):
+    def _load_cached_model(self, fingerprint: str, allow_stale: bool = False):
+        """Load the persisted model.
+
+        With allow_stale, a model fitted against a slightly different
+        corrections table is still returned. That matters on an ephemeral host
+        (Streamlit Cloud), where a committed model may not exactly match a
+        committed DB: a slightly-out-of-date suggestion engine available
+        instantly beats no suggestions for the minutes a refit would take.
+        Exact-match lookups in learning_db are unaffected either way.
+        """
+        if not os.path.exists(self._model_cache_path):
+            return None
+        if not fingerprint and not allow_stale:
             return None
         try:
             with open(self._model_cache_path, "rb") as f:
                 blob = pickle.load(f)
-            if blob.get("fingerprint") != fingerprint:
+            if blob.get("fingerprint") != fingerprint and not allow_stale:
                 return None
             return (blob["vectorizer"], blob["classifier"])
         except Exception as e:
@@ -501,20 +512,39 @@ class CategoryMatcherEngine:
                 pass
 
     def _ensure_correction_model(self, df=None) -> None:
-        """Load the persisted model, or fit one if there is nothing usable.
+        """Make a model available without ever blocking start-up.
 
-        The fit only ever runs synchronously here — on a machine that has never
-        trained this model. Every later update goes through _schedule_retrain()
-        and happens off the request path, so no user interaction blocks on it.
+        Fitting takes minutes on a constrained host. Doing it inline here would
+        stall the first page render — on Streamlit Cloud, past the boot timeout,
+        and again after every container restart because that filesystem is
+        ephemeral. So nothing here is allowed to block: load the exact model if
+        it is on disk, otherwise fall back to a stale one, otherwise start with
+        no classifier at all. Any gap is filled by a background refit.
+
+        Until a model is ready, predict_category_from_learning() still serves
+        exact matches from learning_db, which is the primary path anyway; only
+        the fuzzy fallback is briefly unavailable.
         """
         fingerprint = self._corrections_fingerprint()
         cached = self._load_cached_model(fingerprint)
         if cached is not None:
             self._corr_model = cached
-            logger.info("[CatLearn] Loaded correction model from cache")
+            logger.info("[CatLearn] Loaded correction model (matches corrections table)")
             return
-        logger.info("[CatLearn] No cached correction model — fitting once (this is slow)")
-        self._retrain_correction_classifier(df, fingerprint=fingerprint)
+
+        stale = self._load_cached_model(fingerprint, allow_stale=True)
+        if stale is not None:
+            self._corr_model = stale
+            logger.warning(
+                "[CatLearn] On-disk model does not match the corrections table; "
+                "using it anyway and refitting in the background"
+            )
+        else:
+            logger.warning(
+                "[CatLearn] No usable model on disk — starting without the fuzzy "
+                "category matcher; fitting in the background"
+            )
+        self._schedule_retrain()
 
     def _schedule_retrain(self) -> None:
         """Request a retrain without blocking the caller.

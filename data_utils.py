@@ -591,6 +591,24 @@ def format_local_price(usd_price, country: str) -> str:
 _ZIP_FILE_CACHE = None
 _ZIP_FILE_BYTES_ID = None
 
+# Cap on how many decoded ZIP images are held in memory at once. Each entry is a
+# base64 data URI — roughly 1.33x the original file — so an unbounded store grew
+# without limit as a reviewer paged through a large ZIP, and never shrank. 300
+# images covers several pages of history at a few hundred MB worst case.
+_ZIP_IMAGE_CACHE_MAX = 300
+
+
+def _bounded_store_set(store: dict, key: str, value: str) -> None:
+    """Insert into a plain dict used as an LRU-ish cache, evicting oldest first.
+
+    st.session_state stores a plain dict here (it must stay picklable and
+    session-scoped), so eviction is done explicitly rather than via a subclass.
+    """
+    store[key] = value
+    if len(store) > _ZIP_IMAGE_CACHE_MAX:
+        for _stale in list(store.keys())[: len(store) - _ZIP_IMAGE_CACHE_MAX]:
+            store.pop(_stale, None)
+
 def _basename_lower(value) -> str:
     name = str(value).strip().replace("\\", "/").split("/")[-1].lower()
     return name if name and name != "nan" else ""
@@ -622,7 +640,7 @@ def _load_zip_image_by_key(key: str) -> Optional[str]:
         elif key.endswith(".webp"): mime = "image/webp"
         elif key.endswith(".gif"): mime = "image/gif"
         data_uri = f"data:{mime};base64,{encoded}"
-        store[key] = data_uri
+        _bounded_store_set(store, key, data_uri)
         return data_uri
     except Exception as e:
         logger.warning(f"Failed lazy-loading ZIP image {member}: {e}")
