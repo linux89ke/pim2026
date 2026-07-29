@@ -2952,6 +2952,28 @@ function imgFor(card) {{
   return card.img || IMAGES[card.sid] || PLACEHOLDER;
 }}
 
+// Announce that the listener below is live.
+//
+// The broadcaster used to fire blind: four attempts, 250ms apart, 750ms in
+// total. This document is ~110KB of HTML and ~65KB of JS, so on a cold Cloud
+// container it is routinely still parsing when the last attempt goes out.
+// Every message then lands on a frame with no listener, CARDS stays empty,
+// and the grid draws "No products match your filters" over a batch of 863 —
+// until any interaction triggers a rerun and a fresh send that happens to
+// win the race.
+//
+// Same delivery route the SYNC_ACK below already uses: parent plus every
+// sibling frame, because the broadcaster is a sibling iframe, not the parent.
+function _announceGridReady() {{
+  try {{
+    var _rdy = {{type: 'GRID_READY'}};
+    window.parent.postMessage(_rdy, '*');
+    for (var _r = 0; _r < window.parent.frames.length; _r++) {{
+      try {{ window.parent.frames[_r].postMessage(_rdy, '*'); }} catch(_e) {{}}
+    }}
+  }} catch(_e) {{}}
+}}
+
 window.addEventListener('message', function(e) {{
   if (e.data && e.data.type === 'SYNC_STATE') {{
     var cardsChanged = false;
@@ -3004,6 +3026,12 @@ window.addEventListener('message', function(e) {{
     }}
   }}
 }});
+// Listener is registered — safe to ask for the payload now. Repeated on
+// DOMContentLoaded and load in case the broadcaster iframe had not yet
+// executed when this ran.
+_announceGridReady();
+window.addEventListener('DOMContentLoaded', _announceGridReady);
+window.addEventListener('load', _announceGridReady);
 var LABELS = {labels_json};
 var DEFAULT_PAGE_SIZE = {items_per_page};
 var PAGE_SIZE_OPTIONS = [20, 50, 100, 200, 500];
@@ -5021,9 +5049,14 @@ def visual_review_modal(support_files):
           var acked = false;
           var timer = null;
           window.addEventListener('message', function(ev) {{
-            if (ev.data && ev.data.type === 'SYNC_ACK') {{
+            if (!ev.data) return;
+            if (ev.data.type === 'SYNC_ACK') {{
               acked = true;
               if (timer) {{ clearTimeout(timer); timer = null; }}
+            }} else if (ev.data.type === 'GRID_READY') {{
+              // The grid finished parsing and is listening. Deliver now
+              // rather than hoping a blind retry coincides with it.
+              send(0);
             }}
           }});
           function send(attemptsLeft) {{
@@ -5034,10 +5067,14 @@ def visual_review_modal(support_files):
               }}
             }} catch(e) {{}}
             if (attemptsLeft > 0) {{
-              timer = setTimeout(function() {{ send(attemptsLeft - 1); }}, 250);
+              timer = setTimeout(function() {{ send(attemptsLeft - 1); }}, 400);
             }}
           }}
-          send(3);
+          // GRID_READY is the real trigger; this is the safety net for the
+          // case where the grid announced itself before this script existed.
+          // 12 attempts at 400ms covers ~5s of cold-start parsing, against
+          // the 750ms the old blind loop allowed.
+          send(12);
         }})();
         </script>
         """
