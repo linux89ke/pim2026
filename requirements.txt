@@ -7,9 +7,31 @@
 # at runtime or referenced by an import statement in the app's own path.
 
 streamlit>=1.60.0
-pandas>=2.1.0
-numpy>=1.26.0
-polars>=0.20.0
+
+# pandas MUST stay below 3. In pandas 3 the new string dtype is the default,
+# and under it Series.astype(str) preserves missing values as NaN instead of
+# turning them into the string "nan". This code leans on the old behaviour in
+# a dozen places — most of them guards of the form
+#   x.astype(str) ... then len(x) / x.lower() / x == "nan"
+# so on pandas 3 the guard runs, changes nothing, and the float reaches the
+# string operation. Cloud installs the newest wheel that satisfies the range,
+# so an unbounded ">=2.1.0" is what put pandas 3 on the server while local
+# stayed on 2.3.3 — the app died there and could not be reproduced here.
+#
+# Symptoms it caused, all from this one change: a fatal TypeError in
+# derive_status_report, and — worse, because it was silent — the restricted
+# brand lists for KE/NG/GH/MA failing to load, which made those checks pass
+# every product instead of failing loudly.
+#
+# The code has since been made independent of that behaviour, but the cap
+# stays until the app has actually been exercised against pandas 3 on real
+# batches. Raise it deliberately, not by leaving the door open.
+pandas>=2.1.0,<3
+# Upper bounds for the same reason: majors here have a history of changing
+# dtype and null semantics under the app rather than at it. Both are pinned to
+# the majors the app is tested on (numpy 2.4, polars 1.42).
+numpy>=1.26.0,<3
+polars>=1.0,<2
 
 # Excel IO. xlsxwriter is never imported — it is named as an engine string in
 # export_utils.py and pages/Report.py, so an import scan will not see it and
