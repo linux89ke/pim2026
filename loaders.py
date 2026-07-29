@@ -149,7 +149,7 @@ def load_prohibited_from_local() -> Dict[str, List[Dict]]:
                 df.columns[0],
             )
             category_col = next((c for c in df.columns if "cat" in c), None)
-            kw_series = df[keyword_col].astype(str).str.strip().str.lower()
+            kw_series = df[keyword_col].fillna("").astype(str).str.strip().str.lower()
             valid_mask = kw_series.ne("") & ~kw_series.isin(("nan", "keywords"))
             df_v = df[valid_mask].copy()
             kw_series = kw_series[valid_mask]
@@ -183,20 +183,28 @@ def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
                 config_by_country[country_name] = []
                 continue
             df.columns = [str(c).strip().lower() for c in df.columns]
-            brand_col_vals = df.get("brand", pd.Series(dtype=str)).astype(str).str.strip()
+            # fillna before astype: under pandas' new string dtype astype(str)
+            # no longer renders missing values as "nan", so a blank brand cell
+            # stayed NaN and reached .lower() below as a float. That took out the
+            # whole sheet for KE/NG/GH/MA and, because the loader swallows the
+            # exception and returns [], the restricted-brand checks then passed
+            # every product silently instead of failing loudly.
+            brand_col_vals = df.get("brand", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
             valid = brand_col_vals.str.lower().ne("nan") & brand_col_vals.ne("")
             df = df[valid].copy()
             df["_b_lower"] = brand_col_vals[valid].str.lower().values
             df["_b_norm"] = brand_col_vals[valid].map(normalize_text).values
 
             def _split_set(series, sep=","):
-                return series.astype(str).str.strip().apply(
+                # NaN is truthy, so `not x` does not catch it — without the
+                # fillna the lambda calls .lower() on a float.
+                return series.fillna("").astype(str).str.strip().apply(
                     lambda x: set() if not x or x.lower() in ("nan", "none")
                     else {v.strip().lower() for v in x.split(sep) if v.strip()}
                 )
 
             def _split_cats(series):
-                return series.astype(str).str.strip().apply(
+                return series.fillna("").astype(str).str.strip().apply(
                     lambda x: None if (not x or x.lower() in ("nan", "none"))
                     else {clean_category_code(c.strip()) for c in x.split(",") if c.strip()}
                 )
@@ -572,7 +580,7 @@ def load_perfume_catalog_from_local(_mtime: float = 0.0) -> Dict:
 
                 if aka_col:
                     _skip = {"", "nan", "-", "none"}
-                    for brand, aka_raw in zip(brands_v, df_v[aka_col].astype(str).str.strip()):
+                    for brand, aka_raw in zip(brands_v, df_v[aka_col].fillna("").astype(str).str.strip()):
                         if aka_raw.lower() in _skip:
                             continue
                         for alias in re.split(r"[/,]", aka_raw):
@@ -583,7 +591,7 @@ def load_perfume_catalog_from_local(_mtime: float = 0.0) -> Dict:
 
                 if model_col:
                     _skip = {"", "nan", "-", "none"}
-                    for brand, models_raw in zip(brands_v, df_v[model_col].astype(str).str.strip()):
+                    for brand, models_raw in zip(brands_v, df_v[model_col].fillna("").astype(str).str.strip()):
                         if models_raw.lower() in _skip:
                             continue
                         for model in models_raw.split(";"):

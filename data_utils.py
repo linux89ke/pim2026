@@ -209,7 +209,11 @@ _NOISE_PATTERN = re.compile(
 
 def _normalize_series(s: pd.Series) -> pd.Series:
     return (
-        s.astype(str)
+        # fillna first: astype(str) stops rendering NaN as "nan" under
+        # pandas' new string dtype, and the lambda below would then call
+        # unicodedata.normalize() and .lower() on a float. This helper
+        # normalises brand and name columns, so it fails broadly.
+        s.fillna("").astype(str)
         .map(lambda x: unicodedata.normalize("NFKD", x).encode("ascii", "ignore").decode("ascii") if x and x.lower() not in ("nan", "none") else "")
         .str.lower().str.strip()
         .str.replace(_NOISE_PATTERN, '', regex=True)

@@ -2006,14 +2006,19 @@ def check_brand_image_mismatch(
     if "Brand_Detected_On_Product" not in data.columns or "BRAND" not in data.columns:
         return pd.DataFrame(columns=data.columns)
 
-    det = data["Brand_Detected_On_Product"].astype(str).str.strip()
+    # fillna before astype. astype(str) no longer renders missing values as
+    # "nan" under pandas' new string dtype, so a blank BRAND stayed NaN and
+    # reached re.search() below as a float — "need a bytes-like object, float
+    # found", which killed the check for the whole batch. NaN is truthy, so
+    # the `if not decl` guard in _brands_agree did not catch it either.
+    det = data["Brand_Detected_On_Product"].fillna("").astype(str).str.strip()
     valid = det.ne("") & ~det.str.lower().isin(("nan", "none", "no brand", "unknown", "n/a"))
     d = data[valid].copy()
     if d.empty:
         return pd.DataFrame(columns=data.columns)
 
     d["_det_l"] = det[valid].str.lower()
-    d["_decl_l"] = d["BRAND"].astype(str).str.strip().str.lower()
+    d["_decl_l"] = d["BRAND"].fillna("").astype(str).str.strip().str.lower()
 
     def _brands_agree(decl: str, detected: str) -> bool:
         if not detected:
@@ -2658,11 +2663,19 @@ def check_weight_volume_in_name(
         r"|tea\s*bags?|teabags?|bags?|softgels?|lozenges?|gummies|gummy|vials?|ampoules?|tubes?"
         r"|pieces?|pcs|pack|packs|pairs?|rolls?|sheets?|wipes?|pods?|units?|serves?|servings?|vegan\s+pieces?"
         r"|dozens?|box|boxes|set|sets|bundle|bundles|lot|lots|collection|kit|kits)"
-        r"|\b\d+[\u0027\u2019]?s\b"
+        # Literal characters, not \uXXXX escapes. Python's re understands them,
+        # but pandas can hand this pattern to Arrow's RE2 engine instead, and
+        # RE2 rejects them outright -- "invalid escape sequence: \u" -- which
+        # took this check out entirely on the server. They were redundant too:
+        # \u0027 is the apostrophe, \u2019 the curly one, and the two micro
+        # signs below were already spelled out as literals in the same group.
+        # The Âµ / Î¼ forms were mojibake -- UTF-8 bytes read as
+        # latin-1 -- matching nothing a real product name contains.
+        r"|\d+['’]?s"
         r"|\b(?:a\s+)?dozen\b"
         r"|\b(?:pack|box|set|bundle|lot)\s+of\s+\d+\b"
         r"|\bper\s+(?:kg|kgs?|g|gm|grams?|mg|mcg|ml|l|ltr|oz|lb)\b"
-        r"|\d+\s*(?:\xc2\xb5g|\xce\xbcg|\xb5g|\u00b5g|\u03bcg|mcg|µg|μg)",
+        r"|\d+\s*(?:mcg|µg|μg)",
         re.IGNORECASE,
     )
     return target[~target["_name_lower"].str.contains(pat, na=False)].drop_duplicates(
@@ -3689,9 +3702,15 @@ def derive_status_report(data, results, support_files, country_validator):
 
         sids = new_res["PRODUCT_SET_SID"].values
         
-        comments = new_res["Comment_Detail"].astype(str).values if "Comment_Detail" in new_res.columns else [""] * len(sids)
-        reasons = new_res["Reason"].astype(str).values if "Reason" in new_res.columns else [rinfo["reason"]] * len(sids)
-        max_prices = new_res["CAT_MAX_PRICE"].astype(str).values if "CAT_MAX_PRICE" in new_res.columns else [""] * len(sids)
+        # fillna BEFORE astype, not after. Under pandas' new string dtype
+        # astype(str) leaves missing values as NaN instead of rendering them
+        # as the string "nan", so astype alone stops guaranteeing a str and
+        # the float reaches len() below. Filling first is correct under both
+        # behaviours, and "" is a better empty comment than "nan" ever was —
+        # it is falsy, so the `det_str or ...` fallbacks now actually fire.
+        comments = new_res["Comment_Detail"].fillna("").astype(str).values if "Comment_Detail" in new_res.columns else [""] * len(sids)
+        reasons = new_res["Reason"].fillna("").astype(str).values if "Reason" in new_res.columns else [rinfo["reason"]] * len(sids)
+        max_prices = new_res["CAT_MAX_PRICE"].fillna("").astype(str).values if "CAT_MAX_PRICE" in new_res.columns else [""] * len(sids)
 
         for sid, det_str, row_reason, mx_prc in zip(sids, comments, reasons, max_prices):
             if sid in processed_sids:
