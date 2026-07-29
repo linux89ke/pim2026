@@ -25,6 +25,68 @@ def _kenya_book_mask(rec) -> bool:
     return is_book_product and not is_book_cat
 
 
+# ── Kenya: books are exempt from the Wrong Category matcher ─────────────────
+#
+# The category matcher is a TF-IDF/ML predictor. Book titles are arbitrary
+# prose, so it routinely predicts some unrelated category for a book that is
+# already filed correctly and the product gets rejected for Wrong Category.
+#
+# Real taxonomy (from category_map.xlsx):
+#     Books, Movies and Music
+#     Books, Movies and Music / Art & Humanities / ...
+#     Books, Movies and Music / Bestselling Books
+#     Books, Movies and Music / DVDs
+#     Books, Movies and Music / DVDs / Drama          <- these still get checked
+#
+# So: anything under the Books branch is exempt, except the DVDs sub-tree.
+#
+# Matching is prefix-based on path segments, not a substring search, because
+# the taxonomy contains traps in both directions:
+#     "Baby Products / Nursery / Nursery Decor / Bookends"      contains "book"
+#     "Automobile / ... / In-Dash DVD & Video Receivers"        contains "dvd"
+# Neither belongs to the Books branch.
+_KE_BOOKS_ROOT = "books, movies and music"
+_KE_DVD_SEGMENT = "dvds"
+
+
+def _split_path(path: str) -> list:
+    raw = str(path or "").replace(">", "/")
+    return [seg.strip().lower() for seg in raw.split("/") if seg.strip()]
+
+
+def is_kenya_books_exempt(path: str) -> bool:
+    """True when a Kenya category path must not be flagged as Wrong Category."""
+    segs = _split_path(path)
+    if not segs or segs[0] != _KE_BOOKS_ROOT:
+        return False
+    # Under the Books branch. Only the DVDs sub-tree stays in scope.
+    return not (len(segs) > 1 and segs[1] == _KE_DVD_SEGMENT)
+
+
+def drop_kenya_books_false_positives(
+    flagged: pd.DataFrame, code_to_path: dict = None
+) -> pd.DataFrame:
+    """Remove Kenya book rows the category matcher flagged by mistake."""
+    if flagged is None or flagged.empty:
+        return flagged
+
+    paths = None
+    if "CATEGORY" in flagged.columns:
+        paths = flagged["CATEGORY"].astype(str)
+    if code_to_path and "CATEGORY_CODE" in flagged.columns:
+        _mapped = flagged["CATEGORY_CODE"].apply(
+            lambda c: code_to_path.get(str(c).strip(), "") if pd.notna(c) else ""
+        )
+        # Prefer the mapped path, fall back to whatever CATEGORY held.
+        paths = _mapped.where(_mapped.astype(str).str.strip().ne(""), paths) \
+            if paths is not None else _mapped
+    if paths is None:
+        return flagged
+
+    keep = ~paths.apply(is_kenya_books_exempt)
+    return flagged[keep].copy()
+
+
 def check_kenya_book_category(data: pd.DataFrame) -> pd.DataFrame:
     """
     Return Kenya book-mismatch rows as a normal QC DataFrame.

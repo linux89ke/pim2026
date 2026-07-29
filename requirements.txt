@@ -1,20 +1,29 @@
-streamlit
+# Streamlit app runtime.
+# The API service has its own file — see requirements-api.txt. Splitting them
+# keeps the Cloud image smaller and shortens Streamlit's component scan, which
+# walks the metadata of every installed package on each cold start.
+#
+# Verified against a real 508-row batch: every package below is either loaded
+# at runtime or referenced by an import statement in the app's own path.
+
+streamlit>=1.60.0
 pandas>=2.1.0
 numpy>=1.26.0
-openpyxl
-Pillow
-requests>=2.31.0
-xlsxwriter
-scikit-learn
-beautifulsoup4>=4.12.0
-lxml>=4.9.0
-plotly
-imagehash
-opencv-python-headless
-st-styled
-orjson==3.10.3
 polars>=0.20.0
-fastapi
-uvicorn[standard]
-redis>=5.0.0
-python-multipart
+
+# Excel IO. xlsxwriter is never imported — it is named as an engine string in
+# export_utils.py and pages/Report.py, so an import scan will not see it and
+# removing it breaks every export at write time.
+openpyxl
+xlsxwriter
+
+# lxml is likewise never imported directly, but it is loaded at runtime as a
+# transitive parser backend. Left in deliberately.
+lxml>=4.9.0
+
+Pillow
+imagehash
+requests>=2.31.0
+plotly
+orjson==3.10.3
+scikit-learn

@@ -22,6 +22,14 @@ import streamlit.components.v1 as components
 from PIL import Image
 
 from constants import GRID_COLS, JUMIA_COLORS
+from design_tokens import (
+    COLORS as DT,
+    SEVERITY,
+    SEVERITY_ORDER,
+    flag_label,
+    flag_severity,
+    severity_sort_key,
+)
 from data_utils import (
     _get_image_from_zip,
     clean_category_code,
@@ -268,38 +276,221 @@ PREFETCH_DISPLAY_COLUMNS = {
 }
 
 
+# Search, seller and category are per-flag and built inside each expander
+# (see render_flag_expander). They lived briefly in one shared bar above the
+# flags list, and then in the sidebar; both put them away from the rows they
+# filter. A sticky shared bar would have solved that, but position:sticky
+# does not work inside Streamlit's per-element wrappers — a sticky child's
+# containing block is exactly its own height, so it has no room to travel.
+
+
+def resolve_category_paths(df: pd.DataFrame, code_to_path: dict) -> pd.Series:
+    """Full category path per row, without ever losing what we already had.
+
+    Both call sites used to overwrite CATEGORY with a bare dict lookup on
+    CATEGORY_CODE. When a code was missing from category_map.xlsx — which
+    happens for ZIP uploads carrying newer or renamed categories — the flag
+    table's lookup defaulted to "" and *erased* a perfectly good category,
+    while the grid's defaulted to the raw code. That is why some ZIP products
+    showed no full category at all.
+
+    Order of preference: mapped path -> the CATEGORY already on the row ->
+    the raw code. Blank only if there was genuinely nothing.
+    """
+    idx = df.index
+    existing = (
+        df["CATEGORY"].astype(str) if "CATEGORY" in df.columns
+        else pd.Series("", index=idx)
+    )
+    if "CATEGORY_CODE" not in df.columns:
+        return existing
+
+    codes = df["CATEGORY_CODE"]
+    mapped = codes.apply(
+        lambda c: (code_to_path or {}).get(str(c).strip(), "") if pd.notna(c) else ""
+    ).astype(str)
+
+    out = mapped.where(mapped.str.strip().ne(""), existing)
+    out = out.astype(str)
+    # Still nothing? The code itself beats an empty cell — it is at least
+    # something a reviewer can look up.
+    raw = codes.astype(str)
+    out = out.where(
+        ~out.str.strip().str.lower().isin(["", "nan", "none"]),
+        raw,
+    )
+    return out.where(~out.str.strip().str.lower().isin(["nan", "none"]), "")
+
+
+def render_severity_group_header(level: str, flag_count: int, sku_count: int):
+    """
+    The band that opens each severity group in the flags list.
+
+    The list used to be flat and alphabetical, so `[247] Wrong Category` and
+    `[12] Restricted brands` carried identical weight — one is a cosmetic fix,
+    the other is a legal blocker. Grouping puts the triage decision in the
+    page structure rather than in the reviewer's head.
+    """
+    cfg = SEVERITY[level]
+    st.html(
+        f"""
+    <div style="
+      display:flex; align-items:baseline; gap:10px;
+      margin:22px 0 8px; padding:0 0 6px;
+      border-bottom:1px solid {DT['hairline']};">
+      <span style="
+        display:inline-block; width:3px; height:14px; border-radius:2px;
+        background:{cfg['spine']}; align-self:center;"></span>
+      <span style="
+        font-size:12px; font-weight:700; letter-spacing:.08em;
+        text-transform:uppercase; color:{cfg['color']};">{cfg['label']}</span>
+      <span style="
+        font-family:var(--font-mono); font-variant-numeric:tabular-nums slashed-zero;
+        font-size:12px; font-weight:600; color:{DT['ink']};">{sku_count:,}</span>
+      <span style="font-size:12px; color:{DT['ink_faint']};">
+        SKUs across {flag_count} {"check" if flag_count == 1 else "checks"}
+      </span>
+      <span style="
+        flex:1; text-align:right; font-size:11px;
+        color:{DT['ink_faint']};">{cfg['blurb']}</span>
+    </div>
+    """
+    )
+
+
 def flag_pill_header(flag_name: str, count: int, is_zip: bool = False) -> str:
-    color_map = {
-        "Wrong Category": ("#fef3c7", "#d97706"),
-        "Restricted brands": ("#fee2e2", "#dc2626"),
-        "Suspected Fake product": ("#fee2e2", "#b91c1c"),
-        "BRAND name repeated in NAME": ("#ede9fe", "#7c3aed"),
-        "Product Name Brand Name – Brand Repeated In Title": ("#ede9fe", "#7c3aed"),
-        "Product Name Brand Name – Inspired/Alternative Perfume Brand": ("#ede9fe", "#6d28d9"),
-        "Product Name Brand Name – Generic/Placeholder Brand": ("#ede9fe", "#5b21b6"),
-        "Product Name Brand Name – High-End Brand Counterfeit Suspected": ("#fee2e2", "#b91c1c"),
-        "Product Name Brand Name – Other": ("#f3f4f6", "#4b5563"),
-        "Title Language Check - Not In English": ("#e0f2fe", "#0369a1"),
-        "Title Language Check - Other": ("#f1f5f9", "#475569"),
-        "Duplicate product": ("#dcfce7", "#15803d"),
-    }
-    bg, fg = color_map.get(flag_name, ("#f3f4f6", "#374151"))
+    """
+    The header inside an opened flag expander.
 
-    if is_zip:
-        bg, fg = ("#f8fafc", "#334155")
+    Colour was previously a per-flag lookup across five unrelated hues, which
+    told a reviewer *which check fired* — something the label already says.
+    It now comes from the severity ramp, so colour carries the one thing the
+    label doesn't: how much trouble this is.
+    """
+    level = flag_severity(flag_name)
+    cfg = SEVERITY[level]
+    label = flag_label(flag_name)
 
+    # The ZIP badge stays as it was: this is how a reviewer tells a result the
+    # QC system already produced from one this tool computed itself, and the
+    # blue reads as "different source" rather than as a severity. Only the
+    # gradient's light end was darkened (#3b82f6 -> #2563eb) because white on
+    # it was 3.7:1 at 10px; the darker blue keeps the same look at 5.2:1.
     zip_badge = (
-        ' <span style="background:linear-gradient(135deg, #3b82f6, #1d4ed8);color:white;border-radius:6px;padding:2px 8px;font-size:10px;font-weight:900;box-shadow:0 2px 4px rgba(0,0,0,0.1);margin-left:8px;">ZIP</span>'
+        ' <span style="background:linear-gradient(135deg, #2563eb, #1d4ed8);'
+        'color:white;border-radius:6px;padding:2px 8px;font-size:11px;'
+        'font-weight:900;box-shadow:0 2px 4px rgba(0,0,0,0.1);'
+        'margin-left:8px;">ZIP</span>'
         if is_zip
         else ""
     )
 
     return (
-        f'<div style="display:flex;align-items:center;padding:10px 0;">'
-        f'<span style="background:{fg};color:white;border-radius:8px;'
-        f'padding:4px 12px;font-size:14px;font-weight:900;box-shadow:0 4px 12px {bg};">{count}</span>'
-        f'<span style="font-size:16px;font-weight:700;margin-left:12px;color:#1f2937;">{flag_name}</span>'
+        f'<div style="display:flex;align-items:center;gap:10px;padding:4px 0 12px;'
+        f'border-left:3px solid {cfg["spine"]};padding-left:12px;margin-bottom:4px;">'
+        f'<span style="background:{cfg["wash"]};color:{cfg["color"]};'
+        f'border:1px solid {cfg["spine"]}33;border-radius:6px;padding:3px 10px;'
+        f'font-family:var(--font-mono);font-variant-numeric:tabular-nums slashed-zero;'
+        f'font-size:13px;font-weight:600;">{count:,}</span>'
+        f'<span style="font-size:15px;font-weight:600;color:{DT["ink"]};">{label}</span>'
         f'{zip_badge}</div>'
+    )
+
+
+def render_context_rail(
+    country: str,
+    flag_src: str = "",
+    logo_html: str = "",
+    file_count: int = 0,
+    sku_count: int = 0,
+    rejected_count: int = 0,
+):
+    """
+    The persistent answer to "what am I looking at".
+
+    Country drives which rule set runs — Kenya, Morocco and Nigeria reject
+    different things — but it used to be visible only in the flag picker at
+    the very top of the page. Two thousand pixels down, in a flag expander,
+    nothing on screen said which market produced these rejections. That is a
+    correctness risk, not a polish one, so the rail sticks.
+    """
+    flag_img = (
+        f'<img src="{flag_src}" class="rail-flag" alt="">' if flag_src else ""
+    )
+
+    batch = ""
+    if file_count or sku_count:
+        parts = []
+        if file_count:
+            parts.append(
+                f'<span class="rail-num">{file_count}</span> '
+                f'{"file" if file_count == 1 else "files"}'
+            )
+        if sku_count:
+            parts.append(f'<span class="rail-num">{sku_count:,}</span> SKUs')
+        if rejected_count:
+            parts.append(
+                f'<span class="rail-num rail-rej">{rejected_count:,}</span> rejected'
+            )
+        batch = (
+            '<span class="rail-sep"></span>'
+            + '<span class="rail-dot"></span>'.join(
+                f'<span class="rail-stat">{p}</span>' for p in parts
+            )
+        )
+
+    st.html(
+        f"""
+    <style>
+      .ctx-rail {{
+        position: sticky; top: 0; z-index: 999;
+        display: flex; align-items: center; gap: 10px;
+        /* Tightened from 9px: the rail plus the sticky filter toolbar plus
+           Streamlit's own 60px header were taking 156px — 20% of a 768px
+           laptop screen — before any content. */
+        padding: 6px 14px; margin: 0 0 10px 0;
+        background: {DT['panel']};
+        border: 1px solid {DT['hairline']};
+        border-left: 3px solid {DT['accent']};
+        border-radius: 8px;
+        font-size: 13px; color: {DT['ink']};
+      }}
+      .rail-logo {{ height: 20px; width: auto; opacity: .9; }}
+      .rail-logo-fallback {{ font-size: 20px; color: {DT['accent_text']}; }}
+      .rail-flag {{
+        width: 22px; height: 16px; border-radius: 2px;
+        object-fit: cover; box-shadow: 0 0 0 1px rgba(0,0,0,.12);
+      }}
+      .rail-country {{
+        font-weight: 600; letter-spacing: .04em;
+        text-transform: uppercase; font-size: 12px;
+      }}
+      .rail-rules {{ color: {DT['ink_muted']}; font-size: 12px; }}
+      .rail-sep {{ flex: 1; }}
+      .rail-stat {{ color: {DT['ink_muted']}; font-size: 12px; white-space: nowrap; }}
+      .rail-num {{
+        font-family: var(--font-mono);
+        font-variant-numeric: tabular-nums slashed-zero;
+        font-weight: 600; color: {DT['ink']};
+      }}
+      .rail-rej {{ color: {DT['negative']}; }}
+      .rail-dot {{
+        display: inline-block; width: 3px; height: 3px; border-radius: 50%;
+        background: {DT['ink_faint']}; margin: 0 10px; vertical-align: middle;
+      }}
+      @media (max-width: 760px) {{
+        .ctx-rail {{ flex-wrap: wrap; }}
+        .rail-sep {{ flex-basis: 100%; height: 0; }}
+      }}
+    </style>
+    <div class="ctx-rail">
+      {logo_html}
+      {flag_img}
+      <span class="rail-country">{country}</span>
+      <span class="rail-rules">{country} rules</span>
+      {batch}
+    </div>
+    """
     )
 
 
@@ -313,50 +504,71 @@ def render_kpi_bar(final_report: pd.DataFrame):
         else 0
     )
     pct = round(approved / total * 100, 1) if total else 0
-    trend_color = "#22c55e" if pct >= 70 else "#f59e0b" if pct >= 40 else "#ef4444"
+    trend_color = (
+        DT["positive"] if pct >= 70
+        else SEVERITY["judgment"]["color"] if pct >= 40
+        else DT["negative"]
+    )
+    trend_note = (
+        "In the normal range" if pct >= 70
+        else "Worth a closer look" if pct >= 40
+        else "Most of this batch is failing"
+    )
 
     st.html(
         f"""
     <style>
       .kpi-strip {{
-        display:grid; grid-template-columns:repeat(4,1fr);
-        gap:12px; margin-bottom:8px;
+        display:grid; grid-template-columns:repeat(4,minmax(0,1fr));
+        gap:10px; margin-bottom:14px;
       }}
       .kpi-card {{
-        background:#fff; border:1px solid #e5e7eb;
-        border-radius:12px; padding:16px 20px;
-        box-shadow:0 1px 3px rgba(0,0,0,.06);
-        transition:transform .15s,box-shadow .15s;
+        background:{DT['panel']}; border:1px solid {DT['hairline']};
+        border-radius:10px; padding:12px 16px;
       }}
-      .kpi-card:hover {{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.10);}}
-      .kpi-label {{font-size:11px;font-weight:600;color:#6b7280;letter-spacing:.06em;text-transform:uppercase;}}
-      .kpi-value {{font-size:28px;font-weight:800;margin:4px 0;}}
-      .kpi-sub   {{font-size:11px;color:#9ca3af;}}
-      .kpi-bar   {{height:4px;border-radius:99px;margin-top:10px;background:#f3f4f6;}}
-      .kpi-fill  {{height:4px;border-radius:99px;background:{trend_color};
-                   width:{pct}%;transition:width .8s cubic-bezier(.4,0,.2,1);}}
+      .kpi-label {{
+        font-size:11px; font-weight:600; color:{DT['ink_muted']};
+        letter-spacing:.07em; text-transform:uppercase;
+      }}
+      .kpi-value {{
+        font-family:var(--font-mono);
+        font-variant-numeric:tabular-nums slashed-zero;
+        font-size:26px; font-weight:600; margin:2px 0 1px; line-height:1.15;
+      }}
+      .kpi-sub {{ font-size:11px; color:{DT['ink_faint']}; }}
+      .kpi-bar {{
+        height:3px; border-radius:99px; margin-top:9px;
+        background:{DT['panel_sunken']}; overflow:hidden;
+      }}
+      .kpi-fill {{
+        height:3px; border-radius:99px; background:{trend_color};
+        width:{pct}%; transition:width .6s cubic-bezier(.4,0,.2,1);
+      }}
+      @media (max-width: 860px) {{
+        .kpi-strip {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
+      }}
     </style>
     <div class="kpi-strip">
       <div class="kpi-card">
         <div class="kpi-label">Total SKUs</div>
-        <div class="kpi-value" style="color:#111827">{total:,}</div>
+        <div class="kpi-value" style="color:{DT['ink']}">{total:,}</div>
         <div class="kpi-sub">Unique product sets</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Approved</div>
-        <div class="kpi-value" style="color:#16a34a">{approved:,}</div>
-        <div class="kpi-sub">{pct}% approval rate</div>
+        <div class="kpi-value" style="color:{DT['positive']}">{approved:,}</div>
+        <div class="kpi-sub">{pct}% of the batch</div>
         <div class="kpi-bar"><div class="kpi-fill"></div></div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Rejected</div>
-        <div class="kpi-value" style="color:#dc2626">{rejected:,}</div>
-        <div class="kpi-sub">{zip_rej} from ZIP/prefetch</div>
+        <div class="kpi-value" style="color:{DT['negative']}">{rejected:,}</div>
+        <div class="kpi-sub">{zip_rej:,} from ZIP/prefetch</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">Approval Rate</div>
+        <div class="kpi-label">Approval rate</div>
         <div class="kpi-value" style="color:{trend_color}">{pct}%</div>
-        <div class="kpi-sub">{"Good" if pct>=70 else "Review needed" if pct>=40 else "High rejection"}</div>
+        <div class="kpi-sub">{trend_note}</div>
         <div class="kpi-bar"><div class="kpi-fill"></div></div>
       </div>
     </div>
@@ -555,6 +767,179 @@ def _get_image_maps(all_data):
             st.session_state["_image_maps_df_id"] = id(all_data)
     return st.session_state["_image_maps"]
 
+def _get_phash_maps(all_data):
+    """(sid_to_phash, phash_to_sids) — the same photo, whoever listed it.
+
+    img_to_sids above keys on the raw IMAGE1 value, so two sellers who upload
+    the *same photo* under different URLs never match. A perceptual hash does
+    match them: measured on a real batch, 11 groups covering 64 images (17%)
+    shared an identical phash across different sellers and brands.
+
+    Costs nothing to build. Every hash was already computed during
+    _fetch_all_image_dimensions, in the same pass that fetched dimensions —
+    this is a dict lookup per row, no decoding and no network. Cached against
+    id(all_data) exactly like _get_image_maps, so it is built once per dataset
+    and every later lookup is a dictionary hit.
+
+    Exact equality only. Hamming-distance matching would be all-pairs, which
+    is a billion comparisons on a 50k batch; exact match already catches the
+    overwhelming majority.
+    """
+    if (
+        "_phash_maps" in st.session_state
+        and st.session_state.get("_phash_maps_df_id") == id(all_data)
+    ):
+        return st.session_state["_phash_maps"]
+
+    hash_by_url = st.session_state.get("_image_phash_by_url") or {}
+    if (
+        all_data is None
+        or not hash_by_url
+        or "PRODUCT_SET_SID" not in getattr(all_data, "columns", [])
+        or "MAIN_IMAGE" not in getattr(all_data, "columns", [])
+    ):
+        maps = ({}, {})
+    else:
+        sids = all_data["PRODUCT_SET_SID"].astype(str).str.strip()
+        imgs = all_data["MAIN_IMAGE"].astype(str)
+        sid_to_phash = {}
+        phash_to_sids = {}
+        for sid, img in zip(sids, imgs):
+            ph = hash_by_url.get(img)
+            if not ph:
+                continue
+            sid_to_phash[sid] = ph
+            phash_to_sids.setdefault(ph, set()).add(sid)
+        maps = (sid_to_phash, phash_to_sids)
+
+    st.session_state["_phash_maps"] = maps
+    st.session_state["_phash_maps_df_id"] = id(all_data)
+    return maps
+
+
+def find_same_photo_siblings(sids, exclude_rejected: bool = True) -> dict:
+    """Other products carrying the identical photo of the ones just actioned.
+
+    Returns {sid: [sibling_sid, ...]} for siblings outside `sids`. Already
+    rejected siblings are dropped by default: re-rejecting them is a no-op
+    that would still overwrite their FLAG and destroy the original reason.
+    """
+    all_data = st.session_state.get("all_data_map")
+    sid_to_phash, phash_to_sids = _get_phash_maps(all_data)
+    if not phash_to_sids:
+        return {}
+
+    src = {str(s).strip() for s in sids}
+
+    # Candidates first — pure dict work, no pandas.
+    candidates = {}
+    for sid in src:
+        ph = sid_to_phash.get(sid)
+        if not ph:
+            continue
+        others = (phash_to_sids.get(ph) or set()) - src
+        if others:
+            candidates[sid] = others
+    if not candidates:
+        return {}
+
+    # Only now touch final_report, and only for the handful of candidates.
+    # Scanning it up front cost ~12ms per rejection on a 50k batch because
+    # .astype(str).str.strip() ran over every row; _get_norm_col keeps that
+    # normalisation cached on the frame instead of redoing it each call.
+    rejected = set()
+    if exclude_rejected:
+        fr = st.session_state.get("final_report", pd.DataFrame())
+        if isinstance(fr, pd.DataFrame) and not fr.empty and "Status" in fr.columns:
+            _all_cand = {s for v in candidates.values() for s in v}
+            _norm = _get_norm_col(fr, "ProductSetSid")
+            _hit = _norm.isin(_all_cand) & (fr["Status"] == "Rejected")
+            if _hit.any():
+                rejected = set(_norm[_hit])
+
+    out = {}
+    for sid, others in candidates.items():
+        remaining = others - rejected
+        if remaining:
+            out[sid] = sorted(remaining)
+    return out
+
+
+def render_sibling_prompt():
+    """Offer to carry a judgement rejection across to identical listings.
+
+    Deliberately a prompt and not an automatic cascade. An identical photo
+    proves the same *picture*, not the same listing — variants legitimately
+    share one, which is why the duplicate check keys on
+    seller|phash|colour|size|model rather than the hash alone. For a category
+    or colour call the other seller may have got it right, so a human decides.
+    """
+    _cascaded = st.session_state.pop("_sibling_cascaded", None)
+    if _cascaded:
+        st.info(
+            f"Also rejected **{_cascaded['count']}** identical listing"
+            f"{'s' if _cascaded['count'] != 1 else ''} from other sellers — "
+            f"*{flag_label(_cascaded['flag'])}* applies to the product itself, "
+            "not to who is selling it.",
+            icon=":material/content_copy:",
+        )
+
+    prompt = st.session_state.get("_sibling_prompt")
+    if not prompt or not prompt.get("sids"):
+        return
+
+    sids = prompt["sids"]
+    label = flag_label(prompt["flag"])
+
+    with st.container(border=True):
+        st.markdown(
+            f"**{len(sids)} other listing{'s' if len(sids) != 1 else ''} "
+            f"use the same photo.**"
+        )
+        st.caption(
+            f"You rejected {prompt['from_count']} product"
+            f"{'s' if prompt['from_count'] != 1 else ''} for *{label}*. "
+            "These are a different seller's listing of what looks like the same "
+            "product. This one is a judgement call, so nothing has been applied "
+            "— the other seller may have got it right."
+        )
+
+        _data = st.session_state.get("all_data_map", pd.DataFrame())
+        if isinstance(_data, pd.DataFrame) and not _data.empty:
+            _cols = [c for c in ("PRODUCT_SET_SID", "NAME", "BRAND", "SELLER_NAME", "CATEGORY")
+                     if c in _data.columns]
+            if _cols:
+                _view = _data[_data["PRODUCT_SET_SID"].astype(str).str.strip().isin(sids)][_cols]
+                if not _view.empty:
+                    st.dataframe(_view.head(50), hide_index=True, width="stretch")
+
+        c1, c2 = st.columns(2)
+        if c1.button(
+            f"Reject these too ({len(sids)})",
+            key="btn_sibling_apply", type="primary", width="stretch",
+            help=f"Applies the same reason — {label} — to all of them.",
+        ):
+            n = apply_status_change(
+                sids,
+                status="Rejected",
+                reason=prompt.get("reason", ""),
+                comment=prompt.get("comment", ""),
+                flag=prompt["flag"],
+                is_manual=True,
+                # Already the cascade — do not look for siblings of siblings.
+                propagate_siblings=False,
+            )
+            checkpoint_final_report()
+            st.session_state.pop("_sibling_prompt", None)
+            st.session_state.setdefault("main_toasts", []).append(
+                (f"Rejected {n:,} matching listing(s) as {label}", ":material/content_copy:")
+            )
+            st.rerun()
+        if c2.button("Leave them", key="btn_sibling_dismiss", width="stretch"):
+            st.session_state.pop("_sibling_prompt", None)
+            st.rerun()
+
+
 def checkpoint_final_report(fr: pd.DataFrame = None) -> bool:
     """Persist the current report — including manual decisions — to disk.
 
@@ -595,8 +980,52 @@ def apply_status_change(
     is_manual: bool = True,
     is_zip: bool = False,
     sync_quick_rejects: bool = True,
+    propagate_siblings: bool = True,
 ) -> int:
     sid_set = _normalize_sid_set(sids)
+
+    # ── Same photo, another seller ────────────────────────────────────────
+    #
+    # Rejecting a product on page 1 should not leave an identical listing from
+    # a different seller untouched on page 6. What happens next depends on the
+    # reason, because the two kinds do not travel the same way:
+    #
+    #   blocker   — restricted brand, prohibited, counterfeit. A property of
+    #               the product itself, so it holds for whoever lists it.
+    #               Cascades silently and reports what it did.
+    #   judgement — wrong category, colour, title. Seller-specific: the other
+    #               seller may well have filed the same product correctly.
+    #               Never auto-applied; raised as a prompt to confirm.
+    #
+    # propagate_siblings=False is how the cascade calls back in without
+    # re-triggering itself.
+    _sibling_map = {}
+    if propagate_siblings and status == "Rejected" and flag:
+        try:
+            _sibling_map = find_same_photo_siblings(sid_set)
+        except Exception as _e:
+            logger.warning("Sibling lookup failed: %s", _e)
+            _sibling_map = {}
+
+    _sibling_sids = sorted({s for v in _sibling_map.values() for s in v})
+    _severity = flag_severity(flag) if _sibling_sids else None
+
+    if _sibling_sids and _severity == "blocker":
+        # Compliance reason — apply it to the identical listings too.
+        sid_set.update(_sibling_sids)
+        st.session_state["_sibling_cascaded"] = {
+            "flag": flag,
+            "count": len(_sibling_sids),
+        }
+    elif _sibling_sids:
+        # Judgement reason — surface it, do not act on it.
+        st.session_state["_sibling_prompt"] = {
+            "flag": flag,
+            "reason": reason,
+            "comment": comment,
+            "sids": _sibling_sids,
+            "from_count": len(_sibling_map),
+        }
 
     is_image_rej = status == "Rejected" and any(x in str(flag).lower() for x in ["image", "stretched", "blurry", "poor", "mismatch"])
     if is_image_rej:
@@ -993,9 +1422,7 @@ def render_flag_expander(
 
         _code_to_path = support_files.get("code_to_path", {})
         if _code_to_path and "CATEGORY_CODE" in df_display.columns:
-            df_display["CATEGORY"] = df_display["CATEGORY_CODE"].apply(
-                lambda c: _code_to_path.get(str(c).strip(), "") if pd.notna(c) else ""
-            )
+            df_display["CATEGORY"] = resolve_category_paths(df_display, _code_to_path)
             df_display = df_display.drop(columns=["CATEGORY_CODE"])
         _final_cols = list(
             dict.fromkeys(
@@ -1042,30 +1469,50 @@ def render_flag_expander(
         help="Show a thumbnail for each row in this table.",
     )
 
-    c1, c2, c3 = st.columns([1, 1, 1], gap="large")
-    with c1:
+    # All three controls sit with the rows they filter. They were briefly
+    # hoisted into one bar above the whole flags list, which removed the
+    # duplication but put them at the top of a very long page — so changing a
+    # filter meant scrolling away from the table and back. A sticky bar would
+    # have squared that circle, but position:sticky does not work inside
+    # Streamlit's per-element wrappers (measured; it scrolls away like a
+    # static element). Adjacent beats consolidated here.
+    #
+    # "_fs_"/"_ff_"/"_fc_" prefixes are what _reset_report_state sweeps, so a
+    # new batch never opens with the last batch's filters hiding rows.
+    _f1, _f2, _f3 = st.columns([2, 1.5, 1.5], gap="medium")
+    with _f1:
         search_term = st.text_input(
-            _t("search_grid"),
-            placeholder="Name, Brand...",
+            "Search these rows",
+            placeholder="Name, brand or seller",
             icon=":material/search:",
-            key=f"s_{title}",
+            key=f"_fs_{title}",
+        ).strip()
+    with _f2:
+        _seller_options = (
+            sorted(df_display["SELLER_NAME"].dropna().astype(str).unique())
+            if "SELLER_NAME" in df_display.columns else []
         )
-    with c2:
-        _seller_key = f"f_{title}"
-        _seller_options = sorted(df_display["SELLER_NAME"].dropna().astype(str).unique()) if "SELLER_NAME" in df_display.columns else []
+        _sk = f"_ff_{title}"
+        if _sk in st.session_state:
+            _valid = [v for v in st.session_state[_sk] if v in _seller_options]
+            if _valid != list(st.session_state[_sk]):
+                st.session_state[_sk] = _valid
         seller_filter = st.multiselect(
-            "Filter by Seller",
-            _seller_options,
-            default=[s for s in st.session_state.get(f"_sf_{title}", []) if s in _seller_options],
-            key=_seller_key,
+            "Seller", _seller_options, key=_sk, placeholder="All sellers",
         )
-        st.session_state[f"_sf_{title}"] = seller_filter
-    with c3:
-        _cat_key = f"fc_{title}"
-        _cat_options = sorted(df_display["CATEGORY"].dropna().astype(str).unique()) if "CATEGORY" in df_display.columns else []
-        _cat_default = [c for c in st.session_state.get(f"_cf_{title}", []) if c in _cat_options]
-        category_filter = st.multiselect("Filter by Category", _cat_options, default=_cat_default, key=_cat_key)
-        st.session_state[f"_cf_{title}"] = category_filter
+    with _f3:
+        _cat_options = (
+            sorted(df_display["CATEGORY"].dropna().astype(str).unique())
+            if "CATEGORY" in df_display.columns else []
+        )
+        _ck = f"_fc_{title}"
+        if _ck in st.session_state:
+            _valid = [v for v in st.session_state[_ck] if v in _cat_options]
+            if _valid != list(st.session_state[_ck]):
+                st.session_state[_ck] = _valid
+        category_filter = st.multiselect(
+            "Category", _cat_options, key=_ck, placeholder="All categories",
+        )
 
     df_view = df_display.copy()
     if search_term:
@@ -1083,22 +1530,32 @@ def render_flag_expander(
                 .any(axis=1)
             )
             df_view = df_view[mask]
-    if seller_filter:
-        df_view = df_view[df_view["SELLER_NAME"].isin(seller_filter)]
+    if seller_filter and "SELLER_NAME" in df_view.columns:
+        df_view = df_view[df_view["SELLER_NAME"].astype(str).isin(seller_filter)]
     if category_filter and "CATEGORY" in df_view.columns:
         df_view = df_view[df_view["CATEGORY"].astype(str).isin(category_filter)]
     if "CATEGORY" in df_view.columns:
         df_view = df_view.sort_values("CATEGORY", na_position="last")
     df_view = df_view.reset_index(drop=True)
 
-    if "Is_Zip" in df_view.columns:
-        # Visible marker for ZIP/prefetch-origin rows — the red/bold styling below
-        # (style_rows) is color-only and invisible to colorblind users, so surface
-        # the same signal as a text badge too.
-        df_view.insert(0, "Source", df_view["Is_Zip"].map(lambda v: "⚡ ZIP" if v else ""))
+    # The "Source" column is gone. ZIP provenance is already stated twice
+    # around this table — in the expander label ("⚡ ZIP") and in the flag
+    # header badge — so a whole column repeating it per row was spending the
+    # narrowest resource on screen, horizontal space, on a constant.
+    #
+    # PRODUCT_SET_SID moves to the end and is pinned there: it is an
+    # identifier you copy once you have decided something from the other
+    # columns, not something you read first. Pinning keeps it reachable while
+    # the row scrolls sideways.
+    if "PRODUCT_SET_SID" in df_view.columns:
+        _cols = [c for c in df_view.columns if c != "PRODUCT_SET_SID"]
+        df_view = df_view[_cols + ["PRODUCT_SET_SID"]]
 
     if df_view.empty and not df_display.empty:
-        st.info("No products match your current filters. Try clearing the search, seller, or category filters above.")
+        st.info(
+            f"None of the {len(df_display):,} products under this flag match "
+            "the search above or the seller/category filters in the sidebar."
+        )
 
     # Cap the table at one page of rows. style_rows below is a row-wise Python
     # Styler callback, so styling an unbounded df_view re-styled thousands of
@@ -1108,13 +1565,15 @@ def render_flag_expander(
     _flag_pg = 0
     if _total_view_rows > _FLAG_TABLE_PAGE_SIZE:
         _num_pages = (_total_view_rows + _FLAG_TABLE_PAGE_SIZE - 1) // _FLAG_TABLE_PAGE_SIZE
-        _flag_pg = st.selectbox(
-            "Table page",
-            options=list(range(_num_pages)),
-            format_func=lambda p: f"Page {p + 1} of {_num_pages} (rows {p * _FLAG_TABLE_PAGE_SIZE + 1:,}–{min((p + 1) * _FLAG_TABLE_PAGE_SIZE, _total_view_rows):,} of {_total_view_rows:,})",
-            key=f"flag_tbl_pg_{title}",
-        )
-        df_view = df_view.iloc[_flag_pg * _FLAG_TABLE_PAGE_SIZE:(_flag_pg + 1) * _FLAG_TABLE_PAGE_SIZE].reset_index(drop=True)
+        # st.pagination (1.58) replaces a selectbox whose options were page
+        # numbers and whose label carried the row range. A dropdown made you
+        # open a menu to step one page; this is prev/next plus numbered pages
+        # in one control. It is 1-based, the slice below is 0-based.
+        _flag_pg = st.pagination(_num_pages, key=f"flag_tbl_pg_{title}") - 1
+        _lo = _flag_pg * _FLAG_TABLE_PAGE_SIZE
+        _hi = min(_lo + _FLAG_TABLE_PAGE_SIZE, _total_view_rows)
+        st.caption(f"Rows {_lo + 1:,}–{_hi:,} of {_total_view_rows:,}")
+        df_view = df_view.iloc[_lo:_hi].reset_index(drop=True)
 
     def style_rows(row):
         if row.get("Is_Zip"):
@@ -1145,9 +1604,15 @@ def render_flag_expander(
         df_kwargs["height"] = 150
 
     _col_cfg = {
-            "Source": st.column_config.TextColumn("Source", width="small", pinned=True, help="Product came from a ZIP/prefetch upload"),
-            "PRODUCT_SET_SID": st.column_config.TextColumn(pinned=True),
-            "NAME": st.column_config.TextColumn(pinned=True),
+            # Pinned and narrow, at the far right. NAME is deliberately not
+            # pinned any more: it is the widest column in the table, so
+            # freezing it ate most of the visible width and left very little
+            # room for the columns a reviewer actually scrolls to reach.
+            "PRODUCT_SET_SID": st.column_config.TextColumn(
+                "SID", width="small", pinned=True,
+                help="Product Set SID — pinned so it stays reachable while the row scrolls",
+            ),
+            "NAME": st.column_config.TextColumn("Product Name", width="medium"),
             "Detected Issue": st.column_config.TextColumn(
                 "Detected Issue",
                 width="large",
@@ -1178,6 +1643,15 @@ def render_flag_expander(
             "Is_Zip": None,
         }
 
+    # The raw image column — image1 / MAIN_IMAGE / IMAGE1_ZIP, whichever the
+    # file happens to carry — stays in the frame because _resolve_preview_urls
+    # reads it, but it is a long opaque URL that tells a reviewer nothing and
+    # costs a full column of width. Hidden. The visible thumbnail comes from
+    # _Image_Preview below when the toggle is on.
+    for _img_c in possible_img_cols:
+        if _img_c in df_view.columns:
+            _col_cfg[_img_c] = None
+
     # Resolve previews only now: previews are on, and df_view is already the
     # filtered, paginated slice, so this touches at most one page of rows
     # instead of every row in the bucket.
@@ -1198,8 +1672,8 @@ def render_flag_expander(
     # A pandas Styler renders every cell as text, which stops ImageColumn from
     # drawing anything — so with previews on, the table goes through unstyled
     # and loses style_rows' red tint for ZIP rows. That costs nothing: the tint
-    # only ever encoded Is_Zip, and the "Source" column already states "⚡ ZIP"
-    # in text, which is also the accessible way to carry it.
+    # only ever encoded Is_Zip, which the expander label ("⚡ ZIP") and the flag
+    # header badge both state in text — the accessible way to carry it anyway.
     if show_table_images:
         event = st.dataframe(
             df_view,
@@ -1438,6 +1912,24 @@ def build_fast_grid_html(
     O = JUMIA_COLORS["primary_orange"]
     G = JUMIA_COLORS["success_green"]
     R = JUMIA_COLORS["jumia_red"]
+    # Orange splits by role inside the grid too: O is a fill and never sits
+    # under white text (2.43:1), OT is the darkened text-safe orange (4.7:1),
+    # and INK is what goes on top of an orange fill (7.2:1).
+    OT = DT["accent_text"]
+    INK = DT["ink_on_accent"]
+
+    # Inline stroke icons. currentColor so they inherit each button's state
+    # colours, and no braces anywhere so they drop into the f-string below
+    # without escaping. Every icon-only control carries a title + aria-label —
+    # an icon on its own is not a label.
+    _SVG = ('<svg viewBox="0 0 24 24" width="15" height="15" fill="none" '
+            'stroke="currentColor" stroke-width="2.1" stroke-linecap="round" '
+            'stroke-linejoin="round" aria-hidden="true" focusable="false">')
+    _ICON_UNDO = _SVG + '<path d="M3 8v6h6"/><path d="M3.5 14a9 9 0 1 0 2.2-9.5L3 8"/></svg>'
+    _ICON_GLOBE = (_SVG + '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/>'
+                   '<path d="M12 3c2.5 2.4 3.8 5.6 3.8 9S14.5 18.6 12 21c-2.5-2.4-3.8-5.6-3.8-9S9.5 5.4 12 3z"/></svg>')
+    _ICON_TOP = _SVG + '<path d="M12 19V5"/><path d="M6 11l6-6 6 6"/></svg>'
+    _ICON_BOTTOM = _SVG + '<path d="M12 5v14"/><path d="M6 13l6 6 6-6"/></svg>'
     def _js_json(v):
         return orjson.dumps(v).decode("utf-8").replace("</", "<\\/")
 
@@ -1713,12 +2205,17 @@ def build_fast_grid_html(
     # never sent one, so every sync forced a full re-render.
     cards_sig = hashlib.md5(cards_json.encode("utf-8")).hexdigest()
 
+    # Restores into #card-grid rather than the window: the document no longer
+    # scrolls, the grid container does.
     scroll_js = """
         window.addEventListener('DOMContentLoaded', function() {
             var savedInnerScroll = sessionStorage.getItem('__inner_iframe_scroll__');
             if (savedInnerScroll) {
                 setTimeout(function() {
-                    window.scrollTo({top: parseInt(savedInnerScroll, 10), behavior: 'instant'});
+                    var g = document.getElementById('card-grid');
+                    var y = parseInt(savedInnerScroll, 10) || 0;
+                    if (g) { g.scrollTop = y; }
+                    else { window.scrollTo({top: y, behavior: 'instant'}); }
                 }, 50);
             }
         });
@@ -1807,6 +2304,9 @@ def build_fast_grid_html(
     <option value="REJECT_FAKE_PERFUME">Suspected Fake Perfume</option>
     <option value="REJECT_BRAND_MISMATCH">Brand Image Mismatch</option>
     </optgroup>
+    <optgroup label="Compliance">
+    <option value="REJECT_NSFW">Adult / NSFW Content</option>
+    </optgroup>
     <optgroup label="Seller Approval">
     <option value="REJECT_REFURB">Seller Not Approved (Refurb)</option>
     <option value="REJECT_BOOKS_SELLER">Seller Not Approved (Books)</option>
@@ -1831,18 +2331,29 @@ def build_fast_grid_html(
     </optgroup>
 '''
 
+    # 3 and 4 exist because 5 was the floor and it did not fit a laptop: the
+    # main content area is ~1066px at 1366x768 and ~980px at 1280x800, so five
+    # columns leaves a 186-203px card holding an image, four metadata lines and
+    # its buttons. Four columns gives 236-257px, three gives 318-347px.
     _cols_btns_parts = []
-    for _n in [5, 6, 7]:
+    for _n in [3, 4, 5, 6, 7]:
         _active = _n == cols_per_row
         _border = "var(--accent)" if _active else "var(--border)"
-        _bg = "var(--accent)" if _active else "transparent"
-        _color = "#fff" if _active else "var(--text)"
-        _title = " title='Wide mode + 500/page'" if _n >= 6 else ""
+        _bg = "var(--accent)" if _active else "#fff"
+        # Dark ink on the orange fill, not white: white-on-#F68B1E is 2.43:1
+        # and fails AA, the same fix applied to every other control.
+        _color = "var(--ink-on-accent)" if _active else "var(--text)"
+        _title = (
+            " title='Wide mode + 500 per page'" if _n >= 6
+            else " title='Fewer, larger cards — better on a laptop'" if _n <= 4
+            else ""
+        )
         _cols_btns_parts.append(
             f'<button onclick="sendMsg(\'grid_cols_per_row\', {_n})"{_title} '
-            f'style="padding:1px 7px;font-size:10px;font-weight:700;border-radius:4px;'
-            f'border:1px solid {_border};background:{_bg};color:{_color};'
-            f'cursor:pointer;line-height:1.6;">{_n}</button>'
+            f'aria-label="Show {_n} cards per row" '
+            f'style="min-width:26px;padding:3px 9px;font-size:12px;font-weight:700;'
+            f'border-radius:5px;border:1px solid {_border};background:{_bg};'
+            f'color:{_color};cursor:pointer;line-height:1.5;">{_n}</button>'
         )
     _cols_btns = "".join(_cols_btns_parts)
 
@@ -1856,18 +2367,64 @@ def build_fast_grid_html(
 <meta charset="utf-8">
 <meta name="referrer" content="no-referrer">
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600;700&display=swap');
   :root {{
-    --bg: #f9fafb;
-    --card: #ffffff;
-    --text: #111827;
-    --border: #e5e7eb;
+    --bg: {DT["surface"]};
+    --card: {DT["panel"]};
+    --text: {DT["ink"]};
+    --text-muted: {DT["ink_muted"]};
+    --border: {DT["hairline"]};
     --accent: {O};
+    --accent-text: {OT};
+    --ink-on-accent: {INK};
+    --sev-blocker: {SEVERITY["blocker"]["spine"]};
+    --sev-judgment: {SEVERITY["judgment"]["spine"]};
+    --sev-advisory: {SEVERITY["advisory"]["spine"]};
+    --font-ui: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
   }}
-  *{{box-sizing:border-box;margin:0;padding:0;font-family:sans-serif;}}
+  *{{box-sizing:border-box;margin:0;padding:0;font-family:var(--font-ui);}}
+  /* ── Scrolling lives inside the grid, not on the page ──────────────────
+     The batch bar is position:fixed, which resolves against the iframe's
+     own viewport. Streamlit gives this iframe an explicit pixel height and
+     the document used to be as tall as its content, so "fixed" pinned the
+     bar to the bottom of a 750px+ box that was taller than a laptop screen
+     — it scrolled out of reach instead of staying put. With the document
+     clipped to the iframe box and #card-grid scrolling internally, fixed
+     means what it says and the bar is always on screen. */
+  html,body{{height:100%;overflow:hidden;}}
+  #card-grid{{
+    overflow-y:auto;overflow-x:hidden;
+    /* --grid-top-h is measured in JS because the toolbar wraps to two rows
+       on narrow screens; the fallback covers the first paint. */
+    max-height:calc(100vh - var(--grid-top-h, 56px) - 16px);
+    padding-bottom:84px;  /* clear the fixed batch bar */
+    scroll-behavior:smooth;
+  }}
+  /* Every numeric in a card — SID, price, dimensions — in tabular mono so a
+     column of 12-digit SIDs is scannable rather than a wall of glyphs. */
+  .num, .sid, .price-badge, .sel-count, .page-pill {{
+    font-family:var(--font-mono);
+    font-variant-numeric:tabular-nums slashed-zero;
+  }}
+  @media (prefers-reduced-motion: reduce) {{
+    *, *::before, *::after {{
+      animation-duration:.01ms !important;
+      animation-iteration-count:1 !important;
+      transition-duration:.01ms !important;
+    }}
+  }}
   body{{background:var(--bg);color:var(--text);padding:8px 8px 80px 8px;overflow-x:hidden;width:100%;transition:background .2s, color .2s;}}
 
   .ctrl-bar{{position:-webkit-sticky;position:sticky;top:0;z-index:99999;display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 12px;background:var(--card);backdrop-filter:blur(8px);border-bottom:2px solid var(--accent);border-radius:4px;margin-bottom:12px;box-shadow:0 4px 16px rgba(0,0,0,0.15);}}
   .ctrl-bar.top-bar{{flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin;scrollbar-color:rgba(0,0,0,.35) transparent;}}
+  /* Below roughly a 13" laptop's content width the toolbar has more controls
+     than room. Wrapping to a second row keeps them all reachable; the
+     sideways scroll hid them behind a scrollbar most people never found. */
+  @media (max-width: 1100px) {{
+    .ctrl-bar.top-bar{{flex-wrap:wrap;overflow-x:visible;overflow-y:visible;row-gap:8px;}}
+    .rsearch-wrap{{max-width:none;}}
+  }}
   .ctrl-bar.top-bar::-webkit-scrollbar{{height:8px;}}
   .ctrl-bar.top-bar::-webkit-scrollbar-thumb{{background:rgba(0,0,0,.28);border-radius:999px;}}
   .ctrl-bar.top-bar::-webkit-scrollbar-track{{background:transparent;}}
@@ -1885,7 +2442,7 @@ def build_fast_grid_html(
   }}
   .filter-group{{display:flex;flex-direction:column;gap:4px;min-width:180px;}}
   .filter-group .group-label{{display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:11px;font-weight:800;color:var(--text);opacity:.86;white-space:nowrap;}}
-  .filter-group .sel-count{{font-size:10px;font-weight:700;color:var(--accent);background:rgba(246,139,30,.12);padding:2px 6px;border-radius:999px;white-space:nowrap;}}
+  .filter-group .sel-count{{font-size:11px;font-weight:700;color:{OT};background:rgba(246,139,30,.14);padding:2px 6px;border-radius:999px;white-space:nowrap;}}
   .filter-group select[multiple]{{min-height:72px;padding:6px 10px;}}
   .filter-group select{{width:100%;}}
   .filter-group .hint{{font-size:10px;color:var(--text);opacity:.62;white-space:nowrap;}}
@@ -1900,40 +2457,102 @@ def build_fast_grid_html(
   .empty-state .title{{font-size:15px;font-weight:800;color:var(--text);margin-bottom:4px;}}
   .empty-state .desc{{font-size:12px;color:var(--text);opacity:.74;}}
   .empty-state .actions{{display:flex;gap:8px;flex-wrap:wrap;}}
-  #dark-toggle {{
-    padding: 6px 12px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    background: var(--card);
-    color: var(--text);
-    cursor: pointer;
-    font-size: 13px;
-    font-weight: 600;
-  }}
-  #dark-toggle:hover {{ background: #f3f4f6; }}
+  /* bottom:26px is NOT slack — it is exactly the height of #cols-strip, the
+     fixed column-count bar pinned at bottom:0. Dropping this to 0 puts the
+     batch bar (z-index 10000) straight over the strip (z-index 9999) and the
+     3/4/5/6/7 column buttons vanish. */
+  .bottom-bar {{position: fixed; bottom: 26px; left: 0; width: 100%; top: auto; border-bottom: none; border-top: 1px solid rgba(246, 139, 30, 0.2); margin: 0; z-index: 10000; box-shadow: 0 -4px 16px rgba(0,0,0,0.1); background: var(--card); padding: 10px 16px;}}
 
-  .bottom-bar {{position: fixed; bottom: 26px; left: 0; width: 100%; top: auto; border-bottom: none; border-top: 1px solid rgba(246, 139, 30, 0.2); margin: 0; z-index: 10000; box-shadow: 0 -4px 16px rgba(0,0,0,0.1); background: var(--card); padding: 12px 16px;}}
-
-  .sel-count{{font-weight:700;color:{O};font-size:13px;min-width:80px;}}
+  .sel-count{{font-weight:700;color:{OT};font-size:13px;min-width:80px;font-family:var(--font-mono);font-variant-numeric:tabular-nums slashed-zero;}}
   .reason-sel{{flex:1;min-width:160px;padding:6px 10px;border:1px solid #ccc;border-radius:4px;font-size:12px;background:#fff;cursor:pointer;}}
-  .rsearch-wrap{{position:relative;flex:1;min-width:200px;max-width:260px;}}
-  .rsearch-input{{width:100%;padding:6px 10px;border:1px solid #ccc;border-radius:4px;font-size:12px;background:#fff;cursor:text;box-sizing:border-box;}}
-  .rsearch-input:focus{{outline:2px solid {O};outline-offset:-1px;}}
-  .rsearch-panel{{position:absolute;top:calc(100% + 4px);left:0;width:280px;max-height:320px;overflow-y:auto;background:#fff;border:1px solid #ccc;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,0.18);z-index:100000;padding:4px 0;}}
+  .rsearch-wrap{{position:relative;flex:1 0 auto;min-width:200px;max-width:260px;}}
+  /* Reads as a picker, not a search field: chevron, hover, and a caret that
+     turns when the list is open. */
+  .rsearch-wrap::after{{content:'';position:absolute;right:10px;top:50%;width:7px;height:7px;
+    border-right:2px solid {DT['ink_muted']};border-bottom:2px solid {DT['ink_muted']};
+    transform:translateY(-70%) rotate(45deg);pointer-events:none;
+    transition:transform .18s cubic-bezier(.2,.8,.3,1);}}
+  .rsearch-wrap.open::after{{transform:translateY(-30%) rotate(-135deg);border-color:{OT};}}
+  .rsearch-input{{width:100%;padding:6px 26px 6px 10px;border:1px solid {DT['hairline']};border-radius:6px;font-size:12px;background:#fff;cursor:pointer;box-sizing:border-box;
+    text-overflow:ellipsis;transition:border-color .15s,box-shadow .15s;}}
+  .rsearch-input:hover{{border-color:{O};}}
+  .rsearch-input:focus{{outline:none;border-color:{O};box-shadow:0 0 0 3px rgba(246,139,30,.22);cursor:text;}}
+  /* Fixed, and parented to <body> — the control bar it used to sit inside
+     scrolls horizontally, which clipped the open list at the bar's edge. */
+  .rsearch-panel{{position:fixed;width:280px;max-height:320px;overflow-y:auto;background:#fff;border:1px solid {DT['hairline']};border-radius:8px;box-shadow:0 12px 32px rgba(26,25,23,.18);z-index:2147483000;padding:4px 0;
+    animation:rsearchIn .14s cubic-bezier(.2,.8,.3,1) both;}}
+  @keyframes rsearchIn{{from{{opacity:0;transform:translateY(-4px) scale(.99);}}to{{opacity:1;transform:none;}}}}
   .rsearch-group-label{{padding:6px 10px 3px;font-size:10px;font-weight:800;color:#9ca3af;text-transform:uppercase;letter-spacing:.03em;}}
   .rsearch-item{{padding:7px 12px;font-size:12px;color:#1f2937;cursor:pointer;white-space:normal;}}
-  .rsearch-item:hover, .rsearch-item.rsearch-hl{{background:{O};color:#fff;}}
+  .rsearch-item:hover, .rsearch-item.rsearch-hl{{background:{O};color:{INK};}}
   .rsearch-empty{{padding:10px 12px;font-size:12px;color:#9ca3af;}}
-  .batch-btn{{padding:7px 14px;background:{O};color:#fff;border:none;border-radius:4px;font-weight:700;font-size:12px;cursor:pointer;}}
-  .batch-btn:hover{{opacity:.88;}}
-  .desel-btn{{padding:7px 12px;background:#fff;color:#555;border:1px solid #ccc;border-radius:4px;font-size:12px;cursor:pointer;}}
-  .desel-btn:hover{{background:#f5f5f5;}}
+  /* nowrap + shrink:0 because the control bar is flex-wrap:nowrap: without
+     them "Batch Reject Selected" wrapped to two lines and spilled out below
+     its own orange fill once the bar ran short of room. */
+  .batch-btn{{padding:7px 14px;background:{O};color:{INK};border:1px solid rgba(0,0,0,.12);border-radius:6px;font-weight:700;font-size:12px;cursor:pointer;
+    white-space:nowrap;flex-shrink:0;line-height:1.25;
+    transition:transform .12s cubic-bezier(.2,.8,.3,1),box-shadow .15s,background .15s;}}
+  .batch-btn:hover{{background:{DT['accent_hover']};box-shadow:0 3px 10px rgba(246,139,30,.35);transform:translateY(-1px);}}
+  .batch-btn:active{{transform:translateY(0) scale(.97);}}
+  .batch-btn:focus-visible{{outline:2px solid {OT};outline-offset:2px;}}
+  .desel-btn{{padding:7px 12px;background:#fff;color:{DT['ink']};border:1px solid {DT['hairline']};border-radius:6px;font-size:12px;cursor:pointer;
+    white-space:nowrap;flex-shrink:0;line-height:1.25;
+    transition:transform .12s cubic-bezier(.2,.8,.3,1),border-color .15s,background .15s;}}
+  .desel-btn:hover{{background:{DT['accent_wash']};border-color:{O};color:{OT};}}
+  .desel-btn:active{{transform:scale(.97);}}
+  .desel-btn:focus-visible{{outline:2px solid {OT};outline-offset:2px;}}
+
+  /* Icon-only controls. Square, same height as the text buttons so the bar
+     keeps one baseline, and always paired with title + aria-label. */
+  .icon-btn{{display:inline-flex;align-items:center;justify-content:center;
+    width:32px;height:32px;flex-shrink:0;padding:0;background:#fff;
+    color:{DT['ink_muted']};border:1px solid {DT['hairline']};border-radius:6px;
+    cursor:pointer;transition:background .15s,border-color .15s,color .15s,transform .12s cubic-bezier(.2,.8,.3,1);}}
+  .icon-btn:hover{{background:{DT['accent_wash']};border-color:{O};color:{OT};}}
+  .icon-btn:active{{transform:scale(.94);}}
+  .icon-btn:focus-visible{{outline:2px solid {OT};outline-offset:2px;}}
+  .icon-btn svg{{display:block;}}
+
+  /* Language: native <select> kept for accessibility, dressed as an icon
+     control — globe glyph plus the two-letter code, no chrome. */
+  .lang-wrap{{position:relative;display:inline-flex;align-items:center;flex-shrink:0;}}
+  .lang-ico{{position:absolute;left:7px;display:flex;pointer-events:none;color:{DT['ink_muted']};}}
+  .lang-wrap:hover .lang-ico{{color:{OT};}}
+  .lang-sel{{appearance:none;-webkit-appearance:none;height:32px;
+    padding:0 8px 0 27px;background:#fff;color:{DT['ink']};
+    border:1px solid {DT['hairline']};border-radius:6px;cursor:pointer;
+    font-size:11px;font-weight:700;letter-spacing:.04em;
+    transition:background .15s,border-color .15s;}}
+  .lang-wrap:hover .lang-sel{{background:{DT['accent_wash']};border-color:{O};}}
+  .lang-sel:focus-visible{{outline:2px solid {OT};outline-offset:2px;}}
   .top-btn {{margin-left: auto; background: #313133; color: white; border-color: #313133; font-weight: bold;}}
   .top-btn:hover {{background: #000; color: white;}}
 
   .grid{{display:grid;grid-template-columns:repeat({cols_per_row},minmax(0,1fr));gap:12px;width:100%;}}
-  .card{{border:2px solid var(--border);border-radius:8px;padding:10px;background:var(--card);position:relative;transition:border-color .15s,box-shadow .15s,transform .2s;z-index:1;min-width:0;word-wrap:break-word;display:flex;flex-direction:column;min-height:360px;outline:none;}}
+  .card{{border:2px solid var(--border);border-radius:10px;padding:10px;background:var(--card);position:relative;z-index:1;min-width:0;word-wrap:break-word;display:flex;flex-direction:column;min-height:360px;outline:none;
+    transition:border-color .18s ease,box-shadow .18s ease,transform .18s cubic-bezier(.2,.8,.3,1);}}
+  /* min-height, not height: a 360px floor forced every card to reserve
+     space for a 180px image even when the column was half that wide. */
+  @media (max-width: 1100px) {{ .card{{min-height:300px;}} }}
+  @media (max-width: 900px)  {{ .card{{min-height:270px;padding:8px;}} }}
+  /* There is deliberately NO entry animation on .card.
+     renderAll() swaps the whole page in with a single innerHTML assignment,
+     so every card is a new node on every render — page turn, filter change,
+     even a selection sync. An entry animation therefore never plays "on
+     open"; it replays for all 500 cards every time, which is what made the
+     grid feel slow. Hover and selection stay as transitions, which only run
+     on the one element being touched. */
+  .card:hover{{transform:translateY(-3px);box-shadow:0 10px 26px rgba(26,25,23,.13);border-color:#D8D3CE;}}
   .card:focus {{ border-color: var(--accent); box-shadow: 0 0 0 3px rgba(246,139,30,0.3); transform: translateY(-4px); }}
+  /* A single flash when a card's decision changes, so a bulk action reads as
+     something that happened rather than a silent repaint. */
+  @keyframes stateFlash{{0%{{box-shadow:0 0 0 0 rgba(246,139,30,.55);}}100%{{box-shadow:0 0 0 14px rgba(246,139,30,0);}}}}
+  @keyframes stateFlashRej{{0%{{box-shadow:0 0 0 0 rgba(179,38,30,.55);}}100%{{box-shadow:0 0 0 14px rgba(179,38,30,0);}}}}
+  .card.just-changed{{animation:stateFlash .5s ease-out 1;}}
+  .card.just-changed-rej{{animation:stateFlashRej .5s ease-out 1;}}
+  .card.committed-rej{{transition:opacity .25s ease,filter .25s ease;}}
+  .card-img{{transition:opacity .4s ease,transform .3s cubic-bezier(.2,.8,.3,1);}}
+  .card:hover .card-img{{transform:scale(1.035);}}
 
   .card.selected{{border-color:{O};box-shadow:0 0 0 5px rgba(255,136,0,.35);background:rgba(255,136,0,.04);}}
   .card.staged-rej{{border-color:{R};box-shadow:0 0 0 4px rgba(231,60,23,.3);background:rgba(231,60,23,.04);}}
@@ -1945,7 +2564,10 @@ def build_fast_grid_html(
   .ai-color-pill{{display:inline-block;background:#dbeafe;color:#1e40af;font-size:10px;font-weight:700;padding:2px 7px;border-radius:99px;border:1px solid #93c5fd;margin-top:3px;}}
   .ai-brand-pill{{display:inline-block;background:#fef9c3;color:#854d0e;font-size:10px;font-weight:700;padding:2px 7px;border-radius:99px;border:1px solid #fde68a;margin-top:3px;}}
 
-  .card-img-wrap{{position:relative;cursor:pointer;border-radius:8px;background:#fff;display:flex;align-items:center;justify-content:center;height:180px;overflow:hidden; border:1px solid #111;flex-shrink:0;}}
+  /* Was a hard 180px, which is most of a 186px-wide card at five columns on
+     a 1280px laptop. Squaring to the card's own width lets the whole card
+     shrink with the column count instead of the metadata being crushed. */
+  .card-img-wrap{{position:relative;cursor:pointer;border-radius:8px;background:#fff;display:flex;align-items:center;justify-content:center;aspect-ratio:1/1;max-height:180px;min-height:104px;width:100%;overflow:hidden; border:1px solid {DT['hairline']};flex-shrink:0;}}
   .card-img-wrap::before{{content:'';position:absolute;inset:0;background:linear-gradient(90deg,#FFF8F2 25%,#FFEFE5 50%,#FFF8F2 75%);background-size:200% 100%;animation:shimmer 1.4s infinite;z-index:1;}}
   .card-img-wrap.img-loaded::before{{display:none;}}
   @keyframes shimmer{{0%{{background-position:200% 0}}100%{{background-position:-200% 0}}}}
@@ -1957,7 +2579,13 @@ def build_fast_grid_html(
   .warn-wrap{{position:absolute;top:8px;right:8px;display:flex;flex-direction:column;gap:6px;z-index:10;pointer-events:none;max-width:calc(100% - 16px);}}
   .warn-group{{display:flex;flex-direction:column;gap:4px;align-items:flex-end;}}
   .warn-group.inline{{flex-direction:row;flex-wrap:wrap;justify-content:flex-end;}}
-  .warn-badge{{display:inline-flex;align-items:center;justify-content:center;max-width:100%;background:linear-gradient(90deg,#FFC107,#FF9800);color:#313133;font-size:9px;font-weight:800;padding:3px 8px;border-radius:9999px;box-shadow:0 2px 6px rgba(255,152,0,.3);animation:pulse 2s infinite;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+  /* Three pulses, not infinite. The pulse earns its keep for a few seconds —
+     "look here, this is new" — but a running animation stops the page ever
+     going idle, so the compositor stays scheduled for the whole session for a
+     badge nobody is reading after the first few seconds. .advisory, .info and
+     .neutral already set animation:none; this finishes that decision for the
+     base and .critical variants without losing the initial cue. */
+  .warn-badge{{display:inline-flex;align-items:center;justify-content:center;max-width:100%;background:linear-gradient(90deg,#FFC107,#FF9800);color:#313133;font-size:11px;font-weight:800;padding:3px 8px;border-radius:9999px;box-shadow:0 2px 6px rgba(255,152,0,.3);animation:pulse 2s 3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
   .warn-badge.critical{{background:linear-gradient(90deg,#dc2626,#b91c1c);color:#fff;box-shadow:0 2px 6px rgba(220,38,38,.28);}}
   .warn-badge.advisory{{background:linear-gradient(90deg,#f59e0b,#f97316);color:#fff;box-shadow:0 2px 6px rgba(249,115,22,.22);animation:none;}}
   .warn-badge.info{{background:linear-gradient(90deg,#3b82f6,#2563eb);color:#fff;box-shadow:0 2px 6px rgba(37,99,235,.22);animation:none;}}
@@ -1968,18 +2596,18 @@ def build_fast_grid_html(
   .meta{{font-size:11px;margin-top:8px;line-height:1.35;flex-grow:1;display:flex;flex-direction:column;gap:4px;}}
   .meta-core{{display:flex;flex-direction:column;gap:3px;}}
   .meta .nm{{font-weight:800;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:help;}}
-  .meta .br{{color:{O};font-weight:800;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+  .meta .br{{color:{OT};font-weight:700;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
   .meta .ct{{color:#666;font-size:10px;word-break:break-word;line-height:1.25;}}
-  .meta .sl{{color:#999;font-size:9px;margin-top:2px;border-top:1px dashed #eee;padding-top:4px;cursor:help;display:flex;align-items:center;gap:6px;min-width:0;}}
+  .meta .sl{{color:#6B6560;font-size:11px;margin-top:2px;border-top:1px dashed #eee;padding-top:4px;cursor:help;display:flex;align-items:center;gap:6px;min-width:0;}}
   .meta .co{{color:#555;font-size:10px;margin-top:4px;background:#f0f0f0;padding:3px 5px;border-radius:4px;display:inline-block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;font-weight:600;}}
   .meta-extra{{border-top:1px solid #ececec;padding-top:4px;}}
-  .meta-extra summary{{cursor:pointer;list-style:none;font-size:10px;font-weight:800;color:var(--accent);user-select:none;}}
+  .meta-extra summary{{cursor:pointer;list-style:none;font-size:11px;font-weight:700;color:{OT};user-select:none;}}
   .meta-extra summary::-webkit-details-marker{{display:none;}}
   .meta-extra-body{{display:flex;flex-direction:column;gap:4px;padding-top:6px;}}
   .meta-extra .co{{margin-top:0;}}
 
   .acts{{display:flex;gap:4px;margin-top:auto;padding-top:8px;}}
-  .act-btn{{flex:1;padding:6px;font-size:11px;border:none;border-radius:4px;cursor:pointer;font-weight:700;color:#fff;background:{O};}}
+  .act-btn{{flex:1;padding:6px;font-size:11px;border:1px solid rgba(0,0,0,.12);border-radius:4px;cursor:pointer;font-weight:700;color:{INK};background:{O};}}
   .act-more{{flex:1;font-size:11px;border:1px solid #ccc;border-radius:4px;outline:none;cursor:pointer;background:#fff;}}
 
   .zoom-btn{{position:absolute;bottom:6px;right:6px;width:22px;height:22px;background:rgba(0,0,0,0.4);color:#fff;border-radius:4px;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:25;border:none;transition:background .2s;}}
@@ -1992,8 +2620,8 @@ def build_fast_grid_html(
   .zoom-nav-btn.next {{ right: -40px; }}
 
   .tick{{position:absolute;bottom:6px;left:6px;width:22px;height:22px;border-radius:50%;background:rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;color:transparent;font-size:13px;font-weight:900;pointer-events:none;z-index:10;}}
-  .card.selected .tick{{background:{O};color:#fff;}}
-  .card.committed-rej.selected .tick{{z-index:25;background:{O};color:#fff;}}
+  .card.selected .tick{{background:{O};color:{INK};}}
+  .card.committed-rej.selected .tick{{z-index:25;background:{O};color:{INK};}}
   .card.committed-rej.selected{{box-shadow:0 0 0 4px {O},0 0 0 8px rgba(255,136,0,.25)!important;}}
 
   .rej-overlay{{display:none;position:absolute;inset:0;background:rgba(255,255,255,.90);border-radius:8px;flex-direction:column;align-items:center;justify-content:center;z-index:20;gap:8px;padding:12px;text-align:center;}}
@@ -2195,14 +2823,16 @@ def build_fast_grid_html(
 
 <div class="ctrl-bar top-bar">
 
-  <button id="dark-toggle" onclick="toggleDark()">{labels_dict['dark_mode']}</button>
-  <select id="iframe-lang-sel" class="reason-sel" style="max-width:60px;" onchange="document.getElementById('lang-loading').style.display='flex'; sendMsg('change_lang', this.value)" title="Change Language">
-    <option value="en" {"selected" if lang=="en" else ""}>EN</option>
-    <option value="fr" {"selected" if lang=="fr" else ""}>FR</option>
-    <option value="ar" {"selected" if lang=="ar" else ""}>AR</option>
-  </select>
+  <span class="lang-wrap" title="Change language">
+    <span class="lang-ico">{_ICON_GLOBE}</span>
+    <select id="iframe-lang-sel" class="lang-sel" aria-label="Change language" onchange="document.getElementById('lang-loading').style.display='flex'; sendMsg('change_lang', this.value)">
+      <option value="en" {"selected" if lang=="en" else ""}>EN</option>
+      <option value="fr" {"selected" if lang=="fr" else ""}>FR</option>
+      <option value="ar" {"selected" if lang=="ar" else ""}>AR</option>
+    </select>
+  </span>
 
-  <span class="sel-count-text" style="font-weight:700; color:var(--accent); font-size:13px;">0 {labels_dict["items_pending"]}</span>
+  <span class="sel-count-text" style="font-weight:700; color:var(--accent-text); font-size:13px; font-family:var(--font-mono); font-variant-numeric:tabular-nums slashed-zero;">0 {labels_dict["items_pending"]}</span>
   <select class="reason-sel" id="batch-reason-top">
     <option value="REJECT_POOR_IMAGE">{labels_dict['poor_img']}</option>
     <option value="REJECT_IMG_STRETCHED">{labels_dict['img_stretched']}</option>
@@ -2222,10 +2852,10 @@ def build_fast_grid_html(
     <option value="OTHER_CUSTOM">{labels_dict.get('other_custom', 'Other (Custom)')}</option>
   </select>
   <button class="batch-btn" onclick="doBatchReject('top')">{labels_dict["batch_reject"]}</button>
-  <button class="desel-btn" onclick="doBatchUndo()">{labels_dict["undo"]}</button>
+  <button class="icon-btn" onclick="doBatchUndo()" title="{labels_dict["undo"]}" aria-label="{labels_dict["undo"]}">{_ICON_UNDO}</button>
   <button class="desel-btn" onclick="window.doSelectAll()">{labels_dict["select_all"]}</button>
   <button class="desel-btn" onclick="doDeselAll()">{labels_dict["deselect_all"]}</button>
-  <button class="batch-btn top-btn" onclick="window.scrollTo(0, document.body.scrollHeight)">{_t("go_bottom")}</button>
+  <button class="icon-btn" style="margin-left:auto;" onclick="gridScrollTo('bottom')" title="{_t("go_bottom")}" aria-label="{_t("go_bottom")}">{_ICON_BOTTOM}</button>
   {sort_html}
   {filter_html}
 </div>
@@ -2262,7 +2892,7 @@ def build_fast_grid_html(
 </div>
 
 <div class="ctrl-bar bottom-bar">
-  <span class="sel-count-text" style="font-weight:700; color:var(--accent); font-size:13px;">0 {labels_dict["items_pending"]}</span>
+  <span class="sel-count-text" style="font-weight:700; color:var(--accent-text); font-size:13px; font-family:var(--font-mono); font-variant-numeric:tabular-nums slashed-zero;">0 {labels_dict["items_pending"]}</span>
   <select class="reason-sel" id="batch-reason-bottom">
     <option value="REJECT_POOR_IMAGE">{labels_dict["poor_img"]}</option>
     <option value="REJECT_IMG_STRETCHED">Image Stretched</option>
@@ -2282,10 +2912,10 @@ def build_fast_grid_html(
     <option value="OTHER_CUSTOM">Other Reason (Custom)</option>
   </select>
   <button class="batch-btn" onclick="doBatchReject('bottom')">{labels_dict["batch_reject"]}</button>
-  <button class="desel-btn" onclick="doBatchUndo()">{labels_dict["undo"]}</button>
+  <button class="icon-btn" onclick="doBatchUndo()" title="{labels_dict["undo"]}" aria-label="{labels_dict["undo"]}">{_ICON_UNDO}</button>
   <button class="desel-btn" onclick="window.doSelectAll()">{labels_dict["select_all"]}</button>
   <button class="desel-btn" onclick="doDeselAll()">{labels_dict["deselect_all"]}</button>
-  <button class="desel-btn top-btn" onclick="window.scrollTo(0, 0)">{labels_dict["undo"]}</button>
+  <button class="icon-btn" style="margin-left:auto;" onclick="gridScrollTo('top')" title="Back to top" aria-label="Back to top">{_ICON_TOP}</button>
 </div>
 
 <div id="zoom-backdrop" onclick="closeZoom()"></div>
@@ -2361,14 +2991,16 @@ window.addEventListener('message', function(e) {{
     if (e.data.prefetch) PREFETCH_URLS = e.data.prefetch;
     closeGhostOverlay();
 
-    var oldScroll = window.scrollY;
+    // Scroll state lives on #card-grid now, not the window.
+    var _g = document.getElementById('card-grid');
+    var oldScroll = _g ? _g.scrollTop : 0;
     renderAll();
-    // Only reset scroll to top on an actual page/filter change (cardsChanged);
-    // for committed/poor_img/prefetch-only syncs, preserve scroll position.
-    if (cardsChanged && e.data.scroll_to_top) {{
-      window.scrollTo(0, 0);
-    }} else {{
-      window.scrollTo(0, oldScroll);
+    if (window.sizeGridScroll) window.sizeGridScroll();
+    _g = document.getElementById('card-grid');
+    if (_g) {{
+      // Only reset to top on an actual page/filter change (cardsChanged); for
+      // committed/poor_img/prefetch-only syncs, preserve scroll position.
+      _g.scrollTop = (cardsChanged && e.data.scroll_to_top) ? 0 : oldScroll;
     }}
   }}
 }});
@@ -2451,6 +3083,7 @@ function sendMsg(type, payload) {{
 }}
 
 function scrollToTop() {{
+  if (window.gridScrollTo) return window.gridScrollTo('top');
   window.scrollTo({{top: 0, behavior: 'smooth'}});
 }}
 
@@ -2494,7 +3127,16 @@ function getLazyObserver() {{
         _lazyObserver.unobserve(img);
       }}
     }});
-  }}, {{rootMargin: '200px 0px', threshold: 0.01}});
+  // 200px was tuned for a grid that never actually scrolled. The iframe used
+  // to be as tall as its content (750px+ and growing with the card count), so
+  // every card sat inside the iframe's own viewport and the observer fired for
+  // all of them at once — the page behaved as if nothing was lazy. Clipping
+  // the document to the iframe box to fix the batch bar turned that into real
+  // lazy loading, which is correct but meant images only started fetching as
+  // they came into view. A viewport-sized preload margin restores the "already
+  // there when you scroll to it" feel without going back to fetching every
+  // image on every page.
+  }}, {{rootMargin: '1200px 0px', threshold: 0.01}});
   return _lazyObserver;
 }}
 
@@ -2749,7 +3391,11 @@ function renderCard(card) {{
   // direct src, no shimmer, no 0.4s fade. This is what stops the whole grid
   // from flickering on page turns when the browser already has the images.
   var isCachedImg = window._loadedImgs.has(safeImgSrcForHtml);
-  var isEager = isCachedImg || imgIdx < {cols_per_row * 2};
+  // Four rows eager, not two: the iframe is now sized to the real viewport
+  // (calc(100vh - 190px)), so on a large screen more than two rows are visible
+  // before any scrolling happens — at two rows the bottom of the first screen
+  // was still filling in.
+  var isEager = isCachedImg || imgIdx < {cols_per_row * 4};
   var loadingAttr = isEager ? 'eager' : 'lazy';
   var priorityAttr = isEager ? 'fetchpriority="high"' : 'fetchpriority="low"';
   var imgSrcAttr = isEager
@@ -3318,6 +3964,15 @@ function _applyBatchReject(br) {{
     el.classList.add('committed-rej');
     // Dim the card visually so the user gets instant feedback
     el.style.opacity = '0.55';
+    // One-shot ring so a bulk reject reads as an event, not a silent
+    // repaint. Removed on animationend so a later change can replay it.
+    el.classList.remove('just-changed-rej');
+    void el.offsetWidth;  // restart the animation
+    el.classList.add('just-changed-rej');
+    el.addEventListener('animationend', function handler() {{
+      el.classList.remove('just-changed-rej');
+      el.removeEventListener('animationend', handler);
+    }});
   }}
   updateSelCount();
   sendMsg('reject', payload);
@@ -3391,9 +4046,21 @@ window.doDeselAll = function() {{ for (var k in selected) delete selected[k]; fo
   }}
 }})();
 
-window.addEventListener("scroll", function() {{
-  sessionStorage.setItem("__inner_iframe_scroll__", window.scrollY);
-}});
+// Listens on the grid container, not the window: the document is clipped to
+// the iframe box now, so window never fires a scroll event and the restore
+// on the next rerun would always come back 0.
+(function() {{
+  function _bindScrollMemory() {{
+    var g = document.getElementById('card-grid');
+    if (!g || g.dataset.scrollMemory) return;
+    g.dataset.scrollMemory = '1';
+    g.addEventListener('scroll', function() {{
+      sessionStorage.setItem("__inner_iframe_scroll__", g.scrollTop);
+    }}, {{passive: true}});
+  }}
+  _bindScrollMemory();
+  window.addEventListener('DOMContentLoaded', _bindScrollMemory);
+}})();
 
 {scroll_js}
 
@@ -3501,7 +4168,9 @@ function enhanceReasonSelect(selectId) {{
   panel.className = 'rsearch-panel';
   panel.style.display = 'none';
   wrap.appendChild(input);
-  wrap.appendChild(panel);
+  // Panel is appended to <body>, not to wrap — see positionPanel() below for
+  // why it cannot live inside the scrolling control bar.
+  document.body.appendChild(panel);
   sel.parentNode.insertBefore(wrap, sel.nextSibling);
 
   var initial = byValue[sel.value];
@@ -3509,9 +4178,16 @@ function enhanceReasonSelect(selectId) {{
 
   var hlIndex = -1;
   var visibleItems = [];
+  var pristine = true;
 
   function renderPanel() {{
-    var q = input.value.trim().toLowerCase();
+    // `pristine` is true from the moment the list opens until the reviewer
+    // actually types. Without it the box's own text — which is pre-filled
+    // with the current selection, e.g. "Poor Image" — was being used as the
+    // search query, so opening the list filtered it down to the single
+    // option that was already chosen. Opening shows everything; typing
+    // filters. That is what a combobox is expected to do.
+    var q = pristine ? '' : input.value.trim().toLowerCase();
     var recent = q ? [] : _getRecentReasons().filter(function(r) {{ return byValue[r.value]; }});
     var filtered = items.filter(function(it) {{
       return !q || it.label.toLowerCase().indexOf(q) !== -1;
@@ -3546,9 +4222,47 @@ function enhanceReasonSelect(selectId) {{
     hlIndex = -1;
   }}
 
-  function openPanel() {{ renderPanel(); panel.style.display = 'block'; }}
+  // The panel lives on <body>, not next to the input.
+  //
+  // It used to be position:absolute inside .ctrl-bar.top-bar, which sets
+  // overflow-x:auto / overflow-y:hidden to let the toolbar scroll sideways.
+  // That makes the bar a clipping context, and a clip cannot be escaped by
+  // z-index — so the open list was sliced off at the toolbar's edge and the
+  // reasons underneath were impossible to see or click. Portalling to <body>
+  // with position:fixed puts it outside every ancestor's overflow.
+  function positionPanel() {{
+    var r = input.getBoundingClientRect();
+    panel.style.left = r.left + 'px';
+    panel.style.width = Math.max(r.width, 260) + 'px';
+    // Flip above the input when there is not room below it.
+    var below = window.innerHeight - r.bottom;
+    if (below < 220 && r.top > below) {{
+      panel.style.top = 'auto';
+      panel.style.bottom = (window.innerHeight - r.top + 4) + 'px';
+      panel.style.maxHeight = Math.min(320, r.top - 12) + 'px';
+    }} else {{
+      panel.style.bottom = 'auto';
+      panel.style.top = (r.bottom + 4) + 'px';
+      panel.style.maxHeight = Math.min(320, below - 12) + 'px';
+    }}
+  }}
+  function openPanel() {{
+    renderPanel();
+    panel.style.display = 'block';
+    wrap.classList.add('open');
+    // Whatever is in the box is the current selection, not a query — select
+    // it so the first keystroke replaces it instead of appending to it.
+    if (pristine) {{ try {{ input.select(); }} catch(e) {{}} }}
+    positionPanel();
+    window.addEventListener('scroll', positionPanel, true);
+    window.addEventListener('resize', positionPanel);
+  }}
   function closePanel() {{
     panel.style.display = 'none';
+    wrap.classList.remove('open');
+    pristine = true;
+    window.removeEventListener('scroll', positionPanel, true);
+    window.removeEventListener('resize', positionPanel);
     var curr = byValue[sel.value];
     input.value = curr ? curr.label : '';
   }}
@@ -3558,6 +4272,8 @@ function enhanceReasonSelect(selectId) {{
     input.value = it.label;
     _pushRecentReason(it.value, it.label);
     panel.style.display = 'none';
+    wrap.classList.remove('open');
+    pristine = true;
   }}
   function setHighlight(i) {{
     var nodes = panel.querySelectorAll('.rsearch-item');
@@ -3580,7 +4296,11 @@ function enhanceReasonSelect(selectId) {{
   }});
 
   input.addEventListener('focus', openPanel);
-  input.addEventListener('input', openPanel);
+  input.addEventListener('mousedown', function() {{
+    // Clicking the closed box should open the full list, not re-filter.
+    if (panel.style.display === 'none') pristine = true;
+  }});
+  input.addEventListener('input', function() {{ pristine = false; openPanel(); }});
   input.addEventListener('keydown', function(e) {{
     if (e.key === 'ArrowDown') {{ e.preventDefault(); if (panel.style.display === 'none') openPanel(); setHighlight(Math.min(hlIndex + 1, visibleItems.length - 1)); }}
     else if (e.key === 'ArrowUp') {{ e.preventDefault(); setHighlight(Math.max(hlIndex - 1, 0)); }}
@@ -3595,11 +4315,38 @@ function enhanceReasonSelect(selectId) {{
     if (it) selectItem(it);
   }});
   document.addEventListener('click', function(e) {{
-    if (!wrap.contains(e.target)) closePanel();
+    // The panel is no longer a descendant of wrap, so it has to be tested
+    // separately or clicking an option would immediately close the list.
+    if (!wrap.contains(e.target) && !panel.contains(e.target)) closePanel();
   }});
 }}
 enhanceReasonSelect('batch-reason-top');
 enhanceReasonSelect('batch-reason-bottom');
+
+// #card-grid is the scroll container, so its height has to be the iframe
+// height minus whatever the toolbar currently occupies — and the toolbar
+// wraps to a second row under 1100px, so that is measured rather than
+// assumed. Re-measured on resize and after the grid re-renders.
+window.sizeGridScroll = function() {{
+  var bar = document.querySelector('.ctrl-bar.top-bar');
+  var h = bar ? Math.ceil(bar.getBoundingClientRect().height) : 56;
+  document.documentElement.style.setProperty('--grid-top-h', h + 'px');
+}};
+window.addEventListener('resize', window.sizeGridScroll);
+window.addEventListener('load', window.sizeGridScroll);
+sizeGridScroll();
+try {{
+  var _bar = document.querySelector('.ctrl-bar.top-bar');
+  if (_bar && window.ResizeObserver) new ResizeObserver(window.sizeGridScroll).observe(_bar);
+}} catch(e) {{}}
+
+// The page no longer scrolls, the grid does — so the nav buttons have to
+// move the container, not the window.
+window.gridScrollTo = function(where) {{
+  var g = document.getElementById('card-grid');
+  if (!g) return;
+  g.scrollTo({{top: where === 'bottom' ? g.scrollHeight : 0, behavior: 'smooth'}});
+}};
 
 (function() {{
   var _gs = document.getElementById('grid-search');
@@ -3616,19 +4363,15 @@ enhanceReasonSelect('batch-reason-bottom');
   }});
 }})();
 
-var _dark = false;
-try {{ if (typeof localStorage !== 'undefined') {{ _dark = localStorage.getItem('gridDark') === '1'; }} }} catch(e) {{}}
-window.applyDark = function(on) {{
-  document.documentElement.style.setProperty('--bg',    on ? '#18181b' : '#f9fafb');
-  document.documentElement.style.setProperty('--card',  on ? '#27272a' : '#ffffff');
-  document.documentElement.style.setProperty('--text',  on ? '#f4f4f5' : '#111827');
-  document.documentElement.style.setProperty('--border',on ? '#3f3f46' : '#e5e7eb');
-  var dtEl = document.getElementById('dark-toggle');
-  if (dtEl) dtEl.textContent = on ? 'Light' : 'Dark';
-  try {{ localStorage.setItem('gridDark', on ? '1' : '0'); }} catch(e) {{}}
-}}
-window.toggleDark = function() {{ _dark = !_dark; applyDark(_dark); }}
-try {{ applyDark(_dark); }} catch(e) {{}}
+// The grid used to carry its own dark-mode toggle, persisted in
+// localStorage. It themed only this iframe, so a reviewer who clicked it
+// once got a permanently dark grid inside a permanently light app —
+// .streamlit/config.toml pins base = "light".
+//
+// It also fought the design tokens: applyDark(false) ran on every load and
+// wrote the old hardcoded greys (#f9fafb, #ffffff, #111827, #e5e7eb) as
+// inline styles on documentElement, which beat the :root values by
+// specificity. A real dark theme needs the whole app, not one iframe.
 
 window.batchApproveSingle = function(sid) {{
   window.parent.postMessage({{type:'staged_reject', sid:sid, reason:'Approved'}}, '*');
@@ -3651,8 +4394,8 @@ try {{
 
 </script>
 
-<div id="cols-strip" style="position:fixed;bottom:0;left:0;width:100%;z-index:9999;background:var(--card);border-top:1px solid var(--border);display:flex;align-items:center;gap:6px;padding:3px 12px;height:26px;opacity:0.55;transition:opacity .2s;" onmouseenter="this.style.opacity='1'" onmouseleave="this.style.opacity='0.55'">
-  <span style="font-size:10px;font-weight:700;color:var(--text);opacity:.6;white-space:nowrap;letter-spacing:.5px;">⊞ COLS</span>
+<div id="cols-strip" style="position:fixed;bottom:0;left:0;width:100%;z-index:9999;background:var(--card);border-top:1px solid var(--border);display:flex;align-items:center;gap:6px;padding:2px 12px;height:26px;">
+  <span style="font-size:11px;font-weight:700;color:var(--text-muted);white-space:nowrap;letter-spacing:.04em;">Cards per row</span>
   {_cols_btns}
 </div>
 
@@ -3667,13 +4410,31 @@ try {{
 def visual_review_modal(support_files):
     scroll_top_flag = st.session_state.get("do_scroll_top", False)
     st.session_state.do_scroll_top = False
-    _wide_cols = st.session_state.get("grid_cols_per_row", 5) >= 6
+    # st.dialog(width="large") is documented as a hard 1280px maximum, so at 6
+    # or 7 columns the grid was squeezed into 1280px no matter how big the
+    # screen was. This lifts that cap.
+    #
+    # The previous selector — `[data-testid="stDialog"] > div > div[role=...]`
+    # — matched nothing on Streamlit 1.60: the panel is a direct child div of
+    # the backdrop, and role="dialog" sits on a <section> one level further in.
+    # Measured against the live DOM at 1920px: panel stayed 1280px with the old
+    # rule, goes to 1843px (96vw) with this one.
+    #
+    # Anchored to data-testid and element structure only. The emotion class on
+    # the panel (st-emotion-cache-11wjdxt) is a build hash — it differs between
+    # Streamlit versions, so targeting it would work locally and silently fail
+    # on Cloud whenever the two drift apart.
+    _wide_cols = st.session_state.get("grid_cols_per_row", 4) >= 6
     if _wide_cols:
         st.markdown("""
         <style>
-        [data-testid="stDialog"] > div > div[role="dialog"] {
-            max-width: 96vw !important;
+        [data-testid="stDialog"] > div {
             width: 96vw !important;
+            max-width: 96vw !important;
+        }
+        [data-testid="stDialog"] section[role="dialog"] {
+            width: 100% !important;
+            max-width: none !important;
         }
         </style>""", unsafe_allow_html=True)
     def _clear_grid_search_n():
@@ -3741,11 +4502,7 @@ def visual_review_modal(support_files):
         _code_to_path = support_files.get("code_to_path", {})
         if _code_to_path and "CATEGORY_CODE" in review_data.columns:
             review_data = review_data.copy()
-            review_data["CATEGORY"] = review_data["CATEGORY_CODE"].apply(
-                lambda c: (
-                    _code_to_path.get(str(c).strip(), str(c)) if pd.notna(c) else ""
-                )
-            )
+            review_data["CATEGORY"] = resolve_category_paths(review_data, _code_to_path)
 
     curr_search_n = st.session_state.get("grid_search_n", "")
     curr_sellers = st.session_state.get("grid_filter_sellers", [])
@@ -3828,7 +4585,7 @@ def visual_review_modal(support_files):
         # columns means smaller cards, so 500 of them stays a sensible page; at
         # 5 columns the same 500 cards make the grid iframe roughly 36,000px
         # tall, which is where the browser starts to struggle.
-        _cols_now = st.session_state.get("grid_cols_per_row", 5)
+        _cols_now = st.session_state.get("grid_cols_per_row", 4)
         _allow_500 = _cols_now in (6, 7)
         _ipp_opts = [20, 50, 100, 200] + ([500] if _allow_500 else [])
 
@@ -4148,7 +4905,7 @@ def visual_review_modal(support_files):
                 else:
                     rejected_state[_sid] = "Poor images"
 
-        cols_per_row = st.session_state.get("grid_cols_per_row", 5)
+        cols_per_row = st.session_state.get("grid_cols_per_row", 4)
 
         grid_html = build_fast_grid_html(
             page_data=page_data,
@@ -4206,14 +4963,37 @@ def visual_review_modal(support_files):
         width: 100% !important;
         max-width: 100% !important;
     }
+    /* Python cannot read the browser height, so st.iframe(height=...) below
+       is sized for the smallest supported screen. CSS can, so the rendered
+       element gets a viewport-relative height instead: the grid fills a big
+       monitor and still fits a 768px laptop, with no round-trip and nothing
+       environment-specific — it behaves the same locally and on Cloud.
+       The iframe's internal 100vh follows the element box, so #card-grid's
+       scroll region adapts to this automatically. */
+    div[data-element-key="grid_iframe_container"] iframe {
+        height: calc(100vh - 190px) !important;
+        min-height: 420px !important;
+        max-height: 1400px !important;
+    }
     </style>
     """, unsafe_allow_html=True)
     with st.container(key="grid_iframe_container"):
         _num_cards = len(page_data) if ('page_data' in locals() and isinstance(page_data, pd.DataFrame) and not page_data.empty) else 50
-        _cols_n = max(1, st.session_state.get("grid_cols_per_row", 5))
+        _cols_n = max(1, st.session_state.get("grid_cols_per_row", 4))
         _num_rows = max(1, (_num_cards + _cols_n - 1) // _cols_n)
         _card_h = 360 if st.session_state.get("show_images", True) else 180
-        _dynamic_iframe_h = max(750, _num_rows * _card_h + 150)
+
+        # The iframe is a window onto the grid, not a container sized to hold
+        # all of it. It used to be max(750, rows*card_h + 150) — a 750px floor
+        # against ~612px of usable height on a 1366x768 laptop, so the grid
+        # could never fit and the position:fixed batch bar sat below the fold.
+        # Now the document inside scrolls (see #card-grid) and this only has to
+        # be a comfortable viewport. Python cannot read the browser height, so
+        # this is sized to fit the smallest screen the tool is used on and
+        # short content still shrinks to fit.
+        _GRID_VIEWPORT_H = 620
+        _content_h = _num_rows * _card_h + 150
+        _dynamic_iframe_h = min(_GRID_VIEWPORT_H, max(420, _content_h))
         st.iframe(_grid_html_str, height=_dynamic_iframe_h)
         # Inject a zero-height broadcaster that pushes state into the iframe via postMessage.
         # Sending cards via postMessage prevents the entire iframe DOM from being torn down

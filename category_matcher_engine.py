@@ -8,9 +8,38 @@ import pandas as pd
 import logging
 import traceback
 import sqlite3
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 # SentenceTransformers removed — TF-IDF used exclusively
+#
+# sklearn is imported lazily. Measured with -X importtime, importing this
+# module cost 10.25s of which sklearn was 6.75s — paid on every cold start,
+# including every Streamlit Cloud container spin-up, whether or not a single
+# category is ever matched. Nothing at module scope needs it; the vectoriser
+# and the similarity call are only reached once an index is actually built.
+#
+# _sk() memoises the two symbols so the cost is paid at most once, on the
+# first real use, instead of at import.
+_SK = {}
+
+
+def _sk():
+    """TfidfVectorizer and cosine_similarity, imported on first use."""
+    if not _SK:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+        _SK["TfidfVectorizer"] = TfidfVectorizer
+        _SK["cosine_similarity"] = cosine_similarity
+    return _SK
+
+
+def __getattr__(name):
+    """Module-level fallback so `engine.TfidfVectorizer` still resolves.
+
+    Keeps the previous import surface working for anything that referenced
+    these names from this module, without reintroducing the eager import.
+    """
+    if name in ("TfidfVectorizer", "cosine_similarity"):
+        return _sk()[name]
+    raise AttributeError(name)
 
 
 logger = logging.getLogger(__name__)
@@ -626,7 +655,7 @@ class CategoryMatcherEngine:
                     return
 
             df['clean_name'] = df['name'].apply(clean_text)
-            vectorizer = TfidfVectorizer(
+            vectorizer = _sk()["TfidfVectorizer"](
                 ngram_range=(1, 2), max_features=3000, dtype=np.float32
             )
             X = vectorizer.fit_transform(df['clean_name'])
@@ -869,8 +898,7 @@ class CategoryMatcherEngine:
         self._index_has_full_paths = (sep_count / max(len(self.categories), 1)) > 0.3
 
         try:
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            self.vectorizer = TfidfVectorizer(ngram_range=(1, 2), stop_words='english')
+            self.vectorizer = _sk()["TfidfVectorizer"](ngram_range=(1, 2), stop_words='english')
             self.tfidf_matrix = self.vectorizer.fit_transform(self.categories)
             self._tfidf_built = True
             logger.info(f'[TF-IDF] Built index for {len(self.categories)} categories')
@@ -905,7 +933,7 @@ class CategoryMatcherEngine:
             try:
                 if hasattr(self, 'vectorizer'):
                     name_vec = self.vectorizer.transform([name])
-                    similarities = cosine_similarity(name_vec, self.tfidf_matrix).flatten()
+                    similarities = _sk()["cosine_similarity"](name_vec, self.tfidf_matrix).flatten()
                     best_idx = int(np.argmax(similarities))
                     if similarities[best_idx] > 0.35:
                         return self.categories[best_idx]
@@ -934,7 +962,7 @@ class CategoryMatcherEngine:
         try:
             name_clean = clean_text(name)
             name_vec = self.vectorizer.transform([name_clean])
-            similarities = cosine_similarity(name_vec, self.tfidf_matrix).flatten()
+            similarities = _sk()["cosine_similarity"](name_vec, self.tfidf_matrix).flatten()
             
             top_indices = similarities.argsort()[-top_n:][::-1]
             
@@ -1005,7 +1033,7 @@ class CategoryMatcherEngine:
         pending_names = [names[i] for i in pending_indices]
         try:
             name_vectors = self.vectorizer.transform(pending_names)
-            sim_matrix = cosine_similarity(name_vectors, self.tfidf_matrix)
+            sim_matrix = _sk()["cosine_similarity"](name_vectors, self.tfidf_matrix)
         except Exception as e:
             logger.warning(f"Batch prediction failed: {e}")
             return results

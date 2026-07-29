@@ -2,6 +2,13 @@
 constants.py - Shared constants used across all modules
 """
 
+# Kept as a dict with the original keys because ~26 call sites across
+# streamlit_app, ui_components and export_utils index it directly. The values
+# now resolve from design_tokens so there is one palette rather than four —
+# see the module docstring there for why the orange had to be split into a
+# fill colour and a (darker) text colour.
+from design_tokens import JUMIA_COLORS_OVERRIDE as _TOKENS
+
 JUMIA_COLORS = {
     'primary_orange': '#F68B1E',
     'secondary_orange': '#FF9933',
@@ -15,6 +22,7 @@ JUMIA_COLORS = {
     'white': '#FFFFFF',
     'black': '#000000'
 }
+JUMIA_COLORS.update(_TOKENS)
 
 PRODUCTSETS_COLS = ["ProductSetSid", "ParentSKU", "Status", "ReasonOne", "Comment", "FLAG", "SellerName"]
 REJECTION_REASONS_COLS = ['CODE - REJECTION_REASON', 'COMMENT']
@@ -131,6 +139,7 @@ REASON_MAP = {
     "REJECT_FAKE":           "Suspected Fake product",
     "REJECT_BRAND":          "Restricted brands",
     "REJECT_PROHIBITED":     "Prohibited products",
+    "REJECT_NSFW":           "Adult / NSFW content",
     "REJECT_COLOR":          "Missing COLOR",
     "REJECT_WRONG_BRAND":    "Generic branded products with genuine brands",
     "REJECT_SUSP_DISCOUNT":  "Discount too high",

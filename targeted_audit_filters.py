@@ -540,6 +540,11 @@ def _verify_false_approval(check_key: str, rec: dict, rule: dict, weights: set, 
 # ones like Color_AI_Normalized, Category_Match_Score, Brand_Detected_On_Product).
 def _context_columns(check_key: str, rec: dict) -> dict:
     ctx = {}
+    # Rule of thumb for what belongs here: if a reviewer would have to look at
+    # it to decide approve-or-reject, it goes in. That means the picture for
+    # any check judged by eye — you cannot tell whether a colour is really
+    # missing, a category is really wrong, or a duplicate is really a
+    # duplicate, from text alone.
     if check_key == "category":
         ctx["Initial Category Path"] = _clean(rec.get("Initial_Category_Path"))
         ctx["Suggested Categories"] = _clean(rec.get("Suggested_Categories"))
@@ -547,10 +552,12 @@ def _context_columns(check_key: str, rec: dict) -> dict:
         ctx["Category Match Score"] = _clean(rec.get("Category_Match_Score"))
         ctx["Top1 Score"] = _clean(rec.get("Top1_Score"))
         ctx["AI Product Caption"] = _clean(rec.get("AI_Product_Caption"))
+        ctx["Image"] = _clean(rec.get("MAIN_IMAGE"))
     elif check_key == "color":
         ctx["Color"] = _clean(rec.get("COLOR"))
         ctx["Color Family"] = _clean(rec.get("COLOR_FAMILY"))
         ctx["Color (AI Normalized)"] = _clean(rec.get("Color_AI_Normalized"))
+        ctx["Image"] = _clean(rec.get("MAIN_IMAGE"))
     elif check_key == "warranty":
         ctx["Warranty"] = _clean(rec.get("PRODUCT_WARRANTY"))
         ctx["Warranty Type"] = _clean(rec.get("WARRANTY_TYPE"))
@@ -561,11 +568,18 @@ def _context_columns(check_key: str, rec: dict) -> dict:
         ctx["Existing Variation Count"] = _clean(rec.get("COUNT_OF_EXISTING_VARIATIONS")) or _clean(rec.get("COUNT_VARIATIONS"))
     elif check_key == "fda":
         ctx["FDA"] = _clean(rec.get("FDA"))
-    elif check_key in ("title_weight", "title_english"):
+        ctx["Brand"] = _clean(rec.get("BRAND"))
+        ctx["Image"] = _clean(rec.get("MAIN_IMAGE"))
+    elif check_key == "title_weight":
+        # Weight/volume is usually printed on the pack, so the picture often
+        # settles it faster than the title does.
+        ctx["Image"] = _clean(rec.get("MAIN_IMAGE"))
+    elif check_key == "title_english":
         pass  # Product Name (already in base row) is the whole subject of this check
     elif check_key == "name_brand":
         ctx["Brand"] = _clean(rec.get("BRAND"))
         ctx["Brand Detected On Product"] = _clean(rec.get("Brand_Detected_On_Product"))
+        ctx["Image"] = _clean(rec.get("MAIN_IMAGE"))
     elif check_key == "image_quality":
         ctx["Image"] = _clean(rec.get("MAIN_IMAGE"))
         ctx["Image Filename"] = _clean(rec.get("Image_Filename"))
@@ -578,7 +592,13 @@ def _context_columns(check_key: str, rec: dict) -> dict:
     elif check_key == "ai_caption":
         ctx["Image"] = _clean(rec.get("MAIN_IMAGE"))
     elif check_key == "duplicate":
-        pass  # Seller is now in base row
+        # Had no context at all, which made it the hardest group to act on:
+        # "this is a duplicate" with nothing to compare against. The flag says
+        # what matched, the image is how a human confirms it, and the brand
+        # distinguishes a genuine repeat from two similar products.
+        ctx["Duplicate Flag"] = _clean(rec.get("Duplicate_Flag"))
+        ctx["Brand"] = _clean(rec.get("BRAND"))
+        ctx["Image"] = _clean(rec.get("MAIN_IMAGE"))
     return ctx
 
 

@@ -977,8 +977,33 @@ def load_all_support_files() -> Dict:
     _cm_path = "category_map.xlsx"
     try:
         if os.path.exists(_cm_path):
-            _cm_df = pd.read_excel(_cm_path, engine="openpyxl", dtype=str)
-            _cm_df.columns = [c.strip() for c in _cm_df.columns]
+            # Parquet mirror. This is a 30,085-row workbook and openpyxl takes
+            # 5.4s to parse it — the single largest item in a ~14.5s support
+            # load, paid on every cold start including every Cloud container.
+            # Parquet reads the same frame in a fraction of that.
+            #
+            # load_excel_file() already does this for the files it handles;
+            # this read never went through it. Same invalidation rule: the
+            # mirror is used only while it is newer than the workbook, so
+            # editing category_map.xlsx still takes effect immediately.
+            from data_utils import PARQUET_CACHE_DIR
+            _cm_pq = os.path.join(PARQUET_CACHE_DIR, "category_map.xlsx.parquet")
+            _cm_df = None
+            if os.path.exists(_cm_pq) and os.path.getmtime(_cm_pq) > os.path.getmtime(_cm_path):
+                try:
+                    _cm_df = pd.read_parquet(_cm_pq)
+                except Exception as _pq_err:
+                    logger.warning("category_map parquet unreadable (%s), re-reading xlsx", _pq_err)
+                    _cm_df = None
+            if _cm_df is None:
+                _cm_df = pd.read_excel(_cm_path, engine="openpyxl", dtype=str)
+                _cm_df.columns = [str(c).strip() for c in _cm_df.columns]
+                try:
+                    os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
+                    _atomic_to_parquet(_cm_df, _cm_pq)
+                except Exception as _w_err:
+                    logger.warning("Could not write category_map parquet: %s", _w_err)
+            _cm_df.columns = [str(c).strip() for c in _cm_df.columns]
             _path_col = next(
                 (c for c in _cm_df.columns if c.lower() == "category path"), None
             ) or next((c for c in _cm_df.columns if "path" in c.lower()), None)

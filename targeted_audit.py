@@ -8,6 +8,7 @@ from targeted_audit_filters import (
     evaluate_all_checks,
     diagnose_columns,
     verify_category_rejections_with_ai,
+    _context_columns,
     CHECK_ORDER,
     CHECK_LABELS,
 )
@@ -75,6 +76,140 @@ _VERDICT_STYLE = {
 _VERDICT_ORDER = ["False Approval", "False Rejection", "True Rejection",
                   "Needs Manual Review", "AI Error", "Duplicate", "Skipped"]
 
+# ── Acting on an audit result ──────────────────────────────────────────────
+#
+# The verdict already says what the correct action is, so the UI offers that
+# action rather than a pair of neutral Approve/Reject buttons: a False
+# Approval shipped and needs rejecting, a False Rejection penalised a seller
+# and needs approving. "Needs Manual Review" is the only verdict where the
+# reviewer genuinely chooses, and "AI Error" means the check never ran, so
+# there is nothing to act on.
+#
+#   verdict -> (status, button label, help)
+_VERDICT_ACTION = {
+    "False Approval": (
+        "Rejected", "Reject these",
+        "The pipeline approved these but shouldn't have. Rejects them now.",
+    ),
+    "False Rejection": (
+        "Approved", "Approve these",
+        "The pipeline rejected these wrongly. Restores them to approved.",
+    ),
+    "Duplicate": (
+        "Rejected", "Reject as duplicate",
+        "Rejects these as duplicate listings.",
+    ),
+}
+# Both actions offered; neither is the obvious default.
+_VERDICT_BOTH = {"Needs Manual Review"}
+# The check could not complete, so its verdict is not evidence of anything.
+_VERDICT_NO_ACTION = {"AI Error"}
+
+# Rejections carry a reason code so they export the same way a normal
+# rejection does, rather than landing in the report as an unlabelled manual
+# action.
+_CHECK_REASON_CODE = {
+    "duplicate":     "REJECT_DUPLICATE",
+    "category":      "REJECT_WRONG_CAT",
+    "color":         "REJECT_COLOR",
+    "warranty":      "REJECT_WARRANTY",
+    "variation":     "REJECT_VARIATION",
+    "fda":           "REJECT_FDA",
+    "title_weight":  "REJECT_WEIGHT_VOL",
+    "title_english": "REJECT_TITLE_LANG",
+    "name_brand":    "REJECT_BRAND_REPEAT",
+    "image_quality": "REJECT_POOR_IMAGE",
+    "brand_image":   "REJECT_BRAND_MISMATCH",
+}
+
+_ACTIONED_KEY = "_audit_actioned"
+
+
+def _live_status() -> dict:
+    """{sid: (status, flag, is_manual)} straight from the live report.
+
+    The audit's Verdict says what the pipeline *should* have done. It says
+    nothing about what the product's status is right now — so a row could read
+    "False Approval" while the product had already been rejected for something
+    else entirely, and the UI would still offer to reject it again.
+
+    is_manual carries whether a human already decided it in the flag expanders
+    or the visual grid, which is a different thing from the pipeline's own
+    automatic verdict and worth showing before someone re-decides it.
+    """
+    fr = st.session_state.get("final_report", pd.DataFrame())
+    if not isinstance(fr, pd.DataFrame) or fr.empty or "ProductSetSid" not in fr.columns:
+        return {}
+    n = len(fr)
+    sids = fr["ProductSetSid"].astype(str).str.strip()
+    statuses = fr["Status"].astype(str) if "Status" in fr.columns else pd.Series([""] * n)
+    flags = fr["FLAG"].astype(str) if "FLAG" in fr.columns else pd.Series([""] * n)
+    manual = (
+        fr["Is_Manual"].fillna(False).astype(bool) if "Is_Manual" in fr.columns
+        else pd.Series([False] * n)
+    )
+    return {
+        s: (st_, fl, bool(mn))
+        for s, st_, fl, mn in zip(sids, statuses, flags, manual)
+    }
+
+
+def _actioned() -> dict:
+    """{sid: "Approved"|"Rejected"} for everything actioned from this modal.
+
+    The audit results are computed from `all_data_map`, not from final_report,
+    so applying a status does not change a row's Verdict — re-running the whole
+    audit just to grey out one row would cost seconds. This ledger records what
+    has been actioned so rows can be marked and excluded from a second pass.
+    """
+    return st.session_state.setdefault(_ACTIONED_KEY, {})
+
+
+def _apply_from_audit(sids, status: str, check_key: str, reason_type: str, verdict: str) -> int:
+    """Push an audit decision into the real report.
+
+    Imported here rather than at module scope: ui_components imports
+    targeted_audit_modal from this module, so a top-level import of
+    ui_components would be circular.
+    """
+    from ui_components import apply_status_change, checkpoint_final_report
+
+    sids = [s for s in sids if s]
+    if not sids:
+        return 0
+
+    # apply_status_change() expands the SID set to every product sharing an
+    # image when the FLAG contains "image"/"blurry"/"poor"/"mismatch" etc.
+    # That cascade is right for a reviewer rejecting a bad photo, and wrong
+    # here — the reviewer picked specific rows. Keeping those words out of
+    # FLAG and putting the detail in the comment avoids acting on products
+    # that were never on screen.
+    flag = f"Audit correction — {status.lower()}"
+    comment = f"{CHECK_LABELS.get(check_key, check_key)} · {reason_type} · audited as {verdict}"
+    reason = _CHECK_REASON_CODE.get(check_key, "") if status == "Rejected" else ""
+
+    # Capture what each product was BEFORE the change, so the row can say it
+    # was overwritten rather than just showing the new status. A reviewer
+    # needs to see that this approval reversed an existing rejection —
+    # otherwise "Approved" looks the same whether it confirmed the pipeline
+    # or overruled it. Rows are never dropped from the table; only labelled.
+    _before = _live_status()
+
+    n = apply_status_change(
+        sids, status=status, flag=flag, reason=reason, comment=comment, is_manual=True,
+    )
+    if n:
+        ledger = _actioned()
+        for sid in sids:
+            _sid = str(sid).strip()
+            _prev = (_before.get(_sid) or ("", ""))[0]
+            if _prev and _prev != status:
+                ledger[_sid] = f"Overwritten {status.lower()}"
+            else:
+                ledger[_sid] = status
+        checkpoint_final_report()
+    return n
+
 
 def _inject_css():
     st.markdown("""
@@ -130,15 +265,34 @@ def _has_content(series: pd.Series) -> bool:
     return series.fillna("").astype(str).str.strip().replace({"nan": "", "None": ""}).ne("").any()
 
 
-def _display_columns(df: pd.DataFrame) -> list:
+def _display_columns(df: pd.DataFrame, check_key: str = None) -> list:
     universal = ["ProductSetSid", "Product Name", "Category"]
     tail = [c for c in ("Detail",) if c in df.columns]
     reserved = universal + tail + ["Check", "Reason Type", "Verdict"]
-    # Only keep check-specific columns that actually have data in *this*
-    # slice — since all checks share one combined DataFrame, an unrelated
-    # check's column (e.g. FDA on a Color-check row) would otherwise show
-    # up entirely empty.
-    middle = [c for c in df.columns if c not in reserved and _has_content(df[c])]
+
+    # A check's own context columns always show, empty or not.
+    #
+    # The emptiness filter below exists because all checks share one combined
+    # DataFrame, so an unrelated check's column (FDA on a Color-check row)
+    # would otherwise appear blank. But it also hid the column the check is
+    # *about*: "Color Missing" means COLOR is empty by definition, so the
+    # evidence for the finding was filtered out precisely when it mattered,
+    # and there was no way to tell a genuinely blank colour from one the
+    # audit had simply not shown.
+    #
+    # Derived by calling _context_columns with an empty record, so it tracks
+    # that function automatically rather than duplicating its column list.
+    always = set()
+    if check_key:
+        try:
+            always = set(_context_columns(check_key, {}).keys())
+        except Exception:
+            always = set()
+
+    middle = [
+        c for c in df.columns
+        if c not in reserved and (c in always or _has_content(df[c]))
+    ]
     return [c for c in universal if c in df.columns] + middle + tail
 
 
@@ -162,12 +316,210 @@ def _column_config(df: pd.DataFrame) -> dict:
     return cfg
 
 
-def _render_table(df: pd.DataFrame):
-    cols = _display_columns(df)
-    st.dataframe(df[cols], width='stretch', hide_index=True, column_config=_column_config(df))
+def _render_table(df: pd.DataFrame, key: str = None, selectable: bool = False,
+                  check_key: str = None):
+    """Render one verdict's rows. Returns the SIDs the reviewer ticked.
+
+    Selection is positional, so the frame handed to st.dataframe and the frame
+    indexed afterwards have to be the same object — hence building `view` once
+    and slicing it with .iloc rather than re-deriving the columns.
+    """
+    cols = _display_columns(df, check_key)
+    view = df[cols].copy()
+
+    # What the product is right now, next to what the audit thinks it should
+    # be — without it there is no way to see that a "False Approval" row has
+    # already been rejected for an unrelated reason.
+    live = _live_status()
+    if live and "ProductSetSid" in view.columns:
+        _sid = view["ProductSetSid"].astype(str).str.strip()
+        view.insert(1, "Now", _sid.map(lambda s: (live.get(s) or ("", "", False))[0]))
+        # Whether a human already decided this one, so a reviewer does not
+        # silently overturn a colleague's call without noticing.
+        _dec = _sid.map(
+            lambda s: "Reviewer" if (live.get(s) or ("", "", False))[2] else "Automatic"
+        )
+        view.insert(2, "Decided by", _dec)
+        _why = _sid.map(lambda s: (live.get(s) or ("", "", False))[1])
+        if _why.astype(str).str.strip().ne("").any():
+            view.insert(3, "Rejected for", _why)
+
+    # Mark anything already actioned from this modal so a reviewer does not
+    # apply the same decision twice.
+    ledger = _actioned()
+    if ledger and "ProductSetSid" in view.columns:
+        applied = view["ProductSetSid"].astype(str).map(ledger).fillna("")
+        if applied.ne("").any():
+            view.insert(0, "Applied", applied)
+
+    cfg = _column_config(df)
+    if "Applied" in view.columns:
+        cfg["Applied"] = st.column_config.TextColumn("Applied", width="small")
+    if "Now" in view.columns:
+        cfg["Now"] = st.column_config.TextColumn(
+            "Now", width="small", help="The product's current status in the report",
+        )
+    if "Decided by" in view.columns:
+        cfg["Decided by"] = st.column_config.TextColumn(
+            "Decided by", width="small",
+            help="Reviewer = someone already actioned this in the flag list or "
+                 "the visual grid. Automatic = the pipeline's own verdict.",
+        )
+    if "Rejected for" in view.columns:
+        cfg["Rejected for"] = st.column_config.TextColumn(
+            "Rejected for", width="medium",
+            help="The flag it currently carries, which may be unrelated to this check",
+        )
+
+    if not selectable:
+        st.dataframe(view, width='stretch', hide_index=True, column_config=cfg)
+        return []
+
+    event = st.dataframe(
+        view, width='stretch', hide_index=True, column_config=cfg,
+        selection_mode="multi-row", on_select="rerun", key=key,
+    )
+    rows = event.selection.rows if event and event.selection else []
+    if not rows or "ProductSetSid" not in view.columns:
+        return []
+    return view.iloc[rows]["ProductSetSid"].astype(str).tolist()
 
 
-@st.dialog("Targeted Audit", width="large", dismissible=True)
+def _render_verdict_actions(sub, selected, key_base, check_key, reason_type, verdict):
+    """The action row under one verdict's table."""
+    if verdict in _VERDICT_NO_ACTION:
+        st.caption(
+            "These checks never completed, so there is nothing to act on. "
+            "Re-run the audit once the AI check is reachable."
+        )
+        return
+
+    ledger = _actioned()
+    all_sids = (
+        sub["ProductSetSid"].astype(str).str.strip().tolist()
+        if "ProductSetSid" in sub.columns else []
+    )
+    pending = [s for s in all_sids if s not in ledger]
+    targets = selected or pending
+    scope = "selected" if selected else "all pending"
+
+    if not targets:
+        st.caption(f"All {len(all_sids)} actioned.")
+        return
+
+    # Applying a status a product already has does nothing useful — and for a
+    # rejection it is actively harmful, because it overwrites the existing
+    # FLAG and destroys the original reason. So each action only ever targets
+    # the products it would actually change, whichever direction it goes:
+    # already-approved are dropped from an Approve, already-rejected from a
+    # Reject. This covers decisions made anywhere, since final_report is what
+    # the flag expanders and the visual grid both write to.
+    live = _live_status()
+
+    def _cur(sid):
+        return (live.get(sid) or ("", "", False))
+
+    def _changeable(status):
+        return [s for s in targets if _cur(s)[0] != status]
+
+    def _describe(sids, status):
+        """'12 already rejected (8 decided by a reviewer) — Restricted brands'"""
+        if not sids:
+            return ""
+        _manual = sum(1 for s in sids if _cur(s)[2])
+        bits = [f"{len(sids)} already {status.lower()}"]
+        if _manual:
+            bits.append(
+                f"{_manual} decided by a reviewer in the flag list or the grid"
+            )
+        _flags = sorted({_cur(s)[1].strip() for s in sids if _cur(s)[1].strip()})
+        if _flags and status == "Rejected":
+            bits.append("flagged " + ", ".join(_flags[:3]))
+        return " · ".join(bits)
+
+    # The action this verdict actually recommends.
+    _primary = None
+    if verdict in _VERDICT_ACTION:
+        _primary = _VERDICT_ACTION[verdict][0]
+
+    if _primary and not _changeable(_primary):
+        _same = [s for s in targets if _cur(s)[0] == _primary]
+        _opposite = "Approved" if _primary == "Rejected" else "Rejected"
+        st.info(
+            f"Nothing to do — {_describe(_same, _primary)}. "
+            f"The audit's suggestion has already been applied to all "
+            f"{len(targets)} of these.",
+            icon=":material/task_alt:",
+        )
+        # Still allow the reverse, in case the audit shows the existing
+        # decision was the wrong one.
+        _rev = _changeable(_opposite)
+        if _rev and st.button(
+            f"{'Approve' if _opposite == 'Approved' else 'Reject'} instead ({len(_rev)})",
+            key=f"{key_base}_{_opposite}_reverse", type="secondary", width="stretch",
+            help="Use this only if the existing decision was wrong.",
+        ):
+            n = _apply_from_audit(_rev, _opposite, check_key, reason_type, verdict)
+            st.session_state["_audit_flash"] = (
+                f"{_opposite} {n:,} product{'s' if n != 1 else ''}."
+                if n else "Nothing changed — those products are no longer in the report."
+            )
+        return
+
+    for _st_name in ("Approved", "Rejected"):
+        _same = [s for s in targets if _cur(s)[0] == _st_name]
+        if _same and len(_same) < len(targets):
+            st.caption(
+                f"{_describe(_same, _st_name)}. "
+                f"The {'approve' if _st_name == 'Approved' else 'reject'} action "
+                f"below skips them and applies to the other "
+                f"{len(targets) - len(_same)}."
+            )
+
+    def _button(status, label, help_text, col, kind):
+        _t = _changeable(status)
+        if not _t:
+            return
+        if col.button(
+            f"{label} ({len(_t)} {scope})",
+            key=f"{key_base}_{status}", type=kind, width="stretch", help=help_text,
+        ):
+            n = _apply_from_audit(_t, status, check_key, reason_type, verdict)
+            st.session_state["_audit_flash"] = (
+                f"{status} {n:,} product{'s' if n != 1 else ''} "
+                f"from {CHECK_LABELS.get(check_key, check_key)}."
+                if n else
+                "Nothing changed — those products are no longer in the report."
+            )
+
+    if verdict in _VERDICT_BOTH:
+        c1, c2 = st.columns(2)
+        _button("Approved", "Approve", "Keep these live.", c1, "secondary")
+        _button("Rejected", "Reject", "Take these down.", c2, "secondary")
+    elif verdict in _VERDICT_ACTION:
+        status, label, help_text = _VERDICT_ACTION[verdict]
+        c1, _c2 = st.columns([1, 1])
+        _button(status, label, help_text, c1, "primary")
+
+
+def _on_audit_dismissed():
+    """Clear the open-flag when the dialog is closed by X, Esc or backdrop.
+
+    Without this the modal reopened by itself. show_targeted_audit_modal is
+    what render_manual_review_buttons checks to decide whether to call this
+    dialog, and only the in-dialog "Close" button ever cleared it — dismissing
+    any other way left it True, so the very next rerun (any click anywhere in
+    the app) put the dialog straight back on screen.
+
+    on_dismiss runs the callback before the rest of the script, so the flag is
+    already False by the time the reopen check happens.
+    """
+    st.session_state.show_targeted_audit_modal = False
+
+
+@st.dialog(
+    "Targeted Audit", width="large", dismissible=True, on_dismiss=_on_audit_dismissed
+)
 def targeted_audit_modal(support_files):
     _inject_css()
 
@@ -265,6 +617,10 @@ def targeted_audit_modal(support_files):
                     [base_results, cat_ai_results], ignore_index=True
                 )
             # Rebuild the Word report so it reflects the merged results too.
+            #
+            # The AI check *discovers* findings, it does not action them, so it
+            # is allowed to update the snapshot — unlike an approve/reject,
+            # which must never touch it.
             st.session_state.pop("_audit_docx_bytes", None)
             st.session_state.pop("_audit_docx_error", None)
             with st.spinner("Rebuilding Word report with AI category results..."):
@@ -274,24 +630,49 @@ def targeted_audit_modal(support_files):
                     )
                 except Exception as e:
                     st.session_state["_audit_docx_error"] = f"{type(e).__name__}: {e}"
+            st.session_state["_audit_snapshot"] = {
+                "results": st.session_state["_audit_results"].copy(),
+                "at": pd.Timestamp.now(),
+                "replaced": bool(
+                    (st.session_state.get("_audit_snapshot") or {}).get("replaced")
+                ),
+                "with_ai": True,
+            }
 
     if run_clicked:
         st.session_state.pop("_category_ai_results", None)
         with st.spinner("Re-validating every check against the file's own rules..."):
             st.session_state["_audit_results"] = evaluate_all_checks(data, country_code)
 
-        # Build the Word report once here, not on every rerun — with 1000+
-        # rows this can take a few seconds, and rebuilding it on every
-        # keystroke in the search box made it look broken/missing.
-        st.session_state.pop("_audit_docx_bytes", None)
-        st.session_state.pop("_audit_docx_error", None)
-        with st.spinner("Building Word report... this can take a moment for large files."):
-            try:
-                st.session_state["_audit_docx_bytes"] = build_docx_report(
-                    fr, st.session_state["_audit_results"], country_label=country_code,
-                )
-            except Exception as e:
-                st.session_state["_audit_docx_error"] = f"{type(e).__name__}: {e}"
+        # The first completed run is kept as the audit of record.
+        #
+        # Re-running after approving or rejecting things re-derives the checks
+        # against a report that now carries those decisions, so the second run
+        # legitimately finds fewer errors — and the Word report and CSV would
+        # quietly lose the original findings. Both downloads therefore serve
+        # this snapshot, not the live results, and it is only replaced when
+        # explicitly asked for.
+        _snap_exists = bool(st.session_state.get("_audit_snapshot"))
+        _replace = st.session_state.pop("_audit_replace_snapshot", False)
+
+        if not _snap_exists or _replace:
+            st.session_state.pop("_audit_docx_bytes", None)
+            st.session_state.pop("_audit_docx_error", None)
+            # Built once here, not on every rerun — with 1000+ rows it takes a
+            # few seconds, and rebuilding on every keystroke in the search box
+            # made it look broken.
+            with st.spinner("Building Word report... this can take a moment for large files."):
+                try:
+                    st.session_state["_audit_docx_bytes"] = build_docx_report(
+                        fr, st.session_state["_audit_results"], country_label=country_code,
+                    )
+                except Exception as e:
+                    st.session_state["_audit_docx_error"] = f"{type(e).__name__}: {e}"
+            st.session_state["_audit_snapshot"] = {
+                "results": st.session_state["_audit_results"].copy(),
+                "at": pd.Timestamp.now(),
+                "replaced": bool(_replace),
+            }
 
     results = st.session_state.get("_audit_results", pd.DataFrame())
 
@@ -328,6 +709,34 @@ def targeted_audit_modal(support_files):
         s5.metric("🚨 AI Errors", int(counts.get("AI Error", 0)))
         s6.metric("📑 Duplicates", int(counts.get("Duplicate", 0)))
 
+        # Result of the last approve/reject, shown here rather than as a toast:
+        # acting on a row reruns the dialog, and a toast fired during that run
+        # is easy to miss behind the modal.
+        _flash = st.session_state.pop("_audit_flash", None)
+        if _flash:
+            st.success(_flash, icon=":material/task_alt:")
+
+        _ledger_now = _actioned()
+        if _ledger_now:
+            _n_app = sum(1 for v in _ledger_now.values() if v.endswith("pproved"))
+            _n_rej = sum(1 for v in _ledger_now.values() if v.endswith("ejected"))
+            _n_over = sum(1 for v in _ledger_now.values() if v.startswith("Overwritten"))
+            _bar, _reset = st.columns([4, 1], vertical_alignment="center")
+            with _bar:
+                st.caption(
+                    f"Applied from this audit: **{_n_app:,} approved**, "
+                    f"**{_n_rej:,} rejected**"
+                    + (f", of which **{_n_over:,} overwrote** an existing decision"
+                       if _n_over else "")
+                    + ". These are already in the report and the Excel exports."
+                )
+            with _reset:
+                if st.button("Clear marks", key="btn_clear_audit_marks", width="stretch",
+                             help="Clears the actioned markers here. Does not undo the "
+                                  "status changes — those live in the report."):
+                    st.session_state.pop(_ACTIONED_KEY, None)
+                    st.rerun()
+
         st.markdown('<div class="audit-section-title">Issues by check</div>', unsafe_allow_html=True)
         st.caption("Correctly confirmed rejections and normal pre-QC exclusions are counted above "
                    "but not listed here — only items that need a decision or a fix are shown.")
@@ -342,8 +751,17 @@ def targeted_audit_modal(support_files):
                 continue
             any_visible = True
 
-            with st.expander(f"{icon}  **{label}**   —   {len(check_slice)} item(s) flagged", expanded=False):
-                for reason_type in check_slice["Reason Type"].unique():
+            _ledger = _actioned()
+            _done = (
+                int(check_slice["ProductSetSid"].astype(str).isin(_ledger).sum())
+                if "ProductSetSid" in check_slice.columns else 0
+            )
+            _exp_label = f"{icon}  **{label}**   —   {len(check_slice)} item(s) flagged"
+            if _done:
+                _exp_label += f"   ·   {_done} actioned"
+
+            with st.expander(_exp_label, expanded=False):
+                for _ri, reason_type in enumerate(check_slice["Reason Type"].unique()):
                     reason_slice = check_slice[check_slice["Reason Type"] == reason_type]
                     st.markdown(f'<div class="audit-reason-label">{reason_type} '
                                 f'({len(reason_slice)})</div>', unsafe_allow_html=True)
@@ -354,21 +772,41 @@ def targeted_audit_modal(support_files):
                             continue
                         fg, bg, emoji = _VERDICT_STYLE[verdict]
                         st.markdown(_pill(f"{emoji} {verdict} ({len(sub)})", fg, bg), unsafe_allow_html=True)
-                        _render_table(sub)
+
+                        # Positional selection needs a key that is stable across
+                        # reruns and unique per table: reason types are free text,
+                        # so index them rather than using the string itself.
+                        _key_base = f"audit_{check_key}_{_ri}_{verdict.replace(' ', '_')}"
+                        _actionable = verdict not in _VERDICT_NO_ACTION
+                        _selected = _render_table(
+                            sub, key=f"{_key_base}_tbl", selectable=_actionable,
+                            check_key=check_key,
+                        )
+                        if _actionable:
+                            _render_verdict_actions(
+                                sub, _selected, _key_base, check_key, reason_type, verdict
+                            )
 
         if not any_visible and search_term.strip():
             st.info(f"No results match '{search_term}'.")
 
         # ── Export ───────────────────────────────────────────────────────────
+        # Both downloads serve the snapshot from the first completed run, not
+        # the live results — see the comment where _audit_snapshot is set.
+        _snap = st.session_state.get("_audit_snapshot") or {}
+        _snap_results = _snap.get("results")
+        _export_df = _snap_results if isinstance(_snap_results, pd.DataFrame) and not _snap_results.empty else results
+
         dl_col1, dl_col2 = st.columns(2)
         with dl_col1:
-            if not results.empty:
+            if not _export_df.empty:
                 st.download_button(
                     "⬇️ Download CSV",
-                    data=results.to_csv(index=False).encode("utf-8"),
+                    data=_export_df.to_csv(index=False).encode("utf-8"),
                     file_name="targeted_audit_results.csv",
                     mime="text/csv",
                     width='stretch',
+                    help="The audit as first run, matching the Word report.",
                 )
         with dl_col2:
             docx_bytes = st.session_state.get("_audit_docx_bytes")
@@ -385,6 +823,42 @@ def targeted_audit_modal(support_files):
                 st.error(f"Couldn't build the Word report: {docx_error}")
             else:
                 st.caption("Word report will be ready after you run the audit.")
+
+        # Two outputs, two jobs — and the difference is easy to lose track of
+        # once you start approving and rejecting from this screen:
+        #
+        #   Word  = the audit record. Built once, when Run Full Audit ran, and
+        #           never rebuilt by an approve/reject here. It keeps the
+        #           errors as found, which is the point of having it.
+        #   Excel = the actionable output. render_exports_section reads
+        #           final_report live, so it reflects every decision made here
+        #           and in the flag expanders.
+        if _snap.get("at") is not None:
+            _c1, _c2 = st.columns([3, 1], vertical_alignment="center")
+            with _c1:
+                st.caption(
+                    f":material/lock: **Saved audit — {_snap['at']:%d %b %Y, %H:%M}"
+                    f"{' (incl. AI check)' if _snap.get('with_ai') else ''}.** "
+                    "The Word report and the CSV above both come from this run "
+                    "and do not change when you approve or reject. Re-running "
+                    "the audit updates the tables below but leaves these two "
+                    "alone, so the original findings survive. The Excel exports "
+                    "on the main page read the live report, so they include "
+                    "every decision made here and in the flag expanders."
+                )
+            with _c2:
+                if st.button(
+                    "Replace saved audit", key="btn_replace_audit_snapshot",
+                    width="stretch",
+                    help="Discards the saved findings and re-captures them on the "
+                         "next Run Full Audit. The current Word report and CSV "
+                         "are lost — download them first if you need them.",
+                ):
+                    st.session_state["_audit_replace_snapshot"] = True
+                    st.info(
+                        "The next Run Full Audit will replace the saved report.",
+                        icon=":material/refresh:",
+                    )
 
     elif run_clicked:
         st.success("✅ No issues found across any check.")
