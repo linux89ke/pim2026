@@ -4734,15 +4734,26 @@ def visual_review_modal(support_files):
         def _on_ipp_change():
             st.session_state.grid_items_per_page = st.session_state[_slider_key]
 
-        st.select_slider(
-            "Items per page",
-            options=_ipp_opts,
-            key=_slider_key,
-            on_change=_on_ipp_change,
-            help=("500 per page is available in wide mode (6 or 7 columns)."
-                  if _allow_500 else
-                  "Switch to 6 or 7 columns to unlock 500 per page."),
-        )
+        # In a popover rather than inline. A select_slider carries its label
+        # above the track, making it the tallest widget in this row and setting
+        # the height of the whole band; every other control here is one input
+        # high. Behind a button the band collapses to that single height, and
+        # page size is a setting you change occasionally, not a control you
+        # need under the cursor.
+        with st.popover(
+            f"View · {st.session_state.get('grid_items_per_page', 50)}",
+            use_container_width=True,
+            help="How many products to show per page",
+        ):
+            st.select_slider(
+                "Items per page",
+                options=_ipp_opts,
+                key=_slider_key,
+                on_change=_on_ipp_change,
+                help=("500 per page is available in wide mode (6 or 7 columns)."
+                      if _allow_500 else
+                      "Switch to 6 or 7 columns to unlock 500 per page."),
+            )
         st.session_state.grid_items_per_page = st.session_state[_slider_key]
 
     if "_grid_page_contexts" not in st.session_state:
