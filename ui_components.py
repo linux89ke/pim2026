@@ -2472,6 +2472,39 @@ def build_fast_grid_html(
   .cols-group .cols-label{{font-size:11px;font-weight:700;color:var(--text-muted);white-space:nowrap;letter-spacing:.04em;}}
   @media (max-width: 900px) {{ .cols-group .cols-label {{display:none;}} }}
 
+  /* ── Floating mode ────────────────────────────────────────────────────
+     Docked (default) the bar is opaque, full width, and #card-grid reserves
+     its height so a card can never end up underneath it. Floating, it becomes
+     a translucent island and the reservation drops to a few pixels, handing
+     its whole height back to the cards. The bar is position:fixed either way
+     — the only real difference is whether the grid reserves room for it. */
+  .bottom-bar.floating{{
+    left:12px; right:12px; width:auto; bottom:12px;
+    border:1px solid rgba(246,139,30,.35); border-radius:12px;
+    background:color-mix(in srgb, var(--card) 88%, transparent);
+    backdrop-filter:blur(12px) saturate(1.1);
+    -webkit-backdrop-filter:blur(12px) saturate(1.1);
+    box-shadow:0 8px 28px rgba(26,25,23,.18);
+  }}
+  /* color-mix is recent; without it the rule above is dropped and the bar
+     would be fully transparent over the cards. */
+  @supports not (background: color-mix(in srgb, red 50%, transparent)) {{
+    .bottom-bar.floating{{background:rgba(255,255,255,.9);}}
+  }}
+  /* Collapsed is a manual choice, never automatic. Select All, language, sort
+     and cards-per-row all live in this bar, and those are exactly what you
+     reach for when nothing is selected yet — so collapsing on an empty
+     selection would hide the controls at the moment they are needed. */
+  .bottom-bar.collapsed{{left:auto; right:12px; width:auto; padding:6px 10px;}}
+  .bottom-bar.collapsed > *:not(.bar-toggle):not(.sel-count-text){{display:none !important;}}
+  .bottom-bar.collapsed .sel-count-text{{margin-right:2px;}}
+  .bar-toggle{{display:inline-flex;align-items:center;justify-content:center;
+    min-width:28px;height:28px;padding:0 6px;border:1px solid var(--border);
+    border-radius:6px;background:#fff;color:var(--text);cursor:pointer;
+    font-size:13px;line-height:1;}}
+  .bar-toggle:hover{{border-color:var(--accent);}}
+  .bar-toggle[aria-pressed="true"]{{background:var(--accent);color:var(--ink-on-accent);border-color:var(--accent);}}
+
   .sel-count{{font-weight:700;color:{OT};font-size:13px;min-width:80px;font-family:var(--font-mono);font-variant-numeric:tabular-nums slashed-zero;}}
   .reason-sel{{flex:1;min-width:160px;padding:6px 10px;border:1px solid #ccc;border-radius:4px;font-size:12px;background:#fff;cursor:pointer;}}
   .rsearch-wrap{{position:relative;flex:1 0 auto;min-width:200px;max-width:260px;}}
@@ -2906,6 +2939,10 @@ def build_fast_grid_html(
     {_cols_btns}
   </span>
   <button class="icon-btn" style="margin-left:auto;" onclick="gridScrollTo('top')" title="Back to top" aria-label="Back to top">{_ICON_TOP}</button>
+  <button class="bar-toggle" id="bar-float-btn" onclick="toggleBarFloat()" aria-pressed="false"
+          title="Float the bar over the cards" aria-label="Float the bar over the cards">&#9679;</button>
+  <button class="bar-toggle" id="bar-collapse-btn" onclick="toggleBarCollapse()" aria-expanded="true"
+          title="Collapse the bar" aria-label="Collapse the bar">&#9660;</button>
 </div>
 
 <div id="zoom-backdrop" onclick="closeZoom()"></div>
@@ -4351,11 +4388,68 @@ window.sizeGridScroll = function() {{
   document.documentElement.style.setProperty('--grid-top-h', h + 'px');
   var bot = document.querySelector('.ctrl-bar.bottom-bar');
   var bh = bot ? Math.ceil(bot.getBoundingClientRect().height) : 84;
+  /* Floating means the grid stops reserving the bar's height and the cards
+     scroll underneath it — that reclaim is the entire point of the mode. A
+     few pixels are still held back so the last row clears the bar's shadow
+     rather than touching it. */
+  if (bot && bot.classList.contains('floating')) bh = 10;
   document.documentElement.style.setProperty('--grid-bot-h', bh + 'px');
+}};
+
+/* ── Dock / float / collapse ──────────────────────────────────────────────
+   Kept in localStorage rather than session state: it changes nothing outside
+   this iframe, so a round trip to Python would cost a rerun for a purely
+   visual preference. That is the opposite of the old in-grid dark mode toggle,
+   which was removed precisely because it themed only the iframe and left the
+   grid dark inside a light app — this has no counterpart outside to fall out
+   of step with. */
+window.applyBarMode = function() {{
+  var bot = document.querySelector('.ctrl-bar.bottom-bar');
+  if (!bot) return;
+  var floating = false, collapsed = false;
+  try {{
+    floating = localStorage.getItem('gridBarFloat') === '1';
+    collapsed = localStorage.getItem('gridBarCollapsed') === '1';
+  }} catch (e) {{}}
+  collapsed = collapsed && floating;   // docked and collapsed would just be a gap
+  bot.classList.toggle('floating', floating);
+  bot.classList.toggle('collapsed', collapsed);
+  var fb = document.getElementById('bar-float-btn');
+  if (fb) {{
+    fb.setAttribute('aria-pressed', floating ? 'true' : 'false');
+    fb.title = floating ? 'Dock the bar below the cards' : 'Float the bar over the cards';
+    fb.setAttribute('aria-label', fb.title);
+  }}
+  var cb = document.getElementById('bar-collapse-btn');
+  if (cb) {{
+    cb.style.display = floating ? '' : 'none';   // nothing to collapse when docked
+    cb.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    cb.innerHTML = collapsed ? '&#9650;' : '&#9660;';
+    cb.title = collapsed ? 'Expand the bar' : 'Collapse the bar';
+    cb.setAttribute('aria-label', cb.title);
+  }}
+  window.sizeGridScroll();
+}};
+window.toggleBarFloat = function() {{
+  try {{
+    var on = localStorage.getItem('gridBarFloat') === '1';
+    localStorage.setItem('gridBarFloat', on ? '0' : '1');
+    if (on) localStorage.setItem('gridBarCollapsed', '0');  // don't return collapsed
+  }} catch (e) {{}}
+  window.applyBarMode();
+}};
+window.toggleBarCollapse = function() {{
+  try {{
+    var on = localStorage.getItem('gridBarCollapsed') === '1';
+    localStorage.setItem('gridBarCollapsed', on ? '0' : '1');
+  }} catch (e) {{}}
+  window.applyBarMode();
 }};
 window.addEventListener('resize', window.sizeGridScroll);
 window.addEventListener('load', window.sizeGridScroll);
 sizeGridScroll();
+// After sizeGridScroll exists, so the reservation is right on first paint.
+window.applyBarMode();
 try {{
   var _bar = document.querySelector('.ctrl-bar.top-bar');
   if (_bar && window.ResizeObserver) new ResizeObserver(window.sizeGridScroll).observe(_bar);
