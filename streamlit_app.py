@@ -619,7 +619,16 @@ FLAG_RELEVANT_COLS = {
     "Incomplete Smartphone Name": ["CATEGORY_CODE", "NAME"],
     "Specs Inconsistency": ["CATEGORY_CODE", "NAME", "DESCRIPTION", "SHORT_DESCRIPTION", "CATEGORY"],
     "Brand Image Mismatch": ["BRAND", "NAME", "Brand_Detected_On_Product", "SELLER_NAME"],
-    "Off-Platform Contact": ["NAME", "DESCRIPTION", "SHORT_DESCRIPTION", "SELLER_NAME"],
+    # The localised columns carry real content in the French and Arabic
+    # markets — in one Uganda batch alone, 233 French and 225 Arabic
+    # descriptions were populated. Scanning only the base columns meant a
+    # phone number sitting in DESCRIPTION_AR was invisible to this check.
+    "Off-Platform Contact": [
+        "NAME", "NAME_FR", "NAME_AR",
+        "DESCRIPTION", "DESCRIPTION_FR", "DESCRIPTION_AR",
+        "SHORT_DESCRIPTION", "SHORT_DESCRIPTION_FR", "SHORT_DESCRIPTION_AR",
+        "SELLER_NAME",
+    ],
     "Duplicate product": ["NAME", "SELLER_NAME", "BRAND", "CATEGORY_CODE", "COLOR", "COLOR_FAMILY", "MAIN_IMAGE"],
     "Perfume Tester": ["CATEGORY_CODE", "NAME"],
     "Discount too high": ["GLOBAL_PRICE", "GLOBAL_SALE_PRICE"],
@@ -1343,17 +1352,66 @@ def check_prohibited_products(
             str(c).strip().lower() in ("none", "nan", "") for c in cats
         )
 
-    usable_rules = [r for r in prohibited_rules if not _is_placeholder(r.get("categories"))]
-    _n_dead = len(prohibited_rules) - len(usable_rules)
-    if _n_dead:
-        logger.warning(
-            "[Prohibited] %d of %d rules have no usable category codes and are "
-            "ignored. Fill the 'categories' column in Prohibbited.xlsx to enable "
-            "them.", _n_dead, len(prohibited_rules),
+    # A blank category means "applies everywhere", not "unfinished".
+    #
+    # Dropping these rules outright left the check almost entirely dead:
+    # KE ran 8 of 316, UG 2 of 203, NG 0 of 1831, MA 0 of 2018, GH 2 of 1668.
+    # The blank-category keywords are things like "vape", "shisha",
+    # "e-cigarette" and "hookah" — prohibited whatever they are filed under,
+    # so a category was never going to be filled in.
+    #
+    # The original concern was real but narrow: a handful of keywords are
+    # measurements ("105", "100inch", "100000mah") that would flag every TV
+    # or power bank if fired globally. Those are excluded by shape rather
+    # than by discarding everything — a keyword is unsafe globally when it
+    # carries no alphabetic run of three or more characters outside a unit,
+    # which keeps genuine short prohibitions like "CBD", "LSD" and "XXX"
+    # (already protected by the word boundaries in the pattern below).
+    _UNIT_WORDS = {
+        "inch", "inches", "mah", "cm", "mm", "kg", "hz", "ml", "gb", "tb",
+        "watt", "watts", "volt", "volts", "amp", "amps", "pcs", "pack",
+    }
+    _ALPHA_RUN_RE = re.compile(r"[a-z]{3,}", re.IGNORECASE)
+
+    def _unsafe_global(keyword: str) -> bool:
+        k = str(keyword or "").strip()
+        if not k:
+            return True
+        runs = [r.lower() for r in _ALPHA_RUN_RE.findall(k)]
+        if any(r not in _UNIT_WORDS for r in runs):
+            return False        # a real word: "vape", "100% Human Hair"
+        # No word to anchor on. Still safe if it is purely alphabetic
+        # punctuation — brand initialisms like "D&G", "D-G", "C-D" cannot
+        # collide with a spec, unlike anything carrying a digit.
+        has_digit = any(ch.isdigit() for ch in k)
+        has_alpha = any(ch.isalpha() for ch in k)
+        return has_digit or not has_alpha
+
+    scoped_rules, global_rules, unsafe_kws = [], [], []
+    for r in prohibited_rules:
+        if not _is_placeholder(r.get("categories")):
+            scoped_rules.append(r)
+        elif _unsafe_global(r.get("keyword")):
+            unsafe_kws.append(str(r.get("keyword", "")).strip())
+        else:
+            # Empty category set = matches on keyword alone, any category.
+            global_rules.append({**r, "categories": set()})
+
+    if unsafe_kws:
+        logger.info(
+            "[Prohibited] %d keyword(s) skipped as too generic to apply "
+            "without a category (e.g. %s). Add category codes in "
+            "Prohibbited.xlsx to enable them.",
+            len(unsafe_kws), ", ".join(sorted(set(unsafe_kws))[:5]),
         )
-    if not usable_rules:
+    logger.info(
+        "[Prohibited] %d category-scoped rule(s), %d global rule(s) active.",
+        len(scoped_rules), len(global_rules),
+    )
+
+    prohibited_rules = scoped_rules + global_rules
+    if not prohibited_rules:
         return pd.DataFrame(columns=data.columns)
-    prohibited_rules = usable_rules
 
     all_kws = sorted(
         set(rule["keyword"] for rule in prohibited_rules), key=len, reverse=True
@@ -1367,9 +1425,20 @@ def check_prohibited_products(
         return pd.DataFrame(columns=data.columns)
     candidates = data[match_mask]
 
+    # The per-row test below reads an empty set as "any category", so a
+    # keyword that is global in one rule must stay global even if another
+    # rule scopes it — otherwise the union would silently narrow it back to
+    # that one category and undo the fix above.
     kw_to_cats = {}
+    _global_kws = set()
     for rule in prohibited_rules:
-        kw_to_cats.setdefault(rule["keyword"], set()).update(rule["categories"])
+        kw = rule["keyword"]
+        cats = rule.get("categories") or set()
+        if not cats:
+            _global_kws.add(kw)
+        kw_to_cats.setdefault(kw, set()).update(cats)
+    for kw in _global_kws:
+        kw_to_cats[kw] = set()
 
     flagged_indices = set()
     comment_map = {}
@@ -1721,11 +1790,34 @@ def check_counterfeit_sneakers(
     ].copy()
     if sneakers.empty:
         return pd.DataFrame(columns=data.columns)
+
+    # Whole-word matching. This was `any(b in x for b in brands)` — a bare
+    # substring test against a 369-entry list containing 56 entries of four
+    # characters or fewer ("lv", "tn", "j1", "cd", "af1"). Those matched
+    # inside ordinary words and rejected honest listings:
+    #
+    #   "SILVER Vic Shoes ..."         -> "lv" inside si-LV-er
+    #   "SILVER Victorious Heels ..."  -> "lv" again, plus "victori"
+    #                                     inside "victorious"
+    #
+    # Neither is a counterfeit sneaker; both are rhinestone heels. The
+    # lookaround form is the same one check_counterfeit_jerseys already uses,
+    # and it tolerates the entries containing spaces or punctuation
+    # ("af 1", "l v", "d!or", "n!ke") that \b would handle badly.
+    #
+    # One compiled alternation also replaces 369 substring scans per row.
+    _sensitive = [b for b in (sneaker_sensitive_brands or []) if str(b).strip()]
+    if not _sensitive:
+        return pd.DataFrame(columns=data.columns)
+    _sens_re = re.compile(
+        r"(?<!\w)(?:"
+        + "|".join(re.escape(b) for b in sorted(_sensitive, key=len, reverse=True))
+        + r")(?!\w)",
+        re.IGNORECASE,
+    )
     return sneakers[
         sneakers["_brand_lower"].isin(["generic", "fashion"])
-        & sneakers["_name_lower"].apply(
-            lambda x: any(b in x for b in sneaker_sensitive_brands)
-        )
+        & sneakers["_name_lower"].str.contains(_sens_re, na=False)
     ].drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
@@ -1965,6 +2057,19 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 # Uganda, Ghana, Morocco, Egypt, Senegal or Ivory Coast went straight through.
 # Bare digit runs are deliberately NOT matched — model numbers, EANs and
 # capacities would swamp the check with false positives.
+# Arabic-Indic and Eastern Arabic-Indic digits fold to ASCII before matching.
+# \d already matches ٥ because Python patterns are Unicode-aware, but every
+# literal in the patterns below is ASCII — the leading "0" in the local
+# formats, and prefixes like 212 or 20 — so "٠٦ ١٢ ٣٤ ٥٦ ٧٨" failed while the
+# same number in Latin digits matched. Folding once is far less error-prone
+# than writing a second set of patterns.
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+
+
+def _fold_digits(text: str) -> str:
+    return str(text).translate(_ARABIC_DIGITS)
+
+
 _PHONE_RE = re.compile(
     r"(?:"
     # International for the eight markets. Digit GROUPING is deliberately not
@@ -2019,8 +2124,20 @@ _LOCATION_RE = re.compile(
     r"|\bnext\s+to\s+(?:the\s+)?[a-z]+\s+(?:building|mall|plaza|arcade|market|stage)"
     r"|\b(?:visit|come\s+to|located\s+at|find\s+us\s+at)\s+(?:our\s+)?"
     r"(?:shop|store|office|showroom)\b"
+    # French — "BP 1234", "boîte postale", "magasin n° 12", "2ème étage",
+    # "en face de", "à côté du marché", "situé à"
+    r"|\bb\.?\s*p\.?\s*\d+"
+    r"|\bbo[iî]te\s+postale\s*\d+"
+    r"|\b(?:magasin|boutique|local|bureau)\s*(?:n[o°]\.?|num[ée]ro|#)?\s*\d+"
+    r"|\b\d+\s*(?:er|[eè]me)?\s*[ée]tage\b"
+    r"|\ben\s+face\s+d[eu]\b|\b[aà]\s+c[oô]t[ée]\s+d[eu]\b"
+    r"|\bsitu[ée]\s+[aà]\b|\bvenez\s+(?:nous\s+voir|[aà])\b"
+    # Arabic — "ص.ب ١٢٣" (P.O. Box), "محل رقم", "الطابق", "بجانب", "أمام"
+    r"|ص\.?\s*ب\.?\s*\d+"
+    r"|(?:محل|متجر|مكتب)\s*(?:رقم)?\s*\d+"
+    r"|الطابق\s*\S+|بجانب\s+\S+|أمام\s+\S+|بالقرب\s+من"
     r")",
-    re.IGNORECASE,
+    re.IGNORECASE | re.UNICODE,
 )
 
 # Ordered so the comment names the most actionable kind first.
@@ -2033,11 +2150,26 @@ _CONTACT_KINDS = (
 # Soft signals: divert-the-buyer wording without a number/link. Deliberately
 # phrase-based ("follow us on", not bare "tiktok") so products like ring
 # lights "for TikTok videos" don't false-positive.
+#
+# French and Arabic carry the same intent as the English phrases. \b is not
+# used around the Arabic alternatives: Arabic script has no ASCII word
+# boundary, so \b next to an Arabic letter never matches.
 _OFFPLATFORM_SOFT_RE = re.compile(
     r"(?:\bcall\s+us\b|\bcontact\s+(?:us|the\s+seller|seller)\b"
     r"|\border\s+(?:directly|via|through)\b|\bdm\s+us\b|\binbox\s+us\b"
-    r"|\bfollow\s+us\s+on\b|\bfind\s+us\s+on\b|\bvisit\s+our\b)",
-    re.IGNORECASE,
+    r"|\bfollow\s+us\s+on\b|\bfind\s+us\s+on\b|\bvisit\s+our\b"
+    # French — "appelez-nous", "contactez le vendeur", "commandez directement",
+    # "écrivez-nous", "suivez-nous sur", "visitez notre boutique"
+    r"|\bappelez[\s\-]?(?:nous|moi)\b|\bcontactez[\s\-]?(?:nous|moi|le\s+vendeur)\b"
+    r"|\bcommandez\s+(?:directement|via|par)\b|\b[ée]crivez[\s\-]?nous\b"
+    r"|\bsuivez[\s\-]?nous\s+sur\b|\bvisitez\s+(?:notre|nos)\b"
+    r"|\bnous\s+joindre\b|\bjoignez[\s\-]?nous\b"
+    # Arabic — "اتصل بنا", "تواصل معنا", "اطلب مباشرة", "تابعنا على",
+    # "راسلنا", "زوروا متجرنا"
+    r"|اتصل\s*بنا|تواصل\s*مع(?:نا)?|اطلب\s*مباشرة|تابعنا\s*على"
+    r"|راسلنا|زوروا?\s*(?:متجرنا|محلنا)|كلمنا"
+    r")",
+    re.IGNORECASE | re.UNICODE,
 )
 
 # WhatsApp needs its own three-way classification because the bare word is
@@ -2051,7 +2183,9 @@ _OFFPLATFORM_SOFT_RE = re.compile(
 #   3. Anything else — WhatsApp mentioned with no feature context and no
 #      clear solicitation wording → ambiguous, worth a human glance but not
 #      an automatic reject, so it's soft evidence only.
-_WHATSAPP_ANY_RE = re.compile(r"whats\s*app", re.IGNORECASE)
+# "واتساب" / "واتس اب" is how WhatsApp is written in Arabic listings; the
+# Latin spelling never appears in them, so the bare pattern missed it entirely.
+_WHATSAPP_ANY_RE = re.compile(r"whats\s*app|واتس\s*اب|واتساب", re.IGNORECASE | re.UNICODE)
 _WHATSAPP_FEATURE_CTX_RE = re.compile(
     r"whats\s*app\s*(?:\w+\s+){0,2}(?:notification|notifications|call|calls|calling"
     r"|support|compatib\w*|sync\w*|enabled|feature\w*|message\w*|alert\w*|chat\w*)"
@@ -2088,8 +2222,15 @@ def check_offplatform_contact(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
 
     # Per-column stripped/lowered text — kept separate (not concatenated)
     # so a match can be attributed back to its specific source field.
+    # Digits fold here, once per column, so every pattern below sees ASCII
+    # numerals whatever script the listing was written in. Doing it at this
+    # point also means the comment quotes the folded form, which is what a
+    # reviewer can actually dial.
     col_text = {
-        c: data[c].astype(str).str.replace(_HTML_TAG_RE, " ", regex=True).str.lower()
+        c: data[c].astype(str)
+                  .str.replace(_HTML_TAG_RE, " ", regex=True)
+                  .str.translate(_ARABIC_DIGITS)
+                  .str.lower()
         for c in text_cols
     }
 
