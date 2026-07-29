@@ -4353,6 +4353,111 @@ try {{
   if (_bot && window.ResizeObserver) new ResizeObserver(window.sizeGridScroll).observe(_bot);
 }} catch(e) {{}}
 
+/* ── Size the iframe to the space the dialog actually leaves ───────────────
+   Python cannot read the browser height, so st.iframe(height=...) is a guess
+   sized for the smallest supported screen. The dialog backdrop
+   (div[data-testid="stDialog"]) is overflow-y:auto and the panel inside it is
+   overflow:visible with no max-height, so the panel simply grows to fit its
+   content and the backdrop scrolls it. Measured at 1366x768: panel 968px in a
+   768px viewport, putting the iframe's bottom edge 168px below the fold. The
+   batch bar is position:fixed against the *iframe* viewport, so it was pinned
+   correctly the whole time — it just went off screen with the iframe.
+
+   CSS alone cannot fix this. Streamlit sizes the stElementContainer wrapper
+   from the Python height argument, so setting only the iframe's height leaves
+   a 468px iframe inside a 620px wrapper and an empty gap below the cards.
+   Both boxes have to move together.
+
+   st.iframe renders a srcdoc iframe, which inherits the parent's origin, so
+   window.frameElement and the parent document are both reachable — verified
+   against the live DOM. That makes the grid the only place with all three
+   facts: the real viewport height, its own offset within the dialog, and how
+   much dialog chrome sits below it. So it sizes itself.
+
+   Everything is measured, not assumed. Nothing here depends on a Streamlit
+   emotion class or on the number of control rows above the grid. */
+var MIN_H = 320, MAX_H = 1600, GAP = 16;
+window.fitToViewport = function() {{
+  var fe;
+  try {{ fe = window.frameElement; }} catch (e) {{ return; }}   // cross-origin
+  if (!fe) return;                                            // not embedded
+  var pw = window.parent, wrap = fe.parentElement;
+  var top = fe.getBoundingClientRect().top;
+
+  /* Whatever the dialog puts below the grid — the close row, its padding —
+     measured as the gap between the wrapper's bottom and the panel's. Taken
+     from current geometry so it stays correct when those rows change height,
+     and it is a distance between two elements that both move together, so it
+     does not drift as this function resizes things. */
+  var below = 0;
+  try {{
+    var panel = pw.document.querySelector('[data-testid="stDialog"] section[role="dialog"]');
+    if (panel) below = Math.max(0, panel.getBoundingClientRect().bottom
+                                   - (wrap || fe).getBoundingClientRect().bottom);
+  }} catch (e) {{}}
+
+  var h = Math.round(pw.innerHeight - top - below - GAP);
+  h = Math.max(MIN_H, Math.min(MAX_H, h));
+  var px = h + 'px';
+  if (fe.style.height !== px) {{
+    fe.style.setProperty('height', px, 'important');
+    fe.style.setProperty('max-height', px, 'important');
+  }}
+  /* The wrapper needs flex-basis, not just height. Streamlit gives it
+     flex: 0 0 <python height>px inside a column flex container, where the
+     basis is the main size and wins over the height property outright —
+     setting height alone left a 356px iframe in a 620px wrapper with the
+     inline rule marked !important and losing anyway. Setting both collapses
+     the wrapper with the iframe, which is what lets the dialog shrink:
+     measured overflow 296px -> 32px, and the 32px that remains is the
+     backdrop's own padding, not hidden content. */
+  if (wrap && wrap.style.height !== px) {{
+    wrap.style.setProperty('flex', '0 0 ' + px, 'important');
+    wrap.style.setProperty('height', px, 'important');
+  }}
+  return h;
+}};
+
+/* React re-renders overwrite inline styles it set itself — observed once in
+   testing, the wrapper snapping back to its Python height. Watch the style
+   attribute and re-apply. The height check inside fitToViewport() makes this
+   idempotent, so re-entry from our own write cannot loop. */
+(function() {{
+  var run = function() {{ try {{ window.fitToViewport(); }} catch (e) {{}} }};
+  run();
+  window.addEventListener('load', run);
+  window.addEventListener('resize', run);
+  try {{ window.parent.addEventListener('resize', run); }} catch (e) {{}}
+  /* A resize event alone is not enough: it fires while the dialog is still
+     relaying out, so the measurement reads stale geometry, computes the height
+     it already has, and the guard in fitToViewport turns it into a no-op — the
+     grid then sits at its old size until something else nudges it. Measured:
+     resizing 768 -> 1080 left the grid at 356px.
+
+     A ResizeObserver was the obvious answer and does not work here. Observing a
+     parent-document element from inside the iframe never fired, and neither did
+     one constructed in the parent — 0 callbacks either way, not even the initial
+     one that observe() is supposed to deliver. Rather than depend on cross-
+     document observer semantics, re-check on a timer. The height comparison
+     makes the steady state two getBoundingClientRect calls twice a second,
+     which is nothing, and it covers every trigger uniformly: viewport resize,
+     the dialog's open animation, a re-render, a change in cards-per-row, or the
+     bottom bar wrapping to a second line. */
+  setInterval(run, 500);
+  try {{
+    var fe = window.frameElement;
+    if (fe && window.MutationObserver) {{
+      var mo = new MutationObserver(run);
+      mo.observe(fe, {{attributes: true, attributeFilter: ['style']}});
+      if (fe.parentElement) mo.observe(fe.parentElement, {{attributes: true, attributeFilter: ['style']}});
+    }}
+  }} catch (e) {{}}
+  /* The dialog animates open, so the first measurement can land before the
+     panel has settled. Cheap re-checks over the first second; the height
+     comparison means a no-op costs nothing. */
+  [60, 180, 400, 800].forEach(function(t) {{ setTimeout(run, t); }});
+}})();
+
 // The page no longer scrolls, the grid does — so the nav buttons have to
 // move the container, not the window.
 window.gridScrollTo = function(where) {{
@@ -4956,28 +5061,27 @@ def visual_review_modal(support_files):
 
     st.markdown("""
     <style>
+    /* st.container(key=...) emits class="st-key-<key>". It does NOT emit a
+       data-element-key attribute — measured against the live 1.60 DOM, that
+       selector matches zero elements. This block was written with it and had
+       therefore never applied: the iframe's height came entirely from the
+       st.iframe(height=...) argument below, and both the calc(100vh - 190px)
+       and the calc(100vh - 300px) that replaced it were dead letters. */
     div[data-testid="stElementContainer"]:has(iframe),
-    div[data-element-key="grid_iframe_container"],
-    div[data-element-key="grid_iframe_container"] iframe {
+    div.st-key-grid_iframe_container,
+    div.st-key-grid_iframe_container iframe {
         width: 100% !important;
         max-width: 100% !important;
     }
-    /* Python cannot read the browser height, so st.iframe(height=...) below
-       is sized for the smallest supported screen. CSS can, so the rendered
-       element gets a viewport-relative height instead: the grid fills a big
-       monitor and still fits a 768px laptop, with no round-trip and nothing
-       environment-specific — it behaves the same locally and on Cloud.
-       The iframe's internal 100vh follows the element box, so #card-grid's
-       scroll region adapts to this automatically. */
-    div[data-element-key="grid_iframe_container"] iframe {
-        /* Re-derived after the layout cleanup. The modal's remaining
-           chrome - close row, one filter row, one pagination row and
-           the progress bar - measures ~300px, not the 190px this was
-           written for on the flags page. Overstating the iframe made
-           the whole modal scroll, which is why the card area looked
-           squeezed even after bands were removed. */
-        height: calc(100vh - 300px) !important;
-        min-height: 420px !important;
+    /* Height is NOT set here. Streamlit sizes the stElementContainer wrapper
+       from the Python height argument, so styling the iframe alone leaves the
+       wrapper at its original height and opens an empty gap below the grid
+       (measured: iframe 468px inside a 620px wrapper). Both boxes have to move
+       together, and only the browser knows the viewport — so the grid sizes
+       itself from inside via frameElement. See fitToViewport() in the grid JS.
+       min-height guards the first paint, before that script has run. */
+    div.st-key-grid_iframe_container iframe {
+        min-height: 320px !important;
         max-height: 1600px !important;
     }
     </style>
