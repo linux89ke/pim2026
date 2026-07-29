@@ -2397,8 +2397,11 @@ def build_fast_grid_html(
     overflow-y:auto;overflow-x:hidden;
     /* --grid-top-h is measured in JS because the toolbar wraps to two rows
        on narrow screens; the fallback covers the first paint. */
-    max-height:calc(100vh - var(--grid-top-h, 56px) - 16px);
-    padding-bottom:84px;  /* clear the fixed batch bar */
+    max-height:calc(100vh - var(--grid-top-h, 0px) - 16px);
+    /* Measured, not fixed: the bottom bar now also carries language,
+       sort and filter, so it wraps to two rows on narrow screens and
+       a hardcoded 84px would let it cover the last row of cards. */
+    padding-bottom:calc(var(--grid-bot-h, 84px) + 14px);
     scroll-behavior:smooth;
   }}
   /* Every numeric in a card — SID, price, dimensions — in tabular mono so a
@@ -2821,44 +2824,11 @@ def build_fast_grid_html(
   <div style="margin-top:16px;font-weight:700;color:#333;font-size:16px;">Updating Language...</div>
 </div>
 
-<div class="ctrl-bar top-bar">
-
-  <span class="lang-wrap" title="Change language">
-    <span class="lang-ico">{_ICON_GLOBE}</span>
-    <select id="iframe-lang-sel" class="lang-sel" aria-label="Change language" onchange="document.getElementById('lang-loading').style.display='flex'; sendMsg('change_lang', this.value)">
-      <option value="en" {"selected" if lang=="en" else ""}>EN</option>
-      <option value="fr" {"selected" if lang=="fr" else ""}>FR</option>
-      <option value="ar" {"selected" if lang=="ar" else ""}>AR</option>
-    </select>
-  </span>
-
-  <span class="sel-count-text" style="font-weight:700; color:var(--accent-text); font-size:13px; font-family:var(--font-mono); font-variant-numeric:tabular-nums slashed-zero;">0 {labels_dict["items_pending"]}</span>
-  <select class="reason-sel" id="batch-reason-top">
-    <option value="REJECT_POOR_IMAGE">{labels_dict['poor_img']}</option>
-    <option value="REJECT_IMG_STRETCHED">{labels_dict['img_stretched']}</option>
-    <option value="REJECT_IMG_BLURRY">{labels_dict['img_blurry']}</option>
-    <option value="REJECT_IMG_MISMATCH">{labels_dict['img_mismatch']}</option>
-    <option value="REJECT_IMG_INFRINGING">{labels_dict['img_infringing']}</option>
-    <option value="REJECT_IMG_TOO_MANY">{labels_dict['img_too_many']}</option>
-    <option value="REJECT_WRONG_CAT">{labels_dict['wrong_cat']}</option>
-    <option value="REJECT_FAKE">{labels_dict['fake_prod']}</option>
-    <option value="REJECT_BRAND">{labels_dict['restr_brand']}</option>
-    <option value="REJECT_WRONG_BRAND">{labels_dict.get('wrong_brand', 'Wrong Brand')}</option>
-    <option value="REJECT_PROHIBITED">{labels_dict.get('prohibited', 'Prohibited')}</option>
-    <option value="REJECT_COLOR">{labels_dict.get('missing_color', 'Missing Color')}</option>
-    <option value="REJECT_FDA">FDA</option>
-    <option value="REJECT_DUPLICATE">{labels_dict.get('sort_duplicates', 'Duplicate')}</option>
-    {extra_reason_options_html}
-    <option value="OTHER_CUSTOM">{labels_dict.get('other_custom', 'Other (Custom)')}</option>
-  </select>
-  <button class="batch-btn" onclick="doBatchReject('top')">{labels_dict["batch_reject"]}</button>
-  <button class="icon-btn" onclick="doBatchUndo()" title="{labels_dict["undo"]}" aria-label="{labels_dict["undo"]}">{_ICON_UNDO}</button>
-  <button class="desel-btn" onclick="window.doSelectAll()">{labels_dict["select_all"]}</button>
-  <button class="desel-btn" onclick="doDeselAll()">{labels_dict["deselect_all"]}</button>
-  <button class="icon-btn" style="margin-left:auto;" onclick="gridScrollTo('bottom')" title="{_t("go_bottom")}" aria-label="{_t("go_bottom")}">{_ICON_BOTTOM}</button>
-  {sort_html}
-  {filter_html}
-</div>
+<!-- The top control bar is gone. Every batch control on it (reason, Batch
+     Reject, Select All, Deselect All, undo) duplicated the fixed bottom bar,
+     which is on screen at all times anyway. Its three unique controls -
+     language, sort and filter - moved down there. That reclaims ~55px in a
+     modal that had roughly 370px left for cards. -->
 
 <div id="shortcut-help" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);
   z-index:9999999;align-items:center;justify-content:center;">
@@ -2892,6 +2862,14 @@ def build_fast_grid_html(
 </div>
 
 <div class="ctrl-bar bottom-bar">
+  <span class="lang-wrap" title="Change language">
+    <span class="lang-ico">{_ICON_GLOBE}</span>
+    <select id="iframe-lang-sel" class="lang-sel" aria-label="Change language" onchange="document.getElementById('lang-loading').style.display='flex'; sendMsg('change_lang', this.value)">
+      <option value="en" {"selected" if lang=="en" else ""}>EN</option>
+      <option value="fr" {"selected" if lang=="fr" else ""}>FR</option>
+      <option value="ar" {"selected" if lang=="ar" else ""}>AR</option>
+    </select>
+  </span>
   <span class="sel-count-text" style="font-weight:700; color:var(--accent-text); font-size:13px; font-family:var(--font-mono); font-variant-numeric:tabular-nums slashed-zero;">0 {labels_dict["items_pending"]}</span>
   <select class="reason-sel" id="batch-reason-bottom">
     <option value="REJECT_POOR_IMAGE">{labels_dict["poor_img"]}</option>
@@ -2915,6 +2893,8 @@ def build_fast_grid_html(
   <button class="icon-btn" onclick="doBatchUndo()" title="{labels_dict["undo"]}" aria-label="{labels_dict["undo"]}">{_ICON_UNDO}</button>
   <button class="desel-btn" onclick="window.doSelectAll()">{labels_dict["select_all"]}</button>
   <button class="desel-btn" onclick="doDeselAll()">{labels_dict["deselect_all"]}</button>
+  {sort_html}
+  {filter_html}
   <button class="icon-btn" style="margin-left:auto;" onclick="gridScrollTo('top')" title="Back to top" aria-label="Back to top">{_ICON_TOP}</button>
 </div>
 
@@ -4348,7 +4328,7 @@ function enhanceReasonSelect(selectId) {{
     if (!wrap.contains(e.target) && !panel.contains(e.target)) closePanel();
   }});
 }}
-enhanceReasonSelect('batch-reason-top');
+// batch-reason-top went with the top bar; only the bottom select remains.
 enhanceReasonSelect('batch-reason-bottom');
 
 // #card-grid is the scroll container, so its height has to be the iframe
@@ -4356,9 +4336,12 @@ enhanceReasonSelect('batch-reason-bottom');
 // wraps to a second row under 1100px, so that is measured rather than
 // assumed. Re-measured on resize and after the grid re-renders.
 window.sizeGridScroll = function() {{
-  var bar = document.querySelector('.ctrl-bar.top-bar');
-  var h = bar ? Math.ceil(bar.getBoundingClientRect().height) : 56;
+  var bar = document.querySelector('.ctrl-bar.top-bar');  // removed; kept for safety
+  var h = bar ? Math.ceil(bar.getBoundingClientRect().height) : 0;
   document.documentElement.style.setProperty('--grid-top-h', h + 'px');
+  var bot = document.querySelector('.ctrl-bar.bottom-bar');
+  var bh = bot ? Math.ceil(bot.getBoundingClientRect().height) : 84;
+  document.documentElement.style.setProperty('--grid-bot-h', bh + 'px');
 }};
 window.addEventListener('resize', window.sizeGridScroll);
 window.addEventListener('load', window.sizeGridScroll);
@@ -4366,6 +4349,8 @@ sizeGridScroll();
 try {{
   var _bar = document.querySelector('.ctrl-bar.top-bar');
   if (_bar && window.ResizeObserver) new ResizeObserver(window.sizeGridScroll).observe(_bar);
+  var _bot = document.querySelector('.ctrl-bar.bottom-bar');
+  if (_bot && window.ResizeObserver) new ResizeObserver(window.sizeGridScroll).observe(_bot);
 }} catch(e) {{}}
 
 // The page no longer scrolls, the grid does — so the nav buttons have to
@@ -4567,40 +4552,48 @@ def visual_review_modal(support_files):
     seller_opts.sort()
     category_opts.sort()
 
-    c1, c2, c3, c4 = st.columns(
-        [1.5, 1.5, 1.5, 0.8], gap="large", vertical_alignment="bottom"
-    )
+    # Search stays inline — it is used constantly. Seller and category move
+    # into a popover: they are set occasionally, and as a permanent row they
+    # cost a full band of a modal that had ~370px left for cards. The button
+    # carries the active count so a hidden filter can never be forgotten.
+    _n_active = len(curr_sellers or []) + len(curr_categories or [])
+    c1, c2, c4 = st.columns([2.2, 1.2, 0.9], gap="medium", vertical_alignment="bottom")
     with c1:
         c1a, c1b = st.columns([6, 1], vertical_alignment="bottom", gap="small")
         with c1a:
             search_n = st.text_input(
                 "Search by Name, Brand, or SID", placeholder="Product name, brand, SID…", icon=":material/search:",
+                label_visibility="collapsed",
                 key="grid_search_n",
             )
         with c1b:
             st.button("✖", key="clr_n", help="Clear search", on_click=_clear_grid_search_n, disabled=not bool(curr_search_n))
     with c2:
-        c2a, c2b = st.columns([6, 1], vertical_alignment="bottom", gap="small")
-        with c2a:
-            search_sellers = st.multiselect(
-                "Filter by Seller",
-                options=seller_opts,
-                default=curr_sellers,
-                key="grid_filter_sellers",
-            )
-        with c2b:
-            st.button("✖", key="clr_sellers", help="Clear seller filter", on_click=_clear_grid_filter_sellers, disabled=not bool(curr_sellers))
-    with c3:
-        c3a, c3b = st.columns([6, 1], vertical_alignment="bottom", gap="small")
-        with c3a:
-            search_categories = st.multiselect(
-                "Filter by Category",
-                options=category_opts,
-                default=curr_categories,
-                key="grid_filter_categories",
-            )
-        with c3b:
-            st.button("✖", key="clr_categories", help="Clear category filter", on_click=_clear_grid_filter_categories, disabled=not bool(curr_categories))
+        with st.popover(
+            f"Filters ({_n_active})" if _n_active else "Filters",
+            use_container_width=True,
+            help="Filter the grid by seller or category",
+        ):
+            fa, fb = st.columns([6, 1], vertical_alignment="bottom", gap="small")
+            with fa:
+                search_sellers = st.multiselect(
+                    "Seller", placeholder="All sellers",
+                    options=seller_opts, default=curr_sellers,
+                    key="grid_filter_sellers",
+                )
+            with fb:
+                st.button("✖", key="clr_sellers", help="Clear seller filter",
+                          on_click=_clear_grid_filter_sellers, disabled=not bool(curr_sellers))
+            ga, gb = st.columns([6, 1], vertical_alignment="bottom", gap="small")
+            with ga:
+                search_categories = st.multiselect(
+                    "Category", placeholder="All categories",
+                    options=category_opts, default=curr_categories,
+                    key="grid_filter_categories",
+                )
+            with gb:
+                st.button("✖", key="clr_categories", help="Clear category filter",
+                          on_click=_clear_grid_filter_categories, disabled=not bool(curr_categories))
 
     curr_flag = st.session_state.get("grid_filter_flag", "")
     curr_sort = st.session_state.get("grid_sort_issue", "")
@@ -4772,7 +4765,9 @@ def visual_review_modal(support_files):
         # shrinks the result set to 7 pages should land on page 7, not 1.
         st.session_state.grid_page = total_pages - 1
 
-    st.markdown(f"<div style='margin-bottom:-10px;color:#6b7280;font-size:12px;'>Total items: {len(review_data)}</div>", unsafe_allow_html=True)
+    # 'Total items' used to sit on its own line above a separate 'Page (of N)'
+    # label — two rows saying one thing. The count now rides on the page
+    # control at the bottom.
 
     # ------------------------------------------------------------------
     # Pagination controls
@@ -4818,34 +4813,10 @@ def visual_review_modal(support_files):
     if "jump_bot" not in st.session_state:
         st.session_state.jump_bot = st.session_state.get("grid_page", 0) + 1
 
-    pg_cols = st.columns([1, 2, 1], vertical_alignment="bottom", gap="small")
-    with pg_cols[0]:
-        st.button(
-            "⬅ Prev",
-            key="prev_top",
-            use_container_width=True,
-            disabled=st.session_state.get("grid_page", 0) == 0,
-            on_click=_prev_page,
-        )
-    with pg_cols[1]:
-        st.number_input(
-            f"Page (of {total_pages})",
-            min_value=1,
-            max_value=max(1, total_pages),
-            key="jump_top",
-            on_change=_jump_from_widget,
-            args=("jump_top",),
-        )
-    with pg_cols[2]:
-        st.button(
-            "Next ➡",
-            key="next_top",
-            use_container_width=True,
-            disabled=st.session_state.grid_page >= total_pages - 1,
-            on_click=_next_page,
-        )
-
-    st.progress(min(1.0, (st.session_state.grid_page + 1) / total_pages))
+    # Top pagination removed. Prev/Next, the page number and the progress bar
+    # were rendered twice — once here and again below the cards — costing
+    # ~105px of a modal that only had ~370px left for cards. The bottom pair
+    # is kept because paging is something you do *after* reviewing a screen.
 
     with st.spinner("Loading new page..."):
         page_start = st.session_state.grid_page * ipp
@@ -4999,9 +4970,15 @@ def visual_review_modal(support_files):
        The iframe's internal 100vh follows the element box, so #card-grid's
        scroll region adapts to this automatically. */
     div[data-element-key="grid_iframe_container"] iframe {
-        height: calc(100vh - 190px) !important;
+        /* Re-derived after the layout cleanup. The modal's remaining
+           chrome - close row, one filter row, one pagination row and
+           the progress bar - measures ~300px, not the 190px this was
+           written for on the flags page. Overstating the iframe made
+           the whole modal scroll, which is why the card area looked
+           squeezed even after bands were removed. */
+        height: calc(100vh - 300px) !important;
         min-height: 420px !important;
-        max-height: 1400px !important;
+        max-height: 1600px !important;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -5092,7 +5069,7 @@ def visual_review_modal(support_files):
         )
     with pg_cols_bot[1]:
         st.number_input(
-            f"Page (of {total_pages})",
+            f"{len(review_data):,} items · page of {total_pages}",
             min_value=1,
             max_value=max(1, total_pages),
             key="jump_bot",
