@@ -25,5 +25,10 @@ Pillow
 imagehash
 requests>=2.31.0
 plotly
-orjson==3.10.3
+# Must stay >=3.11.1. Streamlit Cloud runs Python 3.14, and 3.10.3 ships no
+# cp314 wheel — pip falls back to building it from source, which needs PyO3
+# 0.21.2, which refuses anything past Python 3.12. That failure aborts the
+# whole install, so every other package is missing too and the app dies with
+# an unrelated-looking ImportError.
+orjson>=3.11.1
 scikit-learn
