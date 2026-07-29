@@ -2460,11 +2460,17 @@ def build_fast_grid_html(
   .empty-state .title{{font-size:15px;font-weight:800;color:var(--text);margin-bottom:4px;}}
   .empty-state .desc{{font-size:12px;color:var(--text);opacity:.74;}}
   .empty-state .actions{{display:flex;gap:8px;flex-wrap:wrap;}}
-  /* bottom:26px is NOT slack — it is exactly the height of #cols-strip, the
-     fixed column-count bar pinned at bottom:0. Dropping this to 0 puts the
-     batch bar (z-index 10000) straight over the strip (z-index 9999) and the
-     3/4/5/6/7 column buttons vanish. */
-  .bottom-bar {{position: fixed; bottom: 26px; left: 0; width: 100%; top: auto; border-bottom: none; border-top: 1px solid rgba(246, 139, 30, 0.2); margin: 0; z-index: 10000; box-shadow: 0 -4px 16px rgba(0,0,0,0.1); background: var(--card); padding: 10px 16px;}}
+  /* bottom:0 now that #cols-strip is gone. It used to be 26px, which was not
+     slack but exactly the strip's height — the column-count buttons were a
+     second fixed bar underneath this one, and dropping to 0 put the batch bar
+     (z-index 10000) straight over them. The 3/4/5/6/7 buttons live in this bar
+     now, so the strip and the offset both went. */
+  .bottom-bar {{position: fixed; bottom: 0; left: 0; width: 100%; top: auto; border-bottom: none; border-top: 1px solid rgba(246, 139, 30, 0.2); margin: 0; z-index: 10000; box-shadow: 0 -4px 16px rgba(0,0,0,0.1); background: var(--card); padding: 10px 16px;}}
+  /* A hairline before the column buttons, so a group of bare numbers reads as
+     its own control rather than more batch actions. */
+  .cols-group{{display:flex;align-items:center;gap:6px;padding-left:10px;margin-left:4px;border-left:1px solid var(--border);}}
+  .cols-group .cols-label{{font-size:11px;font-weight:700;color:var(--text-muted);white-space:nowrap;letter-spacing:.04em;}}
+  @media (max-width: 900px) {{ .cols-group .cols-label {{display:none;}} }}
 
   .sel-count{{font-weight:700;color:{OT};font-size:13px;min-width:80px;font-family:var(--font-mono);font-variant-numeric:tabular-nums slashed-zero;}}
   .reason-sel{{flex:1;min-width:160px;padding:6px 10px;border:1px solid #ccc;border-radius:4px;font-size:12px;background:#fff;cursor:pointer;}}
@@ -2895,6 +2901,10 @@ def build_fast_grid_html(
   <button class="desel-btn" onclick="doDeselAll()">{labels_dict["deselect_all"]}</button>
   {sort_html}
   {filter_html}
+  <span class="cols-group">
+    <span class="cols-label">Cards per row</span>
+    {_cols_btns}
+  </span>
   <button class="icon-btn" style="margin-left:auto;" onclick="gridScrollTo('top')" title="Back to top" aria-label="Back to top">{_ICON_TOP}</button>
 </div>
 
@@ -4512,10 +4522,10 @@ try {{
 
 </script>
 
-<div id="cols-strip" style="position:fixed;bottom:0;left:0;width:100%;z-index:9999;background:var(--card);border-top:1px solid var(--border);display:flex;align-items:center;gap:6px;padding:2px 12px;height:26px;">
-  <span style="font-size:11px;font-weight:700;color:var(--text-muted);white-space:nowrap;letter-spacing:.04em;">Cards per row</span>
-  {_cols_btns}
-</div>
+<!-- #cols-strip lived here: a second fixed bar, 26px tall, holding only the
+     3/4/5/6/7 buttons and their label. Five small buttons do not need a band
+     of their own, and it forced the batch bar to sit at bottom:26px to clear
+     it. The buttons are in .cols-group inside the batch bar now. -->
 
 </body>
 </html>"""
