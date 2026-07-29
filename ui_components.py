@@ -5174,18 +5174,29 @@ def visual_review_modal(support_files):
         </script>
         """
         st.iframe(_sync_html, height=1)
-    st.markdown("---")
 
-    pg_cols_bot = st.columns([1, 2, 1], vertical_alignment="bottom", gap="small")
-    with pg_cols_bot[0]:
+    # One footer row instead of four stacked bands. Measured on a real batch,
+    # the count line, the Prev/Next row, the progress bar and Close Review came
+    # to ~180px between them, plus a horizontal rule and the gap left by the
+    # zero-height sync iframe above. All of it now fits on one line, and since
+    # the grid sizes itself to the space the dialog leaves, every pixel saved
+    # here becomes a pixel of cards.
+    #
+    # The rule is gone: a divider immediately above a bordered button row draws
+    # a line next to a line.
+    _page_now = st.session_state.get("grid_page", 0)
+    _pg = st.columns([0.9, 1.5, 0.9, 2.2, 1.1], vertical_alignment="center", gap="small")
+    with _pg[0]:
         st.button(
             "⬅ Prev",
             key="prev_bot",
             use_container_width=True,
-            disabled=st.session_state.get("grid_page", 0) == 0,
+            disabled=_page_now == 0,
             on_click=_prev_page,
         )
-    with pg_cols_bot[1]:
+    with _pg[1]:
+        # Label collapsed — the caption beside it already says which page this
+        # is and how many there are, so a label would repeat it.
         st.number_input(
             f"{len(review_data):,} items · page of {total_pages}",
             min_value=1,
@@ -5193,8 +5204,9 @@ def visual_review_modal(support_files):
             key="jump_bot",
             on_change=_jump_from_widget,
             args=("jump_bot",),
+            label_visibility="collapsed",
         )
-    with pg_cols_bot[2]:
+    with _pg[2]:
         st.button(
             "Next ➡",
             key="next_bot",
@@ -5202,12 +5214,13 @@ def visual_review_modal(support_files):
             disabled=st.session_state.grid_page >= total_pages - 1,
             on_click=_next_page,
         )
-
-    st.progress(min(1.0, (st.session_state.grid_page + 1) / total_pages))
-
-    if st.button("✖ Close Review", key="close_bot_fallback", use_container_width=True, type="secondary"):
-        st.session_state.show_review_modal = False
-        st.rerun()
+    with _pg[3]:
+        st.caption(f"{len(review_data):,} items · page {_page_now + 1} of {total_pages}")
+        st.progress(min(1.0, (_page_now + 1) / total_pages))
+    with _pg[4]:
+        if st.button("✖ Close", key="close_bot_fallback", use_container_width=True, type="secondary"):
+            st.session_state.show_review_modal = False
+            st.rerun()
 
 
 @st.fragment
