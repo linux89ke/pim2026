@@ -1352,60 +1352,70 @@ def check_prohibited_products(
             str(c).strip().lower() in ("none", "nan", "") for c in cats
         )
 
-    # A blank category means "applies everywhere", not "unfinished".
+    # A blank category disables a rule, EXCEPT for the curated list below.
     #
-    # Dropping these rules outright left the check almost entirely dead:
-    # KE ran 8 of 316, UG 2 of 203, NG 0 of 1831, MA 0 of 2018, GH 2 of 1668.
-    # The blank-category keywords are things like "vape", "shisha",
-    # "e-cigarette" and "hookah" — prohibited whatever they are filed under,
-    # so a category was never going to be filled in.
+    # Blank categories left the check nearly dead — KE ran 8 of 316 rules,
+    # NG 0 of 1831 — because keywords like "vape" and "shisha" are banned
+    # whatever they are filed under, so nobody was ever going to fill in a
+    # category for them.
     #
-    # The original concern was real but narrow: a handful of keywords are
-    # measurements ("105", "100inch", "100000mah") that would flag every TV
-    # or power bank if fired globally. Those are excluded by shape rather
-    # than by discarding everything — a keyword is unsafe globally when it
-    # carries no alphabetic run of three or more characters outside a unit,
-    # which keeps genuine short prohibitions like "CBD", "LSD" and "XXX"
-    # (already protected by the word boundaries in the pattern below).
-    _UNIT_WORDS = {
-        "inch", "inches", "mah", "cm", "mm", "kg", "hz", "ml", "gb", "tb",
-        "watt", "watts", "volt", "volts", "amp", "amps", "pcs", "pack",
-    }
-    _ALPHA_RUN_RE = re.compile(r"[a-z]{3,}", re.IGNORECASE)
+    # Inferring "blank means everywhere" was tried and is wrong. Measured
+    # against 7,181 real product names, globalising NG's blank rules flagged
+    # 4.6% of the catalogue, 89% of it from one keyword: "military", which is
+    # meant as military equipment and matches "Military-Grade Case" on every
+    # phone cover. "lighter" (meaning cigarette lighter) matched "Lighter
+    # Warm Fleece Lining". Those rules genuinely need a category.
+    #
+    # So the global set is explicit rather than inferred. Every entry was
+    # taken from the sheets and checked against that same corpus: the 49
+    # below with no corpus match at all, plus 6 whose only matches were
+    # genuine prohibited items (adult products and two stun guns).
+    #
+    # To add a term: confirm it cannot appear innocently in a product name,
+    # in any market. If it can, give it a category in Prohibbited.xlsx
+    # instead — that is what the category column is for.
+    _GLOBAL_PROHIBITED = frozenset({
+        # Vaping and smoking paraphernalia
+        "vape", "vapes", "vaping", "vape pen", "vape pens", "vape juice",
+        "vape liquid", "vape cartridge", "vape cart", "vape kit", "vape mod",
+        "vape pod", "vape tank", "vape starter kit", "disposable vape",
+        "refillable vape", "herbal vape", "cloud vape",
+        "e cigarette", "e-cigarette", "e-cigarettes", "ecigarette",
+        "e-juice", "e-hookah",
+        "shisha", "shishaa", "shisha pipe", "shisha pen", "shisha flavor",
+        "shisha flavour", "hookah",
+        # Controlled substances
+        "cannabis", "cannabis oil", "cocaine", "heroin", "marijuana", "lsd",
+        # Weapons
+        "taser", "tasers", "stun gun", "stun gunn", "pepper spray",
+        # Adult products
+        "sex toy", "sex toys", "wand sex toys", "anal sex toys",
+        "fetish sex toy r4", "dildo", "rabbit dildo vibrator g-spot",
+        "vibrating rotating dildo", "vibrator g spot dildo", "g-spot",
+        "butt plug",
+        # Misrepresentation
+        "counterfeit",
+    })
 
-    def _unsafe_global(keyword: str) -> bool:
-        k = str(keyword or "").strip()
-        if not k:
-            return True
-        runs = [r.lower() for r in _ALPHA_RUN_RE.findall(k)]
-        if any(r not in _UNIT_WORDS for r in runs):
-            return False        # a real word: "vape", "100% Human Hair"
-        # No word to anchor on. Still safe if it is purely alphabetic
-        # punctuation — brand initialisms like "D&G", "D-G", "C-D" cannot
-        # collide with a spec, unlike anything carrying a digit.
-        has_digit = any(ch.isdigit() for ch in k)
-        has_alpha = any(ch.isalpha() for ch in k)
-        return has_digit or not has_alpha
-
-    scoped_rules, global_rules, unsafe_kws = [], [], []
+    scoped_rules, global_rules, disabled = [], [], []
     for r in prohibited_rules:
         if not _is_placeholder(r.get("categories")):
             scoped_rules.append(r)
-        elif _unsafe_global(r.get("keyword")):
-            unsafe_kws.append(str(r.get("keyword", "")).strip())
-        else:
+        elif str(r.get("keyword", "")).strip().lower() in _GLOBAL_PROHIBITED:
             # Empty category set = matches on keyword alone, any category.
             global_rules.append({**r, "categories": set()})
+        else:
+            disabled.append(str(r.get("keyword", "")).strip())
 
-    if unsafe_kws:
+    if disabled:
         logger.info(
-            "[Prohibited] %d keyword(s) skipped as too generic to apply "
-            "without a category (e.g. %s). Add category codes in "
-            "Prohibbited.xlsx to enable them.",
-            len(unsafe_kws), ", ".join(sorted(set(unsafe_kws))[:5]),
+            "[Prohibited] %d rule(s) inactive: no category, and the keyword is "
+            "not on the always-prohibited list (e.g. %s). Add category codes "
+            "in Prohibbited.xlsx to enable them.",
+            len(disabled), ", ".join(sorted({d for d in disabled if d})[:5]),
         )
     logger.info(
-        "[Prohibited] %d category-scoped rule(s), %d global rule(s) active.",
+        "[Prohibited] %d category-scoped rule(s), %d always-prohibited rule(s) active.",
         len(scoped_rules), len(global_rules),
     )
 

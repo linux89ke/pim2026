@@ -13,6 +13,7 @@ from targeted_audit_filters import (
     CHECK_LABELS,
 )
 from report_builder import build_docx_report
+from design_tokens import SEVERITY
 
 # Default gateway used by verify_category_rejections_with_ai(). Kept here so the
 # availability probe checks the same host the call will actually use.
@@ -371,12 +372,37 @@ def _render_table(df: pd.DataFrame, key: str = None, selectable: bool = False,
             help="The flag it currently carries, which may be unrelated to this check",
         )
 
+    # Shade the Now cell — green for approved, red for rejected — so a
+    # reviewer can see a row's current state without reading it. Only that
+    # one cell: `subset=["Now"]` keeps the shading off the rest of the row,
+    # where it would compete with the selection highlight.
+    #
+    # Colours come from the severity tokens rather than raw hex, and the ink
+    # is the darker paired value so both stay above 4.5:1 on their wash.
+    _render_obj = view
+    if "Now" in view.columns:
+        _APPROVED = SEVERITY["resolved"]
+        _REJECTED = SEVERITY["blocker"]
+
+        def _shade_now(v):
+            s = str(v).strip().lower()
+            if s == "approved":
+                return f"background-color: {_APPROVED['wash']}; color: {_APPROVED['color']};"
+            if s == "rejected":
+                return f"background-color: {_REJECTED['wash']}; color: {_REJECTED['color']};"
+            return ""
+
+        try:
+            _render_obj = view.style.map(_shade_now, subset=["Now"])
+        except Exception:
+            _render_obj = view      # older pandas: fall back to unstyled
+
     if not selectable:
-        st.dataframe(view, width='stretch', hide_index=True, column_config=cfg)
+        st.dataframe(_render_obj, width='stretch', hide_index=True, column_config=cfg)
         return []
 
     event = st.dataframe(
-        view, width='stretch', hide_index=True, column_config=cfg,
+        _render_obj, width='stretch', hide_index=True, column_config=cfg,
         selection_mode="multi-row", on_select="rerun", key=key,
     )
     rows = event.selection.rows if event and event.selection else []
