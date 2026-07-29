@@ -4704,9 +4704,12 @@ def visual_review_modal(support_files):
     curr_sort = st.session_state.get("grid_sort_issue", "")
 
     with c4:
-        if st.button("✕ Close", key="close_modal_top", type="secondary", use_container_width=True):
-            st.session_state.show_review_modal = False
-            st.rerun()
+        # The modal had two close buttons, one here and one under the footer.
+        # This one also sat alone on its own row: c4 stacks its children, and
+        # the search and filter columns are bottom-aligned to the slider below,
+        # so the whole left of this band was empty. Dropping it takes the band
+        # with it. Close Review at the bottom is the survivor.
+        #
         # 500 per page is only offered in wide mode (6 or 7 columns). More
         # columns means smaller cards, so 500 of them stays a sensible page; at
         # 5 columns the same 500 cards make the grid iframe roughly 36,000px
