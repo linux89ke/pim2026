@@ -46,6 +46,23 @@ lxml>=4.9.0
 Pillow
 imagehash
 requests>=2.31.0
+
+# Word report generation. report_builder.py and audit_report_generator.py both
+# import it at module scope, and report_builder is reached from streamlit_app
+# through ui_components -> targeted_audit, so a missing wheel is not a degraded
+# export — the app will not start at all.
+#
+# This was never declared. It survived on Cloud only because the environment
+# had it left over from an earlier install; the first requirements change that
+# forced a clean resolve took the app down with ModuleNotFoundError: docx.
+python-docx
+
+# Imported directly (from urllib3.util.retry import Retry, streamlit_app.py),
+# not merely used through requests. It arrives as a requests dependency today,
+# so declaring it changes nothing about what gets installed — it just stops a
+# direct import resting on somebody else's dependency, which is exactly how
+# python-docx went missing.
+urllib3>=2.0
 plotly
 # Must stay >=3.11.1. Streamlit Cloud runs Python 3.14, and 3.10.3 ships no
 # cp314 wheel — pip falls back to building it from source, which needs PyO3
