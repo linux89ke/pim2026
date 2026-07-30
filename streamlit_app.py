@@ -135,6 +135,7 @@ from ui_components import (
     render_rejection_donut,
     render_severity_group_header,
     render_summary_header,
+    render_override_history,
 )
 
 # A JS injector used to live here. It reached into the parent document on
@@ -5286,6 +5287,9 @@ def render_main_results():
     # analytical deep-dive, not the orientation) had equal billing. Swapped:
     # KPIs always on, charts behind the disclosure.
     render_summary_header(fr)
+    # Only renders when something has actually been waived, so it costs a dict
+    # lookup on a normal run.
+    render_override_history()
 
     total_count = len(fr)
     auto_count = len(fr[fr["FLAG"] != "Manual review"])

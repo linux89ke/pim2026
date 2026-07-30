@@ -1103,6 +1103,95 @@ def apply_status_change(
     return int(mask.sum())
 
 
+# ── Override history ───────────────────────────────────────────────────────
+# Approving a product out of one flag when other checks still reject it is a
+# judgement call, and it is the one action here with no trace: the report ends
+# up saying "Approved by User" with nothing to say what was waived. This
+# records it so it can be reviewed and undone.
+#
+# It is also what stops the loop. Once a flag is recorded as overridden for a
+# product, re-checking that product ignores it, so approving cannot bounce the
+# same product between the same two flags forever.
+def _override_log() -> dict:
+    return st.session_state.setdefault("_flag_overrides", {})
+
+
+def record_overrides(sid_to_flags: dict, approved_from: str = "") -> None:
+    """Remember which flags a reviewer waived, per product."""
+    if not sid_to_flags:
+        return
+    from datetime import datetime  # local, as elsewhere in this module
+
+    log = _override_log()
+    stamp = datetime.now()
+    for sid, flags in sid_to_flags.items():
+        entry = log.setdefault(str(sid).strip(), {"flags": [], "at": None, "from": ""})
+        # approved_from is recorded alongside the others. The caller already
+        # excludes it from the re-check, so this changes nothing today — but it
+        # makes "an approved product cannot be re-flagged by anything it was
+        # approved past" a property of the log rather than of every call site.
+        for f in list(flags) + ([approved_from] if approved_from else []):
+            if f and f not in entry["flags"]:
+                entry["flags"].append(f)
+        entry["at"] = stamp
+        entry["from"] = approved_from or entry.get("from", "")
+
+
+def overridden_flags(sid: str) -> list:
+    return list(_override_log().get(str(sid).strip(), {}).get("flags", []))
+
+
+def clear_overrides(sids=None) -> int:
+    """Forget waivers, so the next approval re-checks those flags again."""
+    log = _override_log()
+    if sids is None:
+        n = len(log)
+        log.clear()
+        return n
+    n = 0
+    for sid in _normalize_sid_set(sids):
+        if log.pop(str(sid).strip(), None) is not None:
+            n += 1
+    return n
+
+
+def render_override_history() -> None:
+    """Show what was waived, and let it be undone.
+
+    Every expander approval re-validates the selection with the current flag
+    skipped, so "approve anyway" is a deliberate decision to clear other,
+    still-failing checks. Without this the report records only "Approved by
+    User" and the waived issues leave no trace at all.
+    """
+    log = _override_log()
+    if not log:
+        return
+    _rows = []
+    for sid, entry in log.items():
+        _rows.append({
+            "ProductSetSid": sid,
+            "Issues cleared": ", ".join(entry.get("flags", [])),
+            "Approved from": entry.get("from", ""),
+            "When": entry["at"].strftime("%H:%M") if entry.get("at") else "",
+        })
+    _n_flags = sum(len(e.get("flags", [])) for e in log.values())
+    with st.expander(
+        f"Overridden issues — {len(log)} product(s), {_n_flags} check(s) cleared",
+        expanded=False, icon=":material/gavel:",
+    ):
+        st.caption(
+            "Approved despite other checks still failing. Reverting only forgets "
+            "the waiver — it does not change the product's status, so the next "
+            "approval will ask about these issues again."
+        )
+        st.dataframe(pd.DataFrame(_rows), hide_index=True, width="stretch")
+        if st.button("Revert all waivers", key="clear_all_overrides",
+                     help="Forget every waiver above."):
+            _c = clear_overrides()
+            st.toast(f"Reverted waivers on {_c} product(s)", icon=":material/undo:")
+            st.rerun()
+
+
 @st.dialog("Confirm Bulk Approval", icon=":material/check_circle:")
 def bulk_approve_dialog(
     sids_to_process,
@@ -1120,6 +1209,51 @@ def bulk_approve_dialog(
     except ImportError:
         _CAT_MATCHER_AVAILABLE = False
 
+    # ── Third stage: carry out the choice ─────────────────────────────────
+    # Runs before anything is drawn, using the re-check computed on the first
+    # pass. Deliberately does not re-validate: the answer is already known and
+    # a second run would double the wait for no new information.
+    _run = st.session_state.pop(f"_bulk_run_{title}", None)
+    if _run:
+        _mode = st.session_state.pop(f"_bulk_ack_{title}", "all")
+        _still, _sids_all = _run["still"], _run["sids"]
+        _clean = [s for s in _sids_all if s not in _still]
+        _fm = (support_files or {}).get("flags_mapping", {})
+
+        if _mode == "all":
+            # Waiving the other issues is the whole point of this branch, so
+            # it is logged against each product rather than left implicit in
+            # an "Approved by User" row that mentions none of it.
+            record_overrides(_still, approved_from=title)
+            _n = apply_status_change(
+                _sids_all, status="Approved", reason="", comment="",
+                flag="Approved by User", is_manual=True, is_zip=False,
+            )
+            st.toast(f"Approved {_n} product(s), clearing {len(_still)} with other issues",
+                     icon=":material/check_circle:")
+        else:
+            _n = apply_status_change(
+                _clean, status="Approved", reason="", comment="",
+                flag="Approved by User", is_manual=True, is_zip=False,
+            ) if _clean else 0
+            # The rest move to the issue that still applies, so the expander
+            # they land in is the one that explains why they are still here.
+            _moved = 0
+            for _sid, _flags in _still.items():
+                _nf = _flags[0]
+                _info = _fm.get(_nf, {"reason": "1000007 - Other Reason", "en": _nf})
+                apply_status_change(
+                    [_sid], status="Rejected",
+                    reason=_info.get("reason", "1000007 - Other Reason"),
+                    comment=_info.get("en", _nf), flag=_nf,
+                    is_manual=True, is_zip=False, propagate_siblings=False,
+                )
+                _moved += 1
+            st.toast(f"Approved {_n}; {_moved} kept rejected under their remaining issue",
+                     icon=":material/move_down:")
+        st.session_state.data_version = st.session_state.get("data_version", 0) + 1
+        st.rerun()
+
     st.warning(
         f"You are about to approve **{len(sids_to_process)}** items from `{title}`."
     )
@@ -1136,6 +1270,55 @@ def bulk_approve_dialog(
         expanded=len(_preview_df) <= 10,
     ):
         st.dataframe(_preview_df, hide_index=True, width='stretch')
+
+    # ── Second stage: other checks still reject some of these ──────────────
+    # Rendered in place of the approve button rather than after a rerun, so the
+    # validation result computed below is used as-is and never recomputed.
+    _pending = st.session_state.get(f"_bulk_pending_{title}")
+    if _pending:
+        _still = _pending["still"]
+        _sids_all = _pending["sids"]
+        _clean_n = len(_sids_all) - len(_still)
+        st.error(
+            f"**{len(_still)} of {len(_sids_all)} products are still rejected by other checks.** "
+            f"Approving them here would clear those too.",
+            icon=":material/report:",
+        )
+        _by_flag: dict = {}
+        for _s, _fl in _still.items():
+            for _f in _fl:
+                _by_flag[_f] = _by_flag.get(_f, 0) + 1
+        st.dataframe(
+            pd.DataFrame(
+                sorted(_by_flag.items(), key=lambda kv: -kv[1]),
+                columns=["Other issue", "Products"],
+            ),
+            hide_index=True, width="stretch",
+        )
+        _o1, _o2 = st.columns(2)
+        if _o1.button(
+            f"Approve all {len(_sids_all)} anyway",
+            type="primary", width="stretch", key=f"bulk_all_{title}",
+            help="Clears every issue listed above. Recorded so you can revert it.",
+        ):
+            st.session_state[f"_bulk_ack_{title}"] = "all"
+            st.session_state[f"_bulk_run_{title}"] = _pending
+            st.session_state.pop(f"_bulk_pending_{title}", None)
+            st.rerun()
+        if _o2.button(
+            f"Approve only the {_clean_n} clean one(s)",
+            width="stretch", key=f"bulk_clean_{title}",
+            help="The rest stay rejected, under the issue that still applies.",
+        ):
+            st.session_state[f"_bulk_ack_{title}"] = "clean"
+            st.session_state[f"_bulk_run_{title}"] = _pending
+            st.session_state.pop(f"_bulk_pending_{title}", None)
+            st.rerun()
+        if st.button("Cancel", width="stretch", key=f"bulk_cancel_{title}"):
+            st.session_state.pop(f"_bulk_pending_{title}", None)
+            st.rerun()
+        return
+
     if st.button(_t("approve_btn"), type="primary", width='stretch'):
         with st.spinner("Validating…"):
             _progress = st.progress(0, text="Running validation…")
@@ -1161,11 +1344,42 @@ def bulk_approve_dialog(
                     _progress.progress(
                         min(0.9, _elapsed / 10), text="Running validation…"
                     )
-                _future.result()
+                _res = _future.result()
             _progress.progress(1.0, text="Done!")
             _progress.empty()
-            msg_moved = {}
             sids_str = [str(sid).strip() for sid in sids_to_process]
+
+            # This validation run already excluded `title`, so whatever it
+            # still rejects is a genuinely different problem. The result used
+            # to be discarded and every product approved regardless — the cost
+            # was paid and the answer thrown away.
+            _still: dict = {}
+            try:
+                _sub_results = _res[1] if isinstance(_res, tuple) and len(_res) > 1 else {}
+                _wanted = {s for s in sids_str}
+                for _flag, _df in (_sub_results or {}).items():
+                    if _flag == title or _df is None or getattr(_df, "empty", True):
+                        continue
+                    if "PRODUCT_SET_SID" not in getattr(_df, "columns", []):
+                        continue
+                    _hit = _df["PRODUCT_SET_SID"].fillna("").astype(str).str.strip()
+                    for _s in set(_hit) & _wanted:
+                        if _flag in overridden_flags(_s):
+                            continue
+                        _still.setdefault(_s, []).append(_flag)
+            except Exception:
+                logger.exception("Re-check after bulk approval failed")
+                _still = {}
+
+            # One prompt for the whole batch, never one per product: at 200
+            # items with 90 conflicts, per-product confirmation is unusable.
+            if _still:
+                st.session_state[f"_bulk_pending_{title}"] = {
+                    "sids": sids_str, "still": _still, "title": title,
+                }
+                st.rerun()
+
+            msg_moved = {}
             msg_approved = apply_status_change(
                 sids_str,
                 status="Approved",
