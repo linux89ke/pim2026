@@ -5,8 +5,13 @@
 # on, etc.). Settings that belong to the app itself live here instead.
 
 [server]
-# Matches the local launch flag. Cloud enforces its own ceiling as well.
-maxUploadSize = 500
+# 200MB, not 500. The uploaded ZIP is held in session state in full — it is the
+# single largest thing this app keeps in memory — and Streamlit Cloud's
+# container is small enough that a big batch can push it into an OOM restart,
+# which drops the session and takes the grid's images with it. Raising this to
+# match the local launch flag was a mistake on a host that cannot afford it.
+# Raise it only alongside somewhere durable to put the bytes.
+maxUploadSize = 200
 
 # The app directory holds the on-disk caches (app_cache_flags/,
 # app_cache_parquet/), a 23MB sqlite DB and a 27MB model pickle. Watching all of

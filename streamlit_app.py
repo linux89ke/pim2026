@@ -4175,6 +4175,26 @@ def _reset_report_state(*, clear_uploaded_files: bool = False, clear_zip_cache: 
     st.session_state.display_df_cache = {}
     st.session_state.pop("_grid_review_data_cache", None)
     st.session_state.pop("_grid_warm_urls", None)
+
+    # Everything below is scoped to one uploaded batch and used to survive a
+    # new upload, which is how products from a previous file kept appearing.
+    # quick_rejects and _stagedRejections carried the old batch's manual
+    # rejections onto the new one; the _zip_* maps answered image and status
+    # lookups for products that were no longer loaded; post_qc_results made the
+    # approval re-check consult the previous batch's flags.
+    #
+    # current_sig_hash is the dangerous one: it is the filename
+    # checkpoint_final_report() writes to, so leaving it set meant the new
+    # batch's report was saved over the previous batch's cache entry.
+    for _k in (
+        "quick_rejects", "_stagedRejections", "post_qc_results", "zip_qc_results",
+        "_zip_sid_index", "_zip_status_cols", "_zip_prefetch_map",
+        "current_sig_hash", "_data_filtered_ref",
+        # Waivers and the carry-forward offer are both per batch too.
+        "_flag_overrides", "_predecessor_offer", "_predecessor_handled",
+    ):
+        st.session_state.pop(_k, None)
+
     if clear_uploaded_files:
         st.session_state.cached_uploaded_files = []
     if clear_zip_cache:
@@ -4318,7 +4338,12 @@ if _total_estimated_rows > _large_file_threshold:
     st.info(f"**Large file detected** (~{_total_estimated_rows:,} rows estimated) — validation may take 30–60 seconds. Image checks run in parallel to keep things fast.", icon=":material/hourglass_top:")
 
 if st.session_state.get("last_processed_files") != process_signature:
-    _reset_report_state()
+    # clear_zip_cache, because the file set has changed: the previous ZIP's
+    # image index is keyed on name/brand, so leaving it loaded lets a product
+    # from the new upload resolve to an image out of the old archive.
+    # _prepare_lazy_zip_images() repopulates it below for whatever ZIP is in
+    # the new set, or leaves it empty when there is none.
+    _reset_report_state(clear_zip_cache=True)
 
     if process_signature == "empty":
         st.session_state.last_processed_files = "empty"

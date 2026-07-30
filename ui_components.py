@@ -4907,6 +4907,33 @@ def visual_review_modal(support_files):
             max-width: none !important;
         }
         </style>""", unsafe_allow_html=True)
+
+    # ── ZIP images lost with the session ──────────────────────────────────
+    # The uploaded bytes live only in session state; the report is checkpointed
+    # to disk. So a dropped websocket or a container restart on Cloud leaves
+    # the report and the grid perfectly intact and every ZIP image gone —
+    # _prepare_lazy_zip_images() rebuilds its index from cached_uploaded_files,
+    # which is empty by then, and silently produces an empty one.
+    #
+    # The cards then render blank with no explanation, which reads as the app
+    # losing the images rather than the session. Say so instead, and say what
+    # fixes it: re-attaching the same ZIP restores them without redoing the
+    # review, because the decisions are journalled separately.
+    _fr_zip = st.session_state.get("final_report")
+    if (
+        isinstance(_fr_zip, pd.DataFrame)
+        and "Is_Zip" in _fr_zip.columns
+        and bool((_fr_zip["Is_Zip"] == True).any())  # noqa: E712
+        and not st.session_state.get("zip_image_index")
+    ):
+        st.warning(
+            "**Product images are unavailable.** This batch came from a ZIP, and its "
+            "images are held in the session rather than on disk — a reconnect or a "
+            "restart clears them. Re-attach the same ZIP in the uploader to bring them "
+            "back; your approvals and rejections are stored separately and are not affected.",
+            icon=":material/image_not_supported:",
+        )
+
     def _clear_grid_search_n():
         st.session_state["grid_search_n"] = ""
     def _clear_grid_filter_sellers():
