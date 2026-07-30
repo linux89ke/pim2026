@@ -2420,17 +2420,18 @@ def build_fast_grid_html(
   body{{background:var(--bg);color:var(--text);padding:8px 8px 80px 8px;overflow-x:hidden;width:100%;transition:background .2s, color .2s;}}
 
   .ctrl-bar{{position:-webkit-sticky;position:sticky;top:0;z-index:99999;display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 12px;background:var(--card);backdrop-filter:blur(8px);border-bottom:2px solid var(--accent);border-radius:4px;margin-bottom:12px;box-shadow:0 4px 16px rgba(0,0,0,0.15);}}
-  .ctrl-bar.top-bar{{flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin;scrollbar-color:rgba(0,0,0,.35) transparent;}}
-  /* Below roughly a 13" laptop's content width the toolbar has more controls
-     than room. Wrapping to a second row keeps them all reachable; the
-     sideways scroll hid them behind a scrollbar most people never found. */
+  /* The .ctrl-bar.top-bar rules that were here — nowrap plus a horizontal
+     scroll and three webkit-scrollbar rules to style it — went with the top
+     bar itself. They matched nothing once it was removed. The bottom bar wraps
+     by default, which is what the media query below was overriding them to do
+     anyway.
+
+     Below roughly a 13" laptop's content width the bar has more controls than
+     room, and the reason dropdown has to give up its max-width to let the rest
+     fit on the second row. */
   @media (max-width: 1100px) {{
-    .ctrl-bar.top-bar{{flex-wrap:wrap;overflow-x:visible;overflow-y:visible;row-gap:8px;}}
     .rsearch-wrap{{max-width:none;}}
   }}
-  .ctrl-bar.top-bar::-webkit-scrollbar{{height:8px;}}
-  .ctrl-bar.top-bar::-webkit-scrollbar-thumb{{background:rgba(0,0,0,.28);border-radius:999px;}}
-  .ctrl-bar.top-bar::-webkit-scrollbar-track{{background:transparent;}}
 
   #grid-search {{
     flex: 1;
@@ -3971,9 +3972,12 @@ window.undoReject = function(sid) {{
   }}, 400);
 }};
 
+// pos is vestigial — there was a second copy of these controls in a top bar,
+// and every call site passes 'bottom' now. Kept in the signature so the inline
+// onclick in the markup does not have to change; ignored.
 window.doBatchReject = function(pos) {{
-  var selectId = pos === 'top' ? 'batch-reason-top' : 'batch-reason-bottom';
-  var sel = document.getElementById(selectId);
+  var sel = document.getElementById('batch-reason-bottom');
+  if (!sel) return;
   var br = sel.value;
   if (br === 'OTHER_CUSTOM') {{
     showCustomReasonPanel(function(cmt) {{
@@ -4169,10 +4173,10 @@ document.addEventListener('keydown', function(e) {{
   }}
 }});
 
-['batch-reason-top','batch-reason-bottom'].forEach(function(id) {{
-  var el = document.getElementById(id);
+(function() {{
+  var el = document.getElementById('batch-reason-bottom');
   if (el) el.addEventListener('change', function() {{ _lastReason = this.value; }});
-}});
+}})();
 
 // Searchable reject-reason dropdown. The dropdown grew past 30 options once
 // every check got a manual reason — scrolling a native <select> that long is
@@ -4383,9 +4387,11 @@ enhanceReasonSelect('batch-reason-bottom');
 // wraps to a second row under 1100px, so that is measured rather than
 // assumed. Re-measured on resize and after the grid re-renders.
 window.sizeGridScroll = function() {{
-  var bar = document.querySelector('.ctrl-bar.top-bar');  // removed; kept for safety
-  var h = bar ? Math.ceil(bar.getBoundingClientRect().height) : 0;
-  document.documentElement.style.setProperty('--grid-top-h', h + 'px');
+  // --grid-top-h is 0 now: the top bar is gone and nothing sits above the
+  // cards inside the iframe. The variable stays because #card-grid's
+  // max-height still subtracts it, and a future header would only have to
+  // set it here.
+  document.documentElement.style.setProperty('--grid-top-h', '0px');
   var bot = document.querySelector('.ctrl-bar.bottom-bar');
   var bh = bot ? Math.ceil(bot.getBoundingClientRect().height) : 84;
   /* Floating means the grid stops reserving the bar's height and the cards
@@ -4451,8 +4457,8 @@ sizeGridScroll();
 // After sizeGridScroll exists, so the reservation is right on first paint.
 window.applyBarMode();
 try {{
-  var _bar = document.querySelector('.ctrl-bar.top-bar');
-  if (_bar && window.ResizeObserver) new ResizeObserver(window.sizeGridScroll).observe(_bar);
+  // Same-document observer, so this one does fire — unlike the cross-frame
+  // attempt further down. It catches the bar wrapping to a second row.
   var _bot = document.querySelector('.ctrl-bar.bottom-bar');
   if (_bot && window.ResizeObserver) new ResizeObserver(window.sizeGridScroll).observe(_bot);
 }} catch(e) {{}}
@@ -4481,11 +4487,25 @@ try {{
    Everything is measured, not assumed. Nothing here depends on a Streamlit
    emotion class or on the number of control rows above the grid. */
 var MIN_H = 320, MAX_H = 1600, GAP = 16;
-window.fitToViewport = function() {{
+var _lastFitW = -1, _lastFitH = -1;
+window.fitToViewport = function(force) {{
   var fe;
   try {{ fe = window.frameElement; }} catch (e) {{ return; }}   // cross-origin
   if (!fe) return;                                            // not embedded
   var pw = window.parent, wrap = fe.parentElement;
+
+  /* Bail out before touching layout unless the viewport actually changed.
+     innerWidth/innerHeight are plain property reads; getBoundingClientRect
+     below forces a synchronous layout, which on a 500-card grid measures
+     3ms — 6ms/s at two ticks a second, sustained for as long as the modal is
+     open, and 20ms/s while the DOM is being mutated. Gating on the cheap
+     reads takes the idle cost of the timer to roughly nothing while still
+     catching every resize. Callers that know the geometry moved for another
+     reason — the open animation, a re-render clobbering our styles — pass
+     force and skip the gate. */
+  if (!force && pw.innerWidth === _lastFitW && pw.innerHeight === _lastFitH) return;
+  _lastFitW = pw.innerWidth; _lastFitH = pw.innerHeight;
+
   var top = fe.getBoundingClientRect().top;
 
   /* Whatever the dialog puts below the grid — the close row, its padding —
@@ -4527,11 +4547,12 @@ window.fitToViewport = function() {{
    attribute and re-apply. The height check inside fitToViewport() makes this
    idempotent, so re-entry from our own write cannot loop. */
 (function() {{
-  var run = function() {{ try {{ window.fitToViewport(); }} catch (e) {{}} }};
-  run();
-  window.addEventListener('load', run);
-  window.addEventListener('resize', run);
-  try {{ window.parent.addEventListener('resize', run); }} catch (e) {{}}
+  var poll  = function() {{ try {{ window.fitToViewport(false); }} catch (e) {{}} }};
+  var force = function() {{ try {{ window.fitToViewport(true);  }} catch (e) {{}} }};
+  force();
+  window.addEventListener('load', force);
+  window.addEventListener('resize', force);
+  try {{ window.parent.addEventListener('resize', force); }} catch (e) {{}}
   /* A resize event alone is not enough: it fires while the dialog is still
      relaying out, so the measurement reads stale geometry, computes the height
      it already has, and the guard in fitToViewport turns it into a no-op — the
@@ -4541,25 +4562,30 @@ window.fitToViewport = function() {{
      A ResizeObserver was the obvious answer and does not work here. Observing a
      parent-document element from inside the iframe never fired, and neither did
      one constructed in the parent — 0 callbacks either way, not even the initial
-     one that observe() is supposed to deliver. Rather than depend on cross-
-     document observer semantics, re-check on a timer. The height comparison
-     makes the steady state two getBoundingClientRect calls twice a second,
-     which is nothing, and it covers every trigger uniformly: viewport resize,
-     the dialog's open animation, a re-render, a change in cards-per-row, or the
-     bottom bar wrapping to a second line. */
-  setInterval(run, 500);
+     one that observe() is supposed to deliver. So it re-checks on a timer.
+
+     The timer is the cheap variant: fitToViewport() returns immediately unless
+     window.innerWidth/innerHeight changed, which are property reads that do not
+     touch layout. Only the events and observers below, which know the geometry
+     moved for a reason the viewport size cannot show, force a real measurement.
+     Without that gate this cost 3ms of forced layout per tick on a 500-card
+     grid — 6ms/s idle and 20ms/s while the DOM was being mutated, for as long
+     as the modal stayed open. */
+  setInterval(poll, 500);
   try {{
     var fe = window.frameElement;
     if (fe && window.MutationObserver) {{
-      var mo = new MutationObserver(run);
+      // React clobbering our inline styles leaves the viewport unchanged, so
+      // this has to force — the gate would otherwise swallow the recovery.
+      var mo = new MutationObserver(force);
       mo.observe(fe, {{attributes: true, attributeFilter: ['style']}});
       if (fe.parentElement) mo.observe(fe.parentElement, {{attributes: true, attributeFilter: ['style']}});
     }}
   }} catch (e) {{}}
   /* The dialog animates open, so the first measurement can land before the
-     panel has settled. Cheap re-checks over the first second; the height
-     comparison means a no-op costs nothing. */
-  [60, 180, 400, 800].forEach(function(t) {{ setTimeout(run, t); }});
+     panel has settled. These force for the same reason: the viewport is not
+     changing, the panel underneath it is. Four reads over the first second. */
+  [60, 180, 400, 800].forEach(function(t) {{ setTimeout(force, t); }});
 }})();
 
 // The page no longer scrolls, the grid does — so the nav buttons have to
