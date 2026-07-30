@@ -7,6 +7,7 @@ import re
 import hashlib
 import logging
 import os
+import time
 import unicodedata
 import uuid
 import pandas as pd
@@ -97,14 +98,65 @@ MANUAL_DECISION_COLS = [
 ]
 MANUAL_DECISION_PREFIX = "manual_"
 
+# The journal key is content-addressed over the WHOLE uploaded set, which is
+# what makes it reliable for reopening the same batch — and what breaks it the
+# moment the set grows. Upload the CSV, review 900 products, then add the image
+# ZIP: the signature changes, the lookup asks for a key that has never existed,
+# and a full day of decisions sits on disk unreachable. (That is not
+# hypothetical — it is how this was found.)
+#
+# The filename is md5(signature), so nothing can be recovered from the file
+# alone; there is no way to ask "which files did this belong to?". This index
+# records that, so a journal written for a subset of the current upload can be
+# found and offered back.
+MANUAL_INDEX_FILE = "manual_index.json"
+
+
+def _manual_index_path() -> str:
+    return os.path.join(PARQUET_CACHE_DIR, MANUAL_INDEX_FILE)
+
+
+def _read_manual_index() -> dict:
+    try:
+        with open(_manual_index_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        # A corrupt or absent index must never block a review. Worst case the
+        # offer does not appear; the journals themselves are untouched.
+        return {}
+
+
+def _write_manual_index(index: dict) -> None:
+    try:
+        os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
+        path = _manual_index_path()
+        tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(index, fh)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning(f"Failed to write manual index: {e}")
+
 
 def manual_decisions_filename(process_signature: str) -> str:
     """Journal filename for an uploaded file set (content-addressed, stable)."""
     return f"{MANUAL_DECISION_PREFIX}{hashlib.md5(str(process_signature).encode()).hexdigest()}.parquet"
 
 
-def save_manual_decisions(process_signature: str, final_report) -> int:
-    """Persist every manually-decided row. Returns how many were written."""
+def save_manual_decisions(
+    process_signature: str,
+    final_report,
+    *,
+    file_tokens=None,
+    country: str = "",
+) -> int:
+    """Persist every manually-decided row. Returns how many were written.
+
+    file_tokens is the per-file "name+content-digest" list the signature was
+    built from. It is recorded in the index so a later, larger upload can find
+    this journal; without it the entry is still written, just unmatchable.
+    """
     if not process_signature or process_signature == "empty":
         return 0
     if not isinstance(final_report, pd.DataFrame) or final_report.empty:
@@ -117,17 +169,113 @@ def save_manual_decisions(process_signature: str, final_report) -> int:
     cols = [c for c in MANUAL_DECISION_COLS if c in decided.columns]
     decided = decided[cols].drop_duplicates(subset=["ProductSetSid"], keep="last")
 
+    index = _read_manual_index()
     if decided.empty:
         # Undoing back to zero must clear the journal, or the next load would
-        # resurrect decisions the user deliberately removed.
+        # resurrect decisions the user deliberately removed. The index entry
+        # goes with it, or the offer would point at a file that is gone.
         try:
             os.remove(os.path.join(PARQUET_CACHE_DIR, fname))
         except OSError:
             pass
+        if index.pop(fname, None) is not None:
+            _write_manual_index(index)
         return 0
 
     save_df_parquet(decided, fname)
+    index[fname] = {
+        "files": sorted(str(t) for t in (file_tokens or [])),
+        "country": str(country or ""),
+        "saved_at": time.time(),
+        "n": int(len(decided)),
+    }
+    _write_manual_index(index)
     return len(decided)
+
+
+def find_predecessor_decisions(file_tokens, country: str, current_signature: str = ""):
+    """Find a journal written for a strict subset of the current upload.
+
+    That subset relation is the whole point: it is what "I started with the
+    product file and added the image ZIP later" looks like on disk. An equal
+    set is deliberately excluded — that is the same batch reopened, which the
+    normal same-key load already handles and which must not prompt.
+
+    Returns the best candidate as a dict with its loaded decisions, or None.
+    Best means most overlap with the current upload, then most recent.
+    """
+    tokens = {str(t) for t in (file_tokens or [])}
+    if not tokens:
+        return None
+
+    best = None
+    for fname, meta in _read_manual_index().items():
+        if not isinstance(meta, dict):
+            continue
+        if fname == manual_decisions_filename(current_signature):
+            continue
+        # Country is part of the signature, so a journal from a different
+        # market would apply the wrong rules' verdicts onto this report.
+        if str(meta.get("country") or "") != str(country or ""):
+            continue
+        old = {str(t) for t in (meta.get("files") or [])}
+        if not old or not old < tokens:      # strict subset only
+            continue
+        if not os.path.exists(os.path.join(PARQUET_CACHE_DIR, fname)):
+            continue                          # index outlived its journal
+        rank = (len(old), float(meta.get("saved_at") or 0))
+        if best is None or rank > best["_rank"]:
+            best = {
+                "_rank": rank,
+                "filename": fname,
+                "files": sorted(old),
+                "added": sorted(tokens - old),
+                "saved_at": float(meta.get("saved_at") or 0),
+                "n": int(meta.get("n") or 0),
+            }
+    if best is None:
+        return None
+
+    decisions = load_df_parquet(best["filename"])
+    if decisions is None or decisions.empty:
+        return None
+    best["decisions"] = decisions
+    return best
+
+
+def preview_decision_merge(final_report, decisions) -> dict:
+    """Describe what applying `decisions` would do, without doing it.
+
+    The counts here are the whole basis of the confirmation prompt, so they are
+    computed against the real report rather than estimated from row totals.
+    """
+    out = {"total": 0, "matched": 0, "missing": 0, "conflicts": 0, "unchanged": 0}
+    if not isinstance(decisions, pd.DataFrame) or decisions.empty:
+        return out
+    out["total"] = len(decisions)
+    if not isinstance(final_report, pd.DataFrame) or final_report.empty:
+        out["missing"] = out["total"]
+        return out
+    if "ProductSetSid" not in final_report.columns or "ProductSetSid" not in decisions.columns:
+        out["missing"] = out["total"]
+        return out
+
+    dec = decisions.drop_duplicates(subset=["ProductSetSid"], keep="last").copy()
+    dec["ProductSetSid"] = dec["ProductSetSid"].fillna("").astype(str).str.strip()
+    dec = dec.set_index("ProductSetSid")
+
+    fr_sids = final_report["ProductSetSid"].fillna("").astype(str).str.strip()
+    present = fr_sids.isin(dec.index)
+    out["matched"] = int(present.sum())
+    out["missing"] = out["total"] - len(set(fr_sids[present]) & set(dec.index))
+
+    if "Status" in final_report.columns and "Status" in dec.columns:
+        cur = final_report.loc[present, "Status"].fillna("").astype(str)
+        want = fr_sids[present].map(dec["Status"]).fillna("").astype(str)
+        differs = (cur.values != want.values)
+        out["conflicts"] = int(differs.sum())
+        out["unchanged"] = int(out["matched"] - out["conflicts"])
+    return out
 
 
 def load_manual_decisions(process_signature: str):

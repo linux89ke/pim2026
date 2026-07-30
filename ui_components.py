@@ -961,7 +961,15 @@ def checkpoint_final_report(fr: pd.DataFrame = None) -> bool:
     # Journal first: it is keyed on the uploaded file content alone, so it is
     # the copy that still resolves when sig_hash shifts (learning DB grows,
     # cache version bumps) and the report checkpoint below is orphaned.
-    save_manual_decisions(st.session_state.get("last_processed_files"), fr)
+    save_manual_decisions(
+        st.session_state.get("last_processed_files"),
+        fr,
+        # Recorded alongside the journal so a later upload that merely adds a
+        # file to this set can still find it. Without these the journal is
+        # written exactly as before, just not discoverable.
+        file_tokens=st.session_state.get("_process_file_tokens"),
+        country=st.session_state.get("_process_country", ""),
+    )
 
     sig = st.session_state.get("current_sig_hash")
     if not sig:
