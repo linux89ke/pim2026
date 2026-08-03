@@ -229,6 +229,10 @@ RULES: List[CategoryRule] = [
     # products are filed correctly and the complaint is about ranking. A rule
     # for those would reject correct listings, so they are deliberately absent.
 
+    # Parked. Both resolve to 2,112 categories — the whole Tools & Home
+    # Improvement branch — which is far more reach than the report's finding
+    # justified, and neither has been tried against a real batch. Set
+    # active=True to bring either back; nothing else needs changing.
     CategoryRule(
         id="fridge-in-tools",
         flag="Refrigerator in Tools & Home Improvement",
@@ -236,6 +240,7 @@ RULES: List[CategoryRule] = [
         wrong_in=["Home & Office / Tools & Home Improvement"],
         belongs="Electronics / Home Appliances",
         comment="Refrigerator filed under Tools & Home Improvement — belongs in Home Appliances",
+        active=False,
     ),
 
     # "water" and "dispenser" were separate rows of the report describing the
@@ -248,6 +253,7 @@ RULES: List[CategoryRule] = [
         wrong_in=["Home & Office / Tools & Home Improvement"],
         belongs="Electronics / Home Appliances",
         comment="Water dispenser filed under Tools & Home Improvement — belongs in Home Appliances",
+        active=False,
     ),
 
     # No keyword: nothing belongs here. Sellers filing books under the DVD
@@ -268,6 +274,10 @@ RULES: List[CategoryRule] = [
         columns=["CATEGORY_CODE"],        # no NAME dependency: the category is the offence
     ),
 
+    # Parked. A lavalier microphone is a legitimate Musical Instruments
+    # accessory as often as it is a phone accessory, so the report's finding —
+    # three listings — is thin ground for a rule that judges every one of them.
+    # active=True brings it back.
     CategoryRule(
         id="phone-mic-in-instruments",
         flag="Phone microphone in Musical Instruments",
@@ -275,6 +285,7 @@ RULES: List[CategoryRule] = [
         wrong_in=["Musical Instruments / Microphones & Accessories"],
         belongs="Phones & Tablets / Accessories",
         comment="Phone-accessory microphone filed under Musical Instruments",
+        active=False,
     ),
 ]
 
