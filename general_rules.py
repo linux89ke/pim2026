@@ -54,6 +54,10 @@ class CategoryRule:
     wrong_in: List[str]                 # category paths; a prefix covers the subtree
     comment: str
     flag: str = ""                      # defaults to a title derived from id
+    # Matched against BRAND instead of NAME. Either side firing is enough:
+    # sellers put the same thing in either field, and a product whose brand is
+    # the giveaway often has an innocuous name.
+    brand_keyword: object = None
     belongs: str = ""
     match: str = "word"                 # "word" | "substring"
     countries: Optional[List[str]] = None   # None = every market
@@ -99,6 +103,7 @@ class FdaRule:
     keyword: object
     comment: str
     flag: str = ""
+    brand_keyword: object = None
     except_in: List[str] = field(default_factory=list)
     match: str = "word"
     countries: Optional[List[str]] = None
@@ -132,6 +137,32 @@ SEXUAL_WELLNESS_TERMS = [
     "maximal performance",
 ]
 
+# Matched against BRAND, not NAME. Nigeria's restricted list already carries
+# "Titan" as a brand in its own right, separate from "Titan Gel", so the brand
+# field is a real signal and not a guess.
+#
+# Bare "titan" is deliberately absent from the NAME list above. Word matching
+# already stops it hitting "titanium" — the lookahead fails on the following
+# "i" — but "Titan" is also a large and entirely legitimate watch brand, and a
+# name-wide match would reach far beyond these categories. Confined to BRAND
+# and to the shave categories, a watch cannot be caught by it.
+SEXUAL_WELLNESS_BRANDS = [
+    "titan",
+    "titan gel",
+]
+
+# The same signal, minus the ambiguous half, for rules that are NOT confined to
+# a category. Bare "titan" only means what we want it to mean inside the shave
+# branch; applied catalogue-wide it reads a Titan wristwatch as a sexual
+# wellness product. Caught in testing: the FDA rule below covers everywhere
+# except the shave categories, so with bare "titan" it rejected a Titan watch
+# in Watches for having no FDA registration.
+#
+# "Titan Gel" as a brand has no such second life, so it stays.
+SEXUAL_WELLNESS_BRANDS_UNAMBIGUOUS = [
+    "titan gel",
+]
+
 
 # ── The rules ──────────────────────────────────────────────────────────────
 RULES: List[CategoryRule] = [
@@ -155,6 +186,7 @@ RULES: List[CategoryRule] = [
         id="sexual-wellness-in-shaving",
         flag="Sexual wellness product in shaving category",
         keyword=SEXUAL_WELLNESS_TERMS,
+        brand_keyword=SEXUAL_WELLNESS_BRANDS,
         wrong_in=[
             "Health & Beauty / Beauty & Personal Care / Personal Care / Shave & Hair Removal",
             "Health & Beauty / Personal Care / Shave & Hair Removal",
@@ -171,6 +203,7 @@ RULES: List[CategoryRule] = [
         id="sexual-wellness-needs-fda",
         flag="Sexual wellness product without FDA registration",
         keyword=SEXUAL_WELLNESS_TERMS,
+        brand_keyword=SEXUAL_WELLNESS_BRANDS_UNAMBIGUOUS,
         except_in=[
             "Health & Beauty / Beauty & Personal Care / Personal Care / Shave & Hair Removal",
             "Health & Beauty / Personal Care / Shave & Hair Removal",
@@ -301,8 +334,22 @@ def _emit(data, hit, comment: str, reason: str):
     return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
+def _text_hit(data, pat, brand_pat):
+    """NAME or BRAND matching. Either firing is enough — sellers put the
+    same thing in either field, and a product whose brand gives it away
+    often has a deliberately bland name."""
+    hit = None
+    if pat is not None and "NAME" in data.columns:
+        hit = data["NAME"].fillna("").astype(str).str.contains(pat, na=False)
+    if brand_pat is not None and "BRAND" in data.columns:
+        b = data["BRAND"].fillna("").astype(str).str.contains(brand_pat, na=False)
+        hit = b if hit is None else (hit | b)
+    return hit
+
+
 def _make_category_check(rule, codes: set):
     pat = _keyword_pattern(rule.keyword, rule.match)
+    brand_pat = _keyword_pattern(getattr(rule, "brand_keyword", None), rule.match)
 
     def _check(data, **_kwargs):
         if data is None or data.empty or not codes:
@@ -312,12 +359,13 @@ def _make_category_check(rule, codes: set):
         in_scope = _cat_series(data).isin(codes)
         if not in_scope.any():
             return pd.DataFrame(columns=data.columns)
-        if pat is None:
+        if pat is None and brand_pat is None:
             hit = in_scope                      # no keyword: the category is the offence
         else:
-            if "NAME" not in data.columns:
+            text = _text_hit(data, pat, brand_pat)
+            if text is None:
                 return pd.DataFrame(columns=data.columns)
-            hit = in_scope & data["NAME"].fillna("").astype(str).str.contains(pat, na=False)
+            hit = in_scope & text
         detail = rule.comment
         if getattr(rule, "belongs", ""):
             detail = f"{detail} (should be: {rule.belongs})"
@@ -347,13 +395,14 @@ def _fda_missing(data):
 
 def _make_fda_check(rule, except_codes: set):
     pat = _keyword_pattern(rule.keyword, rule.match)
+    brand_pat = _keyword_pattern(getattr(rule, "brand_keyword", None), rule.match)
 
     def _check(data, **_kwargs):
-        if data is None or data.empty or pat is None:
+        if data is None or data.empty or (pat is None and brand_pat is None):
             return pd.DataFrame(columns=getattr(data, "columns", []))
-        if "NAME" not in data.columns:
+        hit = _text_hit(data, pat, brand_pat)
+        if hit is None:
             return pd.DataFrame(columns=data.columns)
-        hit = data["NAME"].fillna("").astype(str).str.contains(pat, na=False)
         if except_codes and "CATEGORY_CODE" in data.columns:
             hit &= ~_cat_series(data).isin(except_codes)
         hit &= _fda_missing(data)
@@ -441,6 +490,8 @@ def build_scopes(code_to_path: Dict, country_code: str = "") -> Dict:
                         if isinstance(rule, CategoryRule) and rule.belongs else set()),
             "pattern": (None if isinstance(rule, GenericCategoryRule)
                         else _keyword_pattern(rule.keyword, rule.match)),
+            "brand_pattern": (None if isinstance(rule, GenericCategoryRule)
+                              else _keyword_pattern(getattr(rule, "brand_keyword", None), rule.match)),
         }
     return scopes
 
@@ -470,12 +521,15 @@ def audit_record(rec: Dict, scopes: Dict, country_code: str = "") -> List[Dict]:
         return out
     code = clean_category_code(str(rec.get("CATEGORY_CODE", "") or ""))
     name = str(rec.get("NAME", "") or "")
+    brand = str(rec.get("BRAND", "") or "")
 
     for scope in scopes.values():
         rule = scope["rule"]
-        pat = scope["pattern"]
-        if pat is not None and not pat.search(name):
-            continue
+        pat, brand_pat = scope["pattern"], scope.get("brand_pattern")
+        if pat is not None or brand_pat is not None:
+            if not ((pat is not None and pat.search(name))
+                    or (brand_pat is not None and brand_pat.search(brand))):
+                continue
 
         if isinstance(rule, FdaRule):
             if code and code in scope["wrong"]:
@@ -505,8 +559,18 @@ def audit_record(rec: Dict, scopes: Dict, country_code: str = "") -> List[Dict]:
 
 def relevant_columns() -> Dict[str, List[str]]:
     """Column dependencies, for the flag cache. Without these an unmapped flag
-    falls back to hashing the whole frame on every run."""
-    return {_flag_name(r): list(r.columns) for r in RULES if r.active}
+    falls back to hashing the whole frame on every run — and a column a rule
+    actually reads but does not declare is worse than that, because the cache
+    would then serve a stale verdict after someone edited it."""
+    out = {}
+    for r in RULES:
+        if not r.active:
+            continue
+        cols = list(r.columns)
+        if getattr(r, "brand_keyword", None) and "BRAND" not in cols:
+            cols.append("BRAND")
+        out[_flag_name(r)] = cols
+    return out
 
 
 def rule_health(support_files: Dict) -> pd.DataFrame:
