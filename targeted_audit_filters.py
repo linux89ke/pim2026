@@ -39,6 +39,11 @@ CHECK_ORDER = [
     "skip", "duplicate", "category", "color", "warranty", "variation", "fda",
     "title_weight", "title_english", "name_brand", "image_quality", "image_extraction",
     "ai_caption", "brand_image",
+    # Appended, not slotted next to "category" where it belongs thematically,
+    # so the order of every existing section in the generated report is
+    # unchanged. Both the audit tables and the .docx iterate this list, so a
+    # check missing from it is silently absent from both.
+    "general_rule",
 ]
 
 CHECK_LABELS = {
@@ -56,12 +61,18 @@ CHECK_LABELS = {
     "image_extraction": "Image Extraction Errors",
     "ai_caption": "AI Product Caption Errors",
     "brand_image": "Brand Detected On Image",
+    "general_rule": "General Rule Violations",
 }
 
 try:
     from custom_country_rules import apply_kenya_book_rule
 except ImportError:
     def apply_kenya_book_rule(*args, **kwargs): return None
+
+try:
+    from general_rules import audit_record as _general_audit_record
+except Exception:  # a broken rules file must not take the audit down with it
+    def _general_audit_record(*args, **kwargs): return []
 
 # (status_column, reason_column) as they actually appear in the file, per check.
 _CHECK_COLUMNS = {
@@ -696,6 +707,17 @@ def evaluate_all_checks(data: pd.DataFrame, country_code: str) -> pd.DataFrame:
     records = _dedup_data[cols].to_dict("records")
     status_cols_present = {status_col for status_col, _ in _CHECK_COLUMNS.values() if status_col in data.columns}
 
+    # Resolved once, not per record: general_rules walks the whole category map
+    # to turn a path into codes, and there are thousands of records here.
+    _gr_scopes = {}
+    try:
+        import streamlit as _st
+        from general_rules import build_scopes as _gr_build_scopes
+        _gr_c2p = (_st.session_state.get("support_files") or {}).get("code_to_path") or {}
+        _gr_scopes = _gr_build_scopes(_gr_c2p, country_code) if _gr_c2p else {}
+    except Exception:
+        logger.exception("general_rules: could not resolve rule scopes for the audit")
+
     rows = []
     for rec in records:
         sid = _clean(rec.get("PRODUCT_SET_SID"))
@@ -735,6 +757,42 @@ def evaluate_all_checks(data: pd.DataFrame, country_code: str) -> pd.DataFrame:
             label = _match_caption_error(caption_text)
             rows.append({**_base_row(sid, "ai_caption", rec), "Reason Type": label,
                          "Verdict": "AI Error", "Detail": caption_text})
+
+        # ── General rules vs the file's category verdict ──────────────────
+        # The rules in general_rules.py are an independent opinion about where
+        # a product belongs, so where they disagree with the ZIP's category
+        # decision, one of the two is wrong and it is worth naming.
+        #
+        # Both directions are reported, but they are not symmetric. A rule
+        # firing on a product the file approved is a clear miss. The reverse —
+        # a rejection on a product the rule says is correctly placed — is only
+        # claimed for rules that carry `belongs`, because a rule states where
+        # something must NOT be; absence of a rule is not a statement that the
+        # listing is fine, and the file may well have rejected it for a reason
+        # no rule here covers.
+        _gr_status_col, _gr_reason_col = _CHECK_COLUMNS["category"]
+        _gr_status = _clean(rec.get(_gr_status_col)).lower() if _gr_status_col in status_cols_present else ""
+        _gr_reason = _clean(rec.get(_gr_reason_col))
+        _gr_rejected = (
+            (_gr_status in ("rejected", "review", "manual review"))
+            or (not _gr_status and _gr_reason and "error" not in _gr_reason.lower())
+        )
+        try:
+            for _gr in _general_audit_record(rec, _gr_scopes, country_code):
+                if _gr["kind"] == "violation" and not _gr_rejected:
+                    rows.append({**_base_row(sid, "general_rule", rec),
+                                 "Reason Type": _gr["reason_type"],
+                                 "Verdict": "False Approval",
+                                 "Detail": f"{_gr['detail']} The file did not reject this "
+                                           f"product on category."})
+                elif _gr["kind"] == "correct_placement" and _gr_rejected:
+                    rows.append({**_base_row(sid, "general_rule", rec),
+                                 "Reason Type": _gr["reason_type"],
+                                 "Verdict": "False Rejection",
+                                 "Detail": f"{_gr['detail']} The file rejected it on category: "
+                                           f"{_gr_reason or '(no reason given)'}"})
+        except Exception:
+            logger.exception("general_rules audit failed for %s", sid)
 
         # ── The file's own nine checks ───────────────────────────────────
         for check_key, (status_col, reason_col) in _CHECK_COLUMNS.items():

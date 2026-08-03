@@ -239,6 +239,74 @@ def build_validators(support_files: Dict, country_code: str = "") -> List[tuple]
     return out
 
 
+def build_scopes(code_to_path: Dict, country_code: str = "") -> Dict:
+    """Resolve every active rule's category paths to codes, once.
+
+    audit_record() is called per product and there are thousands per batch,
+    while resolving a path walks the whole category map. Doing it inside the
+    loop would be tens of millions of comparisons per audit.
+    """
+    scopes = {}
+    for rule in RULES:
+        if not rule.active:
+            continue
+        if rule.countries and country_code and country_code not in rule.countries:
+            continue
+        scopes[rule.id] = {
+            "rule": rule,
+            "wrong": _codes_under(rule.wrong_in, code_to_path),
+            "belongs": _codes_under([rule.belongs], code_to_path) if rule.belongs else set(),
+            "pattern": _keyword_pattern(rule.keyword, rule.match) if str(rule.keyword).strip() else None,
+        }
+    return scopes
+
+
+def audit_record(rec: Dict, scopes: Dict, country_code: str = "") -> List[Dict]:
+    """Judge a single ZIP record against the rules, for the targeted audit.
+
+    Returns one entry per rule that has something to say. `kind` is either:
+
+      violation        — the rule fires: this product is filed where the rule
+                         says it must not be. If the ZIP approved it, the ZIP
+                         is wrong.
+      correct_placement — the keyword matches and the product is sitting in the
+                         category the rule says it belongs in. If the ZIP
+                         rejected it on category, the ZIP is wrong the other
+                         way.
+
+    Only rules carrying `belongs` can produce the second kind. A rule asserts
+    where something must NOT be; without `belongs` it never asserts that any
+    placement is right, so inferring a false rejection from silence would be
+    unfounded — the product could be failing any number of other checks.
+    """
+    out: List[Dict] = []
+    if not rec or not scopes:
+        return out
+    code = clean_category_code(str(rec.get("CATEGORY_CODE", "") or ""))
+    if not code:
+        return out
+    name = str(rec.get("NAME", "") or "")
+
+    for scope in scopes.values():
+        rule = scope["rule"]
+        pat = scope["pattern"]
+        if pat is not None and not pat.search(name):
+            continue
+
+        if code in scope["wrong"]:
+            detail = rule.comment
+            if rule.belongs:
+                detail = f"{detail} (should be: {rule.belongs})"
+            out.append({"rule": _flag_name(rule), "kind": "violation",
+                        "reason_type": _flag_name(rule), "detail": detail})
+        elif scope["belongs"] and code in scope["belongs"]:
+            out.append({"rule": _flag_name(rule), "kind": "correct_placement",
+                        "reason_type": f"{_flag_name(rule)} — correctly placed",
+                        "detail": f"Already filed under {rule.belongs}, which is where this "
+                                  f"product belongs."})
+    return out
+
+
 def relevant_columns() -> Dict[str, List[str]]:
     """Column dependencies, for the flag cache. Without these an unmapped flag
     falls back to hashing the whole frame on every run."""
