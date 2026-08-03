@@ -665,6 +665,16 @@ FLAG_RELEVANT_COLS = {
     # a narrow column set for them would risk serving stale QC verdicts.
 }
 
+# Rules from general_rules.py declare their own columns. Without this every one
+# of them would be unmapped and fall back to hashing the whole frame on each
+# run, so editing any unrelated column would invalidate their cache.
+try:
+    from general_rules import relevant_columns as _general_relevant_columns
+
+    FLAG_RELEVANT_COLS.update(_general_relevant_columns())
+except Exception:  # a broken rules file must not stop the app importing
+    logging.getLogger(__name__).exception("general_rules: could not read column map")
+
 
 # Bump when the cache-key scheme changes, so pickles written by an older scheme
 # can never be read back under a key that now means something different.
@@ -3455,6 +3465,16 @@ def validate_products(
         _gh = load_ghana_qc_rules()
         validations += [("GH - Smart Glasses with Camera", check_ghana_smart_glasses, {"gh_rules": _gh})]
 
+    # Rules from general_rules.py — the file to edit when a new broken pattern
+    # turns up. Appended last so a hand-written rule never displaces a built-in
+    # check in the flag priority order, and wrapped because a syntax error in a
+    # file that gets edited often must not take the whole run down with it.
+    try:
+        from general_rules import build_validators as _general_validators
+        validations += _general_validators(support_files, country_validator.code)
+    except Exception:
+        logger.exception("general_rules failed to load — its rules are skipped")
+
     results = {}
     rejected_sids: set = set()
     dup_groups = {}
@@ -4033,6 +4053,33 @@ with st.sidebar:
         robust_cleanup(FLAG_CACHE_DIR)
         st.toast("Cache cleared! (Locked files skipped)", icon="🧹")
         st.rerun()
+    st.markdown("---")
+    # ── General rules ─────────────────────────────────────────────────────
+    # The validator dispatch catches a failing check and logs it, so a rule
+    # with a bad category path or a typo does not crash anything — it just
+    # never fires. That is the worst way for a file people edit weekly to
+    # fail, so its state is shown rather than left to be inferred from an
+    # expander that never appears.
+    with st.expander("General rules", icon=":material/rule:"):
+        try:
+            from general_rules import RULES as _GRULES, rule_health
+
+            _health = rule_health(st.session_state.get("support_files", {}))
+            _bad = _health[_health["Status"] == "no categories matched"]
+            _on = int(_health["Active"].sum())
+            st.caption(f"{_on} of {len(_GRULES)} active — edit general_rules.py to change them")
+            st.dataframe(_health, hide_index=True, width="stretch")
+            if not _bad.empty:
+                st.warning(
+                    f"{len(_bad)} rule(s) resolved to no categories — check the paths in "
+                    "`wrong_in` against the category map. These will never fire.",
+                    icon=":material/warning:",
+                )
+        except Exception as _e:
+            st.error(
+                f"general_rules.py failed to load — all its rules are inactive.\n\n`{_e}`",
+                icon=":material/error:",
+            )
     st.markdown("---")
     # ── Temporary rule overrides ──────────────────────────────────────────
     # Kept visibly separate from display settings: these change what gets
