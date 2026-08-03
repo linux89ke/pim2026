@@ -437,6 +437,34 @@ def load_qc_excel(country_code: str):
 
 
 # ── Rule-based re-verification for the checks that have a deterministic answer ─
+def _tv_colour_exempt_codes() -> set:
+    """Category codes the TV colour exemption covers, or empty when it is off.
+
+    Read per call rather than cached at import: the toggle can be flipped
+    between runs, and a stale set would leave the audit reporting under a rule
+    that is no longer in force.
+    """
+    try:
+        import streamlit as _st
+        if not _st.session_state.get("tv_color_exempt"):
+            return set()
+        from streamlit_app import tv_exempt_category_codes
+        return tv_exempt_category_codes(_st.session_state.get("support_files", {}))
+    except Exception:
+        return set()
+
+
+def _is_tv_colour_exempt(rec: dict) -> bool:
+    codes = _tv_colour_exempt_codes()
+    if not codes:
+        return False
+    try:
+        from data_utils import clean_category_code
+        return clean_category_code(str(rec.get("CATEGORY_CODE", "") or "")) in codes
+    except Exception:
+        return False
+
+
 def _verify(check_key: str, rec: dict, rule: dict, weights: set, color_re) -> str:
     """Only called for reason types marked None in _REASON_VERDICT — actually
     re-derives whether the file's own mandatory-attribute rule agrees."""
@@ -448,6 +476,13 @@ def _verify(check_key: str, rec: dict, rule: dict, weights: set, color_re) -> st
         return "True Rejection" if req != "no need" else "False Rejection"
 
     if check_key == "color":
+        # The TV colour exemption overrides the rules sheet, which says Color
+        # is Mandatory for all seven television categories. Without this the
+        # audit sides with the file and reports a True Rejection — it would
+        # agree the TV was rightly rejected while the app was busy approving
+        # it, which is the two halves contradicting each other in writing.
+        if _is_tv_colour_exempt(rec):
+            return "False Rejection"
         req = _clean(rule.get("Color", "Mandatory")).lower()
         color_val = _clean(rec.get("COLOR"))
         if req == "no need":
@@ -876,8 +911,20 @@ def evaluate_all_checks(data: pd.DataFrame, country_code: str) -> pd.DataFrame:
                         verdict = _REASON_VERDICT.get(label)
                         if verdict is None:
                             verdict = _verify(check_key, rec, rule, weights, color_re)
+                    _detail = reason or "No reason text provided."
+                    # Named rather than left under the file's own wording. A
+                    # row reading "Color Missing But Inferable From Title —
+                    # False Rejection" gives no clue that a temporary
+                    # exemption produced it, and this one is meant to be
+                    # switched off again.
+                    if check_key == "color" and _is_tv_colour_exempt(rec):
+                        label = "TV Exempt From Colour Check"
+                        verdict = "False Rejection"
+                        _detail = (f"Rejected for colour, but televisions are exempt from the "
+                                   f"colour check while that setting is on. File's reason: "
+                                   f"{reason or '(none provided)'}")
                     rows.append({**_base_row(sid, check_key, rec), "Reason Type": label,
-                                 "Verdict": verdict, "Detail": reason or "No reason text provided."})
+                                 "Verdict": verdict, "Detail": _detail})
 
                 elif status in ("review", "manual review"):
                     label, is_error = _match(check_key, reason) if reason else ("Flagged For Manual Review", False)
