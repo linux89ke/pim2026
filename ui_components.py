@@ -4933,13 +4933,36 @@ def visual_review_modal(support_files):
     # losing the images rather than the session. Say so instead, and say what
     # fixes it: re-attaching the same ZIP restores them without redoing the
     # review, because the decisions are journalled separately.
-    _fr_zip = st.session_state.get("final_report")
-    if (
-        isinstance(_fr_zip, pd.DataFrame)
-        and "Is_Zip" in _fr_zip.columns
-        and bool((_fr_zip["Is_Zip"] == True).any())  # noqa: E712
-        and not st.session_state.get("zip_image_index")
-    ):
+    # Keyed on the ZIP being absent from the upload, NOT on the image index
+    # being empty. An empty index does not mean the images were lost:
+    # _index_zip_images only counts entries under a top-level "images/" folder,
+    # so a ZIP that lays its pictures out differently — or one that carries only
+    # QC results and no images at all, which is a normal way to use this —
+    # indexes to nothing while being perfectly present. Warning on that told
+    # people their images had been lost when both files were sitting right
+    # there in the uploader.
+    #
+    # What the message is actually about is the session dropping the uploaded
+    # bytes, and the honest signal for that is that no ZIP is uploaded any more
+    # while the report still says rows came from one.
+    # Third condition, and the one that matters most: the cards must actually
+    # need the archive. A card only falls back to the ZIP when its MAIN_IMAGE
+    # is not an http URL — see the img_url branch in build_fast_grid_html. A
+    # batch whose images are all URLs renders identically with or without the
+    # ZIP, so telling that reviewer their images are unavailable is nonsense
+    # while the pictures are on screen in front of them. Is_Zip only means the
+    # row was touched by the ZIP's QC results, which says nothing about images.
+    _zip_uploaded = any(
+        str(f.get("name", "")).lower().endswith(".zip")
+        for f in (st.session_state.get("cached_uploaded_files") or [])
+    )
+    _needs_zip_images = False
+    if not _zip_uploaded:
+        _dm = st.session_state.get("all_data_map")
+        if isinstance(_dm, pd.DataFrame) and "MAIN_IMAGE" in _dm.columns:
+            _mi = _dm["MAIN_IMAGE"].fillna("").astype(str).str.strip()
+            _needs_zip_images = bool((_mi.ne("") & ~_mi.str.startswith("http")).any())
+    if _needs_zip_images:
         st.warning(
             "**Product images are unavailable.** This batch came from a ZIP, and its "
             "images are held in the session rather than on disk — a reconnect or a "
