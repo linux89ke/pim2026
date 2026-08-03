@@ -70,6 +70,8 @@ from api_client import (
 
 # ── NEW MODULAR IMPORTS ───────────────────────────────────────────────────────
 from constants import (
+    ASPECT_ADVISORY_TALL, ASPECT_ADVISORY_WIDE,
+    ASPECT_REJECT_TALL, ASPECT_REJECT_WIDE,
     COUNTRY_VALIDATOR_CONFIG,
     FLAG_CACHE_DIR,
     GRID_COLS,
@@ -972,9 +974,12 @@ def check_image_stretched(data: pd.DataFrame, _image_cache: dict = None) -> pd.D
         w, h = dims
         if w > 0:
             ratio = h / w
-            if ratio > 1.5:
+            # Only the extreme tier rejects. Between the two bounds the image
+            # is merely unusual, and that is left to the grid to show as
+            # commentary — see ASPECT_ADVISORY_* below.
+            if ratio > ASPECT_REJECT_TALL:
                 url_issues[url] = f"Image Stretched - Tall Aspect Ratio ({w}x{h})"
-            elif ratio < 0.6:
+            elif ratio < ASPECT_REJECT_WIDE:
                 url_issues[url] = f"Image Stretched - Wide Aspect Ratio ({w}x{h})"
 
     if not url_issues:
@@ -4579,6 +4584,42 @@ if st.session_state.get("last_processed_files") != process_signature:
                                             st.session_state._country_override_sig = process_signature
                                             st.rerun()
                                     st.stop()
+
+                        # ── Same guard, for files with no country column ──────
+                        # The block above needs ACTIVE_STATUS_COUNTRY. Without
+                        # it nothing filters and nothing is detected, so a
+                        # Uganda file selected as Kenya was validated end to end
+                        # under Kenyan rules and came back labelled Kenya —
+                        # every verdict on it wrong, and nothing said so.
+                        # det_names now carries the SKU-prefix inference, which
+                        # is the only signal left in that case.
+                        if ("ACTIVE_STATUS_COUNTRY" not in data_prop.columns
+                                and det_names
+                                and country_validator.country not in det_names
+                                and st.session_state.get("_country_override_sig") != process_signature):
+                            _guess = det_names[0]
+                            _status.update(label="Country mismatch detected", state="error", expanded=True)
+                            st.warning(
+                                f"This file has no country column, and its SKUs look like **{_guess}** — "
+                                f"but **{country_validator.country}** is selected. Nothing can be filtered by "
+                                f"country here, so every one of the {len(data_prop):,} rows would be validated "
+                                f"against {country_validator.country}'s rules.",
+                                icon=":material/flag:",
+                            )
+                            _n1, _n2 = st.columns(2)
+                            with _n1:
+                                if st.button(f"Switch to {_guess} and Reprocess", type="primary",
+                                             icon=":material/swap_horiz:", key="cmg_switch_nocol"):
+                                    st.session_state.selected_country = _guess
+                                    set_country_pref(_guess)
+                                    st.session_state.country_bridge_counter += 1
+                                    st.rerun()
+                            with _n2:
+                                if st.button(f"Process as {country_validator.country} anyway "
+                                             f"({len(data_prop):,} rows)", key="cmg_continue_nocol"):
+                                    st.session_state._country_override_sig = process_signature
+                                    st.rerun()
+                            st.stop()
 
                         actual_counts = data_filtered.groupby("PRODUCT_SET_SID")["PRODUCT_SET_SID"].transform("count")
                         if "COUNT_VARIATIONS" in data_filtered.columns:

@@ -644,9 +644,41 @@ def validate_input_schema(df: pd.DataFrame) -> Tuple[bool, List[str]]:
     return len(errors) == 0, errors
 
 
+_COUNTRY_PREFIXES = {"KE": "Kenya", "UG": "Uganda", "NG": "Nigeria", "GH": "Ghana",
+                     "MA": "Morocco", "EG": "Egypt", "SN": "Senegal", "CI": "Ivory Coast"}
+
+
+def _detect_countries_from_skus(df: pd.DataFrame) -> List[str]:
+    """Infer which markets a file belongs to from SKU/SID prefixes.
+
+    Only used when ACTIVE_STATUS_COUNTRY is absent. Prefix matching is
+    deliberately anchored with a separator — a bare startswith("MA") also
+    matches seller SKUs like "MAX 90", which is why the country column is
+    preferred whenever it exists.
+    """
+    found = set()
+    sku_cols = [c for c in df.columns if 'SKU' in str(c).upper() or 'SID' in str(c).upper()]
+    for col in sku_cols:
+        vals = df[col].dropna().astype(str).str.strip().str.upper()
+        if vals.empty:
+            continue
+        for prefix, name in _COUNTRY_PREFIXES.items():
+            hits = vals.str.match(rf"{prefix}[-_ ]")
+            # A stray match is not a market. Require a real share of the file
+            # before claiming the batch belongs somewhere else.
+            if hits.mean() >= 0.5:
+                found.add(name)
+    return sorted(found)
+
+
 def filter_by_country(df: pd.DataFrame, country_validator) -> Tuple[pd.DataFrame, List[str]]:
     if 'ACTIVE_STATUS_COUNTRY' not in df.columns:
-        return df, []
+        # Without the column every row used to pass through as whatever country
+        # was selected: a Uganda file processed under Kenya, with no filtering,
+        # no detection and no warning, because the SKU-prefix fallback below
+        # sat after this return and could never run. Fall back to it properly
+        # and report what the file looks like, so the caller can refuse.
+        return df, _detect_countries_from_skus(df)
     s = df['ACTIVE_STATUS_COUNTRY'].astype(str).str.strip().str.upper().str.replace(r'^JUMIA-', '', regex=True)
     df['ACTIVE_STATUS_COUNTRY'] = s
     if country_validator.code == 'NG':
@@ -660,20 +692,11 @@ def filter_by_country(df: pd.DataFrame, country_validator) -> Tuple[pd.DataFrame
     # Detect all countries present in the file
     prefix_map = {"KE": "Kenya", "UG": "Uganda", "NG": "Nigeria", "GH": "Ghana", "MA": "Morocco", "EG": "Egypt", "SN": "Senegal", "CI": "Ivory Coast"}
 
-    detected_codes = set()
-    if 'ACTIVE_STATUS_COUNTRY' in df.columns:
-        # Prefer the explicit country column — SKU prefix scanning produces false positives
-        # (e.g. seller SKUs like "MA-D1502W2ME" or "MAX 90" wrongly match Morocco)
-        detected_codes.update(df['ACTIVE_STATUS_COUNTRY'].dropna().unique())
-    else:
-        # Fallback: infer from SKU prefixes only when the country column is absent
-        sku_cols = [c for c in df.columns if 'SKU' in c.upper() or 'SID' in c.upper()]
-        for col in sku_cols:
-            vals = df[col].dropna().astype(str).str.strip().str.upper()
-            for prefix in prefix_map.keys():
-                if vals.str.startswith(prefix).any():
-                    detected_codes.add(prefix)
-    
+    # The column is present by this point — the no-column case returned above
+    # with _detect_countries_from_skus(). Prefer it over prefix scanning, which
+    # produces false positives (seller SKUs like "MAX 90" match Morocco).
+    detected_codes = set(df['ACTIVE_STATUS_COUNTRY'].dropna().unique())
+
     emoji_map = {"KE": "Kenya", "UG": "Uganda", "NG": "Nigeria", "GH": "Ghana", "MA": "Morocco", "EG": "Egypt", "SN": "Senegal", "CI": "Ivory Coast"}
     detected_names = sorted(list(set(emoji_map.get(c, str(c)) for c in detected_codes if str(c).strip() and str(c).strip().lower() != 'nan')))
     

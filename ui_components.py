@@ -21,7 +21,15 @@ import streamlit as st
 import streamlit.components.v1 as components
 from PIL import Image
 
-from constants import GRID_COLS, JUMIA_COLORS
+from constants import (
+    GRID_COLS, JUMIA_COLORS,
+    # Shared with check_image_stretched: the grid badges the band the server
+    # does NOT reject, so the two have to be defined against each other.
+    ASPECT_ADVISORY_TALL as _ASPECT_ADVISORY_TALL,
+    ASPECT_ADVISORY_WIDE as _ASPECT_ADVISORY_WIDE,
+    ASPECT_REJECT_TALL as _ASPECT_REJECT_TALL,
+    ASPECT_REJECT_WIDE as _ASPECT_REJECT_WIDE,
+)
 from design_tokens import (
     COLORS as DT,
     SEVERITY,
@@ -3385,8 +3393,14 @@ function onImgLoad(img, sid) {{
   if (w > 0 && h > 0) {{
     if (w < 250 || h < 250) warns.push('Low Resolution');
     var ratio = h / w;
-    if (ratio > 1.5) warns.push('Tall (Screenshot?)');
-    else if (ratio < 0.6) warns.push('Wide Aspect');
+    /* Advisory band only. Anything past the reject bounds has already been
+       rejected server-side by check_image_stretched and is therefore not in
+       this grid at all, so badging it here would be dead code — which is
+       exactly what the old single-threshold version was: it drew badges at
+       the same numbers that got the product rejected out of the grid.
+       Kept in sync with ASPECT_* in streamlit_app.py. */
+    if (ratio > {_ASPECT_ADVISORY_TALL} && ratio <= {_ASPECT_REJECT_TALL}) warns.push('Tall image — check');
+    else if (ratio < {_ASPECT_ADVISORY_WIDE} && ratio >= {_ASPECT_REJECT_WIDE}) warns.push('Wide image — check');
   }}
   if (warns.length) addWarnings(sid, warns);
 }}

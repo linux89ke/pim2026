@@ -174,3 +174,23 @@ SPLIT_LIMIT = 9998
 MULTI_COUNTRY_VALUES = {'MULTIPLE', 'MULTI'}
 PARQUET_CACHE_DIR = "app_cache_parquet"
 FLAG_CACHE_DIR = "app_cache_flags"
+
+# ── Image aspect ratio tiers ───────────────────────────────────────────────
+# ratio = height / width. Lives here because two places need it and neither
+# can own it: check_image_stretched in streamlit_app.py decides what is
+# rejected, and the grid in ui_components.py decides what is merely flagged
+# for a person to look at. ui_components cannot import from streamlit_app —
+# streamlit_app imports it — so the shared module is the only honest home.
+#
+# One threshold used to do both jobs, at 1.5 / 0.6. The grid drew a
+# "Tall (Screenshot?)" badge at exactly the ratio that got the product
+# rejected, and the grid only shows approved products — so the badge could
+# never appear. The advisory tier was unreachable by construction.
+#
+# 1.5 is also an ordinary product photo: a 2:3 portrait shot is 1.5 exactly,
+# so bottles, standing figures and portrait packaging were auto-rejected on
+# shape alone.
+ASPECT_REJECT_TALL = 2.5      # taller than 2.5x its width  -> rejected
+ASPECT_REJECT_WIDE = 0.4      # wider than 2.5x its height  -> rejected
+ASPECT_ADVISORY_TALL = 1.5    # 1.5 - 2.5 -> commentary in the grid only
+ASPECT_ADVISORY_WIDE = 0.6    # 0.4 - 0.6 -> commentary in the grid only
