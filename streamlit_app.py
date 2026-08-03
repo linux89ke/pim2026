@@ -70,7 +70,7 @@ from api_client import (
 
 # ── NEW MODULAR IMPORTS ───────────────────────────────────────────────────────
 from constants import (
-    TV_COLOR_EXEMPT_PREFIX,
+    TV_COLOR_EXEMPT_NODE, TV_COLOR_EXEMPT_PREFIX,
     ASPECT_ADVISORY_TALL, ASPECT_ADVISORY_WIDE,
     ASPECT_REJECT_TALL, ASPECT_REJECT_WIDE,
     COUNTRY_VALIDATOR_CONFIG,
@@ -2543,7 +2543,8 @@ def tv_exempt_category_codes(support_files: Dict = None) -> set:
     return {
         clean_category_code(str(code))
         for code, path in code_to_path.items()
-        if str(path).startswith(TV_COLOR_EXEMPT_PREFIX)
+        if str(path).strip() == TV_COLOR_EXEMPT_NODE
+        or str(path).startswith(TV_COLOR_EXEMPT_PREFIX)
     }
 
 
@@ -4044,10 +4045,10 @@ with st.sidebar:
         key="tv_color_exempt",
         help=(
             "Skips the Missing COLOR check for everything under "
-            "Electronics / Television & Video / …, and approves anything the ZIP "
-            "rejected for colour in those categories. Off by default. Does not "
-            "cover the parent category on its own, TV accessories, mounts, "
-            "remotes, or DVDs filed under Books, Movies and Music."
+            "Electronics / Television & Video / Televisions / …, and approves "
+            "anything the ZIP rejected for colour in those categories. Off by "
+            "default. Televisions only — not DVD players, VCRs, AV receivers, "
+            "satellite equipment, mounts, remotes or TV furniture."
         ),
     )
     if _tv_now != _tv_prev:

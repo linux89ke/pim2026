@@ -195,15 +195,22 @@ FLAG_CACHE_DIR = "app_cache_flags"
 # subcategories (Smart TVs and Large screen TV are later additions than the
 # rest), and a hardcoded list would quietly stop covering them.
 #
-# The prefix is deliberately narrow. Matching "TV" anywhere in a path also
-# catches "Books, Movies and Music / DVDs / Reality TV", car tuners, TV trays
-# and wall mounts — 102 categories rather than 34.
+# The prefix is deliberately narrow. Matching "TV" anywhere in a path catches
+# 102 categories including "Books, Movies and Music / DVDs / Reality TV", car
+# tuners, TV trays, wall mounts and remotes. Stopping one level higher, at
+# "Electronics / Television & Video /", still gives 34 — that tree also holds
+# DVD players, VCRs, AV receivers, satellite dishes and projection screens,
+# which do have a colour worth declaring.
 #
-# Note this covers the CHILDREN of the node. The node itself,
-# "Electronics / Television & Video" (code 1018021), does not end in the
-# separator and so is not matched; a product filed directly on the parent is
-# still colour-checked.
-TV_COLOR_EXEMPT_PREFIX = "Electronics / Television & Video / "
+# This is televisions and nothing else: the Televisions node plus its six
+# subcategories.
+#
+# The node itself is matched as well as its children. Products are routinely
+# filed on a parent rather than a leaf, and a listing sitting directly in
+# "Televisions" not being covered by the televisions exemption would be a gap
+# nobody would predict from the toggle's label.
+TV_COLOR_EXEMPT_NODE = "Electronics / Television & Video / Televisions"
+TV_COLOR_EXEMPT_PREFIX = TV_COLOR_EXEMPT_NODE + " / "
 
 ASPECT_REJECT_TALL = 2.5      # taller than 2.5x its width  -> rejected
 ASPECT_REJECT_WIDE = 0.4      # wider than 2.5x its height  -> rejected
