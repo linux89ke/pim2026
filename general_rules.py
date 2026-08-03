@@ -50,7 +50,7 @@ class CategoryRule:
     want checking before it goes live."""
 
     id: str
-    keyword: str
+    keyword: object                     # str, or a list of them — any one matching fires
     wrong_in: List[str]                 # category paths; a prefix covers the subtree
     comment: str
     flag: str = ""                      # defaults to a title derived from id
@@ -60,6 +60,77 @@ class CategoryRule:
     reason: str = WRONG_CATEGORY_REASON
     active: bool = True
     columns: List[str] = field(default_factory=lambda: ["NAME", "CATEGORY_CODE"])
+
+
+@dataclass
+class GenericCategoryRule:
+    """Reject anything filed on a branch node that has children.
+
+    "Small Appliances" is not a category a blender belongs in — it is the shelf
+    the blender categories sit on. Filing on the parent when 87 subcategories
+    exist below it is a miscategorisation even though the department is right.
+
+    Only the node itself is matched, never its children: the whole point is
+    that the children are the correct destinations."""
+
+    id: str
+    parent: str                         # exact category path of the branch node
+    comment: str
+    flag: str = ""
+    countries: Optional[List[str]] = None
+    reason: str = WRONG_CATEGORY_REASON
+    active: bool = True
+    columns: List[str] = field(default_factory=lambda: ["CATEGORY_CODE"])
+
+
+@dataclass
+class FdaRule:
+    """Products that need FDA registration wherever they are filed.
+
+    This is the follow-up to a category rule: once a product is somewhere
+    plausible, being in the right place is not the end of it. A regulated
+    product still has to carry its registration number, and the category rule
+    has nothing to say about that.
+
+    `except_in` skips the categories another rule already rejects, so a listing
+    is not reported twice for two different reasons."""
+
+    id: str
+    keyword: object
+    comment: str
+    flag: str = ""
+    except_in: List[str] = field(default_factory=list)
+    match: str = "word"
+    countries: Optional[List[str]] = None
+    reason: str = "1000007 - Other Reason"
+    active: bool = True
+    columns: List[str] = field(default_factory=lambda: ["NAME", "CATEGORY_CODE", "FDA"])
+
+
+# Values that mean "no FDA number", matching check_fda in streamlit_app.py.
+_FDA_EMPTY = {"", "nan", "none", "nat", "n/a"}
+
+# One list, used by both the miscategorisation rule and the FDA rule below.
+# Kept in one place so adding a term covers both without having to remember
+# that there are two.
+SEXUAL_WELLNESS_TERMS = [
+    "titan gel",
+    "mki enlargement",
+    "max men",
+    "penis enlargement",
+    "erectile dysfunction",
+    "maxman gold",
+    "delay gel",
+    "mk improved",
+    "libido boost",
+    "mk provocative",
+    "vagina tightening",
+    # Both spellings: the source list has "Perfomance", which is how it is
+    # often written on the listing itself, but the correct spelling turns up
+    # just as often.
+    "maximal perfomance",
+    "maximal performance",
+]
 
 
 # ── The rules ──────────────────────────────────────────────────────────────
@@ -81,14 +152,41 @@ RULES: List[CategoryRule] = [
     # Creams, Lotions & Gels alone. Naming one code would catch one filing and
     # miss the rest.
     CategoryRule(
-        id="titan-gel-in-shaving",
-        flag="Titan Gel in shaving category",
-        keyword="titan gel",
+        id="sexual-wellness-in-shaving",
+        flag="Sexual wellness product in shaving category",
+        keyword=SEXUAL_WELLNESS_TERMS,
         wrong_in=[
             "Health & Beauty / Beauty & Personal Care / Personal Care / Shave & Hair Removal",
             "Health & Beauty / Personal Care / Shave & Hair Removal",
         ],
-        comment="Titan Gel filed as a shaving product — not a shaving cream, lotion or gel",
+        comment="Sexual wellness product filed as a shaving product — not a shaving cream, lotion or gel",
+    ),
+
+    # Being somewhere plausible is not the end of it. These are regulated
+    # products, so once they are out of the shaving branch the question stops
+    # being where they are filed and becomes whether they carry a registration
+    # number. except_in skips the shave categories the rule above already
+    # rejects, so nothing is reported twice for two different reasons.
+    FdaRule(
+        id="sexual-wellness-needs-fda",
+        flag="Sexual wellness product without FDA registration",
+        keyword=SEXUAL_WELLNESS_TERMS,
+        except_in=[
+            "Health & Beauty / Beauty & Personal Care / Personal Care / Shave & Hair Removal",
+            "Health & Beauty / Personal Care / Shave & Hair Removal",
+        ],
+        comment="Sexual wellness product with no FDA registration number",
+    ),
+
+    # The parent of 87 subcategories. Filing directly on it is a
+    # miscategorisation even though the department is right — a blender belongs
+    # in Blenders, not on the shelf the blender categories sit on.
+    GenericCategoryRule(
+        id="small-appliances-parent",
+        flag="Filed on Small Appliances instead of a subcategory",
+        parent="Home & Office / Home & Kitchen / Kitchen & Dining / Small Appliances",
+        comment="Filed on the Small Appliances parent category — a more specific "
+                "subcategory exists and should be used",
     ),
 
     # ── From the weekly search-quality reports ─────────────────────────────
@@ -150,17 +248,28 @@ RULES: List[CategoryRule] = [
 
 # ── Engine ─────────────────────────────────────────────────────────────────
 
-def _keyword_pattern(keyword: str, match: str) -> re.Pattern:
-    kw = re.escape(str(keyword).strip())
-    # Multi-word keywords tolerate any run of whitespace between the words, so
-    # "titan  gel" and "titan gel" both match.
-    kw = kw.replace(r"\ ", r"\s+")
+def _keyword_pattern(keyword, match: str) -> Optional[re.Pattern]:
+    """One pattern for a keyword or a list of them. Any one matching fires."""
+    words = [keyword] if isinstance(keyword, str) else list(keyword or [])
+    parts = []
+    for w in words:
+        kw = str(w).strip()
+        if not kw:
+            continue
+        kw = re.escape(kw)
+        # Multi-word keywords tolerate any run of whitespace between the words,
+        # so "titan  gel" and "titan gel" both match.
+        kw = kw.replace(r"\ ", r"\s+")
+        parts.append(kw)
+    if not parts:
+        return None
+    body = "|".join(parts)
     if match == "substring":
-        return re.compile(kw, re.IGNORECASE)
+        return re.compile(f"(?:{body})", re.IGNORECASE)
     # Lookarounds rather than \b: \b treats "-" as a boundary, so "titan-gel"
     # would match on \b and not here. Both readings are defensible; this one
     # is consistent with the rest of the app.
-    return re.compile(rf"(?<!\w){kw}(?!\w)", re.IGNORECASE)
+    return re.compile(rf"(?<!\w)(?:{body})(?!\w)", re.IGNORECASE)
 
 
 def _codes_under(paths: List[str], code_to_path: Dict) -> set:
@@ -176,45 +285,98 @@ def _codes_under(paths: List[str], code_to_path: Dict) -> set:
     return out
 
 
-def _make_check(rule: CategoryRule, codes: set):
-    def _check(data: pd.DataFrame, **_kwargs) -> pd.DataFrame:
+def _cat_series(data):
+    """Cleaned category codes, reusing _cat_clean when the pipeline made it."""
+    if "_cat_clean" in data.columns:
+        return data["_cat_clean"]
+    return data["CATEGORY_CODE"].fillna("").astype(str).map(clean_category_code)
+
+
+def _emit(data, hit, comment: str, reason: str):
+    if not hit.any():
+        return pd.DataFrame(columns=data.columns)
+    flagged = data[hit].copy()
+    flagged["Comment_Detail"] = comment
+    flagged["Reason"] = reason
+    return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
+
+
+def _make_category_check(rule, codes: set):
+    pat = _keyword_pattern(rule.keyword, rule.match)
+
+    def _check(data, **_kwargs):
         if data is None or data.empty or not codes:
             return pd.DataFrame(columns=getattr(data, "columns", []))
-        if not {"NAME", "CATEGORY_CODE"}.issubset(data.columns):
+        if "CATEGORY_CODE" not in data.columns:
             return pd.DataFrame(columns=data.columns)
-
-        cat = (
-            data["_cat_clean"]
-            if "_cat_clean" in data.columns
-            else data["CATEGORY_CODE"].fillna("").astype(str).map(clean_category_code)
-        )
-        in_scope = cat.isin(codes)
+        in_scope = _cat_series(data).isin(codes)
         if not in_scope.any():
             return pd.DataFrame(columns=data.columns)
-
-        if str(rule.keyword).strip():
-            pat = _keyword_pattern(rule.keyword, rule.match)
-            names = data["NAME"].fillna("").astype(str)
-            hit = in_scope & names.str.contains(pat, na=False)
+        if pat is None:
+            hit = in_scope                      # no keyword: the category is the offence
         else:
-            # No keyword: the category itself is the offence.
-            hit = in_scope
-        if not hit.any():
-            return pd.DataFrame(columns=data.columns)
-
-        flagged = data[hit].copy()
+            if "NAME" not in data.columns:
+                return pd.DataFrame(columns=data.columns)
+            hit = in_scope & data["NAME"].fillna("").astype(str).str.contains(pat, na=False)
         detail = rule.comment
-        if rule.belongs:
+        if getattr(rule, "belongs", ""):
             detail = f"{detail} (should be: {rule.belongs})"
-        flagged["Comment_Detail"] = detail
-        flagged["Reason"] = rule.reason
-        return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
+        return _emit(data, hit, detail, rule.reason)
 
     return _check
 
 
-def _flag_name(rule: CategoryRule) -> str:
+def _make_generic_check(rule, codes: set):
+    def _check(data, **_kwargs):
+        if data is None or data.empty or not codes:
+            return pd.DataFrame(columns=getattr(data, "columns", []))
+        if "CATEGORY_CODE" not in data.columns:
+            return pd.DataFrame(columns=data.columns)
+        return _emit(data, _cat_series(data).isin(codes), rule.comment, rule.reason)
+
+    return _check
+
+
+def _fda_missing(data):
+    if "FDA" not in data.columns:
+        # No FDA column at all: nothing carries a number, so every match counts.
+        return pd.Series(True, index=data.index)
+    v = data["FDA"].fillna("").astype(str).str.strip().str.lower()
+    return v.isin(_FDA_EMPTY)
+
+
+def _make_fda_check(rule, except_codes: set):
+    pat = _keyword_pattern(rule.keyword, rule.match)
+
+    def _check(data, **_kwargs):
+        if data is None or data.empty or pat is None:
+            return pd.DataFrame(columns=getattr(data, "columns", []))
+        if "NAME" not in data.columns:
+            return pd.DataFrame(columns=data.columns)
+        hit = data["NAME"].fillna("").astype(str).str.contains(pat, na=False)
+        if except_codes and "CATEGORY_CODE" in data.columns:
+            hit &= ~_cat_series(data).isin(except_codes)
+        hit &= _fda_missing(data)
+        return _emit(data, hit, rule.comment, rule.reason)
+
+    return _check
+
+
+def _flag_name(rule) -> str:
     return rule.flag or rule.id.replace("-", " ").title()
+
+
+def _active(rule, country_code: str) -> bool:
+    if not rule.active:
+        return False
+    if rule.countries and country_code and country_code not in rule.countries:
+        return False
+    return True
+
+
+def _exact_codes(path: str, code_to_path: Dict) -> set:
+    return {clean_category_code(str(c)) for c, p in (code_to_path or {}).items()
+            if str(p).strip() == str(path).strip()}
 
 
 def build_validators(support_files: Dict, country_code: str = "") -> List[tuple]:
@@ -222,10 +384,26 @@ def build_validators(support_files: Dict, country_code: str = "") -> List[tuple]
     code_to_path = (support_files or {}).get("code_to_path") or {}
     out = []
     for rule in RULES:
-        if not rule.active:
+        if not _active(rule, country_code):
             continue
-        if rule.countries and country_code and country_code not in rule.countries:
+
+        if isinstance(rule, GenericCategoryRule):
+            # Exact node only. Its children are the correct destinations, so
+            # matching the subtree would reject the very filings this wants.
+            codes = _exact_codes(rule.parent, code_to_path)
+            if not codes:
+                logger.warning("general_rules: %s did not resolve %s", rule.id, rule.parent)
+                continue
+            out.append((_flag_name(rule), _make_generic_check(rule, codes), {}))
             continue
+
+        if isinstance(rule, FdaRule):
+            # except_in may legitimately be empty — the rule then applies
+            # everywhere, so an empty scope is not a failure here.
+            out.append((_flag_name(rule),
+                        _make_fda_check(rule, _codes_under(rule.except_in, code_to_path)), {}))
+            continue
+
         codes = _codes_under(rule.wrong_in, code_to_path)
         if not codes:
             # The category map did not resolve any of the paths. Skipping is
@@ -235,7 +413,7 @@ def build_validators(support_files: Dict, country_code: str = "") -> List[tuple]
             logger.warning("general_rules: %s matched no categories for %s",
                            rule.id, rule.wrong_in)
             continue
-        out.append((_flag_name(rule), _make_check(rule, codes), {}))
+        out.append((_flag_name(rule), _make_category_check(rule, codes), {}))
     return out
 
 
@@ -248,15 +426,21 @@ def build_scopes(code_to_path: Dict, country_code: str = "") -> Dict:
     """
     scopes = {}
     for rule in RULES:
-        if not rule.active:
+        if not _active(rule, country_code):
             continue
-        if rule.countries and country_code and country_code not in rule.countries:
-            continue
+        if isinstance(rule, GenericCategoryRule):
+            wrong = _exact_codes(rule.parent, code_to_path)
+        elif isinstance(rule, FdaRule):
+            wrong = _codes_under(rule.except_in, code_to_path)
+        else:
+            wrong = _codes_under(rule.wrong_in, code_to_path)
         scopes[rule.id] = {
             "rule": rule,
-            "wrong": _codes_under(rule.wrong_in, code_to_path),
-            "belongs": _codes_under([rule.belongs], code_to_path) if rule.belongs else set(),
-            "pattern": _keyword_pattern(rule.keyword, rule.match) if str(rule.keyword).strip() else None,
+            "wrong": wrong,
+            "belongs": (_codes_under([rule.belongs], code_to_path)
+                        if isinstance(rule, CategoryRule) and rule.belongs else set()),
+            "pattern": (None if isinstance(rule, GenericCategoryRule)
+                        else _keyword_pattern(rule.keyword, rule.match)),
         }
     return scopes
 
@@ -264,27 +448,27 @@ def build_scopes(code_to_path: Dict, country_code: str = "") -> Dict:
 def audit_record(rec: Dict, scopes: Dict, country_code: str = "") -> List[Dict]:
     """Judge a single ZIP record against the rules, for the targeted audit.
 
-    Returns one entry per rule that has something to say. `kind` is either:
+    Each entry carries `against`, naming which of the file's own checks the
+    verdict should be compared with — a category rule disagrees with the file's
+    category decision, an FDA rule with its FDA decision. Comparing an FDA
+    finding against the category column would report a false approval every
+    time the file happened to reject the product for something else.
 
-      violation        — the rule fires: this product is filed where the rule
-                         says it must not be. If the ZIP approved it, the ZIP
-                         is wrong.
-      correct_placement — the keyword matches and the product is sitting in the
-                         category the rule says it belongs in. If the ZIP
-                         rejected it on category, the ZIP is wrong the other
-                         way.
+    `kind` is one of:
 
-    Only rules carrying `belongs` can produce the second kind. A rule asserts
-    where something must NOT be; without `belongs` it never asserts that any
-    placement is right, so inferring a false rejection from silence would be
-    unfounded — the product could be failing any number of other checks.
+      violation         — the rule fires. If the file did not reject, it missed it.
+      correct_placement — the keyword matches and the product sits where the
+                          rule says it belongs. If the file rejected it on
+                          category, the file is wrong the other way.
+
+    Only rules carrying `belongs` produce the second kind. A rule asserts where
+    something must NOT be; without `belongs` it never asserts a placement is
+    right, so reading a false rejection out of its silence would be unfounded.
     """
     out: List[Dict] = []
     if not rec or not scopes:
         return out
     code = clean_category_code(str(rec.get("CATEGORY_CODE", "") or ""))
-    if not code:
-        return out
     name = str(rec.get("NAME", "") or "")
 
     for scope in scopes.values():
@@ -293,14 +477,26 @@ def audit_record(rec: Dict, scopes: Dict, country_code: str = "") -> List[Dict]:
         if pat is not None and not pat.search(name):
             continue
 
+        if isinstance(rule, FdaRule):
+            if code and code in scope["wrong"]:
+                continue                       # the category rule owns this one
+            fda = str(rec.get("FDA", "") or "").strip().lower()
+            if fda not in _FDA_EMPTY:
+                continue
+            out.append({"rule": _flag_name(rule), "kind": "violation", "against": "fda",
+                        "reason_type": _flag_name(rule), "detail": rule.comment})
+            continue
+
+        if not code:
+            continue
         if code in scope["wrong"]:
             detail = rule.comment
-            if rule.belongs:
+            if isinstance(rule, CategoryRule) and rule.belongs:
                 detail = f"{detail} (should be: {rule.belongs})"
-            out.append({"rule": _flag_name(rule), "kind": "violation",
+            out.append({"rule": _flag_name(rule), "kind": "violation", "against": "category",
                         "reason_type": _flag_name(rule), "detail": detail})
         elif scope["belongs"] and code in scope["belongs"]:
-            out.append({"rule": _flag_name(rule), "kind": "correct_placement",
+            out.append({"rule": _flag_name(rule), "kind": "correct_placement", "against": "category",
                         "reason_type": f"{_flag_name(rule)} — correctly placed",
                         "detail": f"Already filed under {rule.belongs}, which is where this "
                                   f"product belongs."})
@@ -318,15 +514,39 @@ def rule_health(support_files: Dict) -> pd.DataFrame:
     code_to_path = (support_files or {}).get("code_to_path") or {}
     rows = []
     for rule in RULES:
-        codes = _codes_under(rule.wrong_in, code_to_path) if rule.active else set()
+        if isinstance(rule, GenericCategoryRule):
+            kind, keyword = "generic category", "(any product)"
+            codes = _exact_codes(rule.parent, code_to_path) if rule.active else set()
+            # An unresolved parent means the rule can never fire.
+            status = "off" if not rule.active else ("path not found" if not codes else "ok")
+        elif isinstance(rule, FdaRule):
+            kind = "fda"
+            keyword = _kw_label(rule.keyword)
+            codes = _codes_under(rule.except_in, code_to_path) if rule.active else set()
+            # except_in is an exclusion list; empty just means "applies
+            # everywhere", so it is never a failure for this type.
+            status = "off" if not rule.active else "ok"
+        else:
+            kind = "category"
+            keyword = _kw_label(rule.keyword)
+            codes = _codes_under(rule.wrong_in, code_to_path) if rule.active else set()
+            status = ("off" if not rule.active
+                      else "no categories matched" if not codes else "ok")
         rows.append({
             "Rule": _flag_name(rule),
-            "Keyword": rule.keyword,
-            "Match": rule.match,
+            "Type": kind,
+            "Keyword": keyword,
             "Categories": len(codes),
             "Active": rule.active,
-            "Status": ("off" if not rule.active
-                       else "no categories matched" if not codes
-                       else "ok"),
+            "Status": status,
         })
     return pd.DataFrame(rows)
+
+
+def _kw_label(keyword) -> str:
+    if isinstance(keyword, str):
+        return keyword or "(any product)"
+    words = list(keyword or [])
+    if not words:
+        return "(any product)"
+    return f"{words[0]} +{len(words) - 1} more" if len(words) > 1 else words[0]

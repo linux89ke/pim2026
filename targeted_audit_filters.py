@@ -770,27 +770,37 @@ def evaluate_all_checks(data: pd.DataFrame, country_code: str) -> pd.DataFrame:
         # something must NOT be; absence of a rule is not a statement that the
         # listing is fine, and the file may well have rejected it for a reason
         # no rule here covers.
-        _gr_status_col, _gr_reason_col = _CHECK_COLUMNS["category"]
-        _gr_status = _clean(rec.get(_gr_status_col)).lower() if _gr_status_col in status_cols_present else ""
-        _gr_reason = _clean(rec.get(_gr_reason_col))
-        _gr_rejected = (
-            (_gr_status in ("rejected", "review", "manual review"))
-            or (not _gr_status and _gr_reason and "error" not in _gr_reason.lower())
-        )
+        # Each finding says which of the file's own checks it argues with, so
+        # an FDA finding is compared against the FDA verdict and not the
+        # category one — otherwise every product the file happened to reject
+        # for the wrong thing would read as a false approval.
+        def _file_verdict(_key):
+            _sc, _rc = _CHECK_COLUMNS[_key]
+            _st = _clean(rec.get(_sc)).lower() if _sc in status_cols_present else ""
+            _rn = _clean(rec.get(_rc))
+            _rej = (
+                (_st in ("rejected", "review", "manual review"))
+                or (not _st and _rn and "error" not in _rn.lower())
+            )
+            return _rej, _rn
+
         try:
             for _gr in _general_audit_record(rec, _gr_scopes, country_code):
-                if _gr["kind"] == "violation" and not _gr_rejected:
+                _against = _gr.get("against", "category")
+                _rejected, _reason_txt = _file_verdict(_against)
+                _what = "on category" if _against == "category" else "for FDA"
+                if _gr["kind"] == "violation" and not _rejected:
                     rows.append({**_base_row(sid, "general_rule", rec),
                                  "Reason Type": _gr["reason_type"],
                                  "Verdict": "False Approval",
                                  "Detail": f"{_gr['detail']} The file did not reject this "
-                                           f"product on category."})
-                elif _gr["kind"] == "correct_placement" and _gr_rejected:
+                                           f"product {_what}."})
+                elif _gr["kind"] == "correct_placement" and _rejected:
                     rows.append({**_base_row(sid, "general_rule", rec),
                                  "Reason Type": _gr["reason_type"],
                                  "Verdict": "False Rejection",
-                                 "Detail": f"{_gr['detail']} The file rejected it on category: "
-                                           f"{_gr_reason or '(no reason given)'}"})
+                                 "Detail": f"{_gr['detail']} The file rejected it {_what}: "
+                                           f"{_reason_txt or '(no reason given)'}"})
         except Exception:
             logger.exception("general_rules audit failed for %s", sid)
 
