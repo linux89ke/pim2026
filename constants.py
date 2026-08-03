@@ -190,6 +190,21 @@ FLAG_CACHE_DIR = "app_cache_flags"
 # 1.5 is also an ordinary product photo: a 2:3 portrait shot is 1.5 exactly,
 # so bottles, standing figures and portrait packaging were auto-rejected on
 # shape alone.
+# ── TV colour exemption (temporary) ────────────────────────────────────────
+# Scoped by category PATH prefix, not by a frozen list of codes: the tree gains
+# subcategories (Smart TVs and Large screen TV are later additions than the
+# rest), and a hardcoded list would quietly stop covering them.
+#
+# The prefix is deliberately narrow. Matching "TV" anywhere in a path also
+# catches "Books, Movies and Music / DVDs / Reality TV", car tuners, TV trays
+# and wall mounts — 102 categories rather than 34.
+#
+# Note this covers the CHILDREN of the node. The node itself,
+# "Electronics / Television & Video" (code 1018021), does not end in the
+# separator and so is not matched; a product filed directly on the parent is
+# still colour-checked.
+TV_COLOR_EXEMPT_PREFIX = "Electronics / Television & Video / "
+
 ASPECT_REJECT_TALL = 2.5      # taller than 2.5x its width  -> rejected
 ASPECT_REJECT_WIDE = 0.4      # wider than 2.5x its height  -> rejected
 ASPECT_ADVISORY_TALL = 1.5    # 1.5 - 2.5 -> commentary in the grid only
