@@ -825,6 +825,18 @@ if "zip_image_index" not in st.session_state:
 if "zip_image_source_bytes" not in st.session_state:
     st.session_state.zip_image_source_bytes = None
 
+# TV colour exemption — ON by default, temporarily, until the seven television
+# categories are set to "No Need" in QC Check Validaton.xlsx. That sheet is
+# what actually asserts televisions need a colour; this is an override sitting
+# on top of it, which is why it is meant to be removed rather than kept.
+#
+# Seeded here rather than left to the sidebar toggle's default. Three of the
+# four places that read this use a bare .get(), which returns None when the key
+# is absent — so on the first run of a session, before the sidebar has
+# rendered, the exemption would silently be off for the batch being processed.
+if "tv_color_exempt" not in st.session_state:
+    st.session_state.tv_color_exempt = True
+
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 SID_COLUMN_CANDIDATES = ["PRODUCT_SET_SID", "ProductSetSid", "Product Set SID", "cod_productset_sid", "SID"]
 
@@ -4085,7 +4097,7 @@ with st.sidebar:
     # Kept visibly separate from display settings: these change what gets
     # rejected, not how it looks, and they are meant to be switched off again.
     st.header("Temporary rules")
-    _tv_prev = bool(st.session_state.get("tv_color_exempt", False))
+    _tv_prev = bool(st.session_state.get("tv_color_exempt", True))
     _tv_now = st.toggle(
         "Exempt TVs from colour checks",
         value=_tv_prev,
@@ -4093,9 +4105,10 @@ with st.sidebar:
         help=(
             "Skips the Missing COLOR check for everything under "
             "Electronics / Television & Video / Televisions / …, and approves "
-            "anything the ZIP rejected for colour in those categories. Off by "
-            "default. Televisions only — not DVD players, VCRs, AV receivers, "
-            "satellite equipment, mounts, remotes or TV furniture."
+            "anything the ZIP rejected for colour in those categories, and "
+            "reports those as false rejections in the audit. ON by default, "
+            "temporarily. Televisions only — not DVD players, VCRs, AV "
+            "receivers, satellite equipment, mounts, remotes or TV furniture."
         ),
     )
     if _tv_now != _tv_prev:
