@@ -2255,14 +2255,31 @@ _EMAIL_RE = re.compile(
 
 # Physical locations. Kept to explicit address markers — a generic
 # "<word> road" rule would flag product names like "Silk Road" or "Abbey Road".
+#
+# The landmarks a directions phrase points at. Shared by "opposite" and "next
+# to" so the two cannot drift apart again — the second was anchored to a list
+# like this and the first was not, which is how "opposite direction" came to
+# read as a shop address.
+_LANDMARK_ALT = (
+    r"(?:building|mall|plaza|arcade|market|stage|station|petrol|filling|"
+    r"supermarket|hospital|clinic|pharmacy|church|mosque|school|college|"
+    r"university|hotel|lodge|bank|atm|roundabout|junction|stadium|towers?|"
+    r"centre|center|complex|shop|store|showroom|godown|depot)\b"
+)
+
 _LOCATION_RE = re.compile(
     r"(?:"
     r"\bp\.?\s*o\.?\s*box\s*\d+"                                # P.O. Box 123
     r"|\b(?:shop|stall|suite|kiosk|office)\s*(?:no\.?|number|#)?\s*\d+"
     r"|\b\d+\s*(?:st|nd|rd|th)?\s*floor\b"
     r"|\balong\s+[a-z]+\s+(?:road|rd|street|st|avenue|ave)\b"
-    r"|\bopposite\s+(?:the\s+)?[a-z]+"
-    r"|\bnext\s+to\s+(?:the\s+)?[a-z]+\s+(?:building|mall|plaza|arcade|market|stage)"
+    # "opposite" and "next to" both need a landmark after them. Without one,
+    # "opposite <any word>" flagged "opposite direction", "opposite ends",
+    # "opposite side" and "opposite pattern" — ordinary product wording, and a
+    # fan or a reversible jacket got reported for off-platform contact. The
+    # "next to" rule beside it was always anchored this way; this one was not.
+    r"|\bopposite\s+(?:the\s+)?(?:[a-z]+\s+){0,2}" + _LANDMARK_ALT +
+    r"|\bnext\s+to\s+(?:the\s+)?(?:[a-z]+\s+){0,2}" + _LANDMARK_ALT +
     r"|\b(?:visit|come\s+to|located\s+at|find\s+us\s+at)\s+(?:our\s+)?"
     r"(?:shop|store|office|showroom)\b"
     # French — "BP 1234", "boîte postale", "magasin n° 12", "2ème étage",
