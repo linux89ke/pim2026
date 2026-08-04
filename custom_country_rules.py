@@ -1,6 +1,9 @@
 import logging
+import os
+import re
 
 import pandas as pd
+import streamlit as st
 
 logger = logging.getLogger(__name__)
 
@@ -84,46 +87,6 @@ def drop_kenya_books_false_positives(
     keep = ~paths.apply(is_kenya_books_exempt)
     return flagged[keep].copy()
 
-
-def check_kenya_book_category(data: pd.DataFrame) -> pd.DataFrame:
-    """
-    Return Kenya book-mismatch rows as a normal QC DataFrame.
-
-    This is used by the main validation pipeline so Kenya books that are
-    mis-categorized are rejected, not just reported in the audit dialog.
-    """
-    required = {"PRODUCT_SET_SID", "NAME", "BRAND", "CATEGORY", "CATEGORY_CODE"}
-    if data.empty or not required.issubset(data.columns):
-        return pd.DataFrame(columns=data.columns)
-
-    d = data.copy()
-    name_lower = d["NAME"].astype(str).str.lower()
-    brand_lower = d["BRAND"].astype(str).str.lower()
-    cat_lower = d["CATEGORY"].astype(str).str.lower()
-    cat_code_lower = d["CATEGORY_CODE"].astype(str).str.lower()
-
-    is_book_product = (
-        name_lower.str.contains(r"\bauthor\b|\bbook by\b", regex=True, na=False)
-        | brand_lower.str.contains(r"\bauthor\b|\bbook by\b", regex=True, na=False)
-    )
-    is_book_cat = cat_lower.str.contains("book", na=False) | cat_code_lower.str.contains("book", na=False)
-    flagged = d[is_book_product & ~is_book_cat].copy()
-    if flagged.empty:
-        return pd.DataFrame(columns=data.columns)
-
-    flagged["Comment_Detail"] = flagged.apply(
-        lambda row: (
-            f"Product name/brand indicates a book, but category "
-            f"'{_clean_text(row.get('CATEGORY'))}' is not a book category."
-        ),
-        axis=1,
-    )
-    return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
-
-
-import re
-import os
-import streamlit as st
 
 @st.cache_data(ttl=3600)
 def load_health_beauty_codes() -> set:

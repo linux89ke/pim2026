@@ -102,7 +102,7 @@ from data_utils import (
     validate_input_schema,
     normalize_text,
 )
-from custom_country_rules import check_kenya_book_category, check_kebs_banned_products, load_kebs_hb_codes, check_kebs_fda
+from custom_country_rules import check_kebs_banned_products, load_kebs_hb_codes, check_kebs_fda
 from ghana_rules import check_ghana_smart_glasses, load_ghana_qc_rules
 from loaders import compile_regex_patterns, load_support_files_lazy
 from morocco_rules import check_morocco_prohibited_brands, load_morocco_qc_rules
@@ -1188,12 +1188,17 @@ def check_miscellaneous_category(
         except:
             pass
 
-    custom_flagged = pd.DataFrame(columns=data.columns)
-    if str(country_code or "").upper() == "KE":
-        try:
-            custom_flagged = check_kenya_book_category(data)
-        except Exception as _e:
-            logger.warning("Kenya book rule failed: %s", _e)
+    # check_kenya_book_category ran here for Kenya. It decided "is this a
+    # book category?" with `"book" in CATEGORY`, and CATEGORY carries the
+    # leaf — so a book correctly filed in "Books, Movies and Music /
+    # Business & Finance / Business & Economics" arrived as "Business &
+    # Economics", failed the test and was rejected. Its findings also went
+    # straight into the result, bypassing the Books exemption applied to the
+    # matcher output below, so nothing downstream could undo it.
+    #
+    # Books are judged by the same category matcher as everything else now,
+    # and drop_kenya_books_false_positives protects the ones already filed
+    # correctly — splitting the path properly and keeping DVDs in scope.
 
     if _CAT_MATCHER_AVAILABLE:
         try:
@@ -1226,22 +1231,17 @@ def check_miscellaneous_category(
                             )
                     except Exception as _e:
                         logger.warning("Kenya books exemption failed: %s", _e)
-                if not custom_flagged.empty:
-                    flagged = pd.concat([custom_flagged, base_flagged], ignore_index=True)
-                    return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
                 return base_flagged
         except Exception as _e:
             logger.warning("check_wrong_category engine error: %s", _e)
 
     if "CATEGORY" not in data.columns:
-        return custom_flagged if not custom_flagged.empty else pd.DataFrame(columns=data.columns)
+        return pd.DataFrame(columns=data.columns)
     flagged = data[
         data["CATEGORY"].astype(str).str.contains("miscellaneous", case=False, na=False)
     ].copy()
     if not flagged.empty:
         flagged["Comment_Detail"] = "Category contains 'Miscellaneous'"
-    if not custom_flagged.empty:
-        flagged = pd.concat([custom_flagged, flagged], ignore_index=True)
     return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
