@@ -896,7 +896,20 @@ def _fetch_all_image_dimensions(data: pd.DataFrame) -> dict:
     with _IMAGE_DIM_LOCK:
         new_urls = list(dict.fromkeys(u for u in urls if u and u not in _IMAGE_DIM_CACHE))
 
-    zip_images_to_check = []
+    # Descriptors only — three short strings per image, not the image itself.
+    #
+    # This used to collect the decoded payload for every ZIP image up front and
+    # hold them all until the last one had been measured. _get_image_from_zip
+    # returns a base64 data URI, roughly 1.37x the raw file, so a batch of
+    # 3,000 images at 150KB each parked about 0.6GB in one list before any work
+    # started; 6,000 images, or larger photos, doubled that. The store those
+    # payloads pass through is capped at 300 entries, which looks like a bound
+    # and is not one: the list held its own reference to every payload, so
+    # eviction from the store freed nothing.
+    #
+    # Each image is needed for as long as it takes to read its size and hash.
+    # Holding it after that was the whole cost.
+    zip_descriptors = []
     store = st.session_state.get("zip_image_store", {})
     if store and "MAIN_IMAGE" in data.columns:
         _zip_mask = (
@@ -913,13 +926,13 @@ def _fetch_all_image_dimensions(data: pd.DataFrame) -> dict:
                 img_val = str(_zrow.MAIN_IMAGE)
                 if img_val in _IMAGE_DIM_CACHE:
                     continue
-                name = str(getattr(_zrow, "NAME", ""))
-                brand = str(getattr(_zrow, "BRAND", ""))
-                img_bytes = _get_image_from_zip(name, brand, img_val)
-                if img_bytes:
-                    zip_images_to_check.append((img_val, img_bytes))
+                zip_descriptors.append((
+                    img_val,
+                    str(getattr(_zrow, "NAME", "")),
+                    str(getattr(_zrow, "BRAND", "")),
+                ))
 
-    if not new_urls and not zip_images_to_check:
+    if not new_urls and not zip_descriptors:
         return _IMAGE_DIM_CACHE
 
     def fetch(url):
@@ -960,9 +973,30 @@ def _fetch_all_image_dimensions(data: pd.DataFrame) -> dict:
         with concurrent.futures.ThreadPoolExecutor(max_workers=_img_workers) as executor:
             results.extend(list(executor.map(fetch, new_urls)))
 
-    if zip_images_to_check:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, _img_workers)) as executor:
-            results.extend(list(executor.map(process_zip_img, zip_images_to_check)))
+    if zip_descriptors:
+        # Peak memory is now this many images rather than the whole batch, so
+        # it stays flat as batches grow. The results kept afterwards are a
+        # size tuple and a hash string per image — tens of bytes — so those can
+        # safely be held for all of them.
+        _ZIP_DECODE_CHUNK = 200
+        _zip_workers = min(8, _img_workers)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_zip_workers) as executor:
+            for _start in range(0, len(zip_descriptors), _ZIP_DECODE_CHUNK):
+                _slice = zip_descriptors[_start:_start + _ZIP_DECODE_CHUNK]
+                # Read on this thread, not in the workers. _get_image_from_zip
+                # goes through st.session_state, and calling that from a worker
+                # is what the "missing ScriptRunContext" warnings are about — it
+                # happens to work today and is not worth leaning on harder.
+                _payloads = []
+                for _img_val, _name, _brand in _slice:
+                    _payload = _get_image_from_zip(_name, _brand, _img_val)
+                    if _payload:
+                        _payloads.append((_img_val, _payload))
+                if _payloads:
+                    results.extend(list(executor.map(process_zip_img, _payloads)))
+                # Dropped before the next chunk is built, so two chunks are
+                # never alive at once.
+                _payloads = None
 
     with _IMAGE_DIM_LOCK:
         for key, size, ph in results:
