@@ -65,11 +65,6 @@ CHECK_LABELS = {
 }
 
 try:
-    from custom_country_rules import apply_kenya_book_rule
-except ImportError:
-    def apply_kenya_book_rule(*args, **kwargs): return None
-
-try:
     from general_rules import audit_record as _general_audit_record
 except Exception:  # a broken rules file must not take the audit down with it
     def _general_audit_record(*args, **kwargs): return []
@@ -845,12 +840,19 @@ def evaluate_all_checks(data: pd.DataFrame, country_code: str) -> pd.DataFrame:
             status = _clean(rec.get(status_col)).lower() if has_status_col else ""
             reason = _clean(rec.get(reason_col))
             
-            # ── Custom Country Rules ─────────────────────────────────────────
-            if check_key == "category" and country_code == "KE":
-                custom_row = apply_kenya_book_rule(sid, rec, has_status_col, status, reason, _base_row)
-                if custom_row:
-                    rows.append(custom_row)
-                    continue
+            # The Kenya book rule used to sit here, deciding whether a product
+            # was in a book category with `"book" in CATEGORY`. That reads the
+            # leaf the record carries, not the path, so a book correctly filed
+            # in "Books, Movies and Music / Business & Finance / Business &
+            # Economics" arrived as "Business & Economics", failed the
+            # substring test, and was reported as a false approval. It also
+            # failed the other way: "Nursery Decor / Bookends" contains "book"
+            # and is not a book category.
+            #
+            # Books now go through the same category verification as everything
+            # else. The Books-branch exemption still exists for validation, in
+            # custom_country_rules.is_kenya_books_exempt, which splits the path
+            # properly and keeps the DVDs sub-tree in scope.
 
             # ── Warranty contradiction check ──────────────────────────────
             # If PRODUCT_WARRANTY actually has a value, a rejection for this

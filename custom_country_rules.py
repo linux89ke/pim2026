@@ -12,17 +12,15 @@ def _clean_text(val) -> str:
     return "" if s.strip().lower() in ("nan", "none") else s.strip()
 
 
-def _kenya_book_mask(rec) -> bool:
-    name_lower = _clean_text(rec.get("NAME")).lower()
-    brand_lower = _clean_text(rec.get("BRAND")).lower()
-    cat_lower = _clean_text(rec.get("CATEGORY")).lower()
-    cat_code_lower = _clean_text(rec.get("CATEGORY_CODE")).lower()
-
-    is_book_product = any(
-        k in name_lower for k in ("author", "book by")
-    ) or any(k in brand_lower for k in ("author", "book by"))
-    is_book_cat = "book" in cat_lower or "book" in cat_code_lower
-    return is_book_product and not is_book_cat
+# _kenya_book_mask lived here. It decided whether a product was in a book
+# category with `"book" in CATEGORY`, which is wrong in both directions:
+# the audit record carries the leaf, so a book correctly filed under
+# "Books, Movies and Music / Business & Finance / Business & Economics"
+# arrived as "Business & Economics" and failed; and "Nursery Decor /
+# Bookends" contains "book" while being no kind of book category.
+#
+# Books are verified like every other category now. The exemption below is
+# the surviving definition, and it splits the path properly.
 
 
 # ── Kenya: books are exempt from the Wrong Category matcher ─────────────────
@@ -122,31 +120,6 @@ def check_kenya_book_category(data: pd.DataFrame) -> pd.DataFrame:
     )
     return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
-
-def apply_kenya_book_rule(sid: str, rec: dict, has_status_col: bool, status: str, reason: str, base_row_fn) -> dict | None:
-    """
-    If the product is a book (has 'author' or 'book by' in NAME or BRAND)
-    but its CATEGORY is not a book category, it should be flagged as Wrong Category.
-    If it's already rejected for category by the system, we do nothing (let normal QC handle it).
-    """
-    is_rejection_like = (
-        (has_status_col and status in ("rejected", "review", "manual review"))
-        or (not has_status_col and reason and "error" not in reason.lower())
-    )
-    
-    if is_rejection_like:
-        return None
-        
-    if _kenya_book_mask(rec):
-        row = base_row_fn(sid, "category", rec)
-        row.update({
-            "Reason Type": "Wrong Category (Book mapped incorrectly)",
-            "Verdict": "False Approval",
-            "Detail": f"Product name/brand indicates a book, but category '{_clean_text(rec.get('CATEGORY'))}' is not a book category. Originally: {reason or 'approved'}"
-        })
-        return row
-        
-    return None
 
 import re
 import os
