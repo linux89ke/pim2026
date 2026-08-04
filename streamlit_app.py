@@ -685,7 +685,12 @@ except Exception:  # a broken rules file must not stop the app importing
 
 # Bump when the cache-key scheme changes, so pickles written by an older scheme
 # can never be read back under a key that now means something different.
-FLAG_CACHE_KEY_VERSION = "fk2"
+# fk3: entries written while several checks shared one cache file are wrong and
+# have to be discarded rather than left to expire. Any pickle from that period
+# holds whichever sibling finished first, and the built-in Wrong Category key
+# is unchanged by the check_id fix — so without this bump it would keep serving
+# a rule's result, or an empty one, as the whole flag's verdict.
+FLAG_CACHE_KEY_VERSION = "fk3"
 
 # Columns every check implicitly depends on: results are keyed by SID, and the
 # row set itself is part of a check's input.
@@ -749,6 +754,7 @@ def flag_cache_path(
     digests: "_ColumnDigests",
     country_code: str,
     rules_sig: str,
+    check_id: str = "",
 ) -> str:
     """Where this flag's result for this exact input is cached.
 
@@ -760,9 +766,18 @@ def flag_cache_path(
     country-specific rule sets; without it, the same rows validated for a
     different country could be served another country's verdicts.
     """
+    # check_id separates checks that share a flag name. Several general rules
+    # are filed under "Wrong Category" alongside the built-in check of that
+    # name, and keying on the name alone gave all of them ONE cache file: they
+    # run concurrently, the first to finish writes it, and the rest read that
+    # sibling's result instead of computing their own. On the next run every
+    # one of them reads the same pickle, so whichever check happened to write
+    # it — an empty result from any one of them — became the verdict for the
+    # entire flag. That is a flag that silently finds nothing.
     key = "\x1e".join((
         FLAG_CACHE_KEY_VERSION,
         name,
+        check_id,
         country_code,
         rules_sig,
         digests.signature(FLAG_RELEVANT_COLS.get(name)),
@@ -3664,7 +3679,10 @@ def validate_products(
 
                 ckwargs = {"data": working_data, **kwargs}
                 cache_path = flag_cache_path(
-                    name, digests, country_validator.code, _rules_sig
+                    name, digests, country_validator.code, _rules_sig,
+                    # Empty for the built-in checks, so their cache keys are
+                    # unchanged; set by general_rules on the checks it builds.
+                    getattr(func, "_rule_id", ""),
                 )
                 future_to_name[executor.submit(run_cached_check, func, cache_path, ckwargs)] = name
 

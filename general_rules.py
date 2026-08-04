@@ -402,6 +402,9 @@ def _make_category_check(rule, codes: set):
             detail = f"{detail} (should be: {rule.belongs})"
         return _emit(data, hit, detail, rule.reason)
 
+    # Read by flag_cache_path: several rules share a flag name, and without
+    # this they would share one cache file and serve each other's results.
+    _check._rule_id = rule.id
     return _check
 
 
@@ -413,6 +416,7 @@ def _make_generic_check(rule, codes: set):
             return pd.DataFrame(columns=data.columns)
         return _emit(data, _cat_series(data).isin(codes), rule.comment, rule.reason)
 
+    _check._rule_id = rule.id
     return _check
 
 
@@ -439,6 +443,7 @@ def _make_fda_check(rule, except_codes: set):
         hit &= _fda_missing(data)
         return _emit(data, hit, rule.comment, rule.reason)
 
+    _check._rule_id = rule.id
     return _check
 
 
