@@ -190,7 +190,14 @@ RULES: List[CategoryRule] = [
     # miss the rest.
     CategoryRule(
         id="sexual-wellness-in-shaving",
-        flag="Sexual wellness product in shaving category",
+        # Filed under the existing flag: this is a miscategorisation like the
+        # DVD and Small Appliances rules, so it belongs in the expander a
+        # reviewer already opens for those. The FDA rule below keeps its own
+        # flag deliberately — a missing registration number is not a filing
+        # mistake, and folding it in here would put two different decisions
+        # behind one label.
+        flag="Wrong Category",
+        label="Sexual wellness product in shaving category",
         keyword=SEXUAL_WELLNESS_TERMS,
         brand_keyword=SEXUAL_WELLNESS_BRANDS,
         wrong_in=[
