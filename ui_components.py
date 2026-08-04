@@ -5682,6 +5682,15 @@ def render_manual_review_buttons(support_files):
             ):
                 st.session_state.show_review_modal = True
                 st.session_state.show_targeted_audit_modal = False
+                # Opening the modal always builds a NEW iframe, whose
+                # CARDS start empty. The resend guard keys off the grid
+                # document's hash, and reopening produces byte-identical
+                # HTML — so it concluded the old iframe was still alive
+                # and sent nothing, leaving a blank grid until some
+                # control changed the markup enough to force a resend.
+                # That is what "empty until I change cards per row" was.
+                st.session_state.pop("_grid_last_html_sig", None)
+                st.session_state.pop("_grid_last_sent_sig", None)
         with c3:
             if st.button(
                 _audit_label,
@@ -5709,6 +5718,15 @@ def render_manual_review_buttons(support_files):
             ):
                 st.session_state.show_review_modal = True
                 st.session_state.show_targeted_audit_modal = False
+                # Opening the modal always builds a NEW iframe, whose
+                # CARDS start empty. The resend guard keys off the grid
+                # document's hash, and reopening produces byte-identical
+                # HTML — so it concluded the old iframe was still alive
+                # and sent nothing, leaving a blank grid until some
+                # control changed the markup enough to force a resend.
+                # That is what "empty until I change cards per row" was.
+                st.session_state.pop("_grid_last_html_sig", None)
+                st.session_state.pop("_grid_last_sent_sig", None)
 
     if st.session_state.get("show_targeted_audit_modal", False):
         targeted_audit_modal(support_files)
