@@ -53,7 +53,11 @@ class CategoryRule:
     keyword: object                     # str, or a list of them — any one matching fires
     wrong_in: List[str]                 # category paths; a prefix covers the subtree
     comment: str
-    flag: str = ""                      # defaults to a title derived from id
+    flag: str = ""                      # the QC flag it is filed under
+    # How this rule is named in the audit and the rules panel. `flag` may be
+    # shared with other rules and with a built-in check, so it is too coarse
+    # to identify a finding by. Defaults to the flag when not set.
+    label: str = ""
     # Matched against BRAND instead of NAME. Either side firing is enough:
     # sellers put the same thing in either field, and a product whose brand is
     # the giveaway often has an innocuous name.
@@ -81,6 +85,7 @@ class GenericCategoryRule:
     parent: str                         # exact category path of the branch node
     comment: str
     flag: str = ""
+    label: str = ""
     countries: Optional[List[str]] = None
     reason: str = WRONG_CATEGORY_REASON
     active: bool = True
@@ -103,6 +108,7 @@ class FdaRule:
     keyword: object
     comment: str
     flag: str = ""
+    label: str = ""
     brand_keyword: object = None
     except_in: List[str] = field(default_factory=list)
     match: str = "word"
@@ -216,7 +222,8 @@ RULES: List[CategoryRule] = [
     # in Blenders, not on the shelf the blender categories sit on.
     GenericCategoryRule(
         id="small-appliances-parent",
-        flag="Filed on Small Appliances instead of a subcategory",
+        flag="Wrong Category",
+        label="Filed on Small Appliances instead of a subcategory",
         parent="Home & Office / Home & Kitchen / Kitchen & Dining / Small Appliances",
         comment="Filed on the Small Appliances parent category — a more specific "
                 "subcategory exists and should be used",
@@ -265,9 +272,15 @@ RULES: List[CategoryRule] = [
     # Scoped to DVDs alone. Its siblings under Books, Movies and Music —
     # Fiction, Magazines, Stationery, Bestselling Books and the rest — are
     # legitimate destinations and are untouched.
+    # flag="Wrong Category" files this under the existing flag rather than
+    # creating one of its own. It is a miscategorisation, so it belongs in the
+    # expander a reviewer already opens for those, with the same reason code —
+    # a separate flag would scatter the same decision across two places.
+    # Several rules may share a flag; the runner merges their findings.
     CategoryRule(
         id="anything-in-dvds",
-        flag="Listed under DVDs",
+        flag="Wrong Category",
+        label="Listed under DVDs",
         keyword="",                       # every product in the branch
         wrong_in=["Books, Movies and Music / DVDs"],
         comment="Filed under DVDs — books and other products do not belong in the DVD categories",
@@ -423,7 +436,13 @@ def _make_fda_check(rule, except_codes: set):
 
 
 def _flag_name(rule) -> str:
+    """The QC flag a rule is filed under. May be shared."""
     return rule.flag or rule.id.replace("-", " ").title()
+
+
+def _rule_label(rule) -> str:
+    """How the rule is named to a person. Unique per rule."""
+    return getattr(rule, "label", "") or rule.flag or rule.id.replace("-", " ").title()
 
 
 def _active(rule, country_code: str) -> bool:
@@ -548,8 +567,8 @@ def audit_record(rec: Dict, scopes: Dict, country_code: str = "") -> List[Dict]:
             fda = str(rec.get("FDA", "") or "").strip().lower()
             if fda not in _FDA_EMPTY:
                 continue
-            out.append({"rule": _flag_name(rule), "kind": "violation", "against": "fda",
-                        "reason_type": _flag_name(rule), "detail": rule.comment})
+            out.append({"rule": _rule_label(rule), "kind": "violation", "against": "fda",
+                        "reason_type": _rule_label(rule), "detail": rule.comment})
             continue
 
         if not code:
@@ -558,11 +577,11 @@ def audit_record(rec: Dict, scopes: Dict, country_code: str = "") -> List[Dict]:
             detail = rule.comment
             if isinstance(rule, CategoryRule) and rule.belongs:
                 detail = f"{detail} (should be: {rule.belongs})"
-            out.append({"rule": _flag_name(rule), "kind": "violation", "against": "category",
-                        "reason_type": _flag_name(rule), "detail": detail})
+            out.append({"rule": _rule_label(rule), "kind": "violation", "against": "category",
+                        "reason_type": _rule_label(rule), "detail": detail})
         elif scope["belongs"] and code in scope["belongs"]:
-            out.append({"rule": _flag_name(rule), "kind": "correct_placement", "against": "category",
-                        "reason_type": f"{_flag_name(rule)} — correctly placed",
+            out.append({"rule": _rule_label(rule), "kind": "correct_placement", "against": "category",
+                        "reason_type": f"{_rule_label(rule)} — correctly placed",
                         "detail": f"Already filed under {rule.belongs}, which is where this "
                                   f"product belongs."})
     return out
@@ -577,10 +596,12 @@ def relevant_columns() -> Dict[str, List[str]]:
     for r in RULES:
         if not r.active:
             continue
-        cols = list(r.columns)
-        if getattr(r, "brand_keyword", None) and "BRAND" not in cols:
-            cols.append("BRAND")
-        out[_flag_name(r)] = cols
+        cols = set(r.columns)
+        if getattr(r, "brand_keyword", None):
+            cols.add("BRAND")
+        # Union: several rules can share a flag, and last-wins would drop
+        # the columns every rule but one depends on.
+        out[_flag_name(r)] = sorted(set(out.get(_flag_name(r), [])) | cols)
     return out
 
 
@@ -608,7 +629,8 @@ def rule_health(support_files: Dict) -> pd.DataFrame:
             status = ("off" if not rule.active
                       else "no categories matched" if not codes else "ok")
         rows.append({
-            "Rule": _flag_name(rule),
+            "Rule": _rule_label(rule),
+            "Filed under": _flag_name(rule),
             "Type": kind,
             "Keyword": keyword,
             "Categories": len(codes),
