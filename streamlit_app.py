@@ -5228,10 +5228,35 @@ if st.session_state.get("last_processed_files") != process_signature:
                                 if str(_r.get("Manual_Review", "")).lower() in ("true", "1", "yes"):
                                     _fidx = _fr_sid_to_idx.get(_sid)
                                     if _fidx is not None:
-                                        final_report.at[_fidx, "Status"] = "Approved"
-                                        final_report.at[_fidx, "FLAG"] = "Manual review"
-                                        final_report.at[_fidx, "Comment"] = "Already Approved"
-                                        final_report.at[_fidx, "Is_Zip"] = True
+                                        # "Already approved" upstream does not overturn a rejection
+                                        # our own checks just made.
+                                        #
+                                        # This wrote Approved unconditionally, and it runs after
+                                        # validation, so it silently replaced every verdict we had
+                                        # reached — prohibited terms, restricted brands, wrong
+                                        # category, all of it. A sexual wellness product filed as a
+                                        # shaving gel was rejected by our rules and then handed back
+                                        # as Approved because the file said a human had seen it.
+                                        #
+                                        # The upstream reviewer approved it against the checks THEY
+                                        # ran; that is not a judgement about a check they never
+                                        # applied. So the override still approves anything we passed,
+                                        # and leaves our rejections alone.
+                                        _cur_status = str(final_report.at[_fidx, "Status"]).strip().lower()
+                                        if _cur_status == "rejected":
+                                            # Keep the rejection, but record that the file disagreed,
+                                            # so the conflict is visible rather than just absent.
+                                            _prev_cmt = str(final_report.at[_fidx, "Comment"] or "").strip()
+                                            _note = "File marked this Already Approved; kept rejected by QC checks"
+                                            final_report.at[_fidx, "Comment"] = (
+                                                f"{_prev_cmt} — {_note}" if _prev_cmt else _note
+                                            )
+                                            final_report.at[_fidx, "Is_Zip"] = True
+                                        else:
+                                            final_report.at[_fidx, "Status"] = "Approved"
+                                            final_report.at[_fidx, "FLAG"] = "Manual review"
+                                            final_report.at[_fidx, "Comment"] = "Already Approved"
+                                            final_report.at[_fidx, "Is_Zip"] = True
                             for _flag, _rows in _zip_result_rows.items():
                                 _combined_r = pd.concat(_rows, ignore_index=True)
                                 if _flag in combined_results and not combined_results[_flag].empty: combined_results[_flag] = pd.concat([combined_results[_flag], _combined_r], ignore_index=True)

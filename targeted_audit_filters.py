@@ -665,6 +665,10 @@ _NEEDED = [
     "Category_Match_Score", "Top1_Score", "AI_Product_Caption",
     "Brand_Detected_On_Product",
     "Image_Extraction_Status", "QC_Skip_Reason", "Duplicate_Flag", "SELLER_NAME",
+    # Approves the product outright regardless of the per-check columns, so the
+    # audit has to see it or it reads a rejected check as agreement on a
+    # product that actually shipped approved.
+    "Manual_Review",
 ] + [col for pair in _CHECK_COLUMNS.values() for col in pair]
 
 
@@ -804,7 +808,17 @@ def evaluate_all_checks(data: pd.DataFrame, country_code: str) -> pd.DataFrame:
         # an FDA finding is compared against the FDA verdict and not the
         # category one — otherwise every product the file happened to reject
         # for the wrong thing would read as a false approval.
+        # Manual_Review approves the product outright, whatever the individual
+        # check columns say, so a row can read "Category: Rejected" and still
+        # ship approved. Treated as agreement, that hid the case worth
+        # reporting most: a rule fired, the file's own category check agreed,
+        # and the product was approved anyway.
+        _manual_ok = _clean(rec.get("Manual_Review")).lower() in ("true", "1", "yes")
+
         def _file_verdict(_key):
+            if _manual_ok:
+                # Approved regardless of this check's own column.
+                return False, "marked Already Approved (Manual_Review)"
             _sc, _rc = _CHECK_COLUMNS[_key]
             _st = _clean(rec.get(_sc)).lower() if _sc in status_cols_present else ""
             _rn = _clean(rec.get(_rc))
