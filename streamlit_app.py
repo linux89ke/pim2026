@@ -4528,7 +4528,11 @@ if uploaded_files:
         _new_cache.append({"name": uf.name, "bytes": _raw, "md5": hashlib.md5(_raw).hexdigest()})
     st.session_state.cached_uploaded_files = _new_cache
     st.session_state._uploader_had_files = True
-elif uploaded_files is not None and len(uploaded_files) == 0 and st.session_state.get("_uploader_had_files", False):
+# Any state where the widget is not holding files clears the batch, not
+# just an explicitly emptied list. A None or otherwise falsy selection
+# used to fall through both branches and leave cached_uploaded_files
+# pointing at the previous upload.
+elif st.session_state.get("_uploader_had_files", False):
     _prev_uploader_key = st.session_state.get("_last_uploader_key", -1)
     _curr_uploader_key = st.session_state.uploader_key
     if _prev_uploader_key == _curr_uploader_key:
@@ -4914,7 +4918,13 @@ if st.session_state.get("last_processed_files") != process_signature:
                             data_non_zip = data[data["PRODUCT_SET_SID"].isin(non_zip_sids)].copy()
                             _prog = st.progress(0, text="Preparing validation...")
                             def _on_flag_done(flag_name: str, i: int, total: int): _prog.progress(int(i / total * 100), text=f"Checking: {flag_name}")
-                            fr_non_zip, res_non_zip = cached_validate_products(df_hash(data_non_zip) + country_validator.code, data_non_zip, support_files, country_validator.code, data_has_warranty, skip_validators=fast_skip_list, _on_progress=_on_flag_done)
+                            # sig_hash prefixes the key so the validation cache is tied to
+                            # THIS upload. df_hash alone is content-derived and memoises into
+                            # df.attrs, and its own docstring notes it cannot see an in-place
+                            # edit that leaves shape and columns unchanged — so a different
+                            # file could be served the previous batch's results. Removing a
+                            # file and uploading another is exactly when that shows up.
+                            fr_non_zip, res_non_zip = cached_validate_products(sig_hash + "|" + df_hash(data_non_zip) + country_validator.code, data_non_zip, support_files, country_validator.code, data_has_warranty, skip_validators=fast_skip_list, _on_progress=_on_flag_done)
                             _prog.empty()
                             final_report_parts.append(fr_non_zip)
                             results_parts.append(res_non_zip)
@@ -4924,7 +4934,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                             skip_list = sorted(set(_derive_prefetched_skip_list(qc_zip)) | set(fast_skip_list))
                             _prog_zip = st.progress(0, text="Preparing ZIP validation...")
                             def _on_flag_done_zip(flag_name: str, i: int, total: int): _prog_zip.progress(int(i / total * 100), text=f"Checking (ZIP): {flag_name}")
-                            fr_zip, res_zip = cached_validate_products(df_hash(data_zip) + country_validator.code + "_zip_optimized", data_zip, support_files, country_validator.code, data_has_warranty, skip_validators=skip_list, _on_progress=_on_flag_done_zip)
+                            fr_zip, res_zip = cached_validate_products(sig_hash + "|" + df_hash(data_zip) + country_validator.code + "_zip_optimized", data_zip, support_files, country_validator.code, data_has_warranty, skip_validators=skip_list, _on_progress=_on_flag_done_zip)
                             _prog_zip.empty()
                             final_report_parts.append(fr_zip)
                             results_parts.append(res_zip)
