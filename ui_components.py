@@ -2337,11 +2337,33 @@ def build_fast_grid_html(
             _zai = str(_zr.get("Color_AI_Normalized", "")).strip()
             if _zai.lower() not in ("nan", "none", "null", ""):
                 color_ai = _zai
+        # Several colours declared in one field — "white,black", "Red / Blue".
+        # One listing carrying several colours is the usual sign of a single
+        # photo showing several products, which is the thing the image review
+        # is looking for, so the card says so rather than leaving it to be
+        # spotted in the Color line.
+        _multi_colour = ""
+        if color_val:
+            _parts = [p.strip() for p in re.split(r"[,/;|]| and ", color_val) if p.strip()]
+            if len(_parts) > 1:
+                _multi_colour = ", ".join(_parts[:4]) + ("…" if len(_parts) > 4 else "")
+
         color_mismatch = ""
         if color_ai and color_val:
-            _ai_n = color_ai.lower().replace(" ", "")
-            _dec_n = color_val.lower().replace(" ", "")
-            if _ai_n != _dec_n and _ai_n not in _dec_n and _dec_n not in _ai_n:
+            # "multicolor" and "multicolour" are the same word, and the AI and
+            # the seller do not agree on which spelling to use. Comparing them
+            # literally reported a mismatch between a word and itself.
+            def _norm_colour(s: str) -> str:
+                s = s.lower().replace(" ", "")
+                s = s.replace("colours", "color").replace("colour", "color")
+                s = s.replace("colors", "color")
+                return s
+
+            _ai_n = _norm_colour(color_ai)
+            _dec_n = _norm_colour(color_val)
+            _both_multi = _ai_n.startswith("multi") and _dec_n.startswith("multi")
+            if (not _both_multi
+                    and _ai_n != _dec_n and _ai_n not in _dec_n and _dec_n not in _ai_n):
                 color_mismatch = f"AI: '{color_ai}' vs declared: '{color_val}'"
         elif color_ai and not color_val:
             color_mismatch = f"AI detected color: '{color_ai}' (none declared)"
@@ -2420,6 +2442,7 @@ def build_fast_grid_html(
                 "is_manual_review": is_manual_review,
                 "qc_skip_reason": qc_skip,
                 "color_mismatch": color_mismatch,
+                "multi_colour": _multi_colour,
                 "color_ai": color_ai,
                 "cat_reason": cat_reason,
                 "suggested_cat": suggested_cat,
@@ -3665,6 +3688,9 @@ function renderCard(card) {{
     warnHtml += `<span class="warn-badge" style="background:#dc2626;color:#fff;font-weight:800;" title="${{escapeHtml(card.qc_skip_reason || 'Manual Review')}}">${{mrText}}</span>`;
   }}
   if (card.color_mismatch) warnHtml += `<span class="warn-badge" style="background:#b45309;color:#fff;" title="${{escapeHtml(card.color_mismatch)}}">⚠ Color Mismatch</span>`;
+  // Several colours on one listing usually means one photo showing several
+  // products, which is what the image review is looking for.
+  if (card.multi_colour) warnHtml += `<span class="warn-badge" style="background:#7c3aed;color:#fff;" title="Declared colours: ${{escapeHtml(card.multi_colour)}}">⚠ Too many things?</span>`;
   var priceText = String(card.price || '').trim();
   var priceHtml = priceText ? `<div class="price-badge">${{escapeHtml(priceText)}}</div>` : '';
 
