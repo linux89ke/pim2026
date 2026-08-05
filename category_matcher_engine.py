@@ -643,13 +643,25 @@ class CategoryMatcherEngine:
             if len(df) > self._MAX_TRAIN_ROWS:
                 # Sample proportionally across categories rather than a flat
                 # random sample, so rare-but-kept categories aren't wiped out.
-                df = (
-                    df.groupby("category", group_keys=False)
-                    .apply(lambda g: g.sample(
-                        n=max(1, int(len(g) / len(df) * self._MAX_TRAIN_ROWS)),
-                        random_state=42,
-                    ))
+                # Shuffle once, then take the first N of each category. Same
+                # proportional sample as the groupby.apply this replaces, minus
+                # the per-group Python call.
+                #
+                # The obvious fix for the deprecation warning that apply raised
+                # — include_groups=False — could not be used: it drops the
+                # grouping column from each group, and "category" is read two
+                # lines below to check the class count survived.
+                _frac = self._MAX_TRAIN_ROWS / len(df)
+                _shuffled = df.sample(frac=1.0, random_state=42)
+                _take = (
+                    _shuffled.groupby("category")["category"]
+                    .transform("size")
+                    .mul(_frac)
+                    .astype(int)
+                    .clip(lower=1)
                 )
+                _rank = _shuffled.groupby("category").cumcount()
+                df = _shuffled[_rank < _take]
                 # Re-check class count survived the proportional sample
                 if len(df["category"].unique()) < 2:
                     return
