@@ -4465,6 +4465,15 @@ def _reset_report_state(*, clear_uploaded_files: bool = False, clear_zip_cache: 
         "quick_rejects", "_stagedRejections", "post_qc_results", "zip_qc_results",
         "_zip_sid_index", "_zip_status_cols", "_zip_prefetch_map",
         "current_sig_hash", "_data_filtered_ref",
+        # PIM_QC_Result.xlsx and the verdict map derived from it. These were
+        # missed when the rest of the ZIP state was added here, and they are
+        # the loudest omission of the set: the seeding block below feeds every
+        # SID in zip_pim_verdicts that the checks never saw straight into the
+        # report. zip_qc_results was being cleared while these were not, so a
+        # ZIP from an earlier upload kept injecting its whole verdict table
+        # into the next, unrelated batch — a 2,085-product CSV was reporting
+        # 9,793 products, 7,708 of them from a ZIP no longer loaded.
+        "zip_pim_verdicts", "zip_rejection_reasons", "_platform_verdict",
         # Waivers and the carry-forward offer are both per batch too.
         "_flag_overrides", "_predecessor_offer", "_predecessor_handled",
     ):
@@ -5343,6 +5352,46 @@ if st.session_state.get("last_processed_files") != process_signature:
                             )
                             _have = set(final_report["ProductSetSid"].astype(str).str.strip())
                             _missing = _pv[~_pv["ProductSetSid"].isin(_have)]
+                            # Seed only SIDs the ZIP's own QC CSVs actually
+                            # cover. In every real ZIP checked the verdict
+                            # table and the QC CSVs describe exactly the same
+                            # SID set (KE 804/805, UG 805: zero on either
+                            # side), so this changes nothing for a ZIP that
+                            # matches its batch — the 18 Incomplete SKUs this
+                            # block exists for are in the Incomplete CSV and
+                            # survive.
+                            #
+                            # What it stops is a verdict table that outlives
+                            # the ZIP it came from being poured into an
+                            # unrelated batch. zip_pim_verdicts is now cleared
+                            # on reset, so this is the second line of defence
+                            # rather than the only one, but it is the cheaper
+                            # of the two to reason about: no ZIP loaded means
+                            # nothing to seed, full stop.
+                            if not _missing.empty and not qc_zip.empty:
+                                _qc_sid_col = next(
+                                    (c for c in ("PRODUCT_SET_SID", "ProductSetSid",
+                                                 "Product Set SID", "cod_productset_sid", "SID")
+                                     if c in qc_zip.columns),
+                                    None,
+                                )
+                                if _qc_sid_col:
+                                    _qc_covered = set(
+                                        qc_zip[_qc_sid_col].astype(str).str.strip()
+                                    )
+                                    _dropped = int((~_missing["ProductSetSid"].isin(_qc_covered)).sum())
+                                    if _dropped:
+                                        logger.warning(
+                                            "PIM_QC_Result lists %s SID(s) absent from both the "
+                                            "batch and the ZIP's QC files — not seeded", _dropped,
+                                        )
+                                    _missing = _missing[_missing["ProductSetSid"].isin(_qc_covered)]
+                            elif not _missing.empty:
+                                logger.warning(
+                                    "Discarding %s PIM_QC_Result verdict(s): no ZIP QC data is "
+                                    "loaded for this batch", len(_missing),
+                                )
+                                _missing = _missing.iloc[0:0]
                             if not _missing.empty:
                                 _add = pd.DataFrame({
                                     "ProductSetSid": _missing["ProductSetSid"].values,
