@@ -8,6 +8,22 @@
 
 streamlit>=1.60.0
 
+# Streamlit's own bound is starlette<2,>=0.40.0, which is far too wide: it
+# subclasses starlette's GZipResponder and calls
+#   _MediaAwareGZipResponder(app, minimum_size, compresslevel=...)
+# A starlette newer than the one this app is built against made
+# thread_minimum_size a required keyword-only argument, so every request died
+# with
+#   TypeError: GZipResponder.__init__() missing 1 required keyword-only
+#              argument: 'thread_minimum_size'
+# before reaching any of our code. Cloud installs the newest wheel satisfying
+# the range, so Streamlit's loose bound is what let it in.
+#
+# 1.3.x is what this is verified against — its GZipResponder takes
+# (app, minimum_size, compresslevel) and nothing else. Raise the cap only
+# alongside a Streamlit version whose subclass matches the newer signature.
+starlette>=1.3,<1.4
+
 # pandas MUST stay below 3. In pandas 3 the new string dtype is the default,
 # and under it Series.astype(str) preserves missing values as NaN instead of
 # turning them into the string "nan". This code leans on the old behaviour in
