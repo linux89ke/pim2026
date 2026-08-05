@@ -2296,15 +2296,32 @@ def build_fast_grid_html(
             if _fallback.startswith("http"):
                 img_url = _fallback.replace("http://", "https://", 1)
 
-        sale_p = row.get("GLOBAL_SALE_PRICE")
-        reg_p = row.get("GLOBAL_PRICE")
-        usd_val = sale_p if pd.notna(sale_p) and str(sale_p).strip() != "" else reg_p
-        if pd.isna(usd_val) or str(usd_val).strip().lower() in ("", "nan", "none", "null"):
-            price_str = "NaN"
-        else:
+        # A missing sale price means the product simply is not on sale, so the
+        # regular price is the one to show.
+        #
+        # The fallback was already here but only caught a real NaN. These
+        # columns arrive from CSVs read with dtype=str, so an absent sale price
+        # is the literal string "nan" — which passes pd.notna() and is not
+        # empty, so it was taken as the price and rendered as "NaN". On a real
+        # Kenya batch that was 2,955 of 4,059 cards showing NaN while the
+        # regular price sat unused in the next column.
+        def _usable_price(v):
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return None
+            s = str(v).strip()
+            return None if s.lower() in ("", "nan", "none", "null", "n/a", "-") else v
+
+        usd_val = _usable_price(row.get("GLOBAL_SALE_PRICE"))
+        if usd_val is None:
+            usd_val = _usable_price(row.get("GLOBAL_PRICE"))
+        # Empty, not "NaN", when there is genuinely no price: the grid hides the
+        # badge entirely for an empty string, which is better than a badge
+        # announcing a broken number.
+        price_str = ""
+        if usd_val is not None:
             price_str = format_local_price(
                 usd_val, st.session_state.get("selected_country", "Kenya")
-            ) or "NaN"
+            ) or ""
 
         color_val = str(row.get("COLOR", "")).strip()
         if color_val.lower() in ("nan", "none", "null"):
