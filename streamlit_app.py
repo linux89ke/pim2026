@@ -3691,7 +3691,25 @@ def validate_products(
             for name, func, kw in validations
         ]
 
-    total_tasks = len([v for v in validations if v[0].lower() not in _skip_set and not country_validator.should_skip_validation(v[0])])
+    # Rules from general_rules.py are never skipped by the prefetch skip list.
+    #
+    # That list is keyed on FLAG name, and the hand-written category rules
+    # deliberately file under the built-in "Wrong Category" flag so they land in
+    # the same QC bucket. The ZIP ships a Category_Check_Status column, which
+    # puts "Wrong Category" in the skip set — so "the ZIP already ran its
+    # category check" silently disabled every rule in general_rules.py on
+    # exactly the batches they exist for. The Titan Gel / DVD / Small Appliances
+    # rules only ever ran when no ZIP was loaded.
+    #
+    # These rules are cheap string and regex work on columns already in memory,
+    # and their entire purpose is to catch verdicts the ZIP's AI got wrong, so
+    # there is nothing to save by trusting the ZIP here.
+    def _skipped(name: str, func) -> bool:
+        if getattr(func, "_rule_id", ""):
+            return country_validator.should_skip_validation(name)
+        return name.lower() in _skip_set or country_validator.should_skip_validation(name)
+
+    total_tasks = len([v for v in validations if not _skipped(v[0], v[1])])
     processed_count = 0
     restricted_keys = {}
     validation_errors = []
@@ -3732,7 +3750,7 @@ def validate_products(
         with concurrent.futures.ThreadPoolExecutor(max_workers=_val_workers) as executor:
             future_to_name = {}
             for name, func, kwargs in v_list:
-                if name.lower() in _skip_set or country_validator.should_skip_validation(name):
+                if _skipped(name, func):
                     continue
 
                 working_data = current_data
