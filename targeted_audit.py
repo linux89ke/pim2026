@@ -549,7 +549,8 @@ def _on_audit_dismissed():
 def targeted_audit_modal(support_files):
     _inject_css()
 
-    st.markdown("### :material/fact_check: Targeted Audit")
+    # The dialog's own title bar already reads "Targeted Audit"; an H3 saying it
+    # again cost ~45px of a screen where the findings were below the fold.
 
     fr = st.session_state.get("final_report", pd.DataFrame())
     data = st.session_state.get("all_data_map", pd.DataFrame())
@@ -724,16 +725,29 @@ def targeted_audit_modal(support_files):
     has_results = not results.empty
 
     if has_results:
-        st.markdown('<hr class="audit-divider">', unsafe_allow_html=True)
-
         counts = results["Verdict"].value_counts() if not results.empty else pd.Series(dtype=int)
-        s1, s2, s3, s4, s5, s6 = st.columns(6)
-        s1.metric("❌ False Approvals", int(counts.get("False Approval", 0)))
-        s2.metric("⚠️ False Rejections", int(counts.get("False Rejection", 0)))
-        s3.metric("✅ True Rejections", int(counts.get("True Rejection", 0)))
-        s4.metric("👁️ Needs Review", int(counts.get("Needs Manual Review", 0)))
-        s5.metric("🚨 AI Errors", int(counts.get("AI Error", 0)))
-        s6.metric("📑 Duplicates", int(counts.get("Duplicate", 0)))
+
+        # One pill row instead of six metric cards. Measured at 1366x768, the
+        # cards were 76px plus their margins, and everything above the findings
+        # — title, controls, divider, cards, two captions — came to roughly
+        # 410px of a 768px screen. The counts are worth keeping; a card each is
+        # not, when the cost is that no actual finding is on screen.
+        _SUMMARY = (
+            ("False Approvals",  "False Approval",     "#dc2626", "#fee2e2"),
+            ("False Rejections", "False Rejection",    "#b45309", "#fef3c7"),
+            ("True Rejections",  "True Rejection",     "#15803d", "#dcfce7"),
+            ("Needs Review",     "Needs Manual Review","#1d4ed8", "#dbeafe"),
+            ("AI Errors",        "AI Error",           "#7c3aed", "#ede9fe"),
+            ("Duplicates",       "Duplicate",          "#4b5563", "#f3f4f6"),
+        )
+        st.markdown(
+            "".join(
+                f'<span class="audit-pill" style="background:{bg};color:{fg};">'
+                f'{int(counts.get(key, 0)):,} {lbl}</span>'
+                for lbl, key, fg, bg in _SUMMARY
+            ),
+            unsafe_allow_html=True,
+        )
 
         # Result of the last approve/reject, shown here rather than as a toast:
         # acting on a row reruns the dialog, and a toast fired during that run
@@ -763,55 +777,80 @@ def targeted_audit_modal(support_files):
                     st.session_state.pop(_ACTIONED_KEY, None)
                     st.rerun()
 
-        st.markdown('<div class="audit-section-title">Issues by check</div>', unsafe_allow_html=True)
-        st.caption("Correctly confirmed rejections and normal pre-QC exclusions are counted above "
-                   "but not listed here — only items that need a decision or a fix are shown.")
+        # Title and caption merged onto one line — the caption was its own
+        # block under a heading that said much the same thing.
+        st.markdown(
+            '<div class="audit-section-title">Issues by check'
+            '<span style="font-weight:400;font-size:0.8rem;opacity:.65;"> — only items '
+            'needing a decision or a fix; confirmed rejections are counted above</span></div>',
+            unsafe_allow_html=True,
+        )
+
+        # The findings scroll here rather than the whole dialog.
+        #
+        # The dialog backdrop is the scroll container and the panel has no
+        # max-height, so the panel grew to fit every section and the browser
+        # scrolled the lot: measured at 1366x768, an 896px panel in a 768px
+        # viewport, with the first table already 88px past the bottom. Scrolling
+        # the findings instead keeps the summary and the controls in place while
+        # you work through them.
+        #
+        # st.container(height=...) rather than CSS against Streamlit's own
+        # markup — it is a supported API, where a rule targeting emotion classes
+        # is a build hash away from silently doing nothing.
+        # 340px, chosen so the panel fits a 768px laptop screen rather than
+        # picked for looking right. Measured: everything outside this container
+        # comes to ~372px, the dialog sits 48px from the top and the backdrop
+        # keeps 32px below, which leaves ~340. "stretch" is no use here — it
+        # takes the larger of content and parent, so it does not cap.
+        _sections = st.container(height=340, border=False)
 
         any_visible = False
-        for check_key in CHECK_ORDER:
-            label = CHECK_LABELS[check_key]
-            icon = _CHECK_ICONS.get(check_key, "🔹")
+        with _sections:
+            for check_key in CHECK_ORDER:
+                label = CHECK_LABELS[check_key]
+                icon = _CHECK_ICONS.get(check_key, "🔹")
 
-            check_slice = results_issues[results_issues["Check"] == check_key] if not results_issues.empty else pd.DataFrame()
-            if check_slice.empty:
-                continue
-            any_visible = True
+                check_slice = results_issues[results_issues["Check"] == check_key] if not results_issues.empty else pd.DataFrame()
+                if check_slice.empty:
+                    continue
+                any_visible = True
 
-            _ledger = _actioned()
-            _done = (
-                int(check_slice["ProductSetSid"].astype(str).isin(_ledger).sum())
-                if "ProductSetSid" in check_slice.columns else 0
-            )
-            _exp_label = f"{icon}  **{label}**   —   {len(check_slice)} item(s) flagged"
-            if _done:
-                _exp_label += f"   ·   {_done} actioned"
+                _ledger = _actioned()
+                _done = (
+                    int(check_slice["ProductSetSid"].astype(str).isin(_ledger).sum())
+                    if "ProductSetSid" in check_slice.columns else 0
+                )
+                _exp_label = f"{icon}  **{label}**   —   {len(check_slice)} item(s) flagged"
+                if _done:
+                    _exp_label += f"   ·   {_done} actioned"
 
-            with st.expander(_exp_label, expanded=False):
-                for _ri, reason_type in enumerate(check_slice["Reason Type"].unique()):
-                    reason_slice = check_slice[check_slice["Reason Type"] == reason_type]
-                    st.markdown(f'<div class="audit-reason-label">{reason_type} '
-                                f'({len(reason_slice)})</div>', unsafe_allow_html=True)
+                with st.expander(_exp_label, expanded=False):
+                    for _ri, reason_type in enumerate(check_slice["Reason Type"].unique()):
+                        reason_slice = check_slice[check_slice["Reason Type"] == reason_type]
+                        st.markdown(f'<div class="audit-reason-label">{reason_type} '
+                                    f'({len(reason_slice)})</div>', unsafe_allow_html=True)
 
-                    for verdict in _VERDICT_ORDER:
-                        sub = reason_slice[reason_slice["Verdict"] == verdict]
-                        if sub.empty:
-                            continue
-                        fg, bg, emoji = _VERDICT_STYLE[verdict]
-                        st.markdown(_pill(f"{emoji} {verdict} ({len(sub)})", fg, bg), unsafe_allow_html=True)
+                        for verdict in _VERDICT_ORDER:
+                            sub = reason_slice[reason_slice["Verdict"] == verdict]
+                            if sub.empty:
+                                continue
+                            fg, bg, emoji = _VERDICT_STYLE[verdict]
+                            st.markdown(_pill(f"{emoji} {verdict} ({len(sub)})", fg, bg), unsafe_allow_html=True)
 
-                        # Positional selection needs a key that is stable across
-                        # reruns and unique per table: reason types are free text,
-                        # so index them rather than using the string itself.
-                        _key_base = f"audit_{check_key}_{_ri}_{verdict.replace(' ', '_')}"
-                        _actionable = verdict not in _VERDICT_NO_ACTION
-                        _selected = _render_table(
-                            sub, key=f"{_key_base}_tbl", selectable=_actionable,
-                            check_key=check_key,
-                        )
-                        if _actionable:
-                            _render_verdict_actions(
-                                sub, _selected, _key_base, check_key, reason_type, verdict
+                            # Positional selection needs a key that is stable across
+                            # reruns and unique per table: reason types are free text,
+                            # so index them rather than using the string itself.
+                            _key_base = f"audit_{check_key}_{_ri}_{verdict.replace(' ', '_')}"
+                            _actionable = verdict not in _VERDICT_NO_ACTION
+                            _selected = _render_table(
+                                sub, key=f"{_key_base}_tbl", selectable=_actionable,
+                                check_key=check_key,
                             )
+                            if _actionable:
+                                _render_verdict_actions(
+                                    sub, _selected, _key_base, check_key, reason_type, verdict
+                                )
 
         if not any_visible and search_term.strip():
             st.info(f"No results match '{search_term}'.")
