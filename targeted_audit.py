@@ -727,27 +727,18 @@ def targeted_audit_modal(support_files):
     if has_results:
         counts = results["Verdict"].value_counts() if not results.empty else pd.Series(dtype=int)
 
-        # One pill row instead of six metric cards. Measured at 1366x768, the
-        # cards were 76px plus their margins, and everything above the findings
-        # — title, controls, divider, cards, two captions — came to roughly
-        # 410px of a 768px screen. The counts are worth keeping; a card each is
-        # not, when the cost is that no actual finding is on screen.
-        _SUMMARY = (
-            ("False Approvals",  "False Approval",     "#dc2626", "#fee2e2"),
-            ("False Rejections", "False Rejection",    "#b45309", "#fef3c7"),
-            ("True Rejections",  "True Rejection",     "#15803d", "#dcfce7"),
-            ("Needs Review",     "Needs Manual Review","#1d4ed8", "#dbeafe"),
-            ("AI Errors",        "AI Error",           "#7c3aed", "#ede9fe"),
-            ("Duplicates",       "Duplicate",          "#4b5563", "#f3f4f6"),
-        )
-        st.markdown(
-            "".join(
-                f'<span class="audit-pill" style="background:{bg};color:{fg};">'
-                f'{int(counts.get(key, 0)):,} {lbl}</span>'
-                for lbl, key, fg, bg in _SUMMARY
-            ),
-            unsafe_allow_html=True,
-        )
+        # Six metric cards. I replaced these with a pill row to buy vertical
+        # space and it was the wrong trade — this is the summary people look
+        # for, and shrinking it made it read as missing rather than compact.
+        # The space came from the duplicate heading and the merged caption
+        # instead, which cost nothing to look at.
+        s1, s2, s3, s4, s5, s6 = st.columns(6)
+        s1.metric("❌ False Approvals", int(counts.get("False Approval", 0)))
+        s2.metric("⚠️ False Rejections", int(counts.get("False Rejection", 0)))
+        s3.metric("✅ True Rejections", int(counts.get("True Rejection", 0)))
+        s4.metric("👁️ Needs Review", int(counts.get("Needs Manual Review", 0)))
+        s5.metric("🚨 AI Errors", int(counts.get("AI Error", 0)))
+        s6.metric("📑 Duplicates", int(counts.get("Duplicate", 0)))
 
         # Result of the last approve/reject, shown here rather than as a toast:
         # acting on a row reruns the dialog, and a toast fired during that run
