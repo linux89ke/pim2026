@@ -791,6 +791,7 @@ def targeted_audit_modal(support_files):
         # box, and a run with many put them in a 340px window to scroll
         # through. Letting the sections size to their content is better on
         # both counts — the space saved above them is what actually helped.
+        any_visible = False
         for check_key in CHECK_ORDER:
             label = CHECK_LABELS[check_key]
             icon = _CHECK_ICONS.get(check_key, "🔹")
