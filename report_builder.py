@@ -389,7 +389,33 @@ def build_docx_report(
         )
 
     # ── 3. Issues Found ────────────────────────────────────────────────────
-    doc.add_heading("3. Issues Found", level=1)
+    # Every check and what it found, including the ones that found nothing.
+    #
+    # Only checks with findings get a section below, so a reader could not tell
+    # a check that ran and came back clean from one that never ran. That is the
+    # difference between "no counterfeit listings in this batch" and "the
+    # counterfeit check is broken", and the report was silent on which.
+    doc.add_heading("3. Checks Run", level=1)
+    _counts = {}
+    if results is not None and not results.empty and "Check" in results.columns:
+        _counts = results[results["Verdict"].isin(_REPORTABLE_VERDICTS)]["Check"].value_counts().to_dict() \
+            if "Verdict" in results.columns else results["Check"].value_counts().to_dict()
+    _cov = doc.add_table(rows=1, cols=3)
+    _cov.style = "Table Grid"
+    for _c, _t in zip(_cov.rows[0].cells, ("Check", "Findings", "Result")):
+        _c.text = _t
+        for _p in _c.paragraphs:
+            for _r in _p.runs:
+                _r.bold = True
+    for _k in CHECK_ORDER:
+        _n = int(_counts.get(_k, 0))
+        _row = _cov.add_row().cells
+        _row[0].text = CHECK_LABELS[_k]
+        _row[1].text = f"{_n:,}"
+        _row[2].text = "Needs attention" if _n else "Clean"
+    doc.add_paragraph()
+
+    doc.add_heading("4. Issues Found", level=1)
     issue_num = 1
     any_issue = False
 

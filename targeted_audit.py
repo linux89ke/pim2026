@@ -783,7 +783,41 @@ def targeted_audit_modal(support_files):
         # through. Letting the sections size to their content is better on
         # both counts — the space saved above them is what actually helped.
         any_visible = False
-        for check_key in CHECK_ORDER:
+        # Every check, with its count — including the ones that found nothing.
+        #
+        # Only checks with findings get an expander, so a check that ran and
+        # came back clean is indistinguishable from one that never ran at all.
+        # On a real batch that meant no way to tell that the DVD and Small
+        # Appliances rules had genuinely found nothing, versus being broken.
+        _counts = (
+            results_issues["Check"].value_counts().to_dict()
+            if not results_issues.empty else {}
+        )
+        with st.expander(
+            f"Checks run — {sum(1 for k in CHECK_ORDER if _counts.get(k))} of "
+            f"{len(CHECK_ORDER)} found something",
+            expanded=False, icon=":material/checklist:",
+        ):
+            st.dataframe(
+                pd.DataFrame([
+                    {"Check": CHECK_LABELS[k],
+                     "Findings": int(_counts.get(k, 0)),
+                     "Result": "needs attention" if _counts.get(k) else "clean"}
+                    for k in CHECK_ORDER
+                ]),
+                hide_index=True, width="stretch",
+            )
+
+        # Fewest findings first. The order used to follow CHECK_ORDER, which put
+        # Duplicates and Category — over two thousand rows between them on a
+        # real batch — ahead of an eight-row Color finding. The short lists are
+        # the ones a person can actually work through, and they were the ones
+        # buried.
+        _ordered = sorted(
+            CHECK_ORDER,
+            key=lambda k: (_counts.get(k, 0) or 10**9),
+        )
+        for check_key in _ordered:
             label = CHECK_LABELS[check_key]
             icon = _CHECK_ICONS.get(check_key, "🔹")
 

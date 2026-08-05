@@ -916,10 +916,22 @@ def _basename_lower(value) -> str:
 
 
 def _index_zip_images(zf: zipfile.ZipFile) -> Dict[str, str]:
+    """Index every image sitting in an images/ folder, at any depth.
+
+    This required the folder to be at the top level. Real archives from the QC
+    pipeline put it one level down — "output/images/..." — so the index came
+    back empty and the grid never had a single picture from them, silently.
+    Verified against a real 1,929-image batch: 0 indexed before, all of them
+    after.
+
+    Still anchored to a folder named "images" rather than taking any image
+    anywhere in the archive, so a logo or a thumbnail dropped beside the data
+    files is not mistaken for product photography.
+    """
     return {
         _basename_lower(info.filename): info.filename
         for info in zf.infolist()
-        if info.filename.lower().startswith("images/")
+        if ("images/" in info.filename.lower().replace("\\", "/"))
         and info.filename.lower().endswith(IMAGE_EXTENSIONS)
     }
 
