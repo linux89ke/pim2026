@@ -785,72 +785,56 @@ def targeted_audit_modal(support_files):
             'needing a decision or a fix; confirmed rejections are counted above</span></div>',
             unsafe_allow_html=True,
         )
+        # A fixed-height scrolling container was tried here and made things
+        # worse: it reserves its full height whether or not there is anything
+        # in it, so a run with two findings still showed a tall, mostly empty
+        # box, and a run with many put them in a 340px window to scroll
+        # through. Letting the sections size to their content is better on
+        # both counts — the space saved above them is what actually helped.
+        for check_key in CHECK_ORDER:
+            label = CHECK_LABELS[check_key]
+            icon = _CHECK_ICONS.get(check_key, "🔹")
 
-        # The findings scroll here rather than the whole dialog.
-        #
-        # The dialog backdrop is the scroll container and the panel has no
-        # max-height, so the panel grew to fit every section and the browser
-        # scrolled the lot: measured at 1366x768, an 896px panel in a 768px
-        # viewport, with the first table already 88px past the bottom. Scrolling
-        # the findings instead keeps the summary and the controls in place while
-        # you work through them.
-        #
-        # st.container(height=...) rather than CSS against Streamlit's own
-        # markup — it is a supported API, where a rule targeting emotion classes
-        # is a build hash away from silently doing nothing.
-        # 340px, chosen so the panel fits a 768px laptop screen rather than
-        # picked for looking right. Measured: everything outside this container
-        # comes to ~372px, the dialog sits 48px from the top and the backdrop
-        # keeps 32px below, which leaves ~340. "stretch" is no use here — it
-        # takes the larger of content and parent, so it does not cap.
-        _sections = st.container(height=340, border=False)
+            check_slice = results_issues[results_issues["Check"] == check_key] if not results_issues.empty else pd.DataFrame()
+            if check_slice.empty:
+                continue
+            any_visible = True
 
-        any_visible = False
-        with _sections:
-            for check_key in CHECK_ORDER:
-                label = CHECK_LABELS[check_key]
-                icon = _CHECK_ICONS.get(check_key, "🔹")
+            _ledger = _actioned()
+            _done = (
+                int(check_slice["ProductSetSid"].astype(str).isin(_ledger).sum())
+                if "ProductSetSid" in check_slice.columns else 0
+            )
+            _exp_label = f"{icon}  **{label}**   —   {len(check_slice)} item(s) flagged"
+            if _done:
+                _exp_label += f"   ·   {_done} actioned"
 
-                check_slice = results_issues[results_issues["Check"] == check_key] if not results_issues.empty else pd.DataFrame()
-                if check_slice.empty:
-                    continue
-                any_visible = True
+            with st.expander(_exp_label, expanded=False):
+                for _ri, reason_type in enumerate(check_slice["Reason Type"].unique()):
+                    reason_slice = check_slice[check_slice["Reason Type"] == reason_type]
+                    st.markdown(f'<div class="audit-reason-label">{reason_type} '
+                                f'({len(reason_slice)})</div>', unsafe_allow_html=True)
 
-                _ledger = _actioned()
-                _done = (
-                    int(check_slice["ProductSetSid"].astype(str).isin(_ledger).sum())
-                    if "ProductSetSid" in check_slice.columns else 0
-                )
-                _exp_label = f"{icon}  **{label}**   —   {len(check_slice)} item(s) flagged"
-                if _done:
-                    _exp_label += f"   ·   {_done} actioned"
+                    for verdict in _VERDICT_ORDER:
+                        sub = reason_slice[reason_slice["Verdict"] == verdict]
+                        if sub.empty:
+                            continue
+                        fg, bg, emoji = _VERDICT_STYLE[verdict]
+                        st.markdown(_pill(f"{emoji} {verdict} ({len(sub)})", fg, bg), unsafe_allow_html=True)
 
-                with st.expander(_exp_label, expanded=False):
-                    for _ri, reason_type in enumerate(check_slice["Reason Type"].unique()):
-                        reason_slice = check_slice[check_slice["Reason Type"] == reason_type]
-                        st.markdown(f'<div class="audit-reason-label">{reason_type} '
-                                    f'({len(reason_slice)})</div>', unsafe_allow_html=True)
-
-                        for verdict in _VERDICT_ORDER:
-                            sub = reason_slice[reason_slice["Verdict"] == verdict]
-                            if sub.empty:
-                                continue
-                            fg, bg, emoji = _VERDICT_STYLE[verdict]
-                            st.markdown(_pill(f"{emoji} {verdict} ({len(sub)})", fg, bg), unsafe_allow_html=True)
-
-                            # Positional selection needs a key that is stable across
-                            # reruns and unique per table: reason types are free text,
-                            # so index them rather than using the string itself.
-                            _key_base = f"audit_{check_key}_{_ri}_{verdict.replace(' ', '_')}"
-                            _actionable = verdict not in _VERDICT_NO_ACTION
-                            _selected = _render_table(
-                                sub, key=f"{_key_base}_tbl", selectable=_actionable,
-                                check_key=check_key,
+                        # Positional selection needs a key that is stable across
+                        # reruns and unique per table: reason types are free text,
+                        # so index them rather than using the string itself.
+                        _key_base = f"audit_{check_key}_{_ri}_{verdict.replace(' ', '_')}"
+                        _actionable = verdict not in _VERDICT_NO_ACTION
+                        _selected = _render_table(
+                            sub, key=f"{_key_base}_tbl", selectable=_actionable,
+                            check_key=check_key,
+                        )
+                        if _actionable:
+                            _render_verdict_actions(
+                                sub, _selected, _key_base, check_key, reason_type, verdict
                             )
-                            if _actionable:
-                                _render_verdict_actions(
-                                    sub, _selected, _key_base, check_key, reason_type, verdict
-                                )
 
         if not any_visible and search_term.strip():
             st.info(f"No results match '{search_term}'.")
