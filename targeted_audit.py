@@ -3,6 +3,7 @@ import socket
 from urllib.parse import urlparse
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 from targeted_audit_filters import (
     evaluate_all_checks,
@@ -727,53 +728,64 @@ def targeted_audit_modal(support_files):
     if has_results:
         counts = results["Verdict"].value_counts() if not results.empty else pd.Series(dtype=int)
 
-        # Six metric cards. I replaced these with a pill row to buy vertical
-        # space and it was the wrong trade — this is the summary people look
-        # for, and shrinking it made it read as missing rather than compact.
-        # The space came from the duplicate heading and the merged caption
-        # instead, which cost nothing to look at.
-        s1, s2, s3, s4, s5, s6 = st.columns(6)
-        s1.metric("❌ False Approvals", int(counts.get("False Approval", 0)))
-        s2.metric("⚠️ False Rejections", int(counts.get("False Rejection", 0)))
-        s3.metric("✅ True Rejections", int(counts.get("True Rejection", 0)))
-        s4.metric("👁️ Needs Review", int(counts.get("Needs Manual Review", 0)))
-        s5.metric("🚨 AI Errors", int(counts.get("AI Error", 0)))
-        s6.metric("📑 Duplicates", int(counts.get("Duplicate", 0)))
+        # The summary renders BELOW the findings — see the call site further
+        # down. Measured on a real KE batch: the findings started 3,905px into
+        # a 4,664px dialog, so on a 720px window they sat five screens below
+        # the fold and every run ended with a hunt for them. Nothing here is
+        # something you act on; it is context for findings you have already
+        # read, so it belongs after them.
+        #
+        # Kept as a function rather than moved bodily so the order is one call
+        # site to change if this turns out to read worse in practice.
+        def _render_summary():
+            # Six metric cards. I replaced these with a pill row to buy vertical
+            # space and it was the wrong trade — this is the summary people look
+            # for, and shrinking it made it read as missing rather than compact.
+            # The space came from the duplicate heading and the merged caption
+            # instead, which cost nothing to look at.
+            s1, s2, s3, s4, s5, s6 = st.columns(6)
+            s1.metric("❌ False Approvals", int(counts.get("False Approval", 0)))
+            s2.metric("⚠️ False Rejections", int(counts.get("False Rejection", 0)))
+            s3.metric("✅ True Rejections", int(counts.get("True Rejection", 0)))
+            s4.metric("👁️ Needs Review", int(counts.get("Needs Manual Review", 0)))
+            s5.metric("🚨 AI Errors", int(counts.get("AI Error", 0)))
+            s6.metric("📑 Duplicates", int(counts.get("Duplicate", 0)))
+
+            _ledger_now = _actioned()
+            if _ledger_now:
+                _n_app = sum(1 for v in _ledger_now.values() if v.endswith("pproved"))
+                _n_rej = sum(1 for v in _ledger_now.values() if v.endswith("ejected"))
+                _n_over = sum(1 for v in _ledger_now.values() if v.startswith("Overwritten"))
+                _bar, _reset = st.columns([4, 1], vertical_alignment="center")
+                with _bar:
+                    st.caption(
+                        f"Applied from this audit: **{_n_app:,} approved**, "
+                        f"**{_n_rej:,} rejected**"
+                        + (f", of which **{_n_over:,} overwrote** an existing decision"
+                           if _n_over else "")
+                        + ". These are already in the report and the Excel exports."
+                    )
+                with _reset:
+                    if st.button("Clear marks", key="btn_clear_audit_marks", width="stretch",
+                                 help="Clears the actioned markers here. Does not undo the "
+                                      "status changes — those live in the report."):
+                        st.session_state.pop(_ACTIONED_KEY, None)
+                        st.rerun()
 
         # Result of the last approve/reject, shown here rather than as a toast:
         # acting on a row reruns the dialog, and a toast fired during that run
-        # is easy to miss behind the modal.
+        # is easy to miss behind the modal. Stays at the top: it is feedback on
+        # what you just did, and below the findings it would be missed again.
         _flash = st.session_state.pop("_audit_flash", None)
         if _flash:
             st.success(_flash, icon=":material/task_alt:")
 
-        _ledger_now = _actioned()
-        if _ledger_now:
-            _n_app = sum(1 for v in _ledger_now.values() if v.endswith("pproved"))
-            _n_rej = sum(1 for v in _ledger_now.values() if v.endswith("ejected"))
-            _n_over = sum(1 for v in _ledger_now.values() if v.startswith("Overwritten"))
-            _bar, _reset = st.columns([4, 1], vertical_alignment="center")
-            with _bar:
-                st.caption(
-                    f"Applied from this audit: **{_n_app:,} approved**, "
-                    f"**{_n_rej:,} rejected**"
-                    + (f", of which **{_n_over:,} overwrote** an existing decision"
-                       if _n_over else "")
-                    + ". These are already in the report and the Excel exports."
-                )
-            with _reset:
-                if st.button("Clear marks", key="btn_clear_audit_marks", width="stretch",
-                             help="Clears the actioned markers here. Does not undo the "
-                                  "status changes — those live in the report."):
-                    st.session_state.pop(_ACTIONED_KEY, None)
-                    st.rerun()
-
         # Title and caption merged onto one line — the caption was its own
         # block under a heading that said much the same thing.
         st.markdown(
-            '<div class="audit-section-title">Issues by check'
+            '<div id="audit-findings-top" class="audit-section-title">Issues by check'
             '<span style="font-weight:400;font-size:0.8rem;opacity:.65;"> — only items '
-            'needing a decision or a fix; confirmed rejections are counted above</span></div>',
+            'needing a decision or a fix; confirmed rejections are counted below</span></div>',
             unsafe_allow_html=True,
         )
         # A fixed-height scrolling container was tried here and made things
@@ -793,20 +805,24 @@ def targeted_audit_modal(support_files):
             results_issues["Check"].value_counts().to_dict()
             if not results_issues.empty else {}
         )
-        with st.expander(
-            f"Checks run — {sum(1 for k in CHECK_ORDER if _counts.get(k))} of "
-            f"{len(CHECK_ORDER)} found something",
-            expanded=False, icon=":material/checklist:",
-        ):
-            st.dataframe(
-                pd.DataFrame([
-                    {"Check": CHECK_LABELS[k],
-                     "Findings": int(_counts.get(k, 0)),
-                     "Result": "needs attention" if _counts.get(k) else "clean"}
-                    for k in CHECK_ORDER
-                ]),
-                hide_index=True, width="stretch",
-            )
+        # Coverage, not findings — it answers "did this check run?", which you
+        # ask after reading the results, not before. Renders with the summary
+        # below them.
+        def _render_checks_run():
+            with st.expander(
+                f"Checks run — {sum(1 for k in CHECK_ORDER if _counts.get(k))} of "
+                f"{len(CHECK_ORDER)} found something",
+                expanded=False, icon=":material/checklist:",
+            ):
+                st.dataframe(
+                    pd.DataFrame([
+                        {"Check": CHECK_LABELS[k],
+                         "Findings": int(_counts.get(k, 0)),
+                         "Result": "needs attention" if _counts.get(k) else "clean"}
+                        for k in CHECK_ORDER
+                    ]),
+                    hide_index=True, width="stretch",
+                )
 
         # Fewest findings first. The order used to follow CHECK_ORDER, which put
         # Duplicates and Category — over two thousand rows between them on a
@@ -864,6 +880,62 @@ def targeted_audit_modal(support_files):
 
         if not any_visible and search_term.strip():
             st.info(f"No results match '{search_term}'.")
+
+        # ── Summary, below the findings ─────────────────────────────────────
+        st.markdown('<hr class="audit-divider">', unsafe_allow_html=True)
+        _render_summary()
+        _render_checks_run()
+
+        # ── Land on the findings when a run finishes ────────────────────────
+        # The dialog is a fixed window and the modal is several screens long,
+        # so finishing a run left the reviewer at the top with nothing useful
+        # in view. Reordering above puts the findings first; this puts the
+        # scroll position on them too, which matters on a batch where the
+        # controls and any flash message still sit above.
+        #
+        # Only on run_clicked — a rerun caused by approving a row must leave
+        # the scroll position alone, or actioning an item would yank the page
+        # out from under the next one.
+        #
+        # Written through a component because Streamlit strips <script> from
+        # st.markdown, and it reaches out through window.parent since the
+        # component runs in its own iframe. [data-testid="stDialog"] is the
+        # scroll container — the panel inside it is overflow:visible.
+        #
+        # It re-applies for ~3s instead of firing once. Measured: a single
+        # scroll lands correctly and is then thrown away by the render that
+        # follows, leaving the dialog back at the top. Twenty attempts at
+        # 150ms outlast that and the position sticks (verified: the findings
+        # heading goes from 188px down the page to 17px, i.e. to the top of
+        # the view).
+        #
+        # Any wheel or touch aborts it, so a reviewer who starts scrolling
+        # during those three seconds is not dragged back.
+        if run_clicked:
+            components.html(
+                """
+                <script>
+                (function () {
+                  var doc = window.parent.document, n = 0, stopped = false;
+                  var stop = function () { stopped = true; };
+                  doc.addEventListener('wheel', stop, {once: true, passive: true});
+                  doc.addEventListener('touchstart', stop, {once: true, passive: true});
+                  var timer = setInterval(function () {
+                    n += 1;
+                    if (stopped || n > 20) { clearInterval(timer); return; }
+                    var dlg = doc.querySelector('[data-testid="stDialog"]');
+                    var anchor = doc.getElementById('audit-findings-top');
+                    if (!dlg || !anchor) return;
+                    var y = anchor.getBoundingClientRect().top
+                          - dlg.getBoundingClientRect().top
+                          + dlg.scrollTop;
+                    dlg.scrollTop = Math.max(0, y - 8);
+                  }, 150);
+                })();
+                </script>
+                """,
+                height=0,
+            )
 
         # ── Export ───────────────────────────────────────────────────────────
         # Both downloads serve the snapshot from the first completed run, not
