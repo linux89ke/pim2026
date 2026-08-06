@@ -604,7 +604,11 @@ FLAG_RELEVANT_COLS = {
     # "Matched In" says which of the four the brand was actually found in.
     "Restricted brands": ["NAME", "BRAND", "SELLER_NAME", "CATEGORY_CODE", "CATEGORY",
                           "DESCRIPTION", "SHORT_DESCRIPTION", "Matched In"],
-    "Suspected Fake product": ["CATEGORY_CODE", "BRAND", "GLOBAL_SALE_PRICE", "GLOBAL_PRICE"],
+    # NAME and the descriptions are listed because the price ceiling now looks
+    # for the brand claim there too, not just in the BRAND field. This map also
+    # scopes the per-flag cache digest.
+    "Suspected Fake product": ["CATEGORY_CODE", "BRAND", "NAME", "GLOBAL_SALE_PRICE",
+                               "GLOBAL_PRICE", "DESCRIPTION", "SHORT_DESCRIPTION"],
     "Seller Not approved to sell Refurb": ["PRODUCT_SET_SID", "CATEGORY_CODE", "SELLER_NAME", "NAME"],
     "Product Warranty": ["PRODUCT_WARRANTY", "WARRANTY_DURATION", "CATEGORY_CODE"],
     "Seller Approve to sell books": ["CATEGORY_CODE", "SELLER_NAME"],
@@ -1747,8 +1751,29 @@ def check_prohibited_products(
 
 
 def check_suspected_fake_products(
-    data: pd.DataFrame, suspected_fake_df: pd.DataFrame
+    data: pd.DataFrame, suspected_fake_df: pd.DataFrame,
+    sneaker_category_codes: Optional[List[str]] = None,
 ) -> pd.DataFrame:
+    """Brand claimed + price under the ceiling for that brand and category.
+
+    The ceiling used to be looked up on the declared BRAND field alone, which
+    is the one place a counterfeit listing is careful not to put the brand:
+
+        BRAND "Generic"  NAME "Nike Air Max 90 ..."   -> no ceiling applied
+        BRAND "Airmax"   NAME "Airmax tn ultra"       -> no ceiling applied
+                                                         ("Airmax" is not a
+                                                          column in the sheet)
+
+    A brand is now claimed if it appears in the BRAND field OR as a whole word
+    in NAME — and, inside the sneaker categories, in DESCRIPTION or
+    SHORT_DESCRIPTION too. The description is scoped to sneakers deliberately:
+    across the whole catalogue "compatible with Sony" in an accessory's copy is
+    ordinary, but a sneaker's description naming Nike is a claim about the shoe.
+
+    Price ceilings and their categories come from suspected_fake.xlsx as
+    before — row 0 is the ceiling, the rows beneath it are the categories it
+    applies to, one column per brand.
+    """
     if (
         not all(
             c in data.columns
@@ -1786,15 +1811,78 @@ def check_suspected_fake_products(
             ),
             errors="coerce",
         ).fillna(0)
-        prices = d["price_to_use"].values
-        brands = d["_brand_lower"].values
-        cats = d["_cat_clean"].values
-        d["is_fake"] = [
-            p < brand_cat_price.get((b, c), -1) for p, b, c in zip(prices, brands, cats)
-        ]
-        return d[d["is_fake"] == True][data.columns].drop_duplicates(
-            subset=["PRODUCT_SET_SID"]
+        # Which brands does this listing claim, and where?
+        #
+        # One alternation over the sheet's brand names (about a dozen), run
+        # once per surface rather than per row. Word-bounded, so "Bose" does
+        # not match inside "boses" and "AKG" does not match inside a SKU.
+        _sheet_brands = sorted(
+            {b for (b, _c) in brand_cat_price}, key=len, reverse=True
         )
+        _brand_res = {
+            b: re.compile(r"(?<!\w)" + re.escape(b) + r"(?!\w)", re.IGNORECASE)
+            for b in _sheet_brands
+        }
+        _tag_re = re.compile(r"<[^>]+>")
+        _name = d.get("NAME", pd.Series("", index=d.index)).astype(str).str.lower()
+
+        _sneaker_cats = {
+            clean_category_code(c) for c in (sneaker_category_codes or [])
+        }
+        _in_sneakers = d["_cat_clean"].isin(_sneaker_cats) if _sneaker_cats else pd.Series(False, index=d.index)
+        if _in_sneakers.any():
+            _blob = (
+                d.get("DESCRIPTION", pd.Series("", index=d.index)).astype(str)
+                + " "
+                + d.get("SHORT_DESCRIPTION", pd.Series("", index=d.index)).astype(str)
+            ).where(_in_sneakers, "").str.replace(_tag_re, " ", regex=True).str.lower()
+        else:
+            _blob = pd.Series("", index=d.index)
+
+        _claims = {}   # brand -> boolean Series
+        for b, rx in _brand_res.items():
+            _claims[b] = (
+                (d["_brand_lower"] == b)
+                | _name.str.contains(rx, na=False)
+                | _blob.str.contains(rx, na=False)
+            )
+
+        prices = d["price_to_use"].values
+        cats = d["_cat_clean"].values
+        _flag = pd.Series(False, index=d.index)
+        _detail = pd.Series("", index=d.index)
+        for b, claimed in _claims.items():
+            if not claimed.any():
+                continue
+            _ceil = pd.Series(
+                [brand_cat_price.get((b, c), -1) for c in cats], index=d.index
+            )
+            _under = claimed & (d["price_to_use"] < _ceil) & (_ceil > 0)
+            if not _under.any():
+                continue
+            # Where the claim came from, so a reviewer can see whether the
+            # seller declared the brand or buried it in the copy.
+            _where = pd.Series("BRAND", index=d.index)
+            _where = _where.mask(d["_brand_lower"] != b, "NAME")
+            _where = _where.mask(
+                (d["_brand_lower"] != b) & ~_name.str.contains(_brand_res[b], na=False),
+                "DESCRIPTION",
+            )
+            _new = _under & ~_flag
+            _detail.loc[_new] = (
+                f"{b.title()} claimed in " + _where.loc[_new]
+                + " but priced under the "
+                + _ceil.loc[_new].astype(int).astype(str) + " ceiling"
+            )
+            _flag = _flag | _under
+
+        d["is_fake"] = _flag
+        out = d[d["is_fake"] == True].copy()
+        if out.empty:
+            return pd.DataFrame(columns=data.columns)
+        out["Comment_Detail"] = _detail.loc[out.index]
+        _cols = list(data.columns) + ["Comment_Detail"]
+        return out[_cols].drop_duplicates(subset=["PRODUCT_SET_SID"])
     except Exception as e:
         logger.warning(f"check_suspected_fake_products: {e}")
         return pd.DataFrame(columns=data.columns)
@@ -3563,7 +3651,13 @@ def validate_products(
         (
             "Suspected Fake product",
             check_suspected_fake_products,
-            {"suspected_fake_df": support_files.get("suspected_fake", {}).get(country_validator.code, pd.DataFrame())},
+            {
+                "suspected_fake_df": support_files.get("suspected_fake", {}).get(country_validator.code, pd.DataFrame()),
+                # Scopes the description scan: a sneaker's copy naming Nike is
+                # a claim about the shoe, an accessory's "compatible with
+                # Sony" is not.
+                "sneaker_category_codes": support_files.get("sneaker_category_codes", []),
+            },
         ),
         (
             "Seller Not approved to sell Refurb",
