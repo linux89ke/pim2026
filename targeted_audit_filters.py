@@ -731,6 +731,26 @@ def evaluate_all_checks(data: pd.DataFrame, country_code: str) -> pd.DataFrame:
     weights = load_weight_categories()
     color_re = get_color_regex()
     qc_rules = load_qc_excel(country_code)
+    # The product's FINAL verdict, from PIM_QC_Result.xlsx.
+    #
+    # A per-check column says what one check thought; it does not say what
+    # happened to the product. "Review" especially: it means the AI was unsure
+    # and passed it to a human, not that the product was held. In KE 805, 838
+    # of the 1,385 products whose category check said Review shipped Approved.
+    #
+    # Reading the column alone, the audit counted all 1,385 as "the file caught
+    # it" and reported nothing — so a rule firing on any of those 838 was
+    # silently dropped. That is what hid the Titan Gel product: its category
+    # check said Review, the reason text was correct, and it shipped Approved.
+    _platform_verdict = {}
+    try:
+        _pv = st.session_state.get("_platform_verdict") or {}
+        _platform_verdict = {
+            str(k).strip(): str(v).strip().lower() for k, v in dict(_pv).items()
+        }
+    except Exception:
+        logger.exception("could not read the platform verdict map; "
+                         "falling back to the per-check columns")
     # Deduplicate BOTH sides. The frame's own labels were already handled, but
     # `cols` itself repeats Title_Language_Check_Status/Reason — title_weight
     # and title_english share those two columns — so the selection rebuilt a
@@ -815,10 +835,22 @@ def evaluate_all_checks(data: pd.DataFrame, country_code: str) -> pd.DataFrame:
         # and the product was approved anyway.
         _manual_ok = _clean(rec.get("Manual_Review")).lower() in ("true", "1", "yes")
 
+        # What actually happened to the product, where the file tells us.
+        # Approved here means it shipped, whatever any single check column said,
+        # so a rule firing on it is a miss worth reporting. Rejected likewise
+        # settles it the other way. Only when there is no final verdict to
+        # consult do we fall back to reading the per-check columns.
+        _final = _platform_verdict.get(str(sid).strip(), "")
+
         def _file_verdict(_key):
             if _manual_ok:
                 # Approved regardless of this check's own column.
                 return False, "marked Already Approved (Manual_Review)"
+            if _final == "approved":
+                return False, "the file approved this product"
+            if _final == "rejected":
+                _sc2, _rc2 = _CHECK_COLUMNS[_key]
+                return True, _clean(rec.get(_rc2)) or "the file rejected this product"
             _sc, _rc = _CHECK_COLUMNS[_key]
             _st = _clean(rec.get(_sc)).lower() if _sc in status_cols_present else ""
             _rn = _clean(rec.get(_rc))
