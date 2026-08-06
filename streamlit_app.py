@@ -598,13 +598,19 @@ class CountryValidator:
 
 FLAG_RELEVANT_COLS = {
     "Wrong Category": ["NAME", "CATEGORY", "CATEGORY_CODE"],
-    "Restricted brands": ["NAME", "BRAND", "SELLER_NAME", "CATEGORY_CODE", "CATEGORY"],
+    # DESCRIPTION/SHORT_DESCRIPTION are listed because both checks now read
+    # them. This map also scopes the per-flag cache digest, so leaving them out
+    # would mean an edited description never invalidated the cached result.
+    # "Matched In" says which of the four the brand was actually found in.
+    "Restricted brands": ["NAME", "BRAND", "SELLER_NAME", "CATEGORY_CODE", "CATEGORY",
+                          "DESCRIPTION", "SHORT_DESCRIPTION", "Matched In"],
     "Suspected Fake product": ["CATEGORY_CODE", "BRAND", "GLOBAL_SALE_PRICE", "GLOBAL_PRICE"],
     "Seller Not approved to sell Refurb": ["PRODUCT_SET_SID", "CATEGORY_CODE", "SELLER_NAME", "NAME"],
     "Product Warranty": ["PRODUCT_WARRANTY", "WARRANTY_DURATION", "CATEGORY_CODE"],
     "Seller Approve to sell books": ["CATEGORY_CODE", "SELLER_NAME"],
     "Seller Approved to Sell Perfume": ["CATEGORY_CODE", "SELLER_NAME", "BRAND", "NAME"],
-    "Counterfeit Sneakers": ["CATEGORY_CODE", "NAME", "BRAND"],
+    "Counterfeit Sneakers": ["CATEGORY_CODE", "NAME", "BRAND",
+                             "DESCRIPTION", "SHORT_DESCRIPTION", "Matched In"],
     "Suspected counterfeit Jerseys": ["CATEGORY_CODE", "NAME", "SELLER_NAME"],
     "Suspected Fake Perfume": ["CATEGORY_CODE", "NAME", "BRAND"],
     "Unnecessary words in NAME": ["NAME"],
@@ -1263,6 +1269,27 @@ def _to_polars_cached(data_hash: str, data: pd.DataFrame):
     return pl.from_pandas(data)
 
 
+# Restricted brands that are also ordinary English words.
+#
+# These are still matched in NAME and BRAND exactly as before — putting
+# "Simple" in the brand field is a brand claim. They are NOT matched in
+# DESCRIPTION or SHORT_DESCRIPTION, because there the same letters are usually
+# just an adjective.
+#
+# Measured on a real 8,677-product KE batch: scanning descriptions for every
+# restricted brand flagged 205 extra products, and 198 of them were the word
+# "simple" in ordinary prose — "a slim and simple design", "makes everyday
+# cooking simple", "the simple rules make it easy for children". Excluding
+# these words takes the same scan to 7, which is the evasion this is for.
+#
+# Add a word here if a restricted brand starts producing prose false
+# positives; remove one if a brand is genuinely being hidden in descriptions
+# and the noise is worth it.
+RESTRICTED_BRANDS_NOT_SCANNED_IN_PROSE = {
+    "simple", "classic", "original", "premium", "fashion", "generic", "nature",
+}
+
+
 def check_restricted_brands(
     data: pd.DataFrame, country_rules: List[Dict]
 ) -> pd.DataFrame:
@@ -1301,6 +1328,21 @@ def check_restricted_brands(
     if "_name_lower" not in d.columns:
         d["_name_lower"] = d.get("NAME", pd.Series("", index=d.index)).astype(str).str.lower()
 
+    # Free-text surfaces, kept apart from each other so a finding can say which
+    # one the brand was hidden in rather than just "somewhere in the copy".
+    #
+    # Lowercased only at this point. Tag stripping is deferred until after the
+    # pre-filter below, because it is a regex rewrite of every description in
+    # the batch — thousands of long HTML strings — to serve the handful of rows
+    # that survive filtering. Doing it here roughly doubled the cost of the
+    # whole check on an 8,677-product batch.
+    d["_desc_lower"] = (
+        d.get("DESCRIPTION", pd.Series("", index=d.index)).astype(str).str.lower()
+    )
+    d["_sdesc_lower"] = (
+        d.get("SHORT_DESCRIPTION", pd.Series("", index=d.index)).astype(str).str.lower()
+    )
+
     all_keywords = set()
     brand_names_only = set()
     brand_raw_lower_only = set()
@@ -1317,20 +1359,48 @@ def check_restricted_brands(
     _name_norm_pattern = "(?i)" + "|".join(re.escape(k) for k in brand_names_only if k)
     _brand_substr_pattern = "(?i)" + "|".join(r"\b" + re.escape(k) + r"\b" for k in brand_names_only if k)
     
+    # Prose surfaces use their own alternation: the ordinary-word brands are
+    # dropped from it, so "simple" in a description costs nothing here.
+    _prose_names = [
+        k for k in brand_raw_lower_only
+        if k and k not in RESTRICTED_BRANDS_NOT_SCANNED_IN_PROSE
+    ]
+    _prose_pattern = (
+        "(?i)" + "|".join(r"\b" + re.escape(k) + r"\b" for k in _prose_names)
+        if _prose_names else None
+    )
+
     mask = (
         d["_brand_norm"].isin(all_keywords)
         | d["_brand_norm"].str.contains(_brand_substr_pattern, na=False)
         | d["_name_norm"].str.contains(_name_norm_pattern, na=False)
         | d["_name_lower"].str.contains(_name_raw_pattern, na=False)
     )
-    
+    if _prose_pattern:
+        mask = (
+            mask
+            | d["_desc_lower"].str.contains(_prose_pattern, na=False)
+            | d["_sdesc_lower"].str.contains(_prose_pattern, na=False)
+        )
+
     d = d[mask].copy()
 
     if d.empty:
         return pd.DataFrame(columns=data.columns)
 
+    # Now that the batch is down to candidates, strip the HTML. An attribute
+    # value (class="sony-block", a CDN path containing the brand) is not a
+    # brand claim to a shopper, so matching on raw markup would flag listings
+    # that never show the name. The pre-filter above ran on raw text and is
+    # therefore slightly over-inclusive, which is the right way round: it can
+    # only add candidates for this stricter pass to reject.
+    _tag_re = re.compile(r"<[^>]+>")
+    for _c in ("_desc_lower", "_sdesc_lower"):
+        d[_c] = d[_c].str.replace(_tag_re, " ", regex=True)
+
     flagged_indices = set()
     comment_map = {}
+    where_map = {}
     match_details = {}
     for rule in country_rules:
         brand_name = rule["brand"]
@@ -1351,11 +1421,40 @@ def check_restricted_brands(
         )
         main_name_norm_starts = d["_name_norm"].str.startswith(brand_name, na=False)
         main_name_matches = main_name_lower_matches | main_name_norm_starts
-        current_match_mask = main_brand_matches | main_name_matches
+
+        # Same brand, hidden in the copy instead of the labelled fields. Only
+        # consulted for brands that are not ordinary words — see
+        # RESTRICTED_BRANDS_NOT_SCANNED_IN_PROSE.
+        _prose_ok = brand_raw.lower() not in RESTRICTED_BRANDS_NOT_SCANNED_IN_PROSE
+        _word_re = r"\b" + re.escape(brand_raw.lower()) + r"\b"
+        if _prose_ok:
+            desc_matches = d["_desc_lower"].str.contains(
+                _word_re, regex=True, na=False, flags=re.IGNORECASE
+            )
+            sdesc_matches = d["_sdesc_lower"].str.contains(
+                _word_re, regex=True, na=False, flags=re.IGNORECASE
+            )
+        else:
+            desc_matches = pd.Series(False, index=d.index)
+            sdesc_matches = pd.Series(False, index=d.index)
+
+        current_match_mask = (
+            main_brand_matches | main_name_matches | desc_matches | sdesc_matches
+        )
+        # Most specific surface wins, so a product with the brand in both the
+        # name and the description reads as a name match — the description is
+        # only the interesting finding when the labelled fields look clean.
         for idx in d[main_brand_matches].index:
-            match_details[idx] = ("main_brand", brand_raw)
+            match_details[idx] = ("main_brand", brand_raw, "BRAND")
         for idx in d[main_name_matches & ~main_brand_matches].index:
-            match_details[idx] = ("main_name", brand_raw)
+            match_details[idx] = ("main_name", brand_raw, "NAME")
+        _labelled = main_brand_matches | main_name_matches
+        for idx in d[desc_matches & ~_labelled].index:
+            if idx not in match_details:
+                match_details[idx] = ("description", brand_raw, "DESCRIPTION")
+        for idx in d[sdesc_matches & ~_labelled & ~desc_matches].index:
+            if idx not in match_details:
+                match_details[idx] = ("short_description", brand_raw, "SHORT_DESCRIPTION")
         valid_vars = [v for v in rule.get("variations", []) if str(v).strip()]
         if valid_vars:
             sorted_vars = sorted(valid_vars, key=len, reverse=True)
@@ -1387,6 +1486,7 @@ def check_restricted_brands(
                             match_details[idx] = (
                                 "variation",
                                 f"{brand_raw} (as '{var}')",
+                                "BRAND" if var_brand_matches[idx] else "NAME",
                             )
                             break
             current_match_mask = (
@@ -1422,19 +1522,31 @@ def check_restricted_brands(
         if not rejected.empty:
             for idx in rejected.index:
                 flagged_indices.add(idx)
-                match_type, match_info = match_details.get(idx, ("unknown", brand_raw))
+                match_type, match_info, matched_in = match_details.get(
+                    idx, ("unknown", brand_raw, "")
+                )
                 seller_status = (
                     "Seller not in approved list"
                     if rule["sellers"]
                     else "No sellers approved"
                 )
-                comment_map[idx] = f"Restricted Brand: {match_info} - {seller_status}"
+                # Where it was found is part of the finding, not a footnote: a
+                # brand in the DESCRIPTION with a clean NAME and BRAND is a
+                # different thing from a brand in the BRAND field, and the
+                # reviewer needs to see which one they are looking at.
+                _where = f" in {matched_in}" if matched_in else ""
+                comment_map[idx] = (
+                    f"Restricted Brand: {match_info}{_where} - {seller_status}"
+                )
+                where_map[idx] = matched_in
     if not flagged_indices:
         return pd.DataFrame(columns=data.columns)
     flagged_sids = {d.loc[idx, "PRODUCT_SET_SID"] for idx in flagged_indices}
     sid_comment = {d.loc[idx, "PRODUCT_SET_SID"]: comment_map[idx] for idx in flagged_indices}
+    sid_where = {d.loc[idx, "PRODUCT_SET_SID"]: where_map.get(idx, "") for idx in flagged_indices}
     result = data[data["PRODUCT_SET_SID"].isin(flagged_sids)].copy()
     result["Comment_Detail"] = result["PRODUCT_SET_SID"].map(sid_comment)
+    result["Matched In"] = result["PRODUCT_SET_SID"].map(sid_where)
     return result.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
@@ -1963,10 +2075,39 @@ def check_counterfeit_sneakers(
         + r")(?!\w)",
         re.IGNORECASE,
     )
-    return sneakers[
+    # The same brand name moved out of the title and into the copy is the same
+    # claim to a shopper, so the description and short description are scanned
+    # too. Tags are stripped first — an attribute value is not a claim.
+    #
+    # No ordinary-word exclusion is needed here, unlike the restricted-brand
+    # check: this list is counterfeit sneaker brands, and the surrounding
+    # BRAND == Generic/Fashion condition already keeps it narrow.
+    _tag_re = re.compile(r"<[^>]+>")
+    _desc = (
+        sneakers.get("DESCRIPTION", pd.Series("", index=sneakers.index))
+        .astype(str).str.replace(_tag_re, " ", regex=True).str.lower()
+    )
+    _sdesc = (
+        sneakers.get("SHORT_DESCRIPTION", pd.Series("", index=sneakers.index))
+        .astype(str).str.replace(_tag_re, " ", regex=True).str.lower()
+    )
+    _in_name = sneakers["_name_lower"].str.contains(_sens_re, na=False)
+    _in_desc = _desc.str.contains(_sens_re, na=False)
+    _in_sdesc = _sdesc.str.contains(_sens_re, na=False)
+
+    hit = sneakers[
         sneakers["_brand_lower"].isin(["generic", "fashion"])
-        & sneakers["_name_lower"].str.contains(_sens_re, na=False)
-    ].drop_duplicates(subset=["PRODUCT_SET_SID"])
+        & (_in_name | _in_desc | _in_sdesc)
+    ].copy()
+    if hit.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    # Most specific surface first, same rule as the restricted-brand check:
+    # the description is only the interesting finding when the title is clean.
+    hit["Matched In"] = "SHORT_DESCRIPTION"
+    hit.loc[_in_desc.loc[hit.index], "Matched In"] = "DESCRIPTION"
+    hit.loc[_in_name.loc[hit.index], "Matched In"] = "NAME"
+    return hit.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
 def check_counterfeit_jerseys(
