@@ -610,7 +610,8 @@ FLAG_RELEVANT_COLS = {
     "Seller Approve to sell books": ["CATEGORY_CODE", "SELLER_NAME"],
     "Seller Approved to Sell Perfume": ["CATEGORY_CODE", "SELLER_NAME", "BRAND", "NAME"],
     "Counterfeit Sneakers": ["CATEGORY_CODE", "NAME", "BRAND",
-                             "DESCRIPTION", "SHORT_DESCRIPTION", "Matched In"],
+                             "DESCRIPTION", "SHORT_DESCRIPTION", "Matched In",
+                             "Brand Claim"],
     "Suspected counterfeit Jerseys": ["CATEGORY_CODE", "NAME", "SELLER_NAME"],
     "Suspected Fake Perfume": ["CATEGORY_CODE", "NAME", "BRAND"],
     "Unnecessary words in NAME": ["NAME"],
@@ -2040,7 +2041,31 @@ def check_counterfeit_sneakers(
     data: pd.DataFrame,
     sneaker_category_codes: List[str],
     sneaker_sensitive_brands: List[str],
+    known_brands: Optional[List[str]] = None,
 ) -> pd.DataFrame:
+    """Sneakers invoking a protected brand the listing does not declare.
+
+    The gate used to be BRAND in ("generic", "fashion"). Measured against 220
+    real counterfeit-suspect listings, that caught zero — including zero of
+    the 33 the source data rated most likely counterfeit. Nobody leaves the
+    field blank any more; they fill it with something derived from the brand
+    they are invoking:
+
+        NAME "Airmax tn ultra black"  BRAND "Airmax"      (not Nike)
+        NAME "Conver all star"        BRAND "Conver"      (not Converse)
+        NAME "j4 black red"           BRAND "Jordana"     (not Jordan)
+        NAME "Fashion 254 Nike ..."   BRAND "Fashion 254" (a seller name)
+
+    So the test is now plausibility rather than emptiness: the listing
+    invokes a protected sneaker brand, and the BRAND field is not a
+    recognised brand at all. A genuine "Nike Air Max 90 / BRAND Nike" passes,
+    because Nike is recognised — an unauthorised seller of real Nike is the
+    restricted-brand check's job, not this one.
+
+    known_brands is brands.txt. It is optional so existing callers that pass
+    only the two lists keep working, but without it this falls back to the
+    old generic/fashion gate and catches almost nothing.
+    """
     if not {"CATEGORY_CODE", "NAME", "BRAND"}.issubset(data.columns):
         return pd.DataFrame(columns=data.columns)
     sneakers = data[
@@ -2095,8 +2120,36 @@ def check_counterfeit_sneakers(
     _in_desc = _desc.str.contains(_sens_re, na=False)
     _in_sdesc = _sdesc.str.contains(_sens_re, na=False)
 
+    # Is the declared brand a real brand at all?
+    #
+    # Normalised the same way both sides, so "Air-Max" and "air max" compare
+    # equal. The pseudo-brands are listed explicitly because they are real
+    # entries a seller can pick, not absences — "Fashion" is a selectable
+    # value, and it is never a claim about who made the shoe.
+    _PSEUDO = {"generic", "fashion", "unbranded", "no brand", "none", "n/a", "other", ""}
+
+    def _norm_brand(s):
+        return re.sub(r"[^a-z0-9 ]+", "", str(s).lower()).strip()
+
+    _known = {
+        _norm_brand(b) for b in (known_brands or []) if str(b).strip()
+    } - _PSEUDO
+    _declared = sneakers["_brand_lower"].map(_norm_brand)
+    if _known:
+        _brand_recognised = _declared.isin(_known) & ~_declared.isin(_PSEUDO)
+    else:
+        # No brand list to judge against. Fall back to the old, narrow gate
+        # rather than treating every brand as unrecognised — an empty list
+        # would otherwise flag every sneaker that mentions a protected name,
+        # which is the opposite of a safe default for a missing input.
+        logger.warning(
+            "counterfeit sneakers: no known-brand list supplied, falling back "
+            "to the generic/fashion gate"
+        )
+        _brand_recognised = ~_declared.isin(_PSEUDO)
+
     hit = sneakers[
-        sneakers["_brand_lower"].isin(["generic", "fashion"])
+        ~_brand_recognised
         & (_in_name | _in_desc | _in_sdesc)
     ].copy()
     if hit.empty:
@@ -2107,6 +2160,14 @@ def check_counterfeit_sneakers(
     hit["Matched In"] = "SHORT_DESCRIPTION"
     hit.loc[_in_desc.loc[hit.index], "Matched In"] = "DESCRIPTION"
     hit.loc[_in_name.loc[hit.index], "Matched In"] = "NAME"
+
+    # Why this one was flagged, in the reviewer's words rather than a rule id.
+    # "Fashion" and friends read differently from an invented brand, and the
+    # two want different follow-up, so they are named separately.
+    _d = hit["_brand_lower"].map(_norm_brand)
+    _b = hit["BRAND"].astype(str)
+    hit["Brand Claim"] = "Brand '" + _b + "' is not a recognised brand"
+    hit.loc[_d.isin(_PSEUDO), "Brand Claim"] = "No brand declared (" + _b + ")"
     return hit.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
@@ -3566,6 +3627,9 @@ def validate_products(
                 "sneaker_sensitive_brands": support_files.get(
                     "sneaker_sensitive_brands", []
                 ),
+                # brands.txt, so the check can tell a declared brand that
+                # exists from one invented to dodge the filter.
+                "known_brands": support_files.get("known_brands", []),
             },
         ),
         (
