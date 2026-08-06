@@ -5042,6 +5042,55 @@ if st.session_state.get("last_processed_files") != process_signature:
                             status_cols = [c for c in qc_zip.columns if "status" in c.lower()]
                             fmap = support_files.get("flags_mapping", {})
                             _fr_sid_to_idx = pd.Series(final_report.index, index=final_report["ProductSetSid"].astype(str).str.strip()).to_dict()
+                            # Status as our own checks left it, captured before
+                            # the loop below starts editing final_report.
+                            #
+                            # The overrides answer the ZIP's complaint about ONE
+                            # check: the ZIP said the colour was missing, our data
+                            # shows a valid colour, so that complaint goes. They
+                            # were writing a verdict on the whole product instead —
+                            # Status, FLAG, Comment and Reason all overwritten —
+                            # which silently erased a rejection our own checks had
+                            # made for something unrelated, and blanked the reason
+                            # so nothing downstream could tell.
+                            #
+                            # Snapshotted rather than read live because the loop
+                            # writes rejections itself. Reading final_report as it
+                            # stands would make the guard depend on the order the
+                            # ZIP happens to list its status columns.
+                            _qc_rejected_sids = set(
+                                final_report.loc[
+                                    final_report["Status"].astype(str).str.strip().str.lower() == "rejected",
+                                    "ProductSetSid",
+                                ].astype(str).str.strip()
+                            )
+
+                            def _clear_zip_complaint(_fidx, _sid, _comment, _tag):
+                                """Drop the ZIP's complaint about one check.
+
+                                Approves outright only when the product is not
+                                already rejected by our own checks; otherwise the
+                                complaint is cleared, the rejection stands, and the
+                                disagreement is noted on the comment.
+                                """
+                                if _sid in _qc_rejected_sids:
+                                    _prev = str(final_report.at[_fidx, "Comment"] or "").strip()
+                                    _note = f"ZIP {_tag} complaint cleared; kept rejected by QC checks"
+                                    final_report.at[_fidx, "Comment"] = f"{_prev} — {_note}" if _prev else _note
+                                    # Is_Zip and zip_override are deliberately NOT
+                                    # set here. zip_override drives a green
+                                    # "Overridden — auto-approved" badge on the grid
+                                    # card, which would be a lie on a product that
+                                    # stayed rejected, and Is_Zip feeds the KPI's
+                                    # "from ZIP/prefetch" rejected count — this
+                                    # rejection is ours, not the ZIP's.
+                                    return
+                                final_report.at[_fidx, "Status"] = "Approved"
+                                final_report.at[_fidx, "FLAG"] = "Approved by User"
+                                final_report.at[_fidx, "Comment"] = _comment
+                                final_report.at[_fidx, "Reason"] = ""
+                                final_report.at[_fidx, "Is_Zip"] = True
+                                final_report.at[_fidx, "zip_override"] = _tag
                             # Resolved once per batch, not per row: this walks
                             # the whole category map. Empty set when the toggle
                             # is off, which makes the branch below a no-op.
@@ -5130,23 +5179,17 @@ if st.session_state.get("last_processed_files") != process_signature:
                                     if "warranty" in _base_key.lower():
                                         _wval = str(_r.get("PRODUCT_WARRANTY", "")).strip()
                                         if _wval and _wval.lower() not in ("nan", "none"):
-                                            final_report.at[_fidx, "Status"] = "Approved"
-                                            final_report.at[_fidx, "FLAG"] = "Approved by User"
-                                            final_report.at[_fidx, "Comment"] = "Approved by user for warranty"
-                                            final_report.at[_fidx, "Reason"] = ""
-                                            final_report.at[_fidx, "Is_Zip"] = True
-                                            final_report.at[_fidx, "zip_override"] = "warranty"
+                                            _clear_zip_complaint(
+                                                _fidx, _sid, "Approved by user for warranty", "warranty",
+                                            )
                                             continue
 
                                     if "title" in _base_key.lower() and "weight" in _base_key.lower() or "title_language_weight" in _base_key.lower():
                                         missing_vol_df = res_zip.get("Missing Weight/Volume") if res_zip else None
                                         if missing_vol_df is None or missing_vol_df.empty or _sid not in missing_vol_df["PRODUCT_SET_SID"].astype(str).values:
-                                            final_report.at[_fidx, "Status"] = "Approved"
-                                            final_report.at[_fidx, "FLAG"] = "Approved by User"
-                                            final_report.at[_fidx, "Comment"] = "Approved by user for Title/Volume"
-                                            final_report.at[_fidx, "Reason"] = ""
-                                            final_report.at[_fidx, "Is_Zip"] = True
-                                            final_report.at[_fidx, "zip_override"] = "volume"
+                                            _clear_zip_complaint(
+                                                _fidx, _sid, "Approved by user for Title/Volume", "volume",
+                                            )
                                             continue
 
                                     if "color" in _base_key.lower():
@@ -5163,12 +5206,9 @@ if st.session_state.get("last_processed_files") != process_signature:
                                             if _tv_grp is not None and not _tv_grp.empty and "CATEGORY_CODE" in _tv_grp.columns:
                                                 _tv_code = clean_category_code(str(_tv_grp["CATEGORY_CODE"].iloc[0]))
                                             if _tv_code and _tv_code in _tv_exempt_codes:
-                                                final_report.at[_fidx, "Status"] = "Approved"
-                                                final_report.at[_fidx, "FLAG"] = "Approved by User"
-                                                final_report.at[_fidx, "Comment"] = "Colour check exempt (TV category)"
-                                                final_report.at[_fidx, "Reason"] = ""
-                                                final_report.at[_fidx, "Is_Zip"] = True
-                                                final_report.at[_fidx, "zip_override"] = "color_tv_exempt"
+                                                _clear_zip_complaint(
+                                                    _fidx, _sid, "Colour check exempt (TV category)", "color_tv_exempt",
+                                                )
                                                 continue
 
                                         missing_col_df = res_zip.get("Missing COLOR") if res_zip else None
@@ -5229,12 +5269,9 @@ if st.session_state.get("last_processed_files") != process_signature:
                                         )
 
                                         if passed_main_validation and _color_is_valid:
-                                            final_report.at[_fidx, "Status"] = "Approved"
-                                            final_report.at[_fidx, "FLAG"] = "Approved by User"
-                                            final_report.at[_fidx, "Comment"] = "Approved by user for Color"
-                                            final_report.at[_fidx, "Reason"] = ""
-                                            final_report.at[_fidx, "Is_Zip"] = True
-                                            final_report.at[_fidx, "zip_override"] = "color"
+                                            _clear_zip_complaint(
+                                                _fidx, _sid, "Approved by user for Color", "color",
+                                            )
                                             continue
 
                                     final_report.at[_fidx, "Status"] = "Rejected"
@@ -5269,8 +5306,11 @@ if st.session_state.get("last_processed_files") != process_signature:
                                         # ran; that is not a judgement about a check they never
                                         # applied. So the override still approves anything we passed,
                                         # and leaves our rejections alone.
-                                        _cur_status = str(final_report.at[_fidx, "Status"]).strip().lower()
-                                        if _cur_status == "rejected":
+                                        # Against the pre-loop snapshot, not the live
+                                        # Status: the loop writes rejections of its
+                                        # own, so reading live made this depend on
+                                        # the order the ZIP lists its status columns.
+                                        if _sid in _qc_rejected_sids:
                                             # Keep the rejection, but record that the file disagreed,
                                             # so the conflict is visible rather than just absent.
                                             _prev_cmt = str(final_report.at[_fidx, "Comment"] or "").strip()
