@@ -1819,9 +1819,21 @@ def check_suspected_fake_products(
         _sheet_brands = sorted(
             {b for (b, _c) in brand_cat_price}, key=len, reverse=True
         )
+        # A sub-brand is a claim on its parent's ceiling. "Airmax 97" and
+        # "Air Jordan 4" are Nike, so they answer to Nike's $45 — without this
+        # they answered to nothing, because neither is a column in the sheet.
+        # Only aliases whose parent actually has a ceiling are worth matching.
+        _alias_terms = {}
+        for _alias, _parent in SNEAKER_BRAND_ALIASES.items():
+            if _parent in _sheet_brands and _alias not in _sheet_brands:
+                _alias_terms[_alias] = _parent
         _brand_res = {
             b: re.compile(r"(?<!\w)" + re.escape(b) + r"(?!\w)", re.IGNORECASE)
             for b in _sheet_brands
+        }
+        _alias_res = {
+            a: re.compile(r"(?<!\w)" + re.escape(a) + r"(?!\w)", re.IGNORECASE)
+            for a in _alias_terms
         }
         _tag_re = re.compile(r"<[^>]+>")
         _name = d.get("NAME", pd.Series("", index=d.index)).astype(str).str.lower()
@@ -1843,6 +1855,13 @@ def check_suspected_fake_products(
         for b, rx in _brand_res.items():
             _claims[b] = (
                 (d["_brand_lower"] == b)
+                | _name.str.contains(rx, na=False)
+                | _blob.str.contains(rx, na=False)
+            )
+        for a, parent in _alias_terms.items():
+            rx = _alias_res[a]
+            _claims[parent] = _claims.get(parent, pd.Series(False, index=d.index)) | (
+                (d["_brand_lower"] == a)
                 | _name.str.contains(rx, na=False)
                 | _blob.str.contains(rx, na=False)
             )
@@ -2125,6 +2144,48 @@ def check_perfume_tester(
     return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
+# Sneaker sub-brands and model lines, resolved to the house that owns them.
+#
+# There is no Jordan company and no Airmax company — they are Nike lines, and a
+# listing saying "Airmax 97" or "Air Jordan 4" is making a Nike claim. Treating
+# them as brands in their own right is what let "Airmax" sit in brands.txt as
+# legitimate and dodge Nike's price ceiling.
+#
+# Deliberately excludes model names that are ordinary words — "campus",
+# "samba", "dunk" — because they cannot be told from prose.
+SNEAKER_BRAND_ALIASES = {
+    "jordan": "nike", "air jordan": "nike", "jumpman": "nike", "af1": "nike",
+    "airmax": "nike", "air max": "nike", "airforce": "nike", "air force": "nike",
+    "all star": "converse", "all stars": "converse", "chuck taylor": "converse",
+    "yeezy": "adidas",
+    # Deliberate misspellings, which is a tactic rather than a typo: the seller
+    # wants the shopper to read "Nike" and the filter to read something else.
+    # Only forms with no other meaning are listed — "adida" and "conver" are
+    # not words. "mike" is the exception and is included knowingly: it is a
+    # name, but inside the sneaker categories, next to a Nike silhouette, it is
+    # not a coincidence. Drop it here if it ever costs a real listing.
+    "mike": "nike", "nik": "nike", "n!ke": "nike", "nikee": "nike",
+    "conver": "converse", "convers": "converse", "converce": "converse",
+    "adida": "adidas", "addidas": "adidas", "@didas": "adidas",
+    "timb": "timberland", "timberlan": "timberland",
+}
+
+# Deliberately empty, and not a placeholder to fill in.
+#
+# A blanket "no seller may list this brand" rule was tried and removed. It
+# reached 213 of 220 known counterfeits, but sellers ARE approved for these
+# brands — the problem is the fake ones, not the brand — so on real data it
+# rejected honest listings: a Timberland mention in a slip-on loafer's copy,
+# a Converse mention in an unrelated fashion sneaker. Rejecting a whole brand
+# is only correct when the brand genuinely has no approved seller, which is
+# not the case here.
+#
+# Add a brand here ONLY when that is actually true for it. Listings that no
+# rule can separate from the real thing belong in the visual review grid,
+# where a human decides from the photograph.
+SNEAKER_BRANDS_NO_APPROVED_SELLER: set = set()
+
+
 def check_counterfeit_sneakers(
     data: pd.DataFrame,
     sneaker_category_codes: List[str],
@@ -2236,9 +2297,32 @@ def check_counterfeit_sneakers(
         )
         _brand_recognised = ~_declared.isin(_PSEUDO)
 
+    # Brands nobody may sell yet. The claim is what matters, so this looks at
+    # every surface and resolves aliases first: "Airmax 97" and "Air Jordan 4"
+    # are Nike claims, and Nike has no approved seller.
+    _blocked_terms = {}
+    for _t, _parent in SNEAKER_BRAND_ALIASES.items():
+        if _parent in SNEAKER_BRANDS_NO_APPROVED_SELLER:
+            _blocked_terms[_t] = _parent
+    for _b in SNEAKER_BRANDS_NO_APPROVED_SELLER:
+        _blocked_terms[_b] = _b
+
+    _claim_text = (
+        sneakers["_name_lower"].astype(str) + " "
+        + sneakers["BRAND"].astype(str).str.lower() + " " + _desc + " " + _sdesc
+    )
+    _blocked_hit = pd.Series(False, index=sneakers.index)
+    _blocked_who = pd.Series("", index=sneakers.index)
+    for _t in sorted(_blocked_terms, key=len, reverse=True):
+        _rx = re.compile(r"(?<!\w)" + re.escape(_t) + r"(?!\w)", re.IGNORECASE)
+        _m = _claim_text.str.contains(_rx, na=False) & ~_blocked_hit
+        if _m.any():
+            _blocked_who.loc[_m] = _blocked_terms[_t]
+            _blocked_hit = _blocked_hit | _m
+
     hit = sneakers[
-        ~_brand_recognised
-        & (_in_name | _in_desc | _in_sdesc)
+        (~_brand_recognised & (_in_name | _in_desc | _in_sdesc))
+        | _blocked_hit
     ].copy()
     if hit.empty:
         return pd.DataFrame(columns=data.columns)
@@ -2256,6 +2340,12 @@ def check_counterfeit_sneakers(
     _b = hit["BRAND"].astype(str)
     hit["Brand Claim"] = "Brand '" + _b + "' is not a recognised brand"
     hit.loc[_d.isin(_PSEUDO), "Brand Claim"] = "No brand declared (" + _b + ")"
+    # The no-approved-seller reason wins where both apply: it is the decisive
+    # one, and it is the one a seller can act on.
+    _bw = _blocked_who.loc[hit.index]
+    hit.loc[_bw.ne(""), "Brand Claim"] = (
+        "Claims " + _bw[_bw.ne("")].str.title() + " — no seller is approved for this brand"
+    )
     return hit.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
