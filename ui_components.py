@@ -2268,6 +2268,26 @@ def build_fast_grid_html(
     if not _fr_ss.empty and "zip_override" in _fr_ss.columns and "ProductSetSid" in _fr_ss.columns:
         _zip_override_map = _fr_ss.set_index("ProductSetSid")["zip_override"].fillna("").to_dict()
 
+    # Sneakers claiming a protected brand.
+    #
+    # Not a verdict — most are textually identical to the genuine article
+    # ("ADIDAS Campus" with BRAND=ADIDAS is what a real one looks like), so
+    # the photograph is the only evidence that separates them. The badge puts
+    # them in front of a reviewer here instead of guessing in a rule.
+    #
+    # Computed once per page rather than per card: it scans four text columns.
+    _brand_claims = {}
+    try:
+        from streamlit_app import sneaker_brand_claims as _sneaker_claims
+        _sfx = support_files or {}
+        _brand_claims = _sneaker_claims(
+            page_data,
+            _sfx.get("sneaker_category_codes", []),
+            _sfx.get("sneaker_sensitive_brands", []),
+        )
+    except Exception:
+        logger.exception("could not resolve sneaker brand claims for the grid")
+
     cards_data = []
     for row in page_data.to_dict("records"):
         sid = str(row.get("PRODUCT_SET_SID", "")).strip()
@@ -2450,6 +2470,7 @@ def build_fast_grid_html(
                 "flag_comment": flag_comment,
                 "is_zip": sid in _zip_sid_set,
                 "zip_override": str(_zip_override_map.get(sid, "")),
+                "brand_claim": _brand_claims.get(sid, ""),
             }
         )
 
@@ -3691,6 +3712,9 @@ function renderCard(card) {{
   // Several colours on one listing usually means one photo showing several
   // products, which is what the image review is looking for.
   if (card.multi_colour) warnHtml += `<span class="warn-badge" style="background:#7c3aed;color:#fff;" title="Declared colours: ${{escapeHtml(card.multi_colour)}}">⚠ Too many things?</span>`;
+  // A sneaker claiming a protected brand. No rule can tell these from the
+  // genuine article, so the call belongs to whoever is looking at the photo.
+  if (card.brand_claim) warnHtml += `<span class="warn-badge" style="background:#0f766e;color:#fff;" title="Claims ${{escapeHtml(card.brand_claim)}} — check the photo: no text rule can tell a fake from the real thing here">👟 ${{escapeHtml(card.brand_claim)}}?</span>`;
   var priceText = String(card.price || '').trim();
   var priceHtml = priceText ? `<div class="price-badge">${{escapeHtml(priceText)}}</div>` : '';
 

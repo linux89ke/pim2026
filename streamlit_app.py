@@ -2186,6 +2186,63 @@ SNEAKER_BRAND_ALIASES = {
 SNEAKER_BRANDS_NO_APPROVED_SELLER: set = set()
 
 
+def sneaker_brand_claims(
+    data: pd.DataFrame,
+    sneaker_category_codes: List[str],
+    sneaker_sensitive_brands: List[str],
+) -> Dict[str, str]:
+    """SID -> the protected sneaker brand a listing claims, for the review grid.
+
+    Deliberately not a verdict. Most listings that claim Nike are textually
+    identical to a genuine Nike listing — "ADIDAS Campus" with BRAND=ADIDAS is
+    what the real thing looks like — so no rule can separate them and the
+    photograph is the only evidence left. This marks them for a human to
+    decide in the visual grid instead of guessing.
+
+    Sub-brands resolve to the parent, so an Airmax listing reads as Nike.
+    """
+    if data.empty or not sneaker_category_codes or not sneaker_sensitive_brands:
+        return {}
+    _cats = {clean_category_code(c) for c in sneaker_category_codes}
+    if "_cat_clean" in data.columns:
+        _in = data["_cat_clean"].isin(_cats)
+    elif "CATEGORY_CODE" in data.columns:
+        _in = data["CATEGORY_CODE"].map(clean_category_code).isin(_cats)
+    else:
+        return {}
+    d = data[_in]
+    if d.empty or "PRODUCT_SET_SID" not in d.columns:
+        return {}
+
+    _terms = {}
+    for b in sneaker_sensitive_brands:
+        b = str(b).strip().lower()
+        if b:
+            _terms[b] = SNEAKER_BRAND_ALIASES.get(b, b)
+    for a, parent in SNEAKER_BRAND_ALIASES.items():
+        _terms.setdefault(a, parent)
+
+    _tag_re = re.compile(r"<[^>]+>")
+    _text = (
+        d.get("NAME", pd.Series("", index=d.index)).astype(str) + " "
+        + d.get("BRAND", pd.Series("", index=d.index)).astype(str) + " "
+        + d.get("DESCRIPTION", pd.Series("", index=d.index)).astype(str) + " "
+        + d.get("SHORT_DESCRIPTION", pd.Series("", index=d.index)).astype(str)
+    ).str.replace(_tag_re, " ", regex=True).str.lower()
+
+    out: Dict[str, str] = {}
+    # Longest first so "air jordan" wins over "jordan" and the claim reads as
+    # the most specific thing the listing actually said.
+    for t in sorted(_terms, key=len, reverse=True):
+        rx = re.compile(r"(?<!\w)" + re.escape(t) + r"(?!\w)", re.IGNORECASE)
+        hit = _text.str.contains(rx, na=False)
+        if not hit.any():
+            continue
+        for sid in d.loc[hit, "PRODUCT_SET_SID"].astype(str):
+            out.setdefault(sid, _terms[t].title())
+    return out
+
+
 def check_counterfeit_sneakers(
     data: pd.DataFrame,
     sneaker_category_codes: List[str],
