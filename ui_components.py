@@ -2329,6 +2329,23 @@ def build_fast_grid_html(
     if not _fr_ss.empty and "zip_override" in _fr_ss.columns and "ProductSetSid" in _fr_ss.columns:
         _zip_override_map = _fr_ss.set_index("ProductSetSid")["zip_override"].fillna("").to_dict()
 
+    # Products our OWN duplicate check rejected, as opposed to the ones the
+    # ZIP merely observed.
+    #
+    # The two disagree in a way worth seeing: the ZIP marks every member of a
+    # group (4,904 on a KE batch) and rejects none of them; our check rejects
+    # all but one per group (4,606) so the product stays sellable. Showing them
+    # in one colour would hide that, and hide the 37 our check found that the
+    # ZIP missed.
+    _sys_dup_sids = set()
+    if not _fr_ss.empty and {"ProductSetSid", "FLAG"}.issubset(_fr_ss.columns):
+        _sys_dup_sids = set(
+            _fr_ss.loc[
+                _fr_ss["FLAG"].astype(str).str.strip() == "Duplicate product",
+                "ProductSetSid",
+            ].astype(str).str.strip()
+        )
+
     # Sneakers claiming a protected brand.
     #
     # Not a verdict — most are textually identical to the genuine article
@@ -2519,6 +2536,7 @@ def build_fast_grid_html(
                 "data_sid": sid,
                 "data_cat": str(row.get("CATEGORY", "")).replace('"', "&quot;"),
                 "is_duplicate": is_duplicate,
+                "sys_duplicate": sid in _sys_dup_sids,
                 "is_manual_review": is_manual_review,
                 "qc_skip_reason": qc_skip,
                 "color_mismatch": color_mismatch,
@@ -3763,7 +3781,12 @@ function renderCard(card) {{
   var safeImgSrcForHtml = _src ? _src.replace(/'/g, "%27").replace(/"/g, "%22") : PLACEHOLDER;
   var shortName = card.name.length > 38 ? escapeHtml(card.name.slice(0,38)) + '\u2026' : escapeHtml(card.name);
   var warnHtml = (card.warnings || []).map(w => `<span class="warn-badge">${{escapeHtml(w)}}</span>`).join('');
-  if (card.is_duplicate) warnHtml += `<span class="warn-badge" style="background:#7c3aed;color:#fff;font-weight:800;">⧉ DUPLICATE</span>`;
+  // Purple = the ZIP observed it. It never rejects on this, so on its own it
+  // is information, not a verdict.
+  if (card.is_duplicate) warnHtml += `<span class="warn-badge" style="background:#7c3aed;color:#fff;font-weight:800;" title="The ZIP marked this a duplicate (same seller + product name). The ZIP does not reject on it.">⧉ DUPLICATE</span>`;
+  // Blue = our own check rejected it. Different colour on purpose: this is the
+  // one that changed the verdict. Both badges together mean the two agree.
+  if (card.sys_duplicate) warnHtml += `<span class="warn-badge" style="background:#1d4ed8;color:#fff;font-weight:800;" title="${{card.is_duplicate ? 'Rejected by our duplicate check — the ZIP flagged it too.' : 'Rejected by our duplicate check. The ZIP did not flag this one.'}} One listing per group is kept; the rest are rejected.">⧉ DUPLICATE — system</span>`;
   if (card.is_manual_review) {{
     var mrText = card.qc_skip_reason ? `👁 MANUAL REVIEW: ${{escapeHtml(card.qc_skip_reason)}}` : `👁 MANUAL REVIEW`;
     warnHtml += `<span class="warn-badge" style="background:#dc2626;color:#fff;font-weight:800;" title="${{escapeHtml(card.qc_skip_reason || 'Manual Review')}}">${{mrText}}</span>`;
@@ -4006,7 +4029,9 @@ function getBaseFilteredCards() {{
     if (f === 'committed') cards = cards.filter(function(c) {{ return c.sid in COMMITTED; }});
     else if (f === 'brand_ocr') cards = cards.filter(function(c) {{ return c.sid in COMMITTED && (COMMITTED[c.sid]||'').includes('Brand Image Check'); }});
     else if (f === 'no_flags') cards = cards.filter(function(c) {{ return !(c.warnings||[]).length && !(c.sid in COMMITTED) && !(c.sid in staged); }});
-    else if (f === 'duplicates') cards = cards.filter(function(c) {{ return c.is_duplicate; }});
+    // Either source — filtering to the ZIP's observation alone would hide the
+    // ones our own check caught and the ZIP missed.
+    else if (f === 'duplicates') cards = cards.filter(function(c) {{ return c.is_duplicate || c.sys_duplicate; }});
     else if (f === 'manual_review') cards = cards.filter(function(c) {{ return c.is_manual_review; }});
     else if (f === 'color_mismatch') cards = cards.filter(function(c) {{ return !!c.color_mismatch; }});
     else cards = cards.filter(function(c) {{
