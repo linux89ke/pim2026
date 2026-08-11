@@ -402,8 +402,19 @@ def _derive_prefetched_skip_list(qc_df: pd.DataFrame) -> List[str]:
         skip.update(
             PREFETCH_VALIDATOR_SKIP_MAP.get(_prefetch_key_from_status_col(col), [])
         )
-    if "Duplicate_Flag" in qc_df.columns:
-        skip.add("Duplicate product")
+    # Duplicate_Flag deliberately does NOT skip our own duplicate check.
+    #
+    # It used to, on the reasonable-sounding grounds that the ZIP had already
+    # looked. It hasn't: Duplicate_Flag is an observation with a single value
+    # ("Duplicate — same seller + product name") and no verdict — there is no
+    # Duplicate_Check_Status beside the other eight *_Check_Status columns, and
+    # of 1,747 duplicate-flagged products the platform rejected in one KE
+    # batch, not one was rejected for being a duplicate.
+    #
+    # So the skip handed the job to something that never does it, and on any
+    # batch with a ZIP duplicates were rejected by nobody while still showing a
+    # badge on the card and filling the audit — handled everywhere except where
+    # it counts.
     return sorted(skip)
 
 
@@ -3458,8 +3469,31 @@ def check_duplicate_products(
     exempt_categories: List[str] = None,
     similarity_threshold: float = 0.70,
     known_colors: List[str] = None,
+    full_data: pd.DataFrame = None,
     **kwargs,
 ) -> pd.DataFrame:
+    # Duplicates are a property of the batch, not of a row, so this has to see
+    # every product even when it is asked about a subset.
+    #
+    # The batch is validated in two passes — ZIP-covered products and the rest —
+    # and each pass only ever saw its own half. Two copies of the same listing,
+    # one in the ZIP and one in the other file, were each unique within their
+    # own pass and neither was flagged. That is precisely the case where you
+    # upload both files to find the overlap.
+    #
+    # Grouping therefore runs over full_data when given, and the result is
+    # filtered back to the subset at the end so each pass still reports only
+    # its own rows.
+    _subset_sids = None
+    if (
+        full_data is not None
+        and not full_data.empty
+        and "PRODUCT_SET_SID" in data.columns
+        and len(full_data) > len(data)
+    ):
+        _subset_sids = set(data["PRODUCT_SET_SID"].astype(str).str.strip())
+        data = full_data
+
     if not {"NAME", "SELLER_NAME", "BRAND"}.issubset(data.columns):
         return pd.DataFrame(columns=data.columns)
     d = data.copy()
@@ -3625,7 +3659,13 @@ def check_duplicate_products(
     rdf["Comment_Detail"] = rdf.index.map(flagged_indices)
     base_cols = data.columns.tolist()
     extra_cols = [c for c in ["Comment_Detail"] if c not in base_cols]
-    return rdf[base_cols + extra_cols].drop_duplicates(subset=["PRODUCT_SET_SID"])
+    _out = rdf[base_cols + extra_cols].drop_duplicates(subset=["PRODUCT_SET_SID"])
+    # Grouped over the whole batch above; report only this pass's rows.
+    if _subset_sids is not None and "PRODUCT_SET_SID" in _out.columns:
+        _out = _out[
+            _out["PRODUCT_SET_SID"].astype(str).str.strip().isin(_subset_sids)
+        ]
+    return _out
 
 
 if _reg is not None:
@@ -3669,6 +3709,7 @@ def validate_products(
     common_sids: Optional[set] = None,
     skip_validators: Optional[List[str]] = None,
     on_progress: Optional[callable] = None,
+    full_batch: Optional[pd.DataFrame] = None,
 ):
     data = data.copy()
     # ROW_LEVEL_VALIDATORS map a check's result back onto `data` by index label,
@@ -3918,6 +3959,9 @@ def validate_products(
             {
                 "exempt_categories": support_files.get("duplicate_exempt_codes", []),
                 "known_colors": support_files.get("colors", []),
+                # The whole upload, so a duplicate split across the ZIP and the
+                # other file is still seen. None when this is the only pass.
+                "full_data": full_batch,
             },
         ),
         ("Image Stretched", check_image_stretched, {}),
@@ -4350,6 +4394,7 @@ def cached_validate_products(
     data_has_warranty_cols: bool,
     skip_validators: Optional[List[str]] = None,
     _on_progress: Optional[callable] = None,
+    _full_batch: Optional[pd.DataFrame] = None,
 ):
     country_name = next(
         (
@@ -4367,6 +4412,7 @@ def cached_validate_products(
         data_has_warranty_cols,
         skip_validators=skip_validators,
         on_progress=_on_progress,
+        full_batch=_full_batch,
     )
 
 
@@ -5334,7 +5380,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                             # edit that leaves shape and columns unchanged — so a different
                             # file could be served the previous batch's results. Removing a
                             # file and uploading another is exactly when that shows up.
-                            fr_non_zip, res_non_zip = cached_validate_products(sig_hash + "|" + df_hash(data_non_zip) + country_validator.code, data_non_zip, support_files, country_validator.code, data_has_warranty, skip_validators=fast_skip_list, _on_progress=_on_flag_done)
+                            fr_non_zip, res_non_zip = cached_validate_products(sig_hash + "|" + df_hash(data_non_zip) + country_validator.code, data_non_zip, support_files, country_validator.code, data_has_warranty, skip_validators=fast_skip_list, _on_progress=_on_flag_done, _full_batch=data)
                             _prog.empty()
                             final_report_parts.append(fr_non_zip)
                             results_parts.append(res_non_zip)
@@ -5344,7 +5390,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                             skip_list = sorted(set(_derive_prefetched_skip_list(qc_zip)) | set(fast_skip_list))
                             _prog_zip = st.progress(0, text="Preparing ZIP validation...")
                             def _on_flag_done_zip(flag_name: str, i: int, total: int): _prog_zip.progress(int(i / total * 100), text=f"Checking (ZIP): {flag_name}")
-                            fr_zip, res_zip = cached_validate_products(sig_hash + "|" + df_hash(data_zip) + country_validator.code + "_zip_optimized", data_zip, support_files, country_validator.code, data_has_warranty, skip_validators=skip_list, _on_progress=_on_flag_done_zip)
+                            fr_zip, res_zip = cached_validate_products(sig_hash + "|" + df_hash(data_zip) + country_validator.code + "_zip_optimized", data_zip, support_files, country_validator.code, data_has_warranty, skip_validators=skip_list, _on_progress=_on_flag_done_zip, _full_batch=data)
                             _prog_zip.empty()
                             final_report_parts.append(fr_zip)
                             results_parts.append(res_zip)
