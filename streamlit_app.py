@@ -4178,11 +4178,25 @@ def validate_products(
                         continue
 
                 ckwargs = {"data": working_data, **kwargs}
+                # Empty for the built-in checks, so their cache keys are
+                # unchanged; set by general_rules on the checks it builds.
+                _key_extra = getattr(func, "_rule_id", "")
+                # The duplicate check reads the whole upload, not just the rows
+                # it is handed, so the digest of those rows does not identify
+                # its answer. Without this the cache is actively wrong in the
+                # case the full-batch grouping was added for: upload the CSV
+                # alone, then upload it again with the ZIP, and the non-ZIP
+                # subset is byte-identical — same digest, so the result computed
+                # WITHOUT the ZIP is served and every cross-file duplicate is
+                # missed.
+                if kwargs.get("full_data") is not None:
+                    try:
+                        _key_extra = f"{_key_extra}|fb{df_hash(kwargs['full_data'])}"
+                    except Exception:
+                        # A cache miss is the safe failure here, not a stale hit.
+                        _key_extra = f"{_key_extra}|fb{len(kwargs['full_data'])}r"
                 cache_path = flag_cache_path(
-                    name, digests, country_validator.code, _rules_sig,
-                    # Empty for the built-in checks, so their cache keys are
-                    # unchanged; set by general_rules on the checks it builds.
-                    getattr(func, "_rule_id", ""),
+                    name, digests, country_validator.code, _rules_sig, _key_extra,
                 )
                 future_to_name[executor.submit(run_cached_check, func, cache_path, ckwargs)] = name
 
