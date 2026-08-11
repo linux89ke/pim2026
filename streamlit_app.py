@@ -3492,6 +3492,24 @@ def check_duplicate_products(
         and len(full_data) > len(data)
     ):
         _subset_sids = set(data["PRODUCT_SET_SID"].astype(str).str.strip())
+        # validate_products derives its helper columns on its own copy of the
+        # batch, and full_data is the caller's frame, which has none of them.
+        # Swapping it in without rebuilding them raised KeyError('_cat_clean')
+        # on the first line that filters exempt categories — caught by the
+        # per-check error handler, so the check returned nothing and the
+        # Duplicate product expander simply never appeared.
+        full_data = full_data.copy()
+        if "_cat_clean" not in full_data.columns and "CATEGORY_CODE" in full_data.columns:
+            full_data["_cat_clean"] = full_data["CATEGORY_CODE"].apply(clean_category_code)
+        for _c, _src in (
+            ("_brand_lower", "BRAND"),
+            ("_seller_lower", "SELLER_NAME"),
+            ("_name_lower", "NAME"),
+        ):
+            if _c not in full_data.columns and _src in full_data.columns:
+                full_data[_c] = (
+                    full_data[_src].astype(str).str.lower().str.strip().fillna("")
+                )
         data = full_data
 
     if not {"NAME", "SELLER_NAME", "BRAND"}.issubset(data.columns):
