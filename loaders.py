@@ -547,9 +547,43 @@ def load_perfume_catalog_from_local(_mtime: float = 0.0) -> Dict:
         "term_to_brand": {},
     }
 
+    # Sheet names in this workbook are not stable — the file in the repo has a
+    # single sheet called "Sheet1" carrying exactly the enriched-catalog
+    # columns (brand / also_known_as / sample_models). Asking for the sheet by
+    # name logged a warning on every load and silently produced an empty
+    # catalog, which turns the perfume checks into no-ops without saying so.
+    #
+    # Resolve by shape instead: take the named sheet if it exists, otherwise
+    # the first sheet that has a "brand"-ish column.
+    def _resolve_sheet(preferred: str, must_have: tuple) -> str:
+        try:
+            names = pd.ExcelFile(FILE_NAME).sheet_names
+        except Exception:
+            return preferred
+        if preferred in names:
+            return preferred
+        for _n in names:
+            try:
+                _cols = {
+                    str(c).strip().lower()
+                    for c in pd.read_excel(FILE_NAME, sheet_name=_n, nrows=0).columns
+                }
+            except Exception:
+                continue
+            if any(m in _cols for m in must_have):
+                logger.info(
+                    "load_perfume_catalog: sheet '%s' not found, using '%s' "
+                    "(it has the expected columns)", preferred, _n,
+                )
+                return _n
+        return preferred
+
     # ── Sheet 1: enriched catalog (brands + aliases + models) ───────────────
     try:
-        df = safe_excel_read(FILE_NAME, sheet_name="enriched_perfume_catalog")
+        df = safe_excel_read(
+            FILE_NAME,
+            sheet_name=_resolve_sheet("enriched_perfume_catalog", ("brand", "brands")),
+        )
         if not df.empty:
             # ─ case-insensitive column finder ──────────────────────────────
             col_map = {str(c).strip().lower(): str(c).strip() for c in df.columns}
@@ -603,8 +637,26 @@ def load_perfume_catalog_from_local(_mtime: float = 0.0) -> Dict:
         logger.warning(f"load_perfume_catalog enriched_perfume_catalog: {e}")
 
     # ── Sheet 2: fake / suspicious seller-brand names ──────────────────────
+    # Genuinely optional — the repo's workbook has no such sheet. Absence is
+    # logged once at info level rather than warned about on every load; a
+    # warning that fires every time for a file that is simply not there trains
+    # people to ignore the log.
+    _has_brands_sheet = True
     try:
-        df_brands = safe_excel_read(FILE_NAME, sheet_name="Brands")
+        _has_brands_sheet = "Brands" in pd.ExcelFile(FILE_NAME).sheet_names
+    except Exception:
+        pass
+    if not _has_brands_sheet:
+        logger.info(
+            "load_perfume_catalog: no 'Brands' sheet in %s — the fake-brand "
+            "list is empty, which is expected unless you have added one.",
+            FILE_NAME,
+        )
+    try:
+        df_brands = (
+            safe_excel_read(FILE_NAME, sheet_name="Brands")
+            if _has_brands_sheet else pd.DataFrame()
+        )
         if not df_brands.empty:
             # Accept any column name — just read the first non-empty column
             col = df_brands.columns[0]

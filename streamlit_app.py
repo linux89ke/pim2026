@@ -79,6 +79,7 @@ from constants import (
     JUMIA_COLORS,
     PARQUET_CACHE_DIR,
     REASON_MAP,
+    SNEAKER_BRAND_ALIASES,
 )
 from data_utils import (
     _detect_and_read_csv,
@@ -2144,31 +2145,11 @@ def check_perfume_tester(
     return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
-# Sneaker sub-brands and model lines, resolved to the house that owns them.
-#
-# There is no Jordan company and no Airmax company — they are Nike lines, and a
-# listing saying "Airmax 97" or "Air Jordan 4" is making a Nike claim. Treating
-# them as brands in their own right is what let "Airmax" sit in brands.txt as
-# legitimate and dodge Nike's price ceiling.
-#
-# Deliberately excludes model names that are ordinary words — "campus",
-# "samba", "dunk" — because they cannot be told from prose.
-SNEAKER_BRAND_ALIASES = {
-    "jordan": "nike", "air jordan": "nike", "jumpman": "nike", "af1": "nike",
-    "airmax": "nike", "air max": "nike", "airforce": "nike", "air force": "nike",
-    "all star": "converse", "all stars": "converse", "chuck taylor": "converse",
-    "yeezy": "adidas",
-    # Deliberate misspellings, which is a tactic rather than a typo: the seller
-    # wants the shopper to read "Nike" and the filter to read something else.
-    # Only forms with no other meaning are listed — "adida" and "conver" are
-    # not words. "mike" is the exception and is included knowingly: it is a
-    # name, but inside the sneaker categories, next to a Nike silhouette, it is
-    # not a coincidence. Drop it here if it ever costs a real listing.
-    "mike": "nike", "nik": "nike", "n!ke": "nike", "nikee": "nike",
-    "conver": "converse", "convers": "converse", "converce": "converse",
-    "adida": "adidas", "addidas": "adidas", "@didas": "adidas",
-    "timb": "timberland", "timberlan": "timberland",
-}
+# SNEAKER_BRAND_ALIASES lives in constants.py — imported at the top of this
+# file. It moved there because the review grid needs it too, and having
+# ui_components import this module re-executes the entire entry script:
+# Streamlit re-runs every widget in it, which raised duplicate element IDs
+# and fragment errors on every grid render.
 
 # Deliberately empty, and not a placeholder to fill in.
 #
@@ -2184,63 +2165,6 @@ SNEAKER_BRAND_ALIASES = {
 # rule can separate from the real thing belong in the visual review grid,
 # where a human decides from the photograph.
 SNEAKER_BRANDS_NO_APPROVED_SELLER: set = set()
-
-
-def sneaker_brand_claims(
-    data: pd.DataFrame,
-    sneaker_category_codes: List[str],
-    sneaker_sensitive_brands: List[str],
-) -> Dict[str, str]:
-    """SID -> the protected sneaker brand a listing claims, for the review grid.
-
-    Deliberately not a verdict. Most listings that claim Nike are textually
-    identical to a genuine Nike listing — "ADIDAS Campus" with BRAND=ADIDAS is
-    what the real thing looks like — so no rule can separate them and the
-    photograph is the only evidence left. This marks them for a human to
-    decide in the visual grid instead of guessing.
-
-    Sub-brands resolve to the parent, so an Airmax listing reads as Nike.
-    """
-    if data.empty or not sneaker_category_codes or not sneaker_sensitive_brands:
-        return {}
-    _cats = {clean_category_code(c) for c in sneaker_category_codes}
-    if "_cat_clean" in data.columns:
-        _in = data["_cat_clean"].isin(_cats)
-    elif "CATEGORY_CODE" in data.columns:
-        _in = data["CATEGORY_CODE"].map(clean_category_code).isin(_cats)
-    else:
-        return {}
-    d = data[_in]
-    if d.empty or "PRODUCT_SET_SID" not in d.columns:
-        return {}
-
-    _terms = {}
-    for b in sneaker_sensitive_brands:
-        b = str(b).strip().lower()
-        if b:
-            _terms[b] = SNEAKER_BRAND_ALIASES.get(b, b)
-    for a, parent in SNEAKER_BRAND_ALIASES.items():
-        _terms.setdefault(a, parent)
-
-    _tag_re = re.compile(r"<[^>]+>")
-    _text = (
-        d.get("NAME", pd.Series("", index=d.index)).astype(str) + " "
-        + d.get("BRAND", pd.Series("", index=d.index)).astype(str) + " "
-        + d.get("DESCRIPTION", pd.Series("", index=d.index)).astype(str) + " "
-        + d.get("SHORT_DESCRIPTION", pd.Series("", index=d.index)).astype(str)
-    ).str.replace(_tag_re, " ", regex=True).str.lower()
-
-    out: Dict[str, str] = {}
-    # Longest first so "air jordan" wins over "jordan" and the claim reads as
-    # the most specific thing the listing actually said.
-    for t in sorted(_terms, key=len, reverse=True):
-        rx = re.compile(r"(?<!\w)" + re.escape(t) + r"(?!\w)", re.IGNORECASE)
-        hit = _text.str.contains(rx, na=False)
-        if not hit.any():
-            continue
-        for sid in d.loc[hit, "PRODUCT_SET_SID"].astype(str):
-            out.setdefault(sid, _terms[t].title())
-    return out
 
 
 def check_counterfeit_sneakers(
@@ -4699,10 +4623,11 @@ with st.sidebar:
     # Kept visibly separate from display settings: these change what gets
     # rejected, not how it looks, and they are meant to be switched off again.
     st.header("Temporary rules")
-    _tv_prev = bool(st.session_state.get("tv_color_exempt", True))
+    # No `value=` here. The key is seeded at module scope, and passing both a
+    # default and a session-state value makes Streamlit warn that one of them
+    # is being ignored — it is, the session state wins.
     _tv_now = st.toggle(
         "Exempt TVs from colour checks",
-        value=_tv_prev,
         key="tv_color_exempt",
         help=(
             "Skips the Missing COLOR check for everything under "
@@ -4713,13 +4638,25 @@ with st.sidebar:
             "receivers, satellite equipment, mounts, remotes or TV furniture."
         ),
     )
-    if _tv_now != _tv_prev:
+    # Compared against the value the last batch was actually processed under,
+    # not against session state.
+    #
+    # This used to read the "previous" value out of st.session_state just above
+    # the widget. For a keyed widget that is already the NEW value by the time
+    # the script reruns — Streamlit applies widget state before running — so
+    # the two were always equal and the reprocess below never fired once. The
+    # exemption could be flipped and the stale report stayed on screen, which
+    # is the exact failure the block was written to prevent.
+    _tv_applied = st.session_state.get("_tv_color_exempt_applied")
+    if _tv_applied is not None and _tv_now != _tv_applied:
         # The exemption changes validation output, so the current report is
         # stale the moment it is flipped. Forcing a reprocess is the honest
         # response — leaving the old verdicts on screen under a new rule is
         # how a "temporary" setting turns into a silently wrong batch.
+        st.session_state["_tv_color_exempt_applied"] = _tv_now
         st.session_state.last_processed_files = None
         st.rerun()
+    st.session_state["_tv_color_exempt_applied"] = _tv_now
     if _tv_now:
         _tv_n = len(tv_exempt_category_codes())
         st.caption(

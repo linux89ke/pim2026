@@ -216,3 +216,33 @@ ASPECT_REJECT_TALL = 2.5      # taller than 2.5x its width  -> rejected
 ASPECT_REJECT_WIDE = 0.4      # wider than 2.5x its height  -> rejected
 ASPECT_ADVISORY_TALL = 1.5    # 1.5 - 2.5 -> commentary in the grid only
 ASPECT_ADVISORY_WIDE = 0.6    # 0.4 - 0.6 -> commentary in the grid only
+
+
+# Sneaker sub-brands and model lines, resolved to the house that owns them.
+#
+# There is no Jordan company and no Airmax company — they are Nike lines, and a
+# listing saying "Airmax 97" or "Air Jordan 4" is making a Nike claim.
+#
+# Lives here rather than in streamlit_app because both the validation checks and
+# the review grid need it. ui_components importing streamlit_app re-executes the
+# entry script — Streamlit re-runs every widget in it — which raised duplicate
+# element IDs and fragment errors on every grid render.
+#
+# Deliberately excludes model names that are ordinary words — "campus",
+# "samba", "dunk" — because they cannot be told from prose.
+SNEAKER_BRAND_ALIASES = {
+    "jordan": "nike", "air jordan": "nike", "jumpman": "nike", "af1": "nike",
+    "airmax": "nike", "air max": "nike", "airforce": "nike", "air force": "nike",
+    "all star": "converse", "all stars": "converse", "chuck taylor": "converse",
+    "yeezy": "adidas",
+    # Deliberate misspellings, which is a tactic rather than a typo: the seller
+    # wants the shopper to read "Nike" and the filter to read something else.
+    # Only forms with no other meaning are listed — "adida" and "conver" are
+    # not words. "mike" is the exception and is included knowingly: it is a
+    # name, but inside the sneaker categories, next to a Nike silhouette, it is
+    # not a coincidence. Drop it here if it ever costs a real listing.
+    "mike": "nike", "nik": "nike", "n!ke": "nike", "nikee": "nike",
+    "conver": "converse", "convers": "converse", "converce": "converse",
+    "adida": "adidas", "addidas": "adidas", "@didas": "adidas",
+    "timb": "timberland", "timberlan": "timberland",
+}
