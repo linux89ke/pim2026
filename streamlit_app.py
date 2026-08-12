@@ -2419,6 +2419,37 @@ def check_variation_name_consistency_polars(data: pd.DataFrame, **kwargs) -> pd.
     return data[data["PRODUCT_SET_SID"].isin(flagged_sids)].copy()
 
 
+# Words that describe what a fragrance IS, not which one it is.
+#
+# The catalog lists these as model names — "Eau De Parfum" arrives as a Missoni
+# model — and matching one is worth nothing, because nearly every listing in
+# the category contains it. Left in, they produced findings whose entire
+# evidence was the words on the bottle:
+#
+#   Generic | "Sofia the First Eau De Parfum"
+#     -> Suspected fake Missoni perfume — 'eau de parfum' in name
+#
+# Excluded from the model terms only. A real house's name reaching the same
+# listing still matches, which is the signal this check is after.
+_GENERIC_FRAGRANCE_TERMS = {
+    "eau de parfum", "eau de toilette", "eau de cologne", "eau de perfume",
+    "parfum", "perfume", "cologne", "fragrance", "fragrances",
+    "body mist", "body spray", "body lotion", "body oil", "body butter",
+    "deodorant", "antiperspirant", "roll on", "roll-on",
+    "gift set", "travel spray", "travel size", "spray",
+    "for men", "for women", "for unisex", "pour homme", "pour femme",
+    "natural spray", "long lasting", "edp", "edt", "mist",
+    # Ordinary adjectives that happen to be model names. "Original" is a Police
+    # model, so "Arabic Original Rave Now Eau de Parfum" was reported as a fake
+    # Police — on the strength of the word "original". A real house's name in
+    # the same title still matches; this only stops the adjective standing as
+    # the whole case.
+    "original", "intense", "extreme", "classic", "luxury", "premium",
+    "special", "edition", "limited edition", "collection", "set", "travel",
+    "gold", "silver", "noir", "blanc", "sport", "elegance",
+}
+
+
 def check_suspected_fake_perfume(
     data: pd.DataFrame,
     perfume_catalog: Dict,
@@ -2453,7 +2484,8 @@ def check_suspected_fake_perfume(
     color_words = {str(c).strip().lower() for c in kwargs.get("color_words") or []}
     safe_model_terms = {
         t for t in model_terms
-        if " " in t or (len(t) >= 5 and t not in color_words)
+        if (" " in t or (len(t) >= 5 and t not in color_words))
+        and t not in _GENERIC_FRAGRANCE_TERMS
     }
 
     all_terms = legit_brand_terms | safe_model_terms
