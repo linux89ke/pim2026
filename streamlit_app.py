@@ -1420,6 +1420,16 @@ def check_restricted_brands(
     where_map = {}
     match_details = {}
     for rule in country_rules:
+        # Reset per rule. This dict was carried across the whole loop, so a
+        # later rule's label overwrote an earlier one on the same row — and the
+        # comment then named a rule that had not flagged the product at all.
+        #
+        # A book, "100 Simple Secrets Why Dogs Make Us Happy ... by David
+        # Niven", was reported as "Restricted Brand: Simple". Simple is scoped
+        # to 561 Health & Beauty categories and never matched it; NIVEA did,
+        # through its generated variation "niven" hitting the author's
+        # surname. The wrong label sent the investigation to the wrong rule.
+        match_details = {}
         brand_name = rule["brand"]
         brand_raw = rule["brand_raw"]
         # Exact match: brand column exactly equals the normalised brand
@@ -2447,6 +2457,17 @@ _GENERIC_FRAGRANCE_TERMS = {
     "original", "intense", "extreme", "classic", "luxury", "premium",
     "special", "edition", "limited edition", "collection", "set", "travel",
     "gold", "silver", "noir", "blanc", "sport", "elegance",
+    # Scent notes. A note names what a fragrance smells of, not which fragrance
+    # it is, and it appears in a large share of the category's titles. "Vanilla"
+    # is a The Body Shop model, so a Shalimar "Amber Vanilla Eau de Parfum" was
+    # reported as a fake Body Shop on the strength of the word vanilla.
+    #
+    # Same rule as the rest: a real house's name in the same title still
+    # matches. This only stops a note standing as the whole case.
+    "vanilla", "amber", "oud", "musk", "rose", "jasmine", "sandalwood",
+    "vetiver", "patchouli", "bergamot", "citrus", "lavender", "coconut",
+    "cherry", "caramel", "chocolate", "coffee", "honey", "leather", "tobacco",
+    "saffron", "cedar", "lemon", "mint", "peach", "berry", "floral", "woody",
 }
 
 
@@ -2705,8 +2726,18 @@ _LOCATION_RE = re.compile(
     # "opposite side" and "opposite pattern" — ordinary product wording, and a
     # fan or a reversible jacket got reported for off-platform contact. The
     # "next to" rule beside it was always anchored this way; this one was not.
-    r"|\bopposite\s+(?:the\s+)?(?:[a-z]+\s+){0,2}" + _LANDMARK_ALT +
-    r"|\bnext\s+to\s+(?:the\s+)?(?:[a-z]+\s+){0,2}" + _LANDMARK_ALT +
+    # Same-line only, for the same reason as the shop-number rules above. With
+    # \s+ these reached across a paragraph break to a landmark word opening the
+    # next bullet:
+    #
+    #   1. Mount opposite
+    #
+    #   Market leading warranty
+    #
+    # matched "opposite\n\nmarket". A real direction — "opposite the market",
+    # "next to Kimathi House" — is written on one line.
+    r"|\bopposite[ \t]+(?:the[ \t]+)?(?:[a-z]+[ \t]+){0,2}" + _LANDMARK_ALT +
+    r"|\bnext[ \t]+to[ \t]+(?:the[ \t]+)?(?:[a-z]+[ \t]+){0,2}" + _LANDMARK_ALT +
     r"|\b(?:visit|come\s+to|located\s+at|find\s+us\s+at)\s+(?:our\s+)?"
     r"(?:shop|store|office|showroom)\b"
     # French — "BP 1234", "boîte postale", "magasin n° 12", "2ème étage",
