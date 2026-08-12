@@ -3270,11 +3270,63 @@ _SPEC_RAM_RE1 = re.compile(r"(\d+)\s*gb\s*ram\b", re.IGNORECASE)
 # RAM there is *also* preceded by another spec's "GB " — punctuation, not
 # position, is the reliable signal.
 _SPEC_RAM_RE2 = re.compile(r"\bram\s*[:\-]\s*(\d+)\s*gb\b", re.IGNORECASE)
-_SPEC_STORAGE_GB_RE1 = re.compile(r"(\d+)\s*gb\s*(?:rom|storage|internal(?:\s+storage)?|memory)\b", re.IGNORECASE)
-_SPEC_STORAGE_TB_RE1 = re.compile(r"(\d+)\s*tb\s*(?:rom|storage|internal(?:\s+storage)?|memory)\b", re.IGNORECASE)
+# ssd/hdd/nvme/emmc are how laptops actually state storage — "256GB SSD" is
+# the norm and "256GB Storage" is the exception. Without them the title side
+# extracted nothing and no laptop storage mismatch could ever be found.
+_SPEC_STORAGE_GB_RE1 = re.compile(r"(\d+)\s*gb\s*(?:rom|storage|internal(?:\s+storage)?|ssd|hdd|nvme|emmc)\b", re.IGNORECASE)
+_SPEC_STORAGE_TB_RE1 = re.compile(r"(\d+)\s*tb\s*(?:rom|storage|internal(?:\s+storage)?|memory|ssd|hdd|nvme|emmc)\b", re.IGNORECASE)
 # Same reasoning, mirrored for storage labels.
-_SPEC_STORAGE_RE2 = re.compile(r"\b(?:rom|storage|internal(?:\s+storage)?|memory)\s*[:\-]\s*(\d+)\s*gb\b", re.IGNORECASE)
+_SPEC_STORAGE_RE2 = re.compile(r"\b(?:rom|storage|internal(?:\s+storage)?|ssd|hdd|nvme|emmc)\s*[:\-]\s*(\d+)\s*gb\b", re.IGNORECASE)
+
+# "Memory" is ambiguous and was counted as storage, which is wrong far more
+# often than it is right. On a laptop "16GB Memory" is RAM, so a listing whose
+# title correctly said 256GB SSD was reported as
+#   Storage: title says 256GB, DESCRIPTION says 16GB
+# — the check comparing a storage figure against a RAM one.
+#
+# Resolved by size rather than by label, because the word alone cannot settle
+# it: at or below _MEMORY_IS_RAM_MAX_GB it is RAM, above it is storage. No
+# consumer laptop or phone ships more than 64GB of RAM, and no listing calls
+# 128GB+ of flash "memory" while meaning RAM. TB is unambiguous and stays with
+# storage above.
+_SPEC_MEMORY_RE = re.compile(
+    r"(?:(\d+)\s*gb\s*memory\b|\bmemory\s*[:\-]\s*(\d+)\s*gb\b)", re.IGNORECASE
+)
+_MEMORY_IS_RAM_MAX_GB = 64
 _SPEC_COMBO_RE = re.compile(r"\b(\d+)\s*(?:gb)?\s*[/+]\s*(\d+)\s*gb\b", re.IGNORECASE)
+
+# Operating system, for laptops and desktops. Same failure as RAM and storage
+# and from the same cause — a description reused from another SKU — but with a
+# sharper consequence, since the OS is what the buyer is paying a licence for.
+#
+# Only versioned names are matched. A bare "windows" or "linux" says nothing
+# that can disagree with anything, and matching it would turn every mention
+# into a finding.
+_SPEC_OS_RE = re.compile(
+    r"\b("
+    r"windows\s*(?:11|10|8\.1|8|7)"
+    r"|win\s*(?:11|10|8\.1|8|7)\b"
+    r"|chrome\s*os"
+    r"|mac\s*os(?:\s*x)?"
+    r"|ubuntu(?:\s*\d{2}\.\d{2})?"
+    r"|dos"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_os(text: str) -> set:
+    """Every OS named in `text`, normalised so "Win 11" and "Windows 11" are
+    one value and spacing differences do not read as a disagreement."""
+    out = set()
+    for m in _SPEC_OS_RE.finditer(text):
+        v = re.sub(r"\s+", "", m.group(1).lower())
+        v = v.replace("win11", "windows11").replace("win10", "windows10")
+        v = v.replace("win8.1", "windows8.1").replace("win8", "windows8")
+        v = v.replace("win7", "windows7")
+        v = v.replace("macosx", "macos")
+        out.add(v)
+    return out
 
 
 def _extract_ram_storage(text: str, allow_combo: bool = False) -> tuple:
@@ -3295,10 +3347,23 @@ def _extract_ram_storage(text: str, allow_combo: bool = False) -> tuple:
     storage = {int(m.group(1)) for m in _SPEC_STORAGE_GB_RE1.finditer(text)}
     storage |= {int(m.group(1)) * 1024 for m in _SPEC_STORAGE_TB_RE1.finditer(text)}
     storage |= {int(m.group(1)) for m in _SPEC_STORAGE_RE2.finditer(text)}
+    # "N GB memory" — RAM at consumer sizes, storage above. See the constant.
+    for m in _SPEC_MEMORY_RE.finditer(text):
+        _v = int(m.group(1) or m.group(2))
+        (ram if _v <= _MEMORY_IS_RAM_MAX_GB else storage).add(_v)
     if allow_combo:
         for m in _SPEC_COMBO_RE.finditer(text):
-            ram.add(int(m.group(1)))
-            storage.add(int(m.group(2)))
+            _a, _b = int(m.group(1)), int(m.group(2))
+            # "6/128GB" is RAM/Storage, but "512GB/12GB" is the same shorthand
+            # written the other way round, and a real listing used it:
+            #   "M91 5G Tablet Memory 512GB/12GB Android"
+            # read as RAM=512, which then disagreed with a description saying
+            # 12 and reported "RAM: title says 512GB". Order is settled by size
+            # rather than position — RAM is never the larger of the two.
+            if _a > _b:
+                _a, _b = _b, _a
+            ram.add(_a)
+            storage.add(_b)
     return ram, storage
 
 
@@ -3355,7 +3420,8 @@ def check_specs_inconsistency(
     comments: dict = {}
     for idx in target.index:
         name_ram, name_storage = _extract_ram_storage(name_lower.loc[idx], allow_combo=True)
-        if not name_ram and not name_storage:
+        name_os = _extract_os(name_lower.loc[idx])
+        if not name_ram and not name_storage and not name_os:
             continue
         mismatches = []
         for c in text_cols:
@@ -3363,10 +3429,19 @@ def check_specs_inconsistency(
             if not text.strip():
                 continue
             f_ram, f_storage = _extract_ram_storage(text, allow_combo=False)
+            f_os = _extract_os(text)
             if name_ram and f_ram and not (name_ram & f_ram):
                 mismatches.append(f"RAM: title says {_fmt(name_ram)}, {c} says {_fmt(f_ram)}")
             if name_storage and f_storage and not (name_storage & f_storage):
                 mismatches.append(f"Storage: title says {_fmt(name_storage)}, {c} says {_fmt(f_storage)}")
+            # Same rule as the other two: only a disagreement when the title's
+            # OS appears nowhere in the field, so a description listing several
+            # ("Windows 10 or Windows 11") is not a mismatch.
+            if name_os and f_os and not (name_os & f_os):
+                mismatches.append(
+                    f"OS: title says {'/'.join(sorted(name_os))}, "
+                    f"{c} says {'/'.join(sorted(f_os))}"
+                )
         if mismatches:
             comments[idx] = "Specs inconsistency — " + " | ".join(mismatches)
 
