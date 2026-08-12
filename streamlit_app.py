@@ -2686,8 +2686,19 @@ _LANDMARK_ALT = (
 _LOCATION_RE = re.compile(
     r"(?:"
     r"\bp\.?\s*o\.?\s*box\s*\d+"                                # P.O. Box 123
-    r"|\b(?:shop|stall|suite|kiosk|office)\s*(?:no\.?|number|#)?\s*\d+"
-    r"|\b\d+\s*(?:st|nd|rd|th)?\s*floor\b"
+    # [ \t]* rather than \s*, so the number has to sit on the SAME LINE as the
+    # word. \s* crosses newlines, which made a numbered list read as an
+    # address — the number that opens the next bullet became the shop number
+    # of the word that closed the last one:
+    #
+    #   1. 6 PIECES SET: Complete set for family or office
+    #
+    #   2. AESTHETIC MARBLE DESIGN: ...
+    #
+    # matched "office\n\n2" as "office 2" and rejected a set of mugs for
+    # off-platform contact. A real "Shop No. 12" is written on one line.
+    r"|\b(?:shop|stall|suite|kiosk|office)[ \t]*(?:no\.?|number|#)?[ \t]*\d+"
+    r"|\b\d+[ \t]*(?:st|nd|rd|th)?[ \t]*floor\b"
     r"|\balong\s+[a-z]+\s+(?:road|rd|street|st|avenue|ave)\b"
     # "opposite" and "next to" both need a landmark after them. Without one,
     # "opposite <any word>" flagged "opposite direction", "opposite ends",
@@ -2701,14 +2712,14 @@ _LOCATION_RE = re.compile(
     # French — "BP 1234", "boîte postale", "magasin n° 12", "2ème étage",
     # "en face de", "à côté du marché", "situé à"
     r"|\bb\.?\s*p\.?\s*\d+"
-    r"|\bbo[iî]te\s+postale\s*\d+"
-    r"|\b(?:magasin|boutique|local|bureau)\s*(?:n[o°]\.?|num[ée]ro|#)?\s*\d+"
-    r"|\b\d+\s*(?:er|[eè]me)?\s*[ée]tage\b"
+    r"|\bbo[iî]te\s+postale[ \t]*\d+"
+    r"|\b(?:magasin|boutique|local|bureau)[ \t]*(?:n[o°]\.?|num[ée]ro|#)?[ \t]*\d+"
+    r"|\b\d+[ \t]*(?:er|[eè]me)?[ \t]*[ée]tage\b"
     r"|\ben\s+face\s+d[eu]\b|\b[aà]\s+c[oô]t[ée]\s+d[eu]\b"
     r"|\bsitu[ée]\s+[aà]\b|\bvenez\s+(?:nous\s+voir|[aà])\b"
     # Arabic — "ص.ب ١٢٣" (P.O. Box), "محل رقم", "الطابق", "بجانب", "أمام"
     r"|ص\.?\s*ب\.?\s*\d+"
-    r"|(?:محل|متجر|مكتب)\s*(?:رقم)?\s*\d+"
+    r"|(?:محل|متجر|مكتب)[ \t]*(?:رقم)?[ \t]*\d+"
     r"|الطابق\s*\S+|بجانب\s+\S+|أمام\s+\S+|بالقرب\s+من"
     r")",
     re.IGNORECASE | re.UNICODE,
