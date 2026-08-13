@@ -5788,6 +5788,9 @@ def visual_review_modal(support_files):
     with _pg[4]:
         if st.button("✖ Close", key="close_bot_fallback", use_container_width=True, type="secondary"):
             st.session_state.show_review_modal = False
+            # Tells the next run to cover the page while it rebuilds — see
+            # render_grid_closing_overlay(). Cleared at the bottom of that run.
+            st.session_state["_grid_closing"] = True
             st.rerun()
 
 
@@ -5887,6 +5890,113 @@ def render_manual_review_buttons(support_files):
 
 
 @st.fragment
+def render_grid_closing_overlay():
+    """Cover the page while a closing visual review is written back.
+
+    Closing the grid flips a flag and reruns, and that rerun redraws the whole
+    page — the KPI strip, every flag expander, the exports. On a large batch
+    that is several seconds during which the modal has gone and nothing has
+    replaced it, so the decisions just made look lost.
+
+    Emitted from the TOP of the script so it paints before that work starts,
+    and cleared by end_grid_closing_overlay() at the very bottom, once the
+    page behind it is whole. Pure CSS: Streamlit strips <script> from
+    st.markdown, and a component would render inside an iframe that cannot
+    cover the page.
+    """
+    st.markdown(
+        f"""
+        <div id="grid-closing-overlay">
+          <div class="gco-card">
+            <div class="gco-ring"><span></span><span></span><span></span></div>
+            <div class="gco-title">Saving your review…</div>
+            <div class="gco-sub">Applying your decisions and rebuilding the
+              report. This takes a moment on a large batch — please don't
+              refresh.</div>
+            <div class="gco-bar"><i></i></div>
+          </div>
+        </div>
+        <style>
+          #grid-closing-overlay {{
+            position: fixed; inset: 0; z-index: 2147483000;
+            display: flex; align-items: center; justify-content: center;
+            background: rgba(17, 24, 39, .55);
+            backdrop-filter: blur(3px);
+            animation: gcoIn .18s ease-out;
+          }}
+          @keyframes gcoIn {{ from {{ opacity: 0 }} to {{ opacity: 1 }} }}
+          .gco-card {{
+            width: min(420px, 86vw); padding: 30px 32px 26px;
+            border-radius: 16px; text-align: center;
+            background: {DT['surface']}; color: {DT['ink']};
+            box-shadow: 0 24px 60px rgba(0,0,0,.32);
+            border: 1px solid {DT['hairline']};
+            animation: gcoPop .28s cubic-bezier(.34,1.56,.64,1);
+          }}
+          @keyframes gcoPop {{
+            from {{ transform: translateY(10px) scale(.97); opacity: 0 }}
+            to   {{ transform: none; opacity: 1 }}
+          }}
+          /* Three arcs at different speeds — reads as motion even on a frame
+             the browser drops while the script is busy. */
+          .gco-ring {{ position: relative; width: 54px; height: 54px; margin: 0 auto 16px; }}
+          .gco-ring span {{
+            position: absolute; inset: 0; border-radius: 50%;
+            border: 3px solid transparent; border-top-color: {DT['accent']};
+            animation: gcoSpin 1.1s linear infinite;
+          }}
+          .gco-ring span:nth-child(2) {{
+            inset: 8px; border-top-color: {DT['accent']}; opacity: .55;
+            animation-duration: 1.6s; animation-direction: reverse;
+          }}
+          .gco-ring span:nth-child(3) {{
+            inset: 16px; border-top-color: {DT['ink']}; opacity: .28;
+            animation-duration: 2.1s;
+          }}
+          @keyframes gcoSpin {{ to {{ transform: rotate(360deg) }} }}
+          .gco-title {{ font-size: 1.05rem; font-weight: 700; letter-spacing: -.01em; }}
+          .gco-sub {{
+            margin-top: 7px; font-size: .82rem; line-height: 1.45;
+            color: {DT['ink_muted']};
+          }}
+          .gco-bar {{
+            margin-top: 18px; height: 4px; border-radius: 99px; overflow: hidden;
+            background: {DT['hairline_soft']};
+          }}
+          /* Indeterminate: the work has no measurable progress, so a bar that
+             claimed a percentage would be inventing one. */
+          .gco-bar i {{
+            display: block; width: 38%; height: 100%; border-radius: 99px;
+            background: {DT['accent']};
+            animation: gcoSlide 1.15s ease-in-out infinite;
+          }}
+          @keyframes gcoSlide {{
+            0%   {{ transform: translateX(-100%) }}
+            100% {{ transform: translateX(320%) }}
+          }}
+          @media (prefers-reduced-motion: reduce) {{
+            #grid-closing-overlay, .gco-card {{ animation: none }}
+            .gco-ring span, .gco-bar i {{ animation-duration: 3s }}
+          }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def end_grid_closing_overlay():
+    """Hide the overlay once the page behind it has finished rendering.
+
+    A later stylesheet of equal specificity wins, so this needs no JS and no
+    second rerun — the overlay simply stops applying the moment this element
+    is emitted at the end of the script.
+    """
+    st.markdown(
+        "<style>#grid-closing-overlay{display:none !important}</style>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_image_grid(support_files):
     if (
         st.session_state.get("final_report", pd.DataFrame()).empty

@@ -134,6 +134,8 @@ from ui_components import (
     render_exports_section,
     render_flag_expander,
     render_image_grid,
+    render_grid_closing_overlay,
+    end_grid_closing_overlay,
     render_sibling_prompt,
     render_manual_review_buttons,
     render_rejection_donut,
@@ -5268,6 +5270,13 @@ _large_file_skip_validations = [
     "Image Stretched", "Image Blurry", "Image Mismatch", "Image Infringing", "Image Too Many things displayed",
 ]
 
+# The visual review was just closed, so this run is rebuilding the whole page.
+# Cover it before that starts — emitted here because it is the earliest point
+# after the page chrome exists, and the overlay must paint before the flag
+# expanders and exports begin redrawing.
+if st.session_state.get("_grid_closing"):
+    render_grid_closing_overlay()
+
 _files_for_processing = st.session_state.get("cached_uploaded_files", [])
 
 
@@ -6731,3 +6740,8 @@ if _lang_bridge_val:
         logger.error(f"Lang bridge error: {e}")
 
 handle_jtbridge()
+
+# Page is rendered; drop the closing overlay. A later stylesheet wins, so this
+# needs no rerun — see end_grid_closing_overlay().
+if st.session_state.pop("_grid_closing", False):
+    end_grid_closing_overlay()
