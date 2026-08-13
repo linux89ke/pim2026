@@ -1330,6 +1330,12 @@ RESTRICTED_BRAND_EXCLUDED_PATHS = {
               "industrial & scientific"),
     "nivea baby": ("books, movies and music", "electronics", "computing",
                    "industrial & scientific"),
+    # An Android phone's description names its camera sensor, and that sensor
+    # is very often Sony's — "Sony IMX766", "50MP Sony sensor". The phone is
+    # not a Sony product and the seller is not selling Sony; the word is a
+    # component spec. Scoped to the exact subtree rather than all of Phones &
+    # Tablets, so a genuine Sony handset elsewhere still answers to the rule.
+    "sony": ("phones & tablets / mobile phones / smartphones / android phones",),
 }
 
 
@@ -2517,10 +2523,31 @@ _GENERIC_FRAGRANCE_TERMS = {
     #
     # Same rule as the rest: a real house's name in the same title still
     # matches. This only stops a note standing as the whole case.
+    # Listed properly rather than one name at a time. A title that spells out
+    # its pyramid — "Ginger, Davana, Osmanthus, Vetiver, Tonka & Tobacco" —
+    # collides with whichever house happens to have a model of that name;
+    # "osmanthus" is an Acqua di Parma model, and it rejected a Falcon Wazeer.
     "vanilla", "amber", "oud", "musk", "rose", "jasmine", "sandalwood",
     "vetiver", "patchouli", "bergamot", "citrus", "lavender", "coconut",
     "cherry", "caramel", "chocolate", "coffee", "honey", "leather", "tobacco",
     "saffron", "cedar", "lemon", "mint", "peach", "berry", "floral", "woody",
+    "osmanthus", "davana", "ginger", "tonka", "tonka bean", "iris", "orris",
+    "neroli", "ylang", "ylang ylang", "tuberose", "gardenia", "peony",
+    "magnolia", "lily", "violet", "freesia", "orchid", "lotus", "mimosa",
+    "geranium", "clary sage", "sage", "thyme", "basil", "cardamom",
+    "cinnamon", "clove", "nutmeg", "pepper", "pink pepper", "black pepper",
+    "coriander", "cumin", "anise", "fennel", "juniper", "cypress", "pine",
+    "fir", "birch", "oakmoss", "moss", "labdanum", "benzoin", "myrrh",
+    "frankincense", "incense", "styrax", "tolu", "opoponax", "elemi",
+    "vanille", "praline", "hazelnut", "almond", "pistachio", "coconut milk",
+    "mandarin", "tangerine", "orange", "blood orange", "grapefruit", "lime",
+    "yuzu", "petitgrain", "verbena", "lemongrass", "apple", "pear", "plum",
+    "fig", "raspberry", "strawberry", "blackcurrant", "cassis", "pineapple",
+    "mango", "melon", "watermelon", "lychee", "papaya", "guava",
+    "sea salt", "marine", "aquatic", "ozonic", "aldehydes", "amberwood",
+    "ambroxan", "cashmeran", "iso e super", "white musk", "leathery",
+    "suede", "vinyl", "metallic", "smoky", "spicy", "powdery", "creamy",
+    "gourmand", "oriental", "chypre", "fougere", "aromatic", "fresh",
 }
 
 
