@@ -5901,7 +5901,6 @@ def render_manual_review_buttons(support_files):
         visual_review_modal(support_files)
 
 
-@st.fragment
 def render_grid_closing_overlay():
     """Cover the page while a closing visual review is written back.
 
@@ -6009,6 +6008,7 @@ def end_grid_closing_overlay():
     )
 
 
+@st.fragment
 def render_image_grid(support_files):
     if (
         st.session_state.get("final_report", pd.DataFrame()).empty
