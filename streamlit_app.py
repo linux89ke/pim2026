@@ -1327,17 +1327,39 @@ RESTRICTED_BRANDS_NOT_SCANNED_IN_PROSE = {
 # Add a brand here when its rule has no category scope and it is misfiring in
 # a part of the tree it has no business in. This narrows a rule; it never
 # widens one.
+# Shared by every Sony rule, so they cannot drift apart.
+_SONY_EXCLUDED_PATHS = (
+    "phones & tablets",
+    "computing / computers & accessories / laptop accessories",
+)
+
 RESTRICTED_BRAND_EXCLUDED_PATHS = {
     "nivea": ("books, movies and music", "electronics", "computing",
               "industrial & scientific"),
     "nivea baby": ("books, movies and music", "electronics", "computing",
                    "industrial & scientific"),
-    # An Android phone's description names its camera sensor, and that sensor
-    # is very often Sony's — "Sony IMX766", "50MP Sony sensor". The phone is
-    # not a Sony product and the seller is not selling Sony; the word is a
-    # component spec. Scoped to the exact subtree rather than all of Phones &
-    # Tablets, so a genuine Sony handset elsewhere still answers to the rule.
-    "sony": ("phones & tablets / mobile phones / smartphones / android phones",),
+    # Across phones, tablets and computing accessories, "Sony" is a component
+    # spec or a compatibility list, not a claim to be selling Sony:
+    #
+    #   "50MP SONY'S LYTIA 600 MAIN CAMERA"        — the sensor in a Tecno Spark
+    #   "... for MacBook HP Dell Lenovo Acer ASUS
+    #      Toshiba Samsung Microsoft Surface
+    #      Huawei Xiaomi MSI Sony VAIO Chromebook"  — a sleeve that fits them all
+    #
+    # The whole Phones & Tablets tree, because the same listing turns up under
+    # Android Phones, Tablets and Tablet Accessories depending on the seller.
+    # In Computing only the accessory subtree: a sleeve is not a Sony product,
+    # but an actual Sony VAIO laptop still answers to the rule.
+    #
+    # All THREE Sony rules, not just the plain one. The KE list also carries
+    # "Sony Computer Entertainment" and "Sony Entertainment", and both include
+    # "sony" among their variations — so either fires on any Sony mention. The
+    # Tecno Spark was rejected by "Sony Computer Entertainment (as 'sony')"
+    # while the plain Sony rule was correctly excluded, which is easy to miss:
+    # the exclusion looked like it was working.
+    "sony": _SONY_EXCLUDED_PATHS,
+    "sony computer entertainment": _SONY_EXCLUDED_PATHS,
+    "sony entertainment": _SONY_EXCLUDED_PATHS,
 }
 
 
