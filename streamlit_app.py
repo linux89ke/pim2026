@@ -1307,8 +1307,35 @@ RESTRICTED_BRANDS_NOT_SCANNED_IN_PROSE = {
 }
 
 
+# Parts of the category tree a restricted brand must never fire in.
+#
+# For a rule with no category scope of its own, every match anywhere in the
+# catalogue is a rejection, and the generated typo variations make a stray hit
+# likely. NIVEA carries "niven", which matched the author of "100 Simple
+# Secrets Why Dogs Make Us Happy ... by David Niven, Ph.D." and rejected the
+# book. Nivea is skincare: a match inside a book title, a laptop listing or a
+# lab supply is a false positive by construction.
+#
+# Matched against the full category PATH, not the leaf, because the leaf of a
+# book category is "Philosophy" or "Family & Relationships" and says nothing
+# about being a book. Top-level names come from the category map — the exact
+# strings are "Books, Movies and Music", "Electronics", "Computing" and
+# "Industrial & Scientific".
+#
+# Add a brand here when its rule has no category scope and it is misfiring in
+# a part of the tree it has no business in. This narrows a rule; it never
+# widens one.
+RESTRICTED_BRAND_EXCLUDED_PATHS = {
+    "nivea": ("books, movies and music", "electronics", "computing",
+              "industrial & scientific"),
+    "nivea baby": ("books, movies and music", "electronics", "computing",
+                   "industrial & scientific"),
+}
+
+
 def check_restricted_brands(
-    data: pd.DataFrame, country_rules: List[Dict]
+    data: pd.DataFrame, country_rules: List[Dict],
+    code_to_path: Optional[Dict] = None,
 ) -> pd.DataFrame:
     if data.empty or not country_rules:
         return pd.DataFrame(columns=data.columns)
@@ -1538,6 +1565,32 @@ def check_restricted_brands(
             except Exception:
                 pass
                 
+        # Parts of the tree this brand must never fire in. Applied by PATH, so
+        # a book category whose leaf reads "Philosophy" is still recognised as
+        # a book. Needs code_to_path; without it the rule is left as-is rather
+        # than silently doing nothing different.
+        # Looked up under both spellings. rule["brand"] is normalised with the
+        # spaces stripped — "NIVEA BABY" arrives as "niveababy" — so keying on
+        # that alone silently missed it, and the book stayed rejected while the
+        # exclusion appeared to be in place.
+        _excl = (
+            RESTRICTED_BRAND_EXCLUDED_PATHS.get(brand_name.lower())
+            or RESTRICTED_BRAND_EXCLUDED_PATHS.get(str(brand_raw).strip().lower())
+        )
+        if _excl and code_to_path and not current_match.empty:
+            _paths = (
+                current_match["_cat_clean"].map(code_to_path).fillna("").astype(str).str.lower()
+            )
+            _blocked = pd.Series(False, index=current_match.index)
+            for _frag in _excl:
+                _blocked = _blocked | _paths.str.startswith(_frag)
+            if _blocked.any():
+                logger.info(
+                    "[Restricted] %s: %s match(es) dropped, outside its part of "
+                    "the catalogue", rule["brand_raw"], int(_blocked.sum()),
+                )
+            current_match = current_match[~_blocked]
+
         # Hardcoded rule: 'Sony' is allowed for video games/playstation
         if brand_name.lower() == "sony" and "CATEGORY" in current_match.columns:
             cat_str = current_match["CATEGORY"].astype(str).str.lower()
@@ -3925,7 +3978,12 @@ def validate_products(
         (
             "Restricted brands",
             check_restricted_brands,
-            {"country_rules": support_files.get("restricted_brands_all", {}).get(country_validator.country, [])},
+            {
+                "country_rules": support_files.get("restricted_brands_all", {}).get(country_validator.country, []),
+                # Resolves a category code to its full path, so a rule can be
+                # kept out of parts of the tree it has no business in.
+                "code_to_path": support_files.get("code_to_path", {}),
+            },
         ),
         (
             "Suspected Fake product",
@@ -4171,7 +4229,7 @@ def validate_products(
     if country_validator.code == "MA":
         _ma = load_morocco_qc_rules()
         validations = [v for v in validations if v[0] != "Restricted brands"]
-        validations.insert(1, ("Restricted brands", check_restricted_brands, {"country_rules": _ma.get("restricted", [])}))
+        validations.insert(1, ("Restricted brands", check_restricted_brands, {"country_rules": _ma.get("restricted", []), "code_to_path": support_files.get("code_to_path", {})}))
         ma_prohibited_rules = [{"keyword": kw, "categories": set()} for kw in _ma.get("prohibited_keywords", [])]
         validations = [v for v in validations if v[0] != "Prohibited products"]
         validations.append(("Prohibited products", check_prohibited_products,
