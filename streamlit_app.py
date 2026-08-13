@@ -2617,20 +2617,54 @@ def check_suspected_fake_perfume(
 
     d["_pfume_match"] = d["_name_lower"].apply(_find_match)
     flagged = d[d["_pfume_match"].notna()].copy()
+    if flagged.empty:
+        return pd.DataFrame(columns=data.columns)
 
-    if not flagged.empty:
+    def build_comment(row):
+        term = row["_pfume_match"]
+        brand = term_to_brand.get(term, term.title())
+        return f"Suspected fake {brand} perfume — '{term}' in name"
 
-        def build_comment(row):
-            term = row["_pfume_match"]
-            brand = term_to_brand.get(term, term.title())
-            return f"Suspected fake {brand} perfume — '{term}' in name"
+    flagged["Comment_Detail"] = flagged.apply(build_comment, axis=1)
 
-        flagged["Comment_Detail"] = flagged.apply(build_comment, axis=1)
+    # A house's NAME is proof; one of its MODEL names is a question.
+    #
+    # "Lancome" or "Versace" in a title under a first-copy brand is
+    # unambiguous. A model name is not: many are ordinary words — legend,
+    # paris, brown, gold edition, blossom — and the brands that trip this are
+    # houses that sell their own catalogue, so their own products collide with
+    # somebody's model by chance. Victory Legend and Blossom Paris are
+    # Fragrance Deluxe's own; Brown Orchid is Fragrance World's own.
+    #
+    # There is no text rule separating those from a real copy: "Scandal Pink
+    # Perfume" (a genuine Jean Paul Gaultier dupe) has exactly the same shape.
+    # Frequency, brand-terms-only and "a fake leads with the copied name" were
+    # each measured against the corpus and each failed — the last scored 11/11
+    # on hand-picked cases and then discarded real copies carrying a prefix
+    # ("Arabic Club de Nuit", "Google Boss").
+    #
+    # So the model matches stop being rejections and become a badge in the
+    # visual grid, where a person decides. No genuine catch is lost; the
+    # guesses stop costing rejections.
+    _is_brand_term = flagged["_pfume_match"].isin(legit_brand_terms)
+    _review = flagged[~_is_brand_term]
+    # Handed to the grid through session state rather than an import: the grid
+    # lives in ui_components, and importing this module from there re-executes
+    # the entry script. Cleared with the rest of the batch in
+    # _reset_report_state, or a previous upload's claims would badge this one.
+    try:
+        st.session_state["_perfume_model_claims"] = {
+            str(r["PRODUCT_SET_SID"]).strip(): str(r["Comment_Detail"])
+            for _, r in _review.iterrows()
+            if str(r.get("PRODUCT_SET_SID", "")).strip()
+        }
+    except Exception:
+        logger.exception("could not record perfume model claims for the grid")
 
     # Every matching row is returned (no per-SID dedup): "Suspected Fake
     # Perfume" is a ROW_LEVEL_VALIDATOR, so the runner keeps precisely these
     # rows instead of re-expanding one representative row to its whole SID.
-    return flagged.drop(columns=["_pfume_match"])
+    return flagged[_is_brand_term].drop(columns=["_pfume_match"])
 
 
 def check_brand_image_mismatch(
@@ -5171,6 +5205,10 @@ def _reset_report_state(*, clear_uploaded_files: bool = False, clear_zip_cache: 
         # into the next, unrelated batch — a 2,085-product CSV was reporting
         # 9,793 products, 7,708 of them from a ZIP no longer loaded.
         "zip_pim_verdicts", "zip_rejection_reasons", "_platform_verdict",
+        # Model-name perfume claims for the grid badge. Per batch, and written
+        # by the check rather than the uploader, so it survives a new upload
+        # unless it is cleared here.
+        "_perfume_model_claims",
         # Waivers and the carry-forward offer are both per batch too.
         "_flag_overrides", "_predecessor_offer", "_predecessor_handled",
     ):

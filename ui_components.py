@@ -2346,6 +2346,13 @@ def build_fast_grid_html(
             ].astype(str).str.strip()
         )
 
+    # Perfumes whose title names somebody's model rather than their house.
+    #
+    # Written by check_suspected_fake_perfume, which rejects on a house NAME
+    # and defers on a model name — see the comment there. Read from session
+    # state because importing streamlit_app here re-executes the entry script.
+    _perfume_claims = st.session_state.get("_perfume_model_claims") or {}
+
     # Sneakers claiming a protected brand.
     #
     # Not a verdict — most are textually identical to the genuine article
@@ -2549,6 +2556,7 @@ def build_fast_grid_html(
                 "is_zip": sid in _zip_sid_set,
                 "zip_override": str(_zip_override_map.get(sid, "")),
                 "brand_claim": _brand_claims.get(sid, ""),
+                "perfume_claim": str(_perfume_claims.get(sid, "")),
             }
         )
 
@@ -3798,6 +3806,10 @@ function renderCard(card) {{
   // A sneaker claiming a protected brand. No rule can tell these from the
   // genuine article, so the call belongs to whoever is looking at the photo.
   if (card.brand_claim) warnHtml += `<span class="warn-badge" style="background:#0f766e;color:#fff;" title="Claims ${{escapeHtml(card.brand_claim)}} — check the photo: no text rule can tell a fake from the real thing here">👟 ${{escapeHtml(card.brand_claim)}}?</span>`;
+  // A perfume naming somebody's MODEL rather than their house. Not rejected —
+  // many models are ordinary words and these brands sell their own catalogue,
+  // so the call belongs to whoever is looking at the bottle.
+  if (card.perfume_claim) warnHtml += `<span class="warn-badge" style="background:#7e22ce;color:#fff;" title="${{escapeHtml(card.perfume_claim)}} — check the bottle: the matched word may just be this house's own product name">🧴 Perfume?</span>`;
   var priceText = String(card.price || '').trim();
   var priceHtml = priceText ? `<div class="price-badge">${{escapeHtml(priceText)}}</div>` : '';
 
