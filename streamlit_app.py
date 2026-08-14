@@ -80,6 +80,7 @@ from constants import (
     PARQUET_CACHE_DIR,
     REASON_MAP,
     SNEAKER_BRAND_ALIASES,
+    PRICE_CEILING_MODEL_ALIASES,
 )
 from data_utils import (
     _detect_and_read_csv,
@@ -1936,12 +1937,18 @@ def check_suspected_fake_products(
         _sheet_brands = sorted(
             {b for (b, _c) in brand_cat_price}, key=len, reverse=True
         )
-        # A sub-brand is a claim on its parent's ceiling. "Airmax 97" and
-        # "Air Jordan 4" are Nike, so they answer to Nike's $45 — without this
-        # they answered to nothing, because neither is a column in the sheet.
-        # Only aliases whose parent actually has a ceiling are worth matching.
+        # A sub-brand or a model is a claim on its parent's ceiling. Without
+        # this, "Airmax 97", "AirPods Pro 3" and "Daytona" each answered to no
+        # ceiling because none is a column in the sheet — while their parents
+        # (Nike, Apple, Rolex) sit right there. Sellers evade the check by
+        # writing BRAND=Generic/Fashion/Watch/Audio and putting the model in
+        # the title, and the model IS the claim to a shopper.
+        #
+        # PRICE_CEILING_MODEL_ALIASES combines sneaker aliases with the audio
+        # and luxury-watch model families. Only aliases whose parent has a
+        # ceiling are worth compiling.
         _alias_terms = {}
-        for _alias, _parent in SNEAKER_BRAND_ALIASES.items():
+        for _alias, _parent in PRICE_CEILING_MODEL_ALIASES.items():
             if _parent in _sheet_brands and _alias not in _sheet_brands:
                 _alias_terms[_alias] = _parent
         _brand_res = {

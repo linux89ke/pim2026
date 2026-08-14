@@ -246,3 +246,97 @@ SNEAKER_BRAND_ALIASES = {
     "adida": "adidas", "addidas": "adidas", "@didas": "adidas",
     "timb": "timberland", "timberlan": "timberland",
 }
+
+
+# Audio model names, resolved to the house they belong to.
+#
+# A seller who wants to hide a fake AirPods/Sony/Samsung listing keeps the
+# BRAND field bland — Generic, Fashion, Audio — and puts the model name in the
+# title. That title is a claim about who made it, and the ceiling for that
+# house should apply just as if the BRAND field said so.
+#
+# Only distinctive tokens. Words that also mean something else — "tune",
+# "live", "tour", "studio" — are excluded because a phone tune or a
+# music-tour listing would otherwise pretend to be a JBL under a $30 ceiling.
+# What survives here are proper-noun model families a shopper searches for.
+AUDIO_MODEL_ALIASES = {
+    # Apple
+    "airpods": "apple", "airpod": "apple",
+    "airpods pro": "apple", "airpods pro 2": "apple", "airpods pro 3": "apple",
+    "airpods max": "apple", "airpods 4": "apple", "airpods 3": "apple",
+    # Sony
+    "wh-1000xm5": "sony", "wh-1000xm4": "sony", "wh-1000xm3": "sony",
+    "wf-1000xm5": "sony", "wf-1000xm4": "sony",
+    "inzone": "sony", "linkbuds": "sony", "ult wear": "sony",
+    # Samsung
+    "galaxy buds": "samsung", "galaxy buds pro": "samsung",
+    "galaxy buds live": "samsung", "galaxy buds fe": "samsung",
+    # Beats
+    "beats studio buds": "beats", "beats fit pro": "beats",
+    "beats solo": "beats", "beats studio": "beats", "powerbeats": "beats",
+    "beats pill": "beats",
+    # Bose
+    "quietcomfort": "bose", "soundlink": "bose", "quiet comfort": "bose",
+    # JBL — only the distinctive numbered families
+    "jbl flip": "jbl", "jbl charge": "jbl", "jbl clip": "jbl",
+    "jbl xtreme": "jbl", "jbl boombox": "jbl", "jbl partybox": "jbl",
+    "jbl quantum": "jbl",
+    # Sennheiser
+    "momentum true wireless": "sennheiser", "accentum": "sennheiser",
+    # Marshall
+    "marshall major": "marshall", "marshall monitor": "marshall",
+    "marshall motif": "marshall", "marshall minor": "marshall",
+    "marshall middleton": "marshall",
+}
+
+
+# Luxury-watch model names, resolved to the house.
+#
+# Same reasoning as the audio aliases: a seller writes BRAND=Watch or
+# BRAND=Fashion and puts "Daytona" or "Royal Oak" in the title. Only
+# distinctive tokens survive — "explorer" alone is too generic and is left
+# out, though "explorer ii" is safe. "Tank" is left out for the same reason
+# (it is a word); the Cartier ceiling still applies via BRAND=Cartier or when
+# "cartier" appears in the name.
+WATCH_MODEL_ALIASES = {
+    # Rolex
+    "daytona": "rolex", "submariner": "rolex", "datejust": "rolex",
+    "day-date": "rolex", "day date": "rolex",
+    "gmt-master": "rolex", "gmt master": "rolex",
+    "yacht-master": "rolex", "yacht master": "rolex",
+    "sea-dweller": "rolex", "sea dweller": "rolex",
+    "sky-dweller": "rolex", "sky dweller": "rolex",
+    "oyster perpetual": "rolex", "explorer ii": "rolex",
+    # Patek Philippe
+    "nautilus": "patek philippe", "aquanaut": "patek philippe",
+    "calatrava": "patek philippe",
+    # Audemars Piguet
+    "royal oak": "audemars piguet", "royal oak offshore": "audemars piguet",
+    # Omega
+    "speedmaster": "omega", "seamaster": "omega", "constellation": "omega",
+    "aqua terra": "omega", "planet ocean": "omega",
+    # Cartier — leaving "tank" out, keeping the distinctive ones
+    "ballon bleu": "cartier", "santos de cartier": "cartier",
+    # Breitling
+    "navitimer": "breitling", "chronomat": "breitling",
+    "superocean": "breitling", "avenger": "breitling",
+    # Hublot
+    "big bang": "hublot", "classic fusion": "hublot",
+    # TAG Heuer — only distinct compound names; "carrera" alone is a car
+    "tag heuer carrera": "tag heuer", "aquaracer": "tag heuer",
+    "tag heuer monaco": "tag heuer",
+    # Richard Mille
+    "richard mille": "richard mille",  # its own name — helps when BRAND is
+                                       # empty and the seller only writes it
+                                       # in the title
+}
+
+
+# Every model → parent-brand map, merged. `check_suspected_fake_products`
+# iterates this to give a listing that mentions a model but not its brand the
+# ceiling of the brand that owns the model.
+PRICE_CEILING_MODEL_ALIASES = {
+    **SNEAKER_BRAND_ALIASES,
+    **AUDIO_MODEL_ALIASES,
+    **WATCH_MODEL_ALIASES,
+}
