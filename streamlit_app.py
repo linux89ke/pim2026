@@ -2000,7 +2000,12 @@ def check_suspected_fake_products(
             _ceil = pd.Series(
                 [brand_cat_price.get((b, c), -1) for c in cats], index=d.index
             )
-            _under = claimed & (d["price_to_use"] < _ceil) & (_ceil > 0)
+            # <= not <. The ceilings in suspected_fake.xlsx are the LOWEST
+            # plausible price for a genuine listing, so a price sitting on the
+            # floor is on the wrong side of "genuinely selling for at least
+            # this much". A Sony WH-1000XM5 at $40 (Sony's floor) reads as a
+            # fake to a reviewer, not as a legitimate deal.
+            _under = claimed & (d["price_to_use"] <= _ceil) & (_ceil > 0)
             if not _under.any():
                 continue
             # Where the claim came from, so a reviewer can see whether the
