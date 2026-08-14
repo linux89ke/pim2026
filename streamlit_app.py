@@ -1331,6 +1331,14 @@ RESTRICTED_BRANDS_NOT_SCANNED_IN_PROSE = {
 _SONY_EXCLUDED_PATHS = (
     "phones & tablets",
     "computing / computers & accessories / laptop accessories",
+    # The whole Gaming tree — Sony games, PlayStation titles and accessories
+    # legitimately name Sony everywhere. Same for the Game Hardware subtree
+    # under Computing, and PlayStation entries elsewhere in the catalogue
+    # (Sporting Goods and Toys & Games).
+    "gaming",
+    "computing / computer accessories / game hardware",
+    "sporting goods",
+    "toys & games",
 )
 
 RESTRICTED_BRAND_EXCLUDED_PATHS = {
@@ -1360,6 +1368,10 @@ RESTRICTED_BRAND_EXCLUDED_PATHS = {
     "sony": _SONY_EXCLUDED_PATHS,
     "sony computer entertainment": _SONY_EXCLUDED_PATHS,
     "sony entertainment": _SONY_EXCLUDED_PATHS,
+    # The Playstation rule fires on any mention of "playstation", which is
+    # exactly what a genuine PS5 game or accessory listing says. Same subtree
+    # as Sony, so shares the tuple.
+    "playstation": _SONY_EXCLUDED_PATHS,
 }
 
 
@@ -2856,7 +2868,15 @@ _LOCATION_RE = re.compile(
     #
     # matched "office\n\n2" as "office 2" and rejected a set of mugs for
     # off-platform contact. A real "Shop No. 12" is written on one line.
-    r"|\b(?:shop|stall|suite|kiosk|office)[ \t]*(?:no\.?|number|#)?[ \t]*\d+"
+    # "Microsoft Office 2021", "Office 365", "Office 19 Pro Plus", "Office
+    # 2016" are software listings, not shop-number addresses. Same for the
+    # Windows and Server number-suffixed names. The shop-number rule below
+    # requires an explicit no./number/# token so a product name with a bare
+    # version number does not fire it; the ambiguous case is "office" alone,
+    # which is handled by removing it from the alternation entirely — a real
+    # office address has "no." or "#" beside it, or gives a floor.
+    r"|\b(?:shop|stall|suite|kiosk)[ \t]*(?:no\.?|number|#)?[ \t]*\d+"
+    r"|\boffice[ \t]*(?:no\.?|number|#)[ \t]*\d+"
     r"|\b\d+[ \t]*(?:st|nd|rd|th)?[ \t]*floor\b"
     r"|\balong\s+[a-z]+\s+(?:road|rd|street|st|avenue|ave)\b"
     # "opposite" and "next to" both need a landmark after them. Without one,
@@ -3642,6 +3662,24 @@ def check_specs_inconsistency(
                 continue
             f_ram, f_storage = _extract_ram_storage(text, allow_combo=False)
             f_os = _extract_os(text)
+            # No consumer laptop or phone stores its files in 6GB — but
+            # 6GB of RAM is normal, and "6GB" in a description was being
+            # compared to a 256GB storage title as if it were storage.
+            # Same reasoning as _SPEC_MEMORY_RE: below a threshold it can
+            # only be RAM. Applied to the description-side numbers so a
+            # bare "6GB" or "8GB" cannot masquerade as storage.
+            _ram_threshold = _MEMORY_IS_RAM_MAX_GB
+            _f_storage_plausible = {v for v in f_storage if v > _ram_threshold}
+            _demoted = f_storage - _f_storage_plausible
+            if _demoted:
+                # Move to RAM only if RAM was not itself already stated for
+                # the field. Kept out of the ram comparison otherwise, so a
+                # description saying "8GB RAM, 6GB storage" still reads
+                # RAM=8 and simply drops the impossible storage figure.
+                if not f_ram:
+                    f_ram = f_ram | _demoted
+                f_storage = _f_storage_plausible
+
             if name_ram and f_ram and not (name_ram & f_ram):
                 mismatches.append(f"RAM: title says {_fmt(name_ram)}, {c} says {_fmt(f_ram)}")
             if name_storage and f_storage and not (name_storage & f_storage):
