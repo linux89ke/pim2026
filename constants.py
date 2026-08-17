@@ -190,28 +190,6 @@ FLAG_CACHE_DIR = "app_cache_flags"
 # 1.5 is also an ordinary product photo: a 2:3 portrait shot is 1.5 exactly,
 # so bottles, standing figures and portrait packaging were auto-rejected on
 # shape alone.
-# ── TV colour exemption (temporary) ────────────────────────────────────────
-# Scoped by category PATH prefix, not by a frozen list of codes: the tree gains
-# subcategories (Smart TVs and Large screen TV are later additions than the
-# rest), and a hardcoded list would quietly stop covering them.
-#
-# The prefix is deliberately narrow. Matching "TV" anywhere in a path catches
-# 102 categories including "Books, Movies and Music / DVDs / Reality TV", car
-# tuners, TV trays, wall mounts and remotes. Stopping one level higher, at
-# "Electronics / Television & Video /", still gives 34 — that tree also holds
-# DVD players, VCRs, AV receivers, satellite dishes and projection screens,
-# which do have a colour worth declaring.
-#
-# This is televisions and nothing else: the Televisions node plus its six
-# subcategories.
-#
-# The node itself is matched as well as its children. Products are routinely
-# filed on a parent rather than a leaf, and a listing sitting directly in
-# "Televisions" not being covered by the televisions exemption would be a gap
-# nobody would predict from the toggle's label.
-TV_COLOR_EXEMPT_NODE = "Electronics / Television & Video / Televisions"
-TV_COLOR_EXEMPT_PREFIX = TV_COLOR_EXEMPT_NODE + " / "
-
 ASPECT_REJECT_TALL = 2.5      # taller than 2.5x its width  -> rejected
 ASPECT_REJECT_WIDE = 0.4      # wider than 2.5x its height  -> rejected
 ASPECT_ADVISORY_TALL = 1.5    # 1.5 - 2.5 -> commentary in the grid only
@@ -268,19 +246,50 @@ AUDIO_MODEL_ALIASES = {
     "wh-1000xm5": "sony", "wh-1000xm4": "sony", "wh-1000xm3": "sony",
     "wf-1000xm5": "sony", "wf-1000xm4": "sony",
     "inzone": "sony", "linkbuds": "sony", "ult wear": "sony",
-    # Samsung
+    # Samsung. Bare "galaxy" too — sellers put it in BRAND as a placeholder
+    # for Galaxy Buds Pro the same way others use "Watch" for a fake Rolex.
+    "galaxy": "samsung",
     "galaxy buds": "samsung", "galaxy buds pro": "samsung",
     "galaxy buds live": "samsung", "galaxy buds fe": "samsung",
     # Beats
     "beats studio buds": "beats", "beats fit pro": "beats",
     "beats solo": "beats", "beats studio": "beats", "powerbeats": "beats",
-    "beats pill": "beats",
+    "beats pill": "beats", "beats by dre": "beats", "beats by dr. dre": "beats",
     # Bose
     "quietcomfort": "bose", "soundlink": "bose", "quiet comfort": "bose",
     # JBL — only the distinctive numbered families
     "jbl flip": "jbl", "jbl charge": "jbl", "jbl clip": "jbl",
     "jbl xtreme": "jbl", "jbl boombox": "jbl", "jbl partybox": "jbl",
     "jbl quantum": "jbl",
+    # Sony compact model tokens. Buyers search for "1000XM5" or just "XM5",
+    # and sellers copy those. The check is only ever consulted inside the
+    # audio/speaker/watch categories, so a bare "XM5" cannot match some
+    # unrelated product elsewhere in the catalogue.
+    "1000xm5": "sony", "1000xm4": "sony", "1000xm3": "sony",
+    "xm5": "sony", "xm4": "sony",
+    # JBL model tokens without the "jbl" prefix. "Flip 6", "Charge 5" and
+    # friends inside the audio/speaker categories are unambiguously JBL — a
+    # bathroom flip is not in the speaker categories and would not reach here.
+    "flip 6": "jbl", "flip 7": "jbl", "flip 5": "jbl",
+    "charge 5": "jbl", "charge 6": "jbl",
+    "clip 4": "jbl", "clip 5": "jbl",
+    "xtreme 3": "jbl", "xtreme 4": "jbl",
+    "boombox 3": "jbl", "boombox 2": "jbl",
+    "go 4": "jbl", "go 5": "jbl",
+    # Bose compact tokens. "QC45" and "QC35" are how the QuietComfort series
+    # is written on price tags and in reviews.
+    "quietcomfort 45": "bose", "quietcomfort ultra": "bose",
+    "qc45": "bose", "qc35": "bose",
+    "soundlink flex": "bose", "soundlink mini": "bose", "soundlink micro": "bose",
+    # Harman Kardon and its models. HK is its own brand — it appears as a
+    # column in the sheet too — but a listing pairing "Harman Kardon" with a
+    # JBL model name ("Harman Kardon Flip 6", "Harman Kardon Charge 5") is
+    # still a JBL claim, and the JBL alias above catches those on the JBL
+    # side. This side gets HK's own model families.
+    "onyx studio": "harman kardon", "aura studio": "harman kardon",
+    "go play": "harman kardon", "go + play": "harman kardon",
+    "citation": "harman kardon", "soundsticks": "harman kardon",
+    "esquire mini": "harman kardon",
     # Sennheiser
     "momentum true wireless": "sennheiser", "accentum": "sennheiser",
     # Marshall
@@ -329,6 +338,27 @@ WATCH_MODEL_ALIASES = {
     "richard mille": "richard mille",  # its own name — helps when BRAND is
                                        # empty and the seller only writes it
                                        # in the title
+    # Casio watches. G-Shock is a Casio sub-brand and sellers write it as
+    # either "G-Shock", "Gshock" or "G Shock"; each is really a Casio claim.
+    # Baby-G, Edifice, Pro Trek and Oceanus are the other well-known lines.
+    "g-shock": "casio", "gshock": "casio", "g shock": "casio",
+    "baby-g": "casio", "baby g": "casio", "babyg": "casio",
+    "edifice": "casio", "pro trek": "casio", "protrek": "casio",
+    "oceanus": "casio",
+}
+
+
+# Casio calculator model families. fx-991EX ClassWiz is the counterfeit
+# target — genuine ~$20, fakes ~$3-5 — and sellers write it many ways: with
+# or without hyphen, with "ClassWiz" alone, with the plain "fx-991".
+CALCULATOR_MODEL_ALIASES = {
+    "fx-991ex": "casio", "fx991ex": "casio", "fx-991": "casio", "fx991": "casio",
+    "fx-991es": "casio", "fx-991spx": "casio",
+    "fx-570ex": "casio", "fx-570es": "casio",
+    "fx-115es": "casio", "fx-115": "casio",
+    "fx-9750giii": "casio", "fx-9750": "casio",
+    "fx-9860giii": "casio", "fx-cg50": "casio", "fx-cg500": "casio",
+    "classwiz": "casio",
 }
 
 
@@ -339,4 +369,5 @@ PRICE_CEILING_MODEL_ALIASES = {
     **SNEAKER_BRAND_ALIASES,
     **AUDIO_MODEL_ALIASES,
     **WATCH_MODEL_ALIASES,
+    **CALCULATOR_MODEL_ALIASES,
 }

@@ -5053,7 +5053,7 @@ try {{
 
 
 @st.dialog(
-    "Visual Review Mode", width="large", icon=":material/pageview:", dismissible=False
+    " ", width="large", dismissible=False
 )
 def visual_review_modal(support_files):
     scroll_top_flag = st.session_state.get("do_scroll_top", False)
@@ -5085,6 +5085,23 @@ def visual_review_modal(support_files):
             max-width: none !important;
         }
         </style>""", unsafe_allow_html=True)
+
+    # The header row (blank title + close/icon chrome) still claims its own
+    # band even with an empty label — on a laptop screen that is real height
+    # taken from the grid below it. Shrunk rather than hidden outright: the
+    # row still needs to exist for the dialog's own layout/close affordance,
+    # this just stops it acting like a full title bar.
+    st.markdown("""
+    <style>
+    [data-testid="stDialog"] section[role="dialog"] > div:first-child {
+        padding-top: 2px !important;
+        padding-bottom: 2px !important;
+        min-height: 0 !important;
+    }
+    [data-testid="stDialogIcon"] {
+        display: none !important;
+    }
+    </style>""", unsafe_allow_html=True)
 
     # ── ZIP images lost with the session ──────────────────────────────────
     # The uploaded bytes live only in session state; the report is checkpointed
