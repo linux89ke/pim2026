@@ -66,8 +66,11 @@ def _load_dashboard_catalog(mtime_ns: int, day_key: str) -> pd.DataFrame:
     _seller_nonempty = _seller.replace("", pd.NA)
     frame["sellers_affected"] = _seller_nonempty.groupby(frame["_cluster_key"]).transform("nunique").fillna(0).astype(int)
     frame["confirmed_decisions"] = frame["review_state"].eq("Confirmed").groupby(frame["_cluster_key"]).transform("sum").astype(int)
-    _created = pd.to_datetime(frame.get("created_at", ""), errors="coerce", utc=True)
-    frame["review_due_at"] = pd.to_datetime(frame.get("review_due_at", _created + pd.Timedelta(days=30)), errors="coerce", utc=True)
+    _created_source = frame["created_at"] if "created_at" in frame.columns else pd.Series(pd.NaT, index=frame.index)
+    _created = pd.to_datetime(_created_source, errors="coerce", utc=True)
+    _default_due = _created + pd.to_timedelta(30, unit="D")
+    _due_source = frame["review_due_at"] if "review_due_at" in frame.columns else _default_due
+    frame["review_due_at"] = pd.to_datetime(_due_source, errors="coerce", utc=True)
     frame["lifecycle"] = "Active"
     frame.loc[frame["review_state"].eq("Corrected"), "lifecycle"] = "Correction queued"
     frame.loc[frame["review_due_at"].lt(pd.Timestamp.now(tz="UTC")) & frame["review_state"].eq("Unreviewed"), "lifecycle"] = "Review overdue"

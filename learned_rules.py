@@ -143,7 +143,31 @@ def _remote_upsert_rules(records: list[dict]) -> None:
                 row[field] = None
         payload.append(row)
     try:
-        supabase_store.upsert("learned_image_rules", payload, on_conflict="image_url,flag")
+        # The production table is keyed by (phash, flag). Older deployments
+        # used (image_url, flag), which makes that conflict target return a
+        # PostgREST 400. Send hashed rows against the live constraint and send
+        # rows without a hash as nullable inserts; a duplicate insert is safe
+        # to ignore because the local JSON remains authoritative.
+        _hashed = [row for row in payload if row.get("phash")]
+        _unhashed = [row for row in payload if not row.get("phash")]
+        if _hashed:
+            try:
+                supabase_store.upsert("learned_image_rules", _hashed, on_conflict="phash,flag")
+            except Exception as _phash_conflict_exc:
+                # Compatibility with projects that retained the original
+                # image_url/flag unique constraint instead of the pHash one.
+                if "400" not in str(_phash_conflict_exc) and "constraint" not in str(_phash_conflict_exc).lower():
+                    raise
+                supabase_store.upsert("learned_image_rules", _hashed, on_conflict="image_url,flag")
+        if _unhashed:
+            for row in _unhashed:
+                row["phash"] = None
+                try:
+                    supabase_store.insert("learned_image_rules", [row])
+                except Exception as _insert_exc:
+                    # A pre-existing URL/flag row is already synchronized.
+                    if "409" not in str(_insert_exc) and "duplicate" not in str(_insert_exc).lower():
+                        raise
         global _REMOTE_RULES, _REMOTE_RULES_FETCHED_AT
         _REMOTE_RULES = None
         _REMOTE_RULES_FETCHED_AT = 0.0
