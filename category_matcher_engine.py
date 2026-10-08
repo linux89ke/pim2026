@@ -430,6 +430,14 @@ class CategoryMatcherEngine:
                         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                     )
                 ''')
+                c.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_corrections_name_category "
+                    "ON category_corrections(name, category)"
+                )
+                c.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_negatives_name_category "
+                    "ON category_negatives(name, category)"
+                )
                 conn.commit()
         except Exception as e:
             logger.warning(f"Failed to init category learning DB: {e}")

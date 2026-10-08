@@ -13,6 +13,7 @@ import time
 import uuid
 import zipfile
 import re
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from typing import Any, List, Dict, Optional
@@ -65,6 +66,35 @@ async def get_redis() -> aioredis.Redis:
 _executor = ThreadPoolExecutor(max_workers=int(os.getenv("VALIDATOR_WORKERS", "4")))
 RESULT_TTL = 7200
 JOB_TTL    = 600
+RESULT_DIR = os.getenv(
+    "VALIDATION_RESULT_DIR",
+    os.path.join(tempfile.gettempdir(), "pim-validation-results"),
+)
+os.makedirs(RESULT_DIR, exist_ok=True)
+
+
+def _result_path(result_key: str, suffix: str) -> str:
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", result_key)
+    return os.path.join(RESULT_DIR, f"{safe_key}.{suffix}")
+
+
+def _write_result_pickle(value: Any, result_key: str, suffix: str) -> str:
+    path = _result_path(result_key, suffix)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "wb") as handle:
+        pickle.dump(value, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
+    return path
+
+
+def _read_result_artifact(path_value: bytes | str | None) -> bytes | None:
+    if not path_value:
+        return None
+    path = path_value.decode("utf-8") if isinstance(path_value, bytes) else str(path_value)
+    if not os.path.isfile(path):
+        return None
+    with open(path, "rb") as handle:
+        return handle.read()
 
 @app.on_event("startup")
 async def startup_event():
@@ -108,6 +138,7 @@ def _run_full_pipeline(
     filename: str,
     country: str,
     progress_state: dict | None = None,
+    result_key: str | None = None,
 ) -> dict[str, Any]:
     from data_utils import standardize_input_data, propagate_metadata, filter_by_country, _repair_mojibake, _detect_and_read_csv
     from loaders import load_support_files_lazy
@@ -171,7 +202,7 @@ def _run_full_pipeline(
     data_unique = data_filtered.drop_duplicates(subset=['PRODUCT_SET_SID'], keep='first')
     data_has_warranty = all(c in data_unique.columns for c in ['PRODUCT_WARRANTY', 'WARRANTY_DURATION'])
     _stage("Loading rule files…", 25)
-    support_files = load_support_files_lazy()
+    support_files = load_support_files_lazy(country)
 
     # 3. Validation — on_progress reports which specific check is running
     # (e.g. "Checking: Wrong Category") so /status shows real stage info
@@ -279,9 +310,10 @@ def _run_full_pipeline(
         if zf: zf.close()
 
     _stage("Finalizing report…", 98)
+    artifact_key = result_key or f"adhoc-{uuid.uuid4().hex}"
     return {
-        "report": pickle.dumps(final_report),
-        "data": pickle.dumps(data_unique),
+        "report_path": _write_result_pickle(final_report, artifact_key, "report.pkl"),
+        "data_path": _write_result_pickle(data_unique, artifact_key, "data.pkl"),
         "summary": summary,
     }
 
@@ -312,11 +344,13 @@ async def _validation_task(job_id, file_bytes, filename, country, result_key):
     hb_task = asyncio.create_task(_heartbeat())
     try:
         loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(_executor, _run_full_pipeline, file_bytes, filename, country, progress_state)
+        res = await loop.run_in_executor(
+            _executor, _run_full_pipeline, file_bytes, filename, country, progress_state, result_key
+        )
         pipe = r.pipeline()
-        pipe.setex(result_key + ":report", RESULT_TTL, res["report"])
-        pipe.setex(result_key + ":data", RESULT_TTL, res["data"])
-        pipe.setex(result_key + ":summary", RESULT_TTL, pickle.dumps(res["summary"]))
+        pipe.setex(result_key + ":report", RESULT_TTL, res["report_path"])
+        pipe.setex(result_key + ":data", RESULT_TTL, res["data_path"])
+        pipe.setex(result_key + ":summary", RESULT_TTL, json.dumps(res["summary"]))
         await pipe.execute()
         await _up("done", 100, "Done", result_key)
     except Exception as e:
@@ -338,7 +372,7 @@ async def submit_validation(background_tasks: BackgroundTasks, file: UploadFile 
     fhash = _file_hash(file_bytes)
     rkey = _result_key(fhash, country)
     r = await get_redis()
-    if await r.exists(rkey + ":summary"):
+    if await r.exists(rkey + ":summary") and await r.exists(rkey + ":report") and await r.exists(rkey + ":data"):
         return SubmitResponse(job_id=f"cached-{fhash[:8]}", cache_hit=True, message="Cached")
 
     job_id = str(uuid.uuid4())
@@ -367,26 +401,33 @@ async def get_summary(country: str, file_hash: str):
     r = await get_redis()
     raw = await r.get(_result_key(file_hash, country) + ":summary")
     if not raw: raise HTTPException(404)
-    return ValidationSummary(**pickle.loads(raw))
+    return ValidationSummary(**json.loads(raw))
 
 @app.get("/result/report/{country}/{file_hash}")
 async def get_report(country: str, file_hash: str):
     r = await get_redis()
-    raw = await r.get(_result_key(file_hash, country) + ":report")
-    if not raw: raise HTTPException(404)
+    raw = _read_result_artifact(await r.get(_result_key(file_hash, country) + ":report"))
+    if raw is None: raise HTTPException(404)
     return Response(content=raw, media_type="application/octet-stream")
 
 @app.get("/result/data/{country}/{file_hash}")
 async def get_data(country: str, file_hash: str):
     r = await get_redis()
-    raw = await r.get(_result_key(file_hash, country) + ":data")
-    if not raw: raise HTTPException(404)
+    raw = _read_result_artifact(await r.get(_result_key(file_hash, country) + ":data"))
+    if raw is None: raise HTTPException(404)
     return Response(content=raw, media_type="application/octet-stream")
 
 @app.delete("/result/{country}/{file_hash}")
 async def invalidate_cache(country: str, file_hash: str):
     r = await get_redis()
     rkey = _result_key(file_hash, country)
+    for suffix in ("report", "data"):
+        artifact = await r.get(rkey + ":" + suffix)
+        if artifact:
+            try:
+                os.remove(artifact.decode("utf-8") if isinstance(artifact, bytes) else str(artifact))
+            except FileNotFoundError:
+                pass
     await r.delete(rkey + ":report", rkey + ":data", rkey + ":summary", rkey + ":inflight")
     return {"deleted": True}
 

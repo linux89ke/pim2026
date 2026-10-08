@@ -1194,7 +1194,22 @@ def load_all_support_files(country_code: str = "KE") -> Dict:
                     logger.warning("category_map parquet unreadable (%s), re-reading xlsx", _pq_err)
                     _cm_df = None
             if _cm_df is None:
-                _cm_df = pd.read_excel(_cm_path, engine="openpyxl", dtype=str)
+                # The category workbook contains many auxiliary columns, but
+                # validation only needs the path and category code. Reading
+                # those two columns avoids materialising the rest of the
+                # 30k-row workbook on every cold cache build.
+                _cm_header = pd.read_excel(_cm_path, engine="openpyxl", dtype=str, nrows=0)
+                _cm_cols = [str(c).strip() for c in _cm_header.columns]
+                _cm_usecols = [
+                    c for c in _cm_cols
+                    if c.lower() == "category path" or "path" in c.lower() or "code" in c.lower()
+                ]
+                _cm_df = pd.read_excel(
+                    _cm_path,
+                    engine="openpyxl",
+                    dtype=str,
+                    usecols=_cm_usecols or None,
+                )
                 _cm_df.columns = [str(c).strip() for c in _cm_df.columns]
                 try:
                     os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
