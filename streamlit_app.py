@@ -4,6 +4,7 @@ main.py - Main Streamlit Application Entry Point
 
 import base64
 import concurrent.futures
+import gc
 import hashlib
 import json
 import logging
@@ -13,6 +14,7 @@ import re
 import shutil
 import time
 import traceback
+import unicodedata
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -30,6 +32,25 @@ import streamlit.components.v1 as components
 from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+
+try:
+    from streamlit.runtime.scriptrunner_utils.script_run_context import add_script_run_ctx, get_script_run_ctx
+except ImportError:
+    try:
+        from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+    except ImportError:
+        add_script_run_ctx, get_script_run_ctx = None, None
+
+
+def _run_with_ctx(ctx, fn, *args, **kwargs):
+    if ctx and add_script_run_ctx:
+        try:
+            import threading
+            add_script_run_ctx(threading.current_thread(), ctx)
+        except Exception:
+            pass
+    return fn(*args, **kwargs)
 
 
 # ── Shared Image Fetching Session ──
@@ -72,6 +93,7 @@ from api_client import (
 from constants import (
     ASPECT_ADVISORY_TALL, ASPECT_ADVISORY_WIDE,
     ASPECT_REJECT_TALL, ASPECT_REJECT_WIDE,
+    COLOR_VARIANT_TO_BASE,
     COUNTRY_VALIDATOR_CONFIG,
     FLAG_CACHE_DIR,
     GRID_COLS,
@@ -96,6 +118,7 @@ from data_utils import (
     find_predecessor_decisions,
     load_df_parquet,
     load_manual_decisions,
+    manual_decisions_mtime,
     preview_decision_merge,
     propagate_metadata,
     save_df_parquet,
@@ -103,7 +126,11 @@ from data_utils import (
     validate_input_schema,
     normalize_text,
 )
-from custom_country_rules import check_kebs_banned_products, load_kebs_hb_codes, check_kebs_fda
+from custom_country_rules import (
+    check_kebs_banned_products, load_kebs_hb_codes, check_kebs_fda, check_invalid_brand_name,
+    check_animal_health_banned_products, check_animal_health_prohibited_products,
+    check_animal_health_banned_category, check_animal_health_prohibited_category,
+)
 from ghana_rules import check_ghana_smart_glasses, load_ghana_qc_rules
 from loaders import compile_regex_patterns, load_support_files_lazy
 from morocco_rules import check_morocco_prohibited_brands, load_morocco_qc_rules
@@ -125,10 +152,24 @@ from pricing_rules import (
     check_suspicious_discount,
     check_wrong_price,
 )
+from refurbished_rules import check_refurbished_products, check_out_of_market_devices
 from translations import LANGUAGES, get_translation
+import importlib
+import targeted_audit as _ta_mod
+try:
+    importlib.reload(_ta_mod)
+except Exception:
+    pass
+import ui_components as _ui_mod
+try:
+    importlib.reload(_ui_mod)
+except Exception:
+    pass
+
 from ui_components import (
     apply_status_change,
     checkpoint_final_report,
+    _clear_result_caches,
     flag_pill_header,
     render_context_rail,
     render_exports_section,
@@ -142,6 +183,7 @@ from ui_components import (
     render_severity_group_header,
     render_summary_header,
     render_override_history,
+    register_learning_commit,
 )
 
 # A JS injector used to live here. It reached into the parent document on
@@ -156,48 +198,12 @@ from ui_components import (
 # the lifetime of the session, to style a handful of summaries.
 # ──────────────────────────────────────────────────────────────────────────────
 
-PREFETCH_MAP = {
-    "wrong_category": "Wrong Category",
-    "poor_images": "Poor images",
-    "restricted_brands": "Restricted brands",
-    "prohibited_products": "Prohibited products",
-    "suspected_fake": "Suspected Fake product",
-    "duplicate_product": "Duplicate product",
-    "wrong_variation": "Wrong Variation",
-    "missing_color": "Missing COLOR",
-    "unnecessary_words": "Unnecessary words in NAME",
-    "brand_repeated": "BRAND name repeated in NAME",
-    "generic_brand": "Generic BRAND Issues",
-    "incomplete_smartphone": "Incomplete Smartphone Name",
-    "missing_weight": "Missing Weight/Volume",
-    "product_warranty": "Product Warranty",
-    "category_check": "Category Check",
-    "warranty_check": "Warranty Check",
-    "fda_check": "FDA",
-    "color_check": "Color Check",
-    "variation_check": "Variation Check",
-    "product_name_brand_name": "Product Name Brand Name",
-    "title_language_check": "Title Language Check",
-    "image_quality_check": "Image Quality Check",
-    "brand_image_check": "Brand Image Check",
-}
-
-# The single "Product Name Brand Name" validation is split into these
-# sub-validations based on the reason text (see _classify_name_brand_sub_bucket).
-# "Other" exists so any future/unrecognized reason still gets its own flag
-# instead of being silently dropped or lumped into an existing bucket.
-NAME_BRAND_SUB_FLAGS = [
-    "Product Name Brand Name \u2013 Brand Repeated In Title",
-    "Product Name Brand Name \u2013 Inspired/Alternative Perfume Brand",
-    "Product Name Brand Name \u2013 Generic/Placeholder Brand",
-    "Product Name Brand Name \u2013 High-End Brand Counterfeit Suspected",
-    "Product Name Brand Name \u2013 Other",
-]
-
-TITLE_LANGUAGE_SUB_FLAGS = [
-    "Title Language Check \u2013 Not In English",
-    "Title Language Check \u2013 Other",
-]
+from constants import (
+    PREFETCH_MAP,
+    NAME_BRAND_SUB_FLAGS,
+    TITLE_LANGUAGE_SUB_FLAGS,
+    _prefetch_key_from_status_col,
+)
 
 PREFETCH_REASON_COLUMNS = {
     "category_check": ["Category_Check_Rejection_Reason"],
@@ -212,21 +218,27 @@ PREFETCH_REASON_COLUMNS = {
     "title_language_check": ["Title_Language_Check_Reason"],
     "image_quality_check": ["Image_Quality_Check_Reason"],
     "brand_image_check": ["Brand_Image_Check_Reason"],
+    "restricted_keyword": [
+        "Restricted_Keyword_Reason",
+        "Restricted_Block_Hits",
+        "Restricted_Keyword_Status",
+    ],
 }
-PROCESSING_CACHE_VERSION = "prefetch_context_v5"  # bumped: fake-perfume color-word fix + new validators
+PROCESSING_CACHE_VERSION = "prefetch_context_v7"  # bumped: potential restricted brand validation added
 PREFETCH_VALIDATOR_SKIP_MAP = {
     "category_check": ["Wrong Category", "Category Check"],
     "warranty_check": ["Product Warranty", "Warranty Check"],
     "fda_check": ["FDA"],
-    "color_check": ["Missing COLOR", "Color Check"],
+    "color_check": ["Missing COLOR", "Color Check", "Color Mismatch: Title vs COLOR Column"],
     "variation_check": ["Wrong Variation", "Variation Check"],
     "product_name_brand_name": [
         "BRAND name repeated in NAME", "Product Name Brand Name",
         *NAME_BRAND_SUB_FLAGS,
     ],
     "brand_image_check": ["Brand Image Check"],
+    "restricted_keyword": ["Prohibited products", "Restricted Keywords"],
     "title_language_check": [
-        "Missing Weight/Volume", "Title Language Check",
+        "Missing Weight/Volume", "Incomplete Smartphone Name", "Title Language Check",
         *TITLE_LANGUAGE_SUB_FLAGS,
     ],
     "image_quality_check": [
@@ -239,15 +251,6 @@ PREFETCH_VALIDATOR_SKIP_MAP = {
         "Image Too Many things displayed",
     ],
 }
-
-
-def _prefetch_key_from_status_col(col: str) -> str:
-    return (
-        re.sub(r"[_\s]*status$", "", str(col), flags=re.IGNORECASE)
-        .strip()
-        .lower()
-        .replace(" ", "_")
-    )
 
 
 def _build_zip_sid_index(qc_df: pd.DataFrame) -> None:
@@ -273,7 +276,7 @@ def _prefetch_reason_from_row(row, status_col: str, qc_columns) -> str:
     for candidate in PREFETCH_REASON_COLUMNS.get(base_key, []):
         if candidate in qc_columns:
             val = str(row.get(candidate, "")).strip()
-            if val and val.lower() not in ("nan", "none", "rejected"):
+            if val and val.lower() not in ("nan", "none", "rejected", "block", "clean"):
                 return val
 
     reason_col = re.sub(r"status$", "reason", str(status_col), flags=re.IGNORECASE)
@@ -284,7 +287,7 @@ def _prefetch_reason_from_row(row, status_col: str, qc_columns) -> str:
     ):
         if candidate in qc_columns:
             val = str(row.get(candidate, "")).strip()
-            if val and val.lower() not in ("nan", "none", "rejected"):
+            if val and val.lower() not in ("nan", "none", "rejected", "block", "clean"):
                 return val
     return ""
 
@@ -333,6 +336,18 @@ def _classify_title_language_sub_bucket(reason: str) -> str:
     low = r.lower()
     if not r or low == "nan":
         return "Title Language Check \u2013 Other"
+
+    if "refurbished" in low or "renewed" in low:
+        return "Title Language Check \u2013 Refurbished Missing in Title"
+
+    if (
+        ("phone" in low or "tablet" in low or "laptop" in low or "smartphone" in low)
+        and ("incomplete" in low or "spec" in low or "ram" in low or "storage" in low)
+    ) or ("incomplete" in low and ("spec" in low or "ram" in low or "storage" in low)):
+        return "Title Language Check \u2013 Incomplete Phone/Tablet/Laptop Title"
+
+    if any(k in low for k in ("weight", "volume", "count", "quantity", "sold by")):
+        return "Title Language Check \u2013 Missing Weight/Volume/Count"
 
     if "not in english" in low:
         return "Title Language Check \u2013 Not In English"
@@ -488,6 +503,8 @@ def restore_single_item(sid):
         is_manual=True,
         is_zip=False,
     )
+    if current_flag == "Potential Restricted Brand" and "zip_override" in fr.columns:
+        fr.loc[mask, "zip_override"] = "pot_restricted"
     st.session_state.main_toasts.append("Product Approved.")
 
 
@@ -618,14 +635,17 @@ FLAG_RELEVANT_COLS = {
     # "Matched In" says which of the four the brand was actually found in.
     "Restricted brands": ["NAME", "BRAND", "SELLER_NAME", "CATEGORY_CODE", "CATEGORY",
                           "DESCRIPTION", "SHORT_DESCRIPTION", "Matched In"],
+    "Potential Restricted Brand": ["NAME", "BRAND", "SELLER_NAME", "CATEGORY_CODE", "CATEGORY"],
     # NAME and the descriptions are listed because the price ceiling now looks
     # for the brand claim there too, not just in the BRAND field. This map also
     # scopes the per-flag cache digest.
     "Suspected Fake product": ["CATEGORY_CODE", "BRAND", "NAME", "GLOBAL_SALE_PRICE",
                                "GLOBAL_PRICE", "DESCRIPTION", "SHORT_DESCRIPTION"],
+    "Out of market devices": ["NAME", "BRAND", "CATEGORY_CODE", "CATEGORY"],
     "Seller Not approved to sell Refurb": ["PRODUCT_SET_SID", "CATEGORY_CODE", "SELLER_NAME", "NAME"],
     "Product Warranty": ["PRODUCT_WARRANTY", "WARRANTY_DURATION", "CATEGORY_CODE"],
     "Seller Approve to sell books": ["CATEGORY_CODE", "SELLER_NAME"],
+    "Seller Not Approved to Sell Alcohol": ["CATEGORY", "CATEGORY_CODE", "SELLER_NAME"],
     "Seller Approved to Sell Perfume": ["CATEGORY_CODE", "SELLER_NAME", "BRAND", "NAME"],
     "Counterfeit Sneakers": ["CATEGORY_CODE", "NAME", "BRAND",
                              "DESCRIPTION", "SHORT_DESCRIPTION", "Matched In",
@@ -646,6 +666,7 @@ FLAG_RELEVANT_COLS = {
     "Wrong Variation": ["COUNT_VARIATIONS", "CATEGORY_CODE"],
     "Generic branded products with genuine brands": ["NAME", "BRAND", "CATEGORY"],
     "Missing COLOR": ["CATEGORY_CODE", "NAME", "COLOR"],
+    "Color Mismatch: Title vs COLOR Column": ["CATEGORY_CODE", "NAME", "COLOR"],
     "Missing Weight/Volume": ["CATEGORY_CODE", "NAME"],
     "Incomplete Smartphone Name": ["CATEGORY_CODE", "NAME"],
     "Specs Inconsistency": ["CATEGORY_CODE", "NAME", "DESCRIPTION", "SHORT_DESCRIPTION", "CATEGORY"],
@@ -680,7 +701,7 @@ FLAG_RELEVANT_COLS = {
     "Powerbank Not Authorized": ["CATEGORY_CODE", "NAME", "BRAND"],
     "GH - Smart Glasses with Camera": ["NAME", "CATEGORY_CODE"],
     "ALL CAPS Product Name": ["NAME"],
-    "Product Name Too Short": ["NAME"],
+    "Product Name Too Short": ["NAME", "CATEGORY_CODE", "CATEGORY"],
     "Variation Name Mismatch": ["NAME"],
     "Prohibited products": ["NAME", "CATEGORY_CODE"],
     "FDA": ["CATEGORY_CODE"],
@@ -715,7 +736,7 @@ except Exception:  # a broken rules file must not stop the app importing
 # holds whichever sibling finished first, and the built-in Wrong Category key
 # is unchanged by the check_id fix — so without this bump it would keep serving
 # a rule's result, or an empty one, as the whole flag's verdict.
-FLAG_CACHE_KEY_VERSION = "fk3"
+FLAG_CACHE_KEY_VERSION = "fk5"
 
 # Columns every check implicitly depends on: results are keyed by SID, and the
 # row set itself is part of a check's input.
@@ -849,6 +870,7 @@ class _BoundedDict(OrderedDict):
 
 _IMAGE_DIM_CACHE = _BoundedDict(maxsize=5000)
 _IMAGE_HASH_CACHE = _BoundedDict(maxsize=5000)
+_IMAGE_THUMB_CACHE = _BoundedDict(maxsize=2500)
 _IMAGE_DIM_LOCK = threading.Lock()
 # Staging area for the low-resolution advisory produced by check_image_blurry.
 # That check runs on a worker thread, where st.session_state writes are silently
@@ -859,7 +881,10 @@ _IMAGE_BLURRY_COMMENTARY: dict = {}
 def _compute_phash(img_bytes: bytes) -> str:
     try:
         import imagehash
-        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+        img = Image.open(BytesIO(img_bytes))
+        if img.mode == "P":
+            img = img.convert("RGBA")
+        img = img.convert("RGB")
         return str(imagehash.phash(img))
     except Exception:
         return ""
@@ -902,6 +927,8 @@ def _size_and_phash(img_bytes: bytes):
             img.draft("RGB", (256, 256))   # no-op for non-JPEG formats
         except Exception:
             pass
+        if img.mode == "P":
+            img = img.convert("RGBA")
         ph = str(imagehash.phash(img.convert("RGB")))
     except Exception:
         ph = ""
@@ -951,27 +978,30 @@ def _index_zip_images(zf: zipfile.ZipFile) -> Dict[str, str]:
 
 def _prepare_lazy_zip_images(uploaded_file_records: List[Dict]) -> None:
     st.session_state.zip_image_store = {}
-    st.session_state.zip_image_index = {}
-    st.session_state.zip_image_source_bytes = None
+    combined_index = {}
+    source_bytes_list = []
     for uf in uploaded_file_records:
         if not uf["name"].lower().endswith(".zip"):
             continue
         try:
             with zipfile.ZipFile(BytesIO(uf["bytes"])) as zf:
-                index = _index_zip_images(zf)
-            if index:
-                st.session_state.zip_image_index = index
-                st.session_state.zip_image_source_bytes = uf["bytes"]
+                idx = _index_zip_images(zf)
+            if idx:
+                combined_index.update(idx)
+                source_bytes_list.append(uf["bytes"])
         except Exception as e:
             logger.warning("Failed indexing ZIP images from %s: %s", uf["name"], e)
+    st.session_state.zip_image_index = combined_index
+    st.session_state.zip_image_source_bytes = source_bytes_list if source_bytes_list else None
 
 
 # 🚀 OPTIMIZED: Double Download Eliminated
-def _fetch_all_image_dimensions(data: pd.DataFrame) -> dict:
+def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> dict:
     """
     Download all unique images ONCE and cache. Both caches are filled 
     in a single network pass using session pooling. Thread-safe.
     """
+    _image_t0 = time.perf_counter()
     if "MAIN_IMAGE" not in data.columns:
         return {}
     _all_urls = data["MAIN_IMAGE"].astype(str)
@@ -1016,20 +1046,37 @@ def _fetch_all_image_dimensions(data: pd.DataFrame) -> dict:
                 ))
 
     if not new_urls and not zip_descriptors:
+        st.session_state["validation_stage_timings"] = {
+            **st.session_state.get("validation_stage_timings", {}),
+            "Image download and pHash": 0.0,
+        }
         return _IMAGE_DIM_CACHE
+
+    # Thumbnail files are only needed for the first visible review window.
+    # Generating and writing one for every image during validation added a
+    # second full image-processing pass to large uploads. Cards can safely use
+    # the original URL while a thumbnail is not cached.
+    _thumb_url_limit = 200
+    _thumbnail_urls = set(new_urls[:_thumb_url_limit])
+    _thumbnail_zip_keys = {d[0] for d in zip_descriptors[:_thumb_url_limit]}
 
     def fetch(url):
         session = get_image_session()
         try:
-            # OPTIMIZED: Removed duplicate bare requests.get call
-            r = session.get(url.replace("http://", "https://"), timeout=6)
+            # Bumping timeout to 15s to handle internal CDNs like vendorcenter.jumia.com
+            r = session.get(url.replace("http://", "https://"), timeout=15)
             if r.status_code == 200:
                 raw = r.content
                 size, ph = _size_and_phash(raw)
-                return url, size, ph
+                thumb = thumbnail_data_uri(raw, url, 240) if url in _thumbnail_urls else ""
+                return url, size, ph, thumb
         except Exception:
             pass
-        return url, None, ""
+        # Keep the result shape identical to successful downloads. The image
+        # prefetch collector stores (url, dimensions, phash, thumbnail); a
+        # three-item failure tuple made one bad image abort the whole prefetch
+        # pass with "expected 4, got 3".
+        return url, None, "", ""
 
     def process_zip_img(tup):
         key, payload = tup
@@ -1040,17 +1087,21 @@ def _fetch_all_image_dimensions(data: pd.DataFrame) -> dict:
             else:
                 raw = payload if isinstance(payload, (bytes, bytearray)) else b""
             size, ph = _size_and_phash(raw)
-            return key, size, ph
+            thumb = thumbnail_data_uri(raw, key, 240) if key in _thumbnail_zip_keys else ""
+            return key, size, ph, thumb
         except Exception:
             pass
-        return key, None, ""
+        return key, None, "", ""
 
     results = []
     # Lowered thread concurrency limit to prevent socket exhaustion
     _img_workers = min(16, max(4, (os.cpu_count() or 4) * 2))
     if new_urls:
         with concurrent.futures.ThreadPoolExecutor(max_workers=_img_workers) as executor:
-            results.extend(list(executor.map(fetch, new_urls)))
+            for _image_index, _image_result in enumerate(executor.map(fetch, new_urls), start=1):
+                results.append(_image_result)
+                if progress_callback and (_image_index == len(new_urls) or _image_index % 100 == 0):
+                    progress_callback(f"downloaded {min(_image_index, len(new_urls)):,}/{len(new_urls):,} external images")
 
     if zip_descriptors:
         # Peak memory is now this many images rather than the whole batch, so
@@ -1073,12 +1124,14 @@ def _fetch_all_image_dimensions(data: pd.DataFrame) -> dict:
                         _payloads.append((_img_val, _payload))
                 if _payloads:
                     results.extend(list(executor.map(process_zip_img, _payloads)))
+                if progress_callback:
+                    progress_callback(f"decoded {min(_start + len(_slice), len(zip_descriptors)):,}/{len(zip_descriptors):,} ZIP images")
                 # Dropped before the next chunk is built, so two chunks are
                 # never alive at once.
                 _payloads = None
 
     with _IMAGE_DIM_LOCK:
-        for key, size, ph in results:
+        for key, size, ph, thumb in results:
             # Record failures too. Without this, a URL that 404s or times out is
             # absent from the cache, so it lands in `new_urls` again on the next
             # run and is re-fetched with the full 6s timeout + 2 retries — every
@@ -1086,6 +1139,8 @@ def _fetch_all_image_dimensions(data: pd.DataFrame) -> dict:
             _IMAGE_DIM_CACHE[key] = size if size else None
             if ph:
                 _IMAGE_HASH_CACHE[key] = ph
+            if thumb:
+                _IMAGE_THUMB_CACHE[key] = thumb
 
     # Publish a snapshot for ui_components, which needs the hashes to find the
     # same photo listed by another seller but cannot import this module (it is
@@ -1093,9 +1148,63 @@ def _fetch_all_image_dimensions(data: pd.DataFrame) -> dict:
     # A dict copy of at most a few thousand short strings, once per validation.
     try:
         st.session_state["_image_phash_by_url"] = dict(_IMAGE_HASH_CACHE)
+        st.session_state["_image_thumbnail_by_url"] = dict(_IMAGE_THUMB_CACHE)
+        st.session_state["validation_stage_timings"] = {
+            **st.session_state.get("validation_stage_timings", {}),
+            "Image download and pHash": round(time.perf_counter() - _image_t0, 3),
+        }
     except Exception:
         pass
     return _IMAGE_DIM_CACHE
+
+
+# ── Blocked image fingerprint list ─────────────────────────────────────────
+# Loaded from Image_learn.xlsx in the user's Downloads folder.  The file is
+# read once per session; phashes are computed on first encounter and cached
+# in Image_learn_cache.json next to the xlsx so subsequent runs are instant.
+
+_BLOCKED_IMG_EXCEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Image_learn.xlsx")
+_BLOCKED_IMG_CACHE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Image_learn_cache.json")
+
+# Valid FLAG values the Excel is allowed to specify (case-insensitive).
+_BLOCKED_FLAG_MAP = {
+    "poor images":                  "Poor images",
+    "poor image":                   "Poor images",
+    "image stretched":              "Image Stretched",
+    "image blurry":                 "Image Blurry",
+    "too many things":              "Image Too Many things displayed",
+    "image too many things":        "Image Too Many things displayed",
+    "image too many things displayed": "Image Too Many things displayed",
+    "restricted brands":            "Restricted brands",
+    "restricted brand":             "Restricted brands",
+}
+
+
+from learned_images import (
+    _BLOCKED_IMG_EXCEL,
+    _BLOCKED_IMG_CACHE,
+    _BLOCKED_FLAG_MAP,
+    _blocked_excel_mtime,
+    load_blocked_image_fingerprints,
+    get_blocked_image_matches,
+    check_blocked_image_fingerprints,
+    _learned_brands_agree,
+)
+from learned_rules import (
+    merge_learned_image_rules,
+    load_learned_image_rules,
+    record_learned_image_matches_async,
+    delete_learned_image_rules,
+    restore_learned_image_rules,
+    learn_image_rejections,
+    learn_image_rejections_bulk,
+    reconcile_image_rules,
+)
+from processing_automation import (
+    load_manifest, mark_batch, completed_batches, file_signature,
+    save_chunk_results, load_chunk_results, save_stage_frame, load_stage_frame, thumbnail_data_uri,
+)
+
 
 
 def check_image_stretched(data: pd.DataFrame, _image_cache: dict = None) -> pd.DataFrame:
@@ -1196,6 +1305,33 @@ def check_poor_images_aspect_ratio(data: pd.DataFrame, **kwargs) -> pd.DataFrame
     return check_image_stretched(data)
 
 
+_NON_PHONE_KEYWORDS_RE = re.compile(
+    r"\b(?:"
+    r"heat\s*sealer|sealing\s*machine|packaging\s*machine|"
+    r"power\s*bank|battery\s*pack|magsafe\s*battery|inverter|inerver|"
+    r"solar\s*(?:lighting|system|charger|panel|lamp|bulb)|"
+    r"rear\s*camera|selfie\s*camera|camera\s*lens|camera\s*module|"
+    r"replacement\s*(?:screen|battery|camera|lcd|display)|"
+    r"bill\s*counter|counterfeit\s*detector|"
+    r"disco\s*dj|stage\s*light|magic\s*ball|crystal\s*magic|"
+    r"weighing\s*scale|bathroom\s*scale|personal\s*scale|"
+    r"subwoofer|home\s*audilo|home\s*audio|soundbar|speaker\s*system|"
+    r"storage\s*box|plastic\s*tote|storage\s*bins?|stackable\s*plastic|"
+    r"ab\s*roller|workout|exercise\s*wheel|"
+    r"blender|kettle|toaster|cooker|vacuum\s*cleaner|"
+    r"quadcopter|drone"
+    r")\b"
+    r"|^x6c$"
+    ,
+    re.IGNORECASE,
+)
+
+
+def _is_non_phone_product(name: str) -> bool:
+    n = str(name).strip().lower()
+    return bool(_NON_PHONE_KEYWORDS_RE.search(n))
+
+
 def check_miscellaneous_category(
     data: pd.DataFrame,
     categories_list: list = None,
@@ -1213,17 +1349,7 @@ def check_miscellaneous_category(
         except:
             pass
 
-    # check_kenya_book_category ran here for Kenya. It decided "is this a
-    # book category?" with `"book" in CATEGORY`, and CATEGORY carries the
-    # leaf — so a book correctly filed in "Books, Movies and Music /
-    # Business & Finance / Business & Economics" arrived as "Business &
-    # Economics", failed the test and was rejected. Its findings also went
-    # straight into the result, bypassing the Books exemption applied to the
-    # matcher output below, so nothing downstream could undo it.
-    #
-    # Books are judged by the same category matcher as everything else now,
-    # and drop_kenya_books_false_positives protects the ones already filed
-    # correctly — splitting the path properly and keeping DVDs in scope.
+    base_flagged = pd.DataFrame(columns=data.columns)
 
     if _CAT_MATCHER_AVAILABLE:
         try:
@@ -1237,10 +1363,6 @@ def check_miscellaneous_category(
                     cat_path_to_code=cat_path_to_code,
                     code_to_path=code_to_path,
                 )
-                # Kenya: the matcher predicts arbitrary categories for book
-                # titles and rejects books that are already filed correctly.
-                # Everything under "Books, Movies and Music" is exempt except
-                # the DVDs sub-tree.
                 if str(country_code or "").upper() == "KE":
                     try:
                         from custom_country_rules import drop_kenya_books_false_positives
@@ -1256,9 +1378,54 @@ def check_miscellaneous_category(
                             )
                     except Exception as _e:
                         logger.warning("Kenya books exemption failed: %s", _e)
-                return base_flagged
         except Exception as _e:
             logger.warning("check_wrong_category engine error: %s", _e)
+
+    # 1. Non-phone products miscategorised in smartphone/tablet categories
+    try:
+        _sf = st.session_state.get("support_files", {})
+        _phone_codes = set(clean_category_code(c) for c in _sf.get("smartphone_category_codes", []) if c)
+        if _phone_codes and "CATEGORY_CODE" in data.columns and "NAME" in data.columns:
+            _c_clean = data["_cat_clean"] if "_cat_clean" in data.columns else data["CATEGORY_CODE"].apply(clean_category_code)
+            _in_phone = _c_clean.isin(_phone_codes)
+            if _in_phone.any():
+                _p_cand = data[_in_phone].copy()
+                _is_np = _p_cand["NAME"].astype(str).apply(_is_non_phone_product)
+                if _is_np.any():
+                    _np_df = _p_cand[_is_np].copy()
+                    _np_df["Comment_Detail"] = "Assigned to Wrong Category. Non-phone product listed in smartphone/mobile category."
+                    _np_df["Reason"] = "1000004 - Wrong Category"
+                    if base_flagged is not None and not base_flagged.empty:
+                        base_flagged = pd.concat([base_flagged, _np_df], ignore_index=True).drop_duplicates(subset=["PRODUCT_SET_SID"])
+                    else:
+                        base_flagged = _np_df
+    except Exception as _e:
+        logger.warning("Non-phone in smartphone category check failed: %s", _e)
+
+    # 2. Jerrycans / fuel containers in cooking appliances / kitchen bundles
+    try:
+        if {"NAME"}.issubset(data.columns):
+            _jerry_re = re.compile(r"\b(?:jerrycan|jerry\s*can|jerrican|fuel\s*can)\b", re.IGNORECASE)
+            _is_jerry = data["NAME"].astype(str).str.contains(_jerry_re, na=False)
+            if _is_jerry.any():
+                _j_cand = data[_is_jerry].copy()
+                _cat_cols = [c for c in ("CATEGORY", "Initial_Category_Path", "Category_Path") if c in _j_cand.columns]
+                _in_cooking = pd.Series(False, index=_j_cand.index)
+                for _cc in _cat_cols:
+                    _in_cooking |= _j_cand[_cc].astype(str).str.contains(r"cooking\s*appliance|kitchen\s*bundle", case=False, na=False)
+                if _in_cooking.any():
+                    _j_flagged = _j_cand[_in_cooking].copy()
+                    _j_flagged["Comment_Detail"] = "Assigned to Wrong Category. Jerrycan/liquid container listed in cooking appliances/kitchen bundle."
+                    _j_flagged["Reason"] = "1000004 - Wrong Category"
+                    if base_flagged is not None and not base_flagged.empty:
+                        base_flagged = pd.concat([base_flagged, _j_flagged], ignore_index=True).drop_duplicates(subset=["PRODUCT_SET_SID"])
+                    else:
+                        base_flagged = _j_flagged
+    except Exception as _e:
+        logger.warning("Jerrycan category check failed: %s", _e)
+
+    if base_flagged is not None and not base_flagged.empty:
+        return base_flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
     if "CATEGORY" not in data.columns:
         return pd.DataFrame(columns=data.columns)
@@ -1364,11 +1531,36 @@ _SONY_INCLUDED_PATHS = (
     "gaming / sony psp",
 )
 
+# Gaming-only paths where the "playstation" brand keyword is expected.
+# "PlayStation" in a TV, audio, camera or projector listing is a product feature
+# reference ("PS4-compatible", "PlayStation audio output"), not an unapproved
+# seller — restricting to gaming paths eliminates those false positives.
+_PLAYSTATION_INCLUDED_PATHS = (
+    "gaming / playstation",
+    "gaming / sony psp",
+    "gaming / digital games",
+    "gaming / accessories",
+    "gaming / consoles",
+    "gaming / gaming",
+)
+
+_SONY_EXCLUDED_GAME_PATHS = (
+    "gaming / playstation / playstation 4 / games",
+    "gaming / playstation / playstation 4 / digital games & dlc",
+    "gaming / playstation / playstation 5 / ps 5 games",
+    "gaming / digital games / playstation 4",
+    "gaming / digital games / playstation 5",
+)
+
 RESTRICTED_BRAND_EXCLUDED_PATHS = {
     "nivea": ("books, movies and music", "electronics", "computing",
               "industrial & scientific"),
     "nivea baby": ("books, movies and music", "electronics", "computing",
                    "industrial & scientific"),
+    "sony": _SONY_EXCLUDED_GAME_PATHS,
+    "sony computer entertainment": _SONY_EXCLUDED_GAME_PATHS,
+    "sony entertainment": _SONY_EXCLUDED_GAME_PATHS,
+    "playstation": _SONY_EXCLUDED_GAME_PATHS,
 }
 
 # Parts of the category tree a restricted brand is ALLOWED to fire in —
@@ -1387,14 +1579,66 @@ RESTRICTED_BRAND_EXCLUDED_PATHS = {
 # their variations, so any of the three fires on a plain Sony mention; a
 # Tecno Spark was once rejected by "Sony Computer Entertainment (as 'sony')"
 # while only the plain Sony rule had been excluded, which was easy to miss.
-# "Playstation" is its own rule and fires on any "playstation" mention, same
-# subtree.
+#
+# "Playstation" uses a narrower gaming-only scope — it must not fire in Sony
+# TV, audio, camera or projector categories where "PlayStation" is a feature
+# reference rather than a brand claim.
 RESTRICTED_BRAND_INCLUDED_PATHS = {
     "sony": _SONY_INCLUDED_PATHS,
     "sony computer entertainment": _SONY_INCLUDED_PATHS,
     "sony entertainment": _SONY_INCLUDED_PATHS,
-    "playstation": _SONY_INCLUDED_PATHS,
+    "playstation": _PLAYSTATION_INCLUDED_PATHS,
 }
+
+_PS_GAME_CODES = {
+    "1000363",  # Gaming / Digital Games / PlayStation 4
+    "1000371",  # Gaming / Digital Games / PlayStation 4 / Currency Cards
+    "1000404",  # Gaming / Digital Games / PlayStation 4 / Digital Games
+    "1000414",  # Gaming / Digital Games / PlayStation 4 / Downloadable Content
+    "1000418",  # Gaming / Digital Games / PlayStation 4 / Subscription Cards
+    "1030068",  # Gaming / Digital Games / PlayStation 5
+    "1005730",  # Gaming / Playstation / PlayStation 4 / Digital Games & DLC
+    "1005834",  # Gaming / Playstation / PlayStation 4 / Games
+    "1030067",  # Gaming / Playstation / PlayStation 5 / PS 5 Games
+}
+
+_PS_HARDWARE_FRAGMENTS = (
+    "console", "controller", "headset", "accessories", "accessory",
+    "camera", "cable", "vr", "virtual reality", "repair", "mount",
+    "cooling", "case", "storage", "cleaning", "faceplate", "protector",
+    "skin", "speaker", "thumb grip"
+)
+
+def _is_ps_game_category(cat_str: str = "", cat_code: str = "", code_to_path: Optional[Dict] = None) -> bool:
+    code = str(cat_code).strip()
+    if code in _PS_GAME_CODES:
+        return True
+    path = str(cat_str).strip()
+    if (not path or path.lower() in ("nan", "none", "")) and code and code_to_path:
+        path = str(code_to_path.get(code, "")).strip()
+    c = path.lower()
+    if not c or c in ("nan", "none"):
+        return False
+    is_ps4 = any(x in c for x in ("ps4", "ps 4", "playstation 4", "playstation4"))
+    is_ps5 = any(x in c for x in ("ps5", "ps 5", "playstation 5", "playstation5"))
+    if not (is_ps4 or is_ps5):
+        return False
+    # Hardware/consoles must never be treated as games (consoles remain restricted)
+    if any(h in c for h in _PS_HARDWARE_FRAGMENTS):
+        return False
+    return any(g in c for g in ("game", "dlc")) or "digital games" in c
+
+
+def _is_books_movies_music_category(cat_str: str = "", cat_code: str = "", code_to_path: Optional[Dict] = None) -> bool:
+    code = clean_category_code(cat_code)
+    path = str(cat_str or "").strip()
+    if (not path or path.lower() in ("nan", "none", "")) and code and code_to_path:
+        path = str(code_to_path.get(code, "")).strip()
+    elif code and code_to_path and not path.lower().startswith("books, movies and music"):
+        full = str(code_to_path.get(code, "")).strip()
+        if full:
+            path = full
+    return path.lower().startswith("books, movies and music")
 
 
 def check_restricted_brands(
@@ -1406,22 +1650,30 @@ def check_restricted_brands(
 
     d = data.copy()
 
-    # Exclude categories that should never be flagged for restricted brands.
-    # PS5 / PlayStation game titles legitimately contain brand-like keywords.
-    _EXCLUDED_CATEGORY_FRAGMENTS = (
-        "ps 5 games",
-        "ps5 games",
-        "playstation 5",
-        "playstation5",
+    # Exclude categories that should never be flagged for restricted brands:
+    # 1. PS4 and PS5 game titles legitimately contain brand-like keywords,
+    #    and game discs/software are exempt from Sony restricted brand rules.
+    # 2. Books categories: all categories starting with "Books, Movies and Music"
+    #    are exempt from restricted brands.
+    # Keep the category exemption vectorized. The previous row-wise helper
+    # called category-path lookups and several string checks once per product,
+    # which became a major cost on large catalogues.
+    _cat_text = d.get("CATEGORY", pd.Series("", index=d.index)).fillna("").astype(str).str.strip()
+    _cat_code = d.get("CATEGORY_CODE", pd.Series("", index=d.index)).fillna("").astype(str).str.strip()
+    _mapped_path = _cat_code.map(code_to_path or {}).fillna("").astype(str).str.strip()
+    _cat_path = _cat_text.where(_cat_text.str.len().gt(0), _mapped_path)
+    _cat_path_l = _cat_path.str.lower()
+    _is_ps = _cat_code.isin(_PS_GAME_CODES) | _cat_path_l.str.contains(
+        r"(?:ps\s*4|ps\s*5|playstation\s*4|playstation\s*5)", regex=True, na=False
     )
-    if "CATEGORY" in d.columns:
-        _cat_lower = d["CATEGORY"].astype(str).str.lower()
-        _cat_excl_mask = _cat_lower.apply(
-            lambda c: any(f in c for f in _EXCLUDED_CATEGORY_FRAGMENTS)
-        )
-        d = d[~_cat_excl_mask].copy()
-    if "CATEGORY_CODE" in d.columns and "code_to_path" in (data.attrs or {}):
-        pass  # code_to_path lookup not available here; CATEGORY column is the source of truth
+    _is_ps &= ~_cat_path_l.str.contains(
+        r"console|controller|headset|accessories|accessory|camera|cable|vr|virtual reality|repair|mount|cooling|case|storage|cleaning|faceplate|protector|skin|speaker|thumb grip",
+        regex=True, na=False,
+    )
+    _is_ps &= _cat_path_l.str.contains(r"game|dlc|digital games", regex=True, na=False)
+    _is_books = _cat_path_l.str.startswith("books, movies and music")
+    _cat_excl_mask = _is_ps | _is_books
+    d = d[~_cat_excl_mask].copy()
 
     if d.empty:
         return pd.DataFrame(columns=data.columns)
@@ -1739,6 +1991,217 @@ _LIGHTENING_OK_CATEGORY_RE = re.compile(
     re.IGNORECASE,
 )
 
+_PSEUDO_BRANDS = {
+    "generic", "generique", "générique", "fashion", "beauty",
+    "unbranded", "no brand", "nobrand", "sans marque",
+    "original", "originals", "oroginal", "new", "other", "autre", "nan", "none", ""
+}
+
+
+# ── Potential Restricted Brand Signatures ────────────────────────────────────
+# Sourced from Master_All_Brands_Searchable_Catalog.xlsx for restricted brands in Kenya.
+# Sellers list products with generic/evasive brand values (Generic, Fashion, Unbranded, etc.)
+# while putting restricted product-line or model names in the title.
+_POTENTIAL_RESTRICTED_SIGNATURES: Dict[str, List[str]] = {
+    "Simple": [
+        r"kind\s+to\s+skin",
+        r"daily\s+skin\s+detox",
+        r"vitamin\s+c\s+glow",
+        r"water\s+boost",
+        r"active\s+skin\s+barrier",
+        r"regeneration\s+age\s+resisting",
+        r"age\s+resisting(?:\s+day|\s+night|\s+facial|\s+duo)",
+        r"(?:10%|3%)\s+(?:niacinamide|vitamin\s+c|hyaluronic\s+acid)\s+booster\s+serum",
+        r"replenishing\s+rich\s+moisturi[sz]er",
+        r"protecting\s+light\s+moisturi[sz]er",
+    ],
+    "NIVEA": [
+        r"cellular\s+expert\s+filler",
+        r"cellular\s+expert\s+lift",
+        r"derma\s+skin\s+clear",
+        r"black\s*(?:&|and)\s*white\s+invisible",
+        r"radiant\s*(?:&|and)\s*beauty",
+        r"perfect\s*(?:&|and)\s*radiant",
+        r"perfect\s*(?:&|and)\s*matte",
+        r"pearl\s*(?:&|and)\s*beauty",
+        r"luminous\s*630",
+        r"q10\s*(?:\+|plus)?\s*(?:anti[\s\-]?wrinkle|firming|power|vitamin\s+c)",
+        r"nivea\s+men\s+(?:cool\s+kick|deep|dry\s+impact|energy|hyaluron|sensitive)",
+        r"nivea\s+sun(?:\s+kids|\s+uv|\s+protect)?",
+        r"rich\s+nourishing\s+body\s+(?:milk|lotion)",
+        r"hyaluron\s+lip\s+moisture",
+        r"blackberry\s+shine\s+lip",
+    ],
+    "La Roche-Posay": [
+        r"anthelios(?:\s+uvmune|\s+age\s+correct|\s+dermo|\s+oil\s+control)?",
+        r"cicaplast(?:\s+baume|\s+levres|\s+mains)?",
+        r"effaclar(?:\s+duo|\s+mat|\s+purifying|\s+micro|\s+serum|\s+astringent)?",
+        r"lipikar(?:\s+baume|\s+huile|\s+syndet)?",
+        r"toleriane(?:\s+dermallergo|\s+sensitive|\s+hydrating)?",
+        r"hyalu\s+b5",
+        r"retinol\s+b3",
+        r"mela\s+b3",
+        r"(?:pure\s+)?vitamin\s+c10\s+radiance",
+        r"thermal\s+spring\s+water\s+soothing",
+    ],
+    "CeraVe": [
+        r"hydrating\s+facial\s+cleanser",
+        r"foaming\s+facial\s+cleanser",
+        r"acne\s+foaming\s+cream\s+cleanser",
+        r"sa\s+smoothing\s+(?:cleanser|cream)",
+        r"daily\s+moisturi[sz]ing\s+lotion",
+        r"(?:am|pm)\s+facial\s+moisturi[sz]ing\s+lotion",
+        r"healing\s+ointment",
+        r"eye\s+repair\s+cream",
+        r"hydrating\s+foaming\s+oil\s+cleanser",
+        r"resurfacing\s+retinol\s+serum",
+        r"skin\s+renewing\s+(?:retinol|vitamin\s+c)\s+serum",
+        r"hydrating\s+hyaluronic\s+acid\s+serum",
+    ],
+    "L'Oreal Paris": [
+        r"revitalift(?:\s+filler|\s+laser|\s+hyaluronic|\s+vitamin\s+c)?",
+        r"elvive(?:\s+dream\s+lengths|\s+extraordinary|\s+hyaluron)?",
+        r"infallible\s+(?:32h|matte|fresh\s+wear)",
+        r"infaillible\s+(?:32h|matte|fresh\s+wear)",
+        r"bright\s+reveal\s+dark\s+spot",
+        r"voluminous\s+lash\s+paradise",
+        r"hyaluron\s+specialist\s+replumping",
+    ],
+    "Maybelline": [
+        r"fit\s+me(?:\s+matte|\s+liquid|\s+concealer|\s+pressed|\s+poreless|\s+foundation|\s+powder)?",
+        r"super\s*stay(?:\s+active|\s+matte|\s+vinyl|\s+ink|\s+24h|\s+30h)?",
+        r"instant\s+age\s+rewind",
+        r"lash\s+sensational(?:\s+sky\s+high)?",
+        r"sky\s+high\s+mascara",
+        r"lifter\s+gloss",
+        r"baby\s+lips\s+moisturi[sz]ing",
+        r"the\s+colossal\s+volum",
+        r"hyper\s+precise\s+(?:all\s+day\s+)?liquid\s+eyeliner",
+        r"tattoo\s+studio\s+gel\s+eyeliner",
+    ],
+    "JBL": [
+        r"party\s*box(?:\s+(?:110|310|club\s+120|encore|710|1000))?",
+        r"boom\s*box(?:\s+[23](?:\s+wi[\s\-]?fi)?)?",
+        r"cinema\s+sb\s*170",
+        r"(?:jbl\s+)?(?:clip\s+[345]|charge\s+[345]|flip\s+[456]|go\s+[234]|xtreme\s+[234])\b",
+        r"(?:jbl\s+)?tune\s+(?:130nc|230nc|310c|500bt|510bt|670nc|720bt|760nc)\b",
+        r"(?:jbl\s+)?live\s+(?:770nc|beam\s+3)\b",
+        r"(?:jbl\s+)?wave\s+(?:beam|buds|flex)\b",
+        r"(?:jbl\s+)?bar\s+(?:1000|500|2\.1)\b",
+        r"(?:jbl\s+)?endurance\s+race",
+    ],
+    "Sony": [
+        r"\bbravia(?:\s+[378]|\s+theatre|\s+x\d+)?\b",
+        r"\bdualsense(?:\s+wireless\s+controller)?\b",
+        r"\bplaystation\s+5\b",
+        r"\bps5\s+(?:console|slim|digital)\b",
+        r"\blinkbuds(?:\s+[sS]|\s+open)?\b",
+        r"\binzone\s+h[379]\b",
+        r"\balpha\s+(?:6700|7\s*iv|7r\s*v|7\s*iii|7c)\b",
+        r"\b(?:wh|wf)[\s\-]?1000xm[45]\b",
+        r"\bwf[\s\-]?(?:c500|c700n)\b",
+        r"\bwh[\s\-]?(?:ch520|ch720n)\b",
+        r"\bsrs[\s\-](?:xg300|xv800)\b",
+        r"\bult\s+(?:field|tower)\b",
+        r"\bht[\s\-]?(?:a3000|s20r|s400)\b",
+        r"\bzv[\s\-](?:1|e10)\b",
+    ],
+}
+
+_COMPILED_POTENTIAL_RESTRICTED: Dict[str, re.Pattern] = {
+    brand: re.compile(rf"\b(?:{'|'.join(f'(?:{p})' for p in pats)})\b", re.IGNORECASE)
+    for brand, pats in _POTENTIAL_RESTRICTED_SIGNATURES.items()
+}
+
+
+def check_potential_restricted_brand(
+    data: pd.DataFrame,
+    country_rules: Optional[List[Dict]] = None,
+    code_to_path: Optional[Dict] = None,
+) -> pd.DataFrame:
+    """Flag products where sellers use generic/pseudo brands to evade restricted brands.
+
+    Identifies products with BRAND in (Generic, Fashion, Unbranded, etc.) whose
+    NAME contains signature product-line or model names of restricted brands
+    (e.g., Effaclar, GO 3, Fit Me, Revitalift, Kind to Skin, etc.).
+    """
+    if data.empty or "NAME" not in data.columns:
+        return pd.DataFrame(columns=data.columns)
+
+    if "_brand_lower" not in data.columns:
+        data["_brand_lower"] = data.get("BRAND", pd.Series("", index=data.index)).astype(str).str.lower().str.strip()
+
+    mask = data["_brand_lower"].isin(_PSEUDO_BRANDS)
+    if "CATEGORY" in data.columns:
+        mask = mask & ~data["CATEGORY"].astype(str).str.lower().str.contains(
+            r"\b(?:case|cases|cover|covers)\b", regex=True, na=False
+        )
+
+    # Exclude PS game software/discs & books categories like check_restricted_brands
+    if code_to_path:
+        cat_mask = data.apply(
+            lambda r: (
+                _is_ps_game_category(r.get("CATEGORY", ""), r.get("CATEGORY_CODE", ""), code_to_path)
+                or _is_books_movies_music_category(r.get("CATEGORY", ""), r.get("CATEGORY_CODE", ""), code_to_path)
+            ),
+            axis=1,
+        )
+        mask = mask & ~cat_mask
+
+    target = data[mask].copy()
+    if target.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    active_patterns = _COMPILED_POTENTIAL_RESTRICTED
+    if country_rules:
+        restr_brand_names = {
+            str(r.get("brand", "")).lower() for r in country_rules if r.get("brand")
+        }
+        filtered_pats = {}
+        for b_name, regex in _COMPILED_POTENTIAL_RESTRICTED.items():
+            b_low = b_name.lower()
+            if any(b_low in rb or rb in b_low for rb in restr_brand_names):
+                filtered_pats[b_name] = regex
+        if filtered_pats:
+            active_patterns = filtered_pats
+
+    names = target["NAME"].astype(str).values
+    detected_brands = []
+    detected_matches = []
+
+    for name in names:
+        matched_b = None
+        matched_phrase = None
+        for b_name, regex in active_patterns.items():
+            m = regex.search(name)
+            if m:
+                matched_b = b_name
+                matched_phrase = m.group(0).strip()
+                break
+        detected_brands.append(matched_b)
+        detected_matches.append(matched_phrase)
+
+    target["_pot_brand"] = detected_brands
+    target["_pot_match"] = detected_matches
+
+    flagged = target[target["_pot_brand"].notna()].copy()
+    if flagged.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    flagged["Comment_Detail"] = (
+        "Potential "
+        + flagged["_pot_brand"]
+        + ": title contains product line '"
+        + flagged["_pot_match"]
+        + "'"
+    )
+    flagged["Pot_Restricted_Brand"] = flagged["_pot_brand"]
+    flagged["Pot_Restricted_Match"] = flagged["_pot_match"]
+
+    if "PRODUCT_SET_SID" in flagged.columns:
+        return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
+    return flagged
+
 
 def check_prohibited_products(
     data: pd.DataFrame, prohibited_rules: List[Dict], code_to_path: dict = None
@@ -1810,6 +2273,8 @@ def check_prohibited_products(
         "butt plug",
         # Misrepresentation
         "counterfeit",
+        # Drones / UAVs — prohibited without a specific category
+        "drone", "drones", "quadcopter", "quadcopters", "uav", "uavs",
     })
 
     scoped_rules, global_rules, disabled = [], [], []
@@ -1838,6 +2303,22 @@ def check_prohibited_products(
     if not prohibited_rules:
         return pd.DataFrame(columns=data.columns)
 
+    # ── Evasion normalisation ────────────────────────────────────────────────
+    # Sellers evade keyword filters by:
+    #   a) Swapping letters for accented lookalikes: Dronè, Droñe, Droné …
+    #   b) Inserting separators mid-word:            d-rone, d+rone, d_rone
+    # We build a normalised copy of every name for matching only; the original
+    # name is preserved for display and highlighting.
+    def _normalise_evasion(text: str) -> str:
+        # Strip combining accents (NFKD decomposes ñ → n + combining tilde)
+        nfkd = unicodedata.normalize("NFKD", text)
+        ascii_text = nfkd.encode("ascii", "ignore").decode("ascii")
+        # Remove separator characters inserted between alphabetic chars
+        # e.g. d-rone → drone, d+rone → drone, d_rone → drone
+        return re.sub(r"(?<=[a-z0-9])[-+_.~*](?=[a-z0-9])", "", ascii_text, flags=re.IGNORECASE)
+
+    _norm_names = data["_name_lower"].astype(str).map(_normalise_evasion)
+
     all_kws = sorted(
         set(rule["keyword"] for rule in prohibited_rules), key=len, reverse=True
     )
@@ -1845,7 +2326,12 @@ def check_prohibited_products(
         r"(?<!\w)(?:" + "|".join(re.escape(k) for k in all_kws) + r")(?!\w)",
         re.IGNORECASE,
     )
-    match_mask = data["_name_lower"].str.contains(combined_pattern, na=False)
+    # Match against the normalised names so accent/separator evasion is caught;
+    # fall back to the original _name_lower to ensure non-evasion rules still work.
+    match_mask = (
+        _norm_names.str.contains(combined_pattern, na=False)
+        | data["_name_lower"].str.contains(combined_pattern, na=False)
+    )
     if not match_mask.any():
         return pd.DataFrame(columns=data.columns)
     candidates = data[match_mask]
@@ -1870,9 +2356,11 @@ def check_prohibited_products(
     name_replacements = {}
     for idx in candidates.index:
         name_lower = data.loc[idx, "_name_lower"]
+        # Use the normalised form for matching so evasion variants are found
+        name_for_match = _norm_names.loc[idx]
         cat_clean = data.loc[idx, "_cat_clean"]
         raw_name = str(data.loc[idx, "NAME"])
-        matches = combined_pattern.findall(name_lower)
+        matches = combined_pattern.findall(name_for_match) or combined_pattern.findall(name_lower)
         if not matches:
             continue
         cat_path = (code_to_path or {}).get(cat_clean, "")
@@ -1907,7 +2395,9 @@ def check_prohibited_products(
     result["Comment_Detail"] = result.index.map(lambda i: comment_map[i])
     for idx, new_name in name_replacements.items():
         result.loc[idx, "NAME"] = new_name
-    return result.drop_duplicates(subset=["PRODUCT_SET_SID"])
+    if "PRODUCT_SET_SID" in result.columns:
+        return result.drop_duplicates(subset=["PRODUCT_SET_SID"])
+    return result.drop_duplicates()
 
 
 def check_suspected_fake_products(
@@ -2099,7 +2589,7 @@ def check_suspected_fake_products(
 
 
 def check_refurb_seller_approval(
-    data: pd.DataFrame, refurb_data: dict, country_code: str
+    data: pd.DataFrame, refurb_data: dict, country_code: str, code_to_path: Optional[Dict] = None
 ) -> pd.DataFrame:
     required = {"PRODUCT_SET_SID", "CATEGORY_CODE", "SELLER_NAME", "NAME"}
     if not required.issubset(data.columns):
@@ -2108,34 +2598,51 @@ def check_refurb_seller_approval(
     laptop_cats = refurb_data.get("categories", {}).get("Laptops", set())
     keywords = refurb_data.get("keywords", set())
     sellers = refurb_data.get("sellers", {}).get(country_code, {})
-    if not phone_cats and not laptop_cats:
+    if not phone_cats and not laptop_cats and not code_to_path:
         return pd.DataFrame(columns=data.columns)
-    if not keywords:
-        return pd.DataFrame(columns=data.columns)
-    kw_pattern = re.compile(
-        r"\b(?:"
-        + "|".join(re.escape(k) for k in sorted(keywords, key=len, reverse=True))
-        + r")\b",
-        re.IGNORECASE,
-    )
+
+    kw_pattern = None
+    if keywords:
+        kw_pattern = re.compile(
+            r"\b(?:"
+            + "|".join(re.escape(k) for k in sorted(keywords, key=len, reverse=True))
+            + r")\b",
+            re.IGNORECASE,
+        )
+
     d = data
-    is_phone = d["_cat_clean"].isin(phone_cats)
-    is_laptop = d["_cat_clean"].isin(laptop_cats)
+    c2p = code_to_path or {}
+
+    # Category scope matching (code or path)
+    cat_paths = d["_cat_clean"].map(c2p).fillna("").astype(str).str.lower()
+    is_phone = d["_cat_clean"].isin(phone_cats) | cat_paths.str.contains(r"\b(?:phone|smartphone|mobile)\b", regex=True)
+    is_laptop = d["_cat_clean"].isin(laptop_cats) | cat_paths.str.contains(r"\b(?:laptop|notebook|macbook|ultrabook)\b", regex=True)
     in_scope = is_phone | is_laptop
-    has_keyword = d["NAME"].astype(str).str.contains(kw_pattern, na=False)
+
+    # Refurb detection: by keyword in title OR brand explicitly set to Refurbished/Renewed
+    is_refurb_brand = d["_brand_lower"].isin({"refurbished", "renewed", "refurbished / renewed", "apple refurbished"})
+    has_keyword = pd.Series(False, index=d.index)
+    if kw_pattern:
+        has_keyword = d["NAME"].astype(str).str.contains(kw_pattern, na=False)
+    is_refurb = is_refurb_brand | has_keyword
+
     approved_phones = sellers.get("Phones", set())
     approved_laptops = sellers.get("Laptops", set())
     not_approved = (is_phone & ~d["_seller_lower"].isin(approved_phones)) | (
         is_laptop & ~d["_seller_lower"].isin(approved_laptops)
     )
-    flagged = d[in_scope & has_keyword & not_approved].copy()
+
+    flagged = d[in_scope & is_refurb & not_approved].copy()
     if not flagged.empty:
+        REASON_UNAPPROVED_REFURB_SELLER = (
+            "1000028 - Kindly Contact Jumia Seller Support To Confirm Possibility Of Sale Of This Product By Raising A Claim"
+        )
+        flagged["Reason"] = REASON_UNAPPROVED_REFURB_SELLER
 
         def build_comment(row):
-            ptype = "Phone" if row["_cat_clean"] in phone_cats else "Laptop"
-            match = kw_pattern.search(str(row["NAME"]))
-            kw_found = match.group(0) if match else "?"
-            return f"Unapproved {ptype} refurb seller — keyword '{kw_found}' in name (cat: {row['_cat_clean']})"
+            ptype = "Phone" if row["_cat_clean"] in phone_cats or "phone" in str(c2p.get(str(row["_cat_clean"]), "")).lower() else "Laptop"
+            seller = row.get("SELLER_NAME", "")
+            return f"Unapproved {ptype} refurb seller — seller '{seller}' is not authorized to sell refurbished {ptype}s in {country_code}."
 
         flagged["Comment_Detail"] = flagged.apply(build_comment, axis=1)
     return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
@@ -2235,6 +2742,47 @@ def check_seller_approved_for_books(
         flagged["Comment_Detail"] = "Seller not approved to sell books: " + flagged[
             "SELLER_NAME"
         ].astype(str)
+    return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
+
+
+def check_seller_approved_for_alcohol(
+    data: pd.DataFrame,
+    alcohol_data: Dict,
+    country_code: str,
+    code_to_path: Optional[Dict] = None,
+) -> pd.DataFrame:
+    """Restrict alcoholic-drink categories to sellers approved in Alcohol.xlsx."""
+    if not {"PRODUCT_SET_SID", "SELLER_NAME"}.issubset(data.columns):
+        return pd.DataFrame(columns=data.columns)
+    if country_code != "KE":
+        return pd.DataFrame(columns=data.columns)
+
+    approved_sellers = alcohol_data.get("sellers", {}).get("KE", set())
+    prefixes = tuple(
+        str(v).strip().casefold().rstrip("/")
+        for v in alcohol_data.get("category_prefixes", set())
+        if str(v).strip()
+    )
+    if not approved_sellers or not prefixes:
+        return pd.DataFrame(columns=data.columns)
+
+    # Prefer the resolved category path. Fall back to the raw CATEGORY field
+    # when a source already contains full paths instead of category codes.
+    raw_path = data.get("CATEGORY", pd.Series("", index=data.index)).fillna("").astype(str).str.strip().str.casefold()
+    if code_to_path and "_cat_clean" in data.columns:
+        resolved = data["_cat_clean"].map(code_to_path).fillna("").astype(str).str.strip().str.casefold()
+        raw_path = raw_path.mask(raw_path.isin({"", "nan", "none"}), resolved)
+    in_scope = raw_path.str.startswith(prefixes, na=False)
+    not_approved = ~data["_seller_lower"].isin(approved_sellers)
+    flagged = data[in_scope & not_approved].copy()
+    if not flagged.empty:
+        flagged["Reason"] = (
+            "1000028 - Kindly Contact Jumia Seller Support To Confirm Possibility Of Sale Of This Product By Raising A Claim"
+        )
+        flagged["Comment_Detail"] = (
+            "Seller not approved to sell alcohol: "
+            + flagged["SELLER_NAME"].astype(str)
+        )
     return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
@@ -2521,7 +3069,8 @@ def check_counterfeit_sneakers(
 
 
 def check_counterfeit_jerseys(
-    data: pd.DataFrame, jerseys_data: Dict, country_code: str
+    data: pd.DataFrame, jerseys_data: Dict, country_code: str,
+    code_to_path: Optional[Dict] = None,
 ) -> pd.DataFrame:
     if not {"CATEGORY_CODE", "NAME", "SELLER_NAME"}.issubset(data.columns):
         return pd.DataFrame(columns=data.columns)
@@ -2540,15 +3089,89 @@ def check_counterfeit_jerseys(
 
     if not categories or not keywords:
         return pd.DataFrame(columns=data.columns)
+
+    _FOOTWEAR_TERMS = (
+        "footwear", "shoe", "shoes", "formal shoes", "lace up", "slip on", "boots",
+        "sneaker", "sneakers", "sandal", "sandals", "slipper", "slippers",
+        "heels", "loafer", "loafers", "oxford", "oxfords", "derby", "derbies", "moccasin", "moccasins"
+    )
+    _FOOTWEAR_NAME_RE = re.compile(
+        r"\b(?:shoes?|boots?|loafers?|oxfords?|sneakers?|heels?|footwear|sandals?|slippers?|derby|derbies|moccasins?)\b",
+        re.IGNORECASE,
+    )
+
+    # Hats, caps and headwear are NOT jerseys — exclude them so a "Manchester United Cap" is
+    # never flagged as a counterfeit jersey (caps are legitimate licensed merchandise).
+    _HEADWEAR_TERMS = (
+        "hats & caps", "hats and caps", "caps & hats", "caps and hats",
+        "headwear", "cap", "caps", "hat", "hats", "beanie", "beanies",
+        "snapback", "trucker cap", "baseball cap", "fitted cap", "bucket hat",
+        "headband", "headbands",
+    )
+    _HEADWEAR_CAT_RE = re.compile(
+        r"\b(?:hats?\s*(?:&|and)\s*caps?|caps?\s*(?:&|and)\s*hats?|headwear|snapback"
+        r"|baseball\s*cap|trucker\s*cap|fitted\s*cap|bucket\s*hat|beanies?)\b",
+        re.IGNORECASE,
+    )
+    _HEADWEAR_NAME_RE = re.compile(
+        r"\b(?:cap|caps|hat|hats|beanie|beanies|snapback|headband|headwear|trucker cap|bucket hat)\b",
+        re.IGNORECASE,
+    )
+
+    def _is_footwear(row) -> bool:
+        cat_str = str(row.get("CATEGORY", "") or "").strip().lower()
+        code = clean_category_code(row.get("CATEGORY_CODE", "") or row.get("_cat_clean", ""))
+        if any(term in cat_str for term in _FOOTWEAR_TERMS):
+            return True
+        if code and code_to_path:
+            path = str(code_to_path.get(code, "") or "").strip().lower()
+            if any(term in path for term in _FOOTWEAR_TERMS):
+                return True
+        name = str(row.get("NAME", "") or "")
+        if _FOOTWEAR_NAME_RE.search(name):
+            return True
+        return False
+
+    def _is_headwear(row) -> bool:
+        """Caps, hats and headwear are legitimate licensed merchandise — NOT counterfeit jerseys."""
+        cat_str = str(row.get("CATEGORY", "") or "").strip().lower()
+        code = clean_category_code(row.get("CATEGORY_CODE", "") or row.get("_cat_clean", ""))
+        if any(term in cat_str for term in _HEADWEAR_TERMS):
+            return True
+        if _HEADWEAR_CAT_RE.search(cat_str):
+            return True
+        if code and code_to_path:
+            path = str(code_to_path.get(code, "") or "").strip().lower()
+            if any(term in path for term in _HEADWEAR_TERMS):
+                return True
+            if _HEADWEAR_CAT_RE.search(path):
+                return True
+        name = str(row.get("NAME", "") or "")
+        if _HEADWEAR_NAME_RE.search(name):
+            return True
+        return False
+
+    d = data.copy()
+    if "_cat_clean" not in d.columns:
+        d["_cat_clean"] = d["CATEGORY_CODE"].apply(clean_category_code)
+
+    # Exclude footwear and headwear from jersey counterfeit validation
+    is_footwear_mask = d.apply(_is_footwear, axis=1)
+    is_headwear_mask = d.apply(_is_headwear, axis=1)
+    d = d[~is_footwear_mask & ~is_headwear_mask].copy()
+    if d.empty:
+        return pd.DataFrame(columns=data.columns)
+
     kw_pattern = re.compile(
         r"(?<!\w)(?:"
         + "|".join(re.escape(k) for k in sorted(keywords, key=len, reverse=True))
         + r")(?!\w)",
         re.IGNORECASE,
     )
-    d = data
     in_scope = d["_cat_clean"].isin(categories)
     has_keyword = d["NAME"].astype(str).str.contains(kw_pattern, na=False)
+    if "_seller_lower" not in d.columns:
+        d["_seller_lower"] = d.get("SELLER_NAME", pd.Series("", index=d.index)).fillna("").astype(str).str.strip().str.lower()
     not_exempted = ~d["_seller_lower"].isin(exempted)
     flagged = d[in_scope & has_keyword & not_exempted].copy()
     if not flagged.empty:
@@ -2574,11 +3197,28 @@ def check_all_caps_name(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
     return data[mask].copy()
 
 
-def check_name_too_short(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
+def check_name_too_short(
+    data: pd.DataFrame,
+    code_to_path: Optional[Dict] = None,
+    book_category_codes: Optional[List[str]] = None,
+    **kwargs
+) -> pd.DataFrame:
     if "NAME" not in data.columns:
         return pd.DataFrame(columns=data.columns)
-    mask = data["NAME"].astype(str).str.strip().str.len() < 15
-    return data[mask].copy()
+    d = data.copy()
+    _book_codes = set(str(c).strip() for c in (book_category_codes or []))
+
+    def _is_book(row) -> bool:
+        cat_str = str(row.get("CATEGORY", "") or "").strip()
+        cat_code = clean_category_code(row.get("CATEGORY_CODE", "") or row.get("_cat_clean", ""))
+        if cat_code and cat_code in _book_codes:
+            return True
+        return _is_books_movies_music_category(cat_str, cat_code, code_to_path)
+
+    is_book_mask = d.apply(_is_book, axis=1)
+    d_filtered = d[~is_book_mask]
+    mask = d_filtered["NAME"].astype(str).str.strip().str.len() < 15
+    return d_filtered[mask].copy()
 
 
 def check_variation_name_consistency_polars(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
@@ -2775,6 +3415,11 @@ def check_suspected_fake_perfume(
     return flagged[_is_brand_term].drop(columns=["_pfume_match"])
 
 
+# Staging dict: overturned Apple-accessories rows are deposited here by
+# check_brand_image_mismatch so validate_products can pick them up.
+_APPLE_ACC_OVERTURNED_STAGING: dict = {}
+
+
 def check_brand_image_mismatch(
     data: pd.DataFrame, country_rules: list = None, **kwargs
 ) -> pd.DataFrame:
@@ -2839,6 +3484,42 @@ def check_brand_image_mismatch(
         return f"Image shows '{det_raw}' but listing brand is '{decl_raw}'"
 
     flagged["Comment_Detail"] = flagged.apply(_build_comment, axis=1)
+
+    # Apple accessories override: cases/covers for phones/tablets/laptops
+    # often carry Apple imagery but are accessories FOR Apple devices.
+    # The AI rejection is wrong; approve and log for audit.
+    _APPLE_ACC_CAT_RE = re.compile(
+        r"\b(?:case|cases|cover|covers|sleeve|sleeves|pouch|pouches|screen.?protector)\b",
+        re.IGNORECASE,
+    )
+    if "CATEGORY" in flagged.columns:
+        _acc_apple_mask = (
+            flagged["_det_l"].str.strip().eq("apple")
+            & flagged["CATEGORY"].astype(str).str.contains(_APPLE_ACC_CAT_RE, na=False)
+        )
+    else:
+        _acc_apple_mask = pd.Series(False, index=flagged.index)
+
+    overturned = flagged[_acc_apple_mask].copy()
+    flagged = flagged[~_acc_apple_mask].copy()
+
+    if not overturned.empty:
+        overturned["Comment_Detail"] = (
+            "AI rejection overturned: Apple brand detected on image of a "
+            "cases/covers accessory -- product approved. Original: "
+            + overturned["Comment_Detail"].fillna("").astype(str)
+        )
+        _APPLE_ACC_OVERTURNED_STAGING.clear()
+        _APPLE_ACC_OVERTURNED_STAGING.update(
+            overturned
+            .drop(columns=["_det_l", "_decl_l"], errors="ignore")
+            .drop_duplicates(subset=["PRODUCT_SET_SID"])
+            .set_index("PRODUCT_SET_SID")
+            .to_dict(orient="index")
+        )
+
+    if flagged.empty:
+        return pd.DataFrame(columns=data.columns)
     return flagged.drop(columns=["_det_l", "_decl_l"]).drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
@@ -2874,14 +3555,19 @@ def _fold_digits(text: str) -> str:
 
 _PHONE_RE = re.compile(
     r"(?:"
-    # International for the eight markets. Digit GROUPING is deliberately not
-    # pinned down — the same Senegalese number gets written "+221 77 123 4567"
-    # and "+221 77 123 45 67", and fixed 3-3-3 grouping missed both.
-    r"\+?(?:254|256|234|233|212|221|225)[\s\-]?(?:\d[\s\-]?){7,11}\d"
+    # International for the eight markets. Require leading + OR valid country operator prefixes when un-prefixed.
+    r"\+(?:254|256|234|233|212|221|225)[\s\-]?(?:\d[\s\-]?){7,11}\d\b"
+    r"|\b254[\s\-]?[17](?:[\s\-]?\d){8}\b"                                # Kenya without + (07xx, 01xx)
+    r"|\b256[\s\-]?[7](?:[\s\-]?\d){8}\b"                                 # Uganda without +
+    r"|\b234[\s\-]?[789](?:[\s\-]?\d){9}\b"                               # Nigeria without +
+    r"|\b233[\s\-]?[235](?:[\s\-]?\d){8}\b"                               # Ghana without +
+    r"|\b212[\s\-]?[567](?:[\s\-]?\d){8}\b"                               # Morocco without +
+    r"|\b221[\s\-]?[37](?:[\s\-]?\d){7,8}\b"                              # Senegal without + (valid SN mobile 7x or landline 33)
+    r"|\b225[\s\-]?[0-9](?:[\s\-]?\d){9}\b"                               # Ivory Coast without + (10 digits)
     # Egypt's country code is only two digits, so require the leading + to stop
     # ordinary numbers in text ("20 000 mAh") from matching.
-    r"|\+20[\s\-]?(?:\d[\s\-]?){8,10}\d"
-    r"|\+\d{1,3}[\s\-]?(?:\d[\s\-]?){7,13}\d"                  # any other international
+    r"|\+20[\s\-]?(?:\d[\s\-]?){8,10}\d\b"
+    r"|\+\d{1,3}[\s\-]?(?:\d[\s\-]?){7,13}\d\b"                  # any other international
     # Local formats, also grouping-tolerant: "0712 345 678", "0712345678" and
     # "0712-345-678" are the same number written three ways.
     r"|\b0[17](?:[\s\-]?\d){8}\b"                              # 10-digit 07../01.. (KE, UG)
@@ -2894,14 +3580,53 @@ _PHONE_RE = re.compile(
 # Websites. Explicit schemes and www. plus a conservative bare-domain form —
 # restricted to a known TLD list so strings like "3.5mm" or "image.png" cannot
 # match.
+#
+# YouTube URLs (youtube.com, youtu.be, youtube-nocookie.com) are explicitly excluded
+# at the regex level via a negative lookahead — tutorial/unboxing links in descriptions
+# are not off-platform contact and must never fire this check.
+#
+# IPv4 addresses (e.g. http://192.168.0.1/) are also excluded — they appear
+# legitimately in product descriptions for router setup, IP cameras, NAS devices,
+# and similar tech products, and are not off-platform seller contact.
+_YOUTUBE_LOOKAHEAD = r"(?!(?:[a-z0-9_\-]+\.)?(?:youtube\.com|youtu\.be|youtube-nocookie\.com))"
+_IPV4_LOOKAHEAD = r"(?!\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"
 _WEBSITE_RE = re.compile(
     r"(?:"
-    r"https?://\S+"
-    r"|\bwww\.\S+"
+    r"https?://" + _YOUTUBE_LOOKAHEAD + _IPV4_LOOKAHEAD + r"\S+"
+    r"|\bwww\.(?!(?:[a-z0-9_\-]+\.)?(?:youtube\.com|youtu\.be|youtube-nocookie\.com))\S+"
     r"|wa\.me/\S+"
-    r"|\b[a-z0-9][a-z0-9\-]{1,30}\.(?:com|net|org|shop|store|biz|info|"
+    r"|\b(?!(?:[a-z0-9_\-]+\.)?(?:youtube\.com|youtu\.be|youtube-nocookie\.com))" + r"[a-z0-9][a-z0-9\-]{1,30}\.(?:com|net|org|shop|store|biz|info|"
     r"co\.ke|co\.ug|com\.ng|com\.gh|co\.za|ma|eg|sn|ci)\b"
     r")",
+    re.IGNORECASE,
+)
+# Domains used as harmless placeholders or examples in product copy.  They
+# still match the explicit ``http://`` branch above, so they must be filtered
+# after extraction as well as bare-domain false positives.
+_WEBSITE_FALSE_POSITIVE_DOMAINS = frozenset({"fl.oz"})
+
+
+def _is_website_false_positive(term: str) -> bool:
+    """Return True for an explicitly allowed example/placeholder domain."""
+    value = str(term or "").strip().lower()
+    # Markdown links and punctuation can leave a trailing ``]``/``)`` in the
+    # regex match. Stop at URL punctuation before extracting the host.
+    value = re.split(r"[\s\]\)\}>,'\";]+", value, maxsplit=1)[0]
+    value = re.sub(r"^(?:https?://|www\.)", "", value)
+    host = value.split("/", 1)[0].rstrip(".")
+    return host in _WEBSITE_FALSE_POSITIVE_DOMAINS
+
+
+# Pre-compiled IPv4 pattern reused in _is_platform_url for belt-and-suspenders filtering
+_IPV4_URL_RE = re.compile(r"https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", re.IGNORECASE)
+
+# Allowed platform/video URLs that should be masked before phone/contact scanning,
+# so digits in video IDs, timestamps, or tracking tokens cannot trigger _PHONE_RE.
+_PLATFORM_URL_RE = re.compile(
+    r"(?:https?://(?:[a-z0-9_\-]+\.)?(?:youtube\.com|youtu\.be|youtube-nocookie\.com|jumia\.[a-z.]+|wsrv\.nl|cloudfront\.net)"
+    r"|\b(?:www\.)?(?:[a-z0-9_\-]+\.)?(?:youtube\.com|youtu\.be|youtube-nocookie\.com)"
+    r")"
+    r"(?:[/?][^\s<\"'>]*[^\s<\"'>.,;:)])?",
     re.IGNORECASE,
 )
 
@@ -2931,58 +3656,30 @@ _LANDMARK_ALT = (
 _LOCATION_RE = re.compile(
     r"(?:"
     r"\bp\.?\s*o\.?\s*box\s*\d+"                                # P.O. Box 123
-    # [ \t]* rather than \s*, so the number has to sit on the SAME LINE as the
-    # word. \s* crosses newlines, which made a numbered list read as an
-    # address — the number that opens the next bullet became the shop number
-    # of the word that closed the last one:
-    #
-    #   1. 6 PIECES SET: Complete set for family or office
-    #
-    #   2. AESTHETIC MARBLE DESIGN: ...
-    #
-    # matched "office\n\n2" as "office 2" and rejected a set of mugs for
-    # off-platform contact. A real "Shop No. 12" is written on one line.
-    # "Microsoft Office 2021", "Office 365", "Office 19 Pro Plus", "Office
-    # 2016" are software listings, not shop-number addresses. Same for the
-    # Windows and Server number-suffixed names. The shop-number rule below
-    # requires an explicit no./number/# token so a product name with a bare
-    # version number does not fire it; the ambiguous case is "office" alone,
-    # which is handled by removing it from the alternation entirely — a real
-    # office address has "no." or "#" beside it, or gives a floor.
-    r"|\b(?:shop|stall|suite|kiosk)[ \t]*(?:no\.?|number|#)?[ \t]*\d+"
-    r"|\boffice[ \t]*(?:no\.?|number|#)[ \t]*\d+"
+    r"|\b(?:shop|stall|suite|kiosk)[ \t]*(?:no\.?|number|#)?[ \t]*\d+(?![A-Za-z])"
+    r"|\boffice[ \t]*(?:no\.?|number|#)[ \t]*\d+(?![A-Za-z])"
     r"|\b\d+[ \t]*(?:st|nd|rd|th)?[ \t]*floor\b"
     r"|\balong\s+[a-z]+\s+(?:road|rd|street|st|avenue|ave)\b"
-    # "opposite" and "next to" both need a landmark after them. Without one,
-    # "opposite <any word>" flagged "opposite direction", "opposite ends",
-    # "opposite side" and "opposite pattern" — ordinary product wording, and a
-    # fan or a reversible jacket got reported for off-platform contact. The
-    # "next to" rule beside it was always anchored this way; this one was not.
-    # Same-line only, for the same reason as the shop-number rules above. With
-    # \s+ these reached across a paragraph break to a landmark word opening the
-    # next bullet:
-    #
-    #   1. Mount opposite
-    #
-    #   Market leading warranty
-    #
-    # matched "opposite\n\nmarket". A real direction — "opposite the market",
-    # "next to Kimathi House" — is written on one line.
     r"|\bopposite[ \t]+(?:the[ \t]+)?(?:[a-z]+[ \t]+){0,2}" + _LANDMARK_ALT +
     r"|\bnext[ \t]+to[ \t]+(?:the[ \t]+)?(?:[a-z]+[ \t]+){0,2}" + _LANDMARK_ALT +
-    r"|\b(?:visit|come\s+to|located\s+at|find\s+us\s+at)\s+(?:our\s+)?"
-    r"(?:shop|store|office|showroom)\b"
+    r"|\b(?:located\s+at|find\s+us\s+at)\s+(?:our\s+)?(?:shop|store|office|showroom)\b"
+    r"|\b(?:visit|come\s+to)\s+(?:our\s+)?(?:office|showroom)\b"
+    r"|\b(?:visit|come\s+to|located\s+at|find\s+us\s+at)\s+(?:our\s+)?(?:shop|store)\s+(?:at|in|along|opposite|next\s+to|near|behind|around)\s+[a-z0-9]"
+    r"|\b(?:visit|come\s+to)\s+(?:our\s+)?(?:shop|store)[ \t]*(?:no\.?|number|#)?[ \t]*\d+"
     # French — "BP 1234", "boîte postale", "magasin n° 12", "2ème étage",
-    # "en face de", "à côté du marché", "situé à"
-    r"|\bb\.?\s*p\.?\s*\d+"
-    r"|\bbo[iî]te\s+postale[ \t]*\d+"
-    r"|\b(?:magasin|boutique|local|bureau)[ \t]*(?:n[o°]\.?|num[ée]ro|#)?[ \t]*\d+"
+    # "en face de", "à côté du marché", "situé à" (requires ≥3 digits so battery codes like BP02XL never match)
+    r"|\b(?:b\.?\s*p\.?|bo[iî]te\s+postale)\s*(?:n[o°]\.?|num[ée]ro|#)?[ \t]*\d{3,6}\b"
+    # A bare "local 5" is common in technical text ("local 5G networks"),
+    # so require an explicit unit marker for local. The other address words
+    # retain their optional marker but stop before an attached letter.
+    r"|\b(?:magasin|boutique|bureau)[ \t]*(?:n[o°]\.?|num[ée]ro|#)?[ \t]*\d+(?![A-Za-z])"
+    r"|\blocal[ \t]*(?:n[o°]\.?|num[ée]ro|#)[ \t]*\d+(?![A-Za-z])"
     r"|\b\d+[ \t]*(?:er|[eè]me)?[ \t]*[ée]tage\b"
     r"|\ben\s+face\s+d[eu]\b|\b[aà]\s+c[oô]t[ée]\s+d[eu]\b"
     r"|\bsitu[ée]\s+[aà]\b|\bvenez\s+(?:nous\s+voir|[aà])\b"
     # Arabic — "ص.ب ١٢٣" (P.O. Box), "محل رقم", "الطابق", "بجانب", "أمام"
     r"|ص\.?\s*ب\.?\s*\d+"
-    r"|(?:محل|متجر|مكتب)[ \t]*(?:رقم)?[ \t]*\d+"
+    r"|(?:محل|متجر|مكتب)[ \t]*(?:رقم)?[ \t]*\d+(?![A-Za-z])"
     r"|الطابق\s*\S+|بجانب\s+\S+|أمام\s+\S+|بالقرب\s+من"
     r")",
     re.IGNORECASE | re.UNICODE,
@@ -2995,27 +3692,22 @@ _CONTACT_KINDS = (
     ("email", _EMAIL_RE),
     ("location", _LOCATION_RE),
 )
-# Soft signals: divert-the-buyer wording without a number/link. Deliberately
-# phrase-based ("follow us on", not bare "tiktok") so products like ring
-# lights "for TikTok videos" don't false-positive.
-#
-# French and Arabic carry the same intent as the English phrases. \b is not
-# used around the Arabic alternatives: Arabic script has no ASCII word
-# boundary, so \b next to an Arabic letter never matches.
+
 _OFFPLATFORM_SOFT_RE = re.compile(
     r"(?:\bcall\s+us\b|\bcontact\s+(?:us|the\s+seller|seller)\b"
     r"|\border\s+(?:directly|via|through)\b|\bdm\s+us\b|\binbox\s+us\b"
-    r"|\bfollow\s+us\s+on\b|\bfind\s+us\s+on\b|\bvisit\s+our\b"
+    r"|\bfollow\s+us\s+on\b|\bfind\s+us\s+on\b"
+    r"|\bvisit\s+our\s+(?:website|site|facebook|instagram|ig|tiktok|page\s+on)\b"
     # French — "appelez-nous", "contactez le vendeur", "commandez directement",
     # "écrivez-nous", "suivez-nous sur", "visitez notre boutique"
     r"|\bappelez[\s\-]?(?:nous|moi)\b|\bcontactez[\s\-]?(?:nous|moi|le\s+vendeur)\b"
     r"|\bcommandez\s+(?:directement|via|par)\b|\b[ée]crivez[\s\-]?nous\b"
-    r"|\bsuivez[\s\-]?nous\s+sur\b|\bvisitez\s+(?:notre|nos)\b"
+    r"|\bsuivez[\s\-]?nous\s+sur\b|\bvisitez\s+(?:notre|nos)\s+(?:site|page\s+facebook|page\s+instagram)\b"
     r"|\bnous\s+joindre\b|\bjoignez[\s\-]?nous\b"
     # Arabic — "اتصل بنا", "تواصل معنا", "اطلب مباشرة", "تابعنا على",
     # "راسلنا", "زوروا متجرنا"
     r"|اتصل\s*بنا|تواصل\s*مع(?:نا)?|اطلب\s*مباشرة|تابعنا\s*على"
-    r"|راسلنا|زوروا?\s*(?:متجرنا|محلنا)|كلمنا"
+    r"|راسلنا|كلمنا"
     r")",
     re.IGNORECASE | re.UNICODE,
 )
@@ -3051,11 +3743,76 @@ _WHATSAPP_CONTACT_RE = re.compile(
 )
 
 
+# Common English words that legitimately appear before TLD-like suffixes in
+# product descriptions — e.g. "only.Store in a cool and dry place", "ends.net
+# weight 1 kg".  Without this filter, _WEBSITE_RE treats them as bare domains
+# and raises a false Off-Platform Contact flag.
+# Only the bare-domain branch of _WEBSITE_RE is tested here; matches that
+# start with https?://, www., or wa.me/ are never false positives of this kind.
+_BARE_DOMAIN_FALSE_POSITIVE_SLDS = frozenset({
+    # Adverbs / conjunctions common in instructions
+    "only", "also", "just", "even", "then", "when", "than", "that",
+    "this", "thus", "else", "away", "back", "from", "into", "over",
+    "with", "well", "still", "here", "there",
+    # Instruction / storage words
+    "ends", "cool", "warm", "cold", "dry", "safe", "best", "good",
+    "full", "soft", "hard", "fast", "slow", "free", "more", "less",
+    "most", "open", "fine", "real", "true", "pure", "clean", "fresh",
+    "dark", "deep", "flat", "long", "wide", "thin", "slim", "mini",
+    "dual", "quad", "auto", "gold", "bold",
+    # Colour words frequently followed by .net, .org, .info
+    "blue", "pink", "grey", "gray", "rose", "mint", "sand", "navy",
+    "teal", "lime", "jade",
+    # Product/instruction action words
+    "keep", "hold", "use", "add", "mix", "wash", "pack",
+    "sets", "pair", "unit", "size", "type", "kind", "form",
+    "mode", "code", "core", "data", "rate", "port",
+    "heat", "fire", "edge", "base", "head", "side", "face", "body",
+    "case", "part", "area", "spot", "line", "note", "care", "date",
+    # Common English stop words
+    "have", "been", "will", "your", "they", "them", "what", "some",
+    "many", "much", "each", "both", "such", "like", "same", "time",
+    "very", "need", "know", "come", "find", "make", "take", "give",
+    # Time / calendar words — "any day.Shop", "all day.store", "every day.net"
+    # are sentence fragments, not domain names.
+    "day", "days", "today", "everyday", "anyday", "night", "nights",
+    "week", "weeks", "year", "years", "hour", "hours", "noon",
+    "dawn", "dusk", "morning", "evening", "always", "daily",
+    # Quantity / shopping-phrase words that appear before .shop / .store
+    "any", "all", "buy", "shop", "sale", "deal", "top", "new",
+    "now", "soon", "fast", "easy", "next", "last", "late",
+})
+
+
+def _is_bare_domain_false_positive(term: str) -> bool:
+    """Return True when *term* is a bare-domain match (no http/www/wa.me prefix)
+    whose second-level domain is a common English word — e.g. 'only.store' from
+    'only.Store in a cool and dry place', 'ends.net' from 'product ends.net here'.
+    Those are sentence fragments caught by the broad bare-domain pattern, not URLs.
+    Matches that carry a scheme or www. prefix are always real URLs and are never
+    filtered here.
+    """
+    t = term.strip().lower()
+    if t.startswith(("http://", "https://", "www.", "wa.me/")):
+        return False
+    domain_part = t.split("/")[0]   # strip any path component
+    dot = domain_part.rfind(".")
+    if dot <= 0:
+        return False
+    sld = domain_part[:dot]
+    return sld in _BARE_DOMAIN_FALSE_POSITIVE_SLDS
+
+
 def check_offplatform_contact(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
     """
     Detect sellers hiding contact details (phones, WhatsApp, URLs) or
-    divert-the-buyer wording in NAME/DESCRIPTION/SHORT_DESCRIPTION — the
+    divert-the-buyer wording in DESCRIPTION/SHORT_DESCRIPTION — the
     standard pattern for taking buyers off-platform.
+
+    NAME is intentionally excluded: product titles legitimately contain
+    model numbers that look like phone numbers, and many titles include
+    manufacturer/demo URLs. Scanning NAME produced far too many false
+    positives and missed the real abuse vector (buried in the description).
 
     HTML tags are stripped before scanning so markup attributes (styles,
     color hex codes) can't false-positive the phone patterns. Matches are
@@ -3064,7 +3821,10 @@ def check_offplatform_contact(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
     can say exactly WHAT was found and WHICH field it was found in, instead
     of just "something matched somewhere in this product".
     """
-    text_cols = [c for c in ("NAME", "DESCRIPTION", "SHORT_DESCRIPTION") if c in data.columns]
+    # NAME excluded — see docstring above. Product titles legitimately contain
+    # model numbers, firmware version strings, and manufacturer URLs. Scanning
+    # NAME for contact info produced far too many false positives.
+    text_cols = [c for c in ("DESCRIPTION", "SHORT_DESCRIPTION") if c in data.columns]
     if not text_cols or "PRODUCT_SET_SID" not in data.columns:
         return pd.DataFrame(columns=data.columns)
 
@@ -3077,6 +3837,7 @@ def check_offplatform_contact(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
     col_text = {
         c: data[c].astype(str)
                   .str.replace(_HTML_TAG_RE, " ", regex=True)
+                  .str.replace(_PLATFORM_URL_RE, " ", regex=True)
                   .str.translate(_ARABIC_DIGITS)
                   .str.lower()
         for c in text_cols
@@ -3094,9 +3855,34 @@ def check_offplatform_contact(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
         return pd.DataFrame(columns=data.columns)
 
     def _is_platform_url(term: str) -> bool:
-        """Jumia's own domains and image CDNs are not off-platform contact."""
+        """Jumia's own domains, image CDNs, content-sharing sites, and IP-address
+        URLs are not off-platform contact — a YouTube link or a router admin page
+        (http://192.168.0.1/) in a description is not the same as a seller phone
+        number or external website."""
         t = term.lower()
-        return "jumia" in t or "wsrv.nl" in t or "cloudfront" in t
+        return (
+            "jumia" in t
+            or "wsrv.nl" in t
+            or "cloudfront" in t
+            or "youtube" in t
+            or "youtu.be" in t
+            or _is_website_false_positive(t)
+            or bool(_IPV4_URL_RE.match(t))  # e.g. http://192.168.0.1/
+        )
+
+    def _is_phone_false_positive(m_match, full_text: str) -> bool:
+        start, end = m_match.start(), m_match.end()
+        pre_text = full_text[max(0, start - 35):start].lower()
+        if re.search(r"\b(?:model|mod|model\s*no\.?|model\s*#|p/?n|mpn|part\s*no\.?|sku|ref\.?|item\s*no\.?|s/?n|serial|barcode|ean|upc|code)\s*[:\-]?\s*$", pre_text):
+            return True
+        post_text = full_text[end:min(len(full_text), end + 20)].lower()
+        if re.search(r"^\s*(?:mah|wh|w\b|v\b|hz|khz|mhz|ghz|rpm|dpi|px|mp|gb|tb|mb|kb|mm|cm|m\b|kg|g\b|pcs|pieces|x\s*\d)", post_text):
+            return True
+        if start > 0 and full_text[start - 1].isalnum():
+            return True
+        if end < len(full_text) and full_text[end].isalnum():
+            return True
+        return False
 
     comments: dict = {}
     for idx in data.index[pre_mask]:
@@ -3106,18 +3892,26 @@ def check_offplatform_contact(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
             text = col_text[c].loc[idx]
             hits: list = []
             for kind_label, kind_re in _CONTACT_KINDS:
-                terms = sorted({
-                    m.strip() for m in kind_re.findall(text)
-                    if m and m.strip() and not _is_platform_url(m)
-                })
+                if kind_label == "phone number":
+                    terms = sorted({
+                        m.group(0).strip() for m in kind_re.finditer(text)
+                        if m.group(0) and m.group(0).strip() and not _is_platform_url(m.group(0)) and not _is_phone_false_positive(m, text)
+                    })
+                else:
+                    terms = sorted({
+                        m.strip() for m in kind_re.findall(text)
+                        if m and m.strip() and not _is_platform_url(m)
+                        and not (kind_label == "website" and _is_bare_domain_false_positive(m))
+                    })
                 if terms:
                     hits.append(f"{kind_label}: {', '.join(terms[:2])}")
 
             # A WhatsApp mention only counts when it comes with a number or a
             # wa.me link. A bare mention, or a device-feature mention such as
             # "WhatsApp notification support", is not contact information.
-            if _WHATSAPP_CONTACT_RE.search(text):
-                hits.append("whatsapp contact")
+            wa_match = _WHATSAPP_CONTACT_RE.search(text)
+            if wa_match:
+                hits.append(f"whatsapp contact: {wa_match.group(0).strip()}")
 
             if hits:
                 found_by_col.append((c, hits))
@@ -3291,51 +4085,158 @@ def check_generic_with_brand_in_name(
 ) -> pd.DataFrame:
     if not {"NAME", "BRAND"}.issubset(data.columns) or not brands_list:
         return pd.DataFrame(columns=data.columns)
-    _PSEUDO_BRANDS = {"generic", "fashion", "unbranded", "no brand", "original", "new"}
+    _PSEUDO_BRANDS = {
+        "generic", "generique", "générique", "fashion", "beauty",
+        "unbranded", "no brand", "nobrand", "no-brand", "sans marque",
+        "original", "originals", "oroginal", "origional", "originel", "origine", "orijinal",
+        "genuine", "geniune", "authentic", "authentique", "real", "official", "officiel",
+        "100% original", "100% authentic", "100%", "brand",
+        "new", "other", "autre", "nan", "none"
+    }
+    _SKIP_PREFIX_TOKENS = {
+        "generic", "generique", "générique", "fashion", "beauty",
+        "unbranded", "nobrand",
+        "original", "originals", "oroginal", "origional", "originel", "origine", "orijinal", "orig", "og",
+        "authentic", "authentique", "genuine", "geniune", "real", "official", "officiel",
+        "new", "brandnew", "nouveau", "nouvelle", "neuf", "latest",
+        "100%", "100", "brand", "no", "sans", "marque", "high", "top", "best", "quality", "premium",
+        "men", "mens", "women", "womens", "ladies", "unisex", "kids", "boy", "boys", "girl", "girls",
+        "casual", "canvas", "leather", "cotton", "summer", "vintage", "retro", "classic", "waterproof",
+        "digital", "sport", "sports", "running", "walking", "watch", "shoes", "sneakers", "sneaker",
+        "scientific", "calculator", "calculators",
+    }
+    _ALLOWED_SHORT_BRANDS = {"hp", "lg", "mi", "ge", "mk", "ck"}
+    # Single-word entries in brands.txt that are also ordinary English words.
+    # Matching these at position-0 causes false positives on normal product
+    # titles (e.g. "Just a Girl Who Loves Christmas" -> brand "Just").
+    # They are excluded from the trie entirely; multi-word brand entries that
+    # START with one of these words are still indexed via their first word but
+    # a bare single-word match is rejected.
+    _COMMON_WORDS_NOT_BRANDS = {
+        "just", "simple", "rapid", "like", "love", "good", "best", "top",
+        "next", "life", "style", "pure", "true", "real", "ace", "cool",
+        "hot", "select", "choice", "plus", "ultra", "mega", "smart",
+        "bright", "clean", "fresh", "soft", "light", "classic", "modern",
+        "global", "local", "natural", "active", "power", "clear", "fast",
+        "quick", "basic", "super", "pro", "prime", "first", "core",
+        "peak", "rise", "elite", "hero", "nice", "fine", "bold", "rich",
+        "easy", "well", "great", "grand",
+    }
+
+    _EVASION_BRANDS: dict[str, str] = {
+        "air": "Nike",
+        "air max": "Nike",
+        "airmax": "Nike",
+        "air-max": "Nike",
+        "air jordan": "Nike",
+        "airjordan": "Nike",
+        "air-jordan": "Nike",
+        "jumpman": "Nike",
+        "air force": "Nike",
+        "airforce": "Nike",
+        "af1": "Nike",
+        "all star": "Converse",
+        "all stars": "Converse",
+        "allstar": "Converse",
+        "allstars": "Converse",
+        "chuck taylor": "Converse",
+        "g-shock": "Casio",
+        "gshock": "Casio",
+        "g shock": "Casio",
+        "edifice": "Casio",
+        "fx-82ms": "Casio",
+        "fx82ms": "Casio",
+        "fx-991": "Casio",
+        "fx991": "Casio",
+        "fx-991ex": "Casio",
+        "fx991ex": "Casio",
+        "classwiz": "Casio",
+        "yeezy": "Adidas",
+    }
+
+    # 1. Directly flag listings that declared an evasion alias as the brand
+    evasion_mask = data["_brand_lower"].isin(_EVASION_BRANDS)
+    evasion_flagged = data[evasion_mask].copy()
+    if not evasion_flagged.empty:
+        evasion_flagged["Detected_Brand"] = evasion_flagged["_brand_lower"].map(_EVASION_BRANDS)
+        evasion_flagged["Comment_Detail"] = (
+            "Brand declared as '"
+            + evasion_flagged["_brand_lower"].str.title()
+            + "' which is a protected model line of "
+            + evasion_flagged["Detected_Brand"]
+        )
+
+    # 2. Check pseudo-brands for protected brands in title (brands.txt only)
     mask = data["_brand_lower"].isin(_PSEUDO_BRANDS)
     if "CATEGORY" in data.columns:
         mask = mask & ~data["CATEGORY"].astype(str).str.lower().str.contains(
             r"\b(?:case|cases|cover|covers)\b", regex=True, na=False
         )
     gen = data[mask].copy()
-    if gen.empty:
+
+    flagged_list = []
+    if not evasion_flagged.empty:
+        flagged_list.append(evasion_flagged)
+
+    if not gen.empty:
+        brand_trie = {}
+        for b in brands_list:
+            if not b:
+                continue
+            bc = re.sub(r"\s+", " ", re.sub(r"['\.\-]", " ", str(b).lower())).strip()
+            if not bc or bc in _PSEUDO_BRANDS or (len(bc) < 3 and bc not in _ALLOWED_SHORT_BRANDS):
+                continue
+            if bc in _COMMON_WORDS_NOT_BRANDS:
+                continue
+            first_word = bc.split()[0]
+            if first_word not in brand_trie:
+                brand_trie[first_word] = []
+            brand_trie[first_word].append((bc, b.title() if len(b) > 2 else b.upper()))
+
+        # NOTE: PRICE_CEILING_MODEL_ALIASES is intentionally NOT used here.
+        # Model aliases like "boston", "low top", "motion", "desktop" are too
+        # broad and cause false positives on ordinary product titles.
+        # Price ceiling model checks belong only in check_suspected_fake_products.
+
+        for fw in brand_trie:
+            brand_trie[fw].sort(key=lambda x: len(x[0]), reverse=True)
+
+        def detect(n):
+            if not n or str(n).strip() == "":
+                return None
+            nc = re.sub(r"\s+", " ", re.sub(r"['\.\-\[\]\(\)\/\\:,_\|]", " ", str(n).lower())).strip()
+            words = nc.split()
+            if not words:
+                return None
+            max_skip = min(len(words), 8)
+            for i in range(max_skip):
+                sub_text = " ".join(words[i:])
+                first_word = words[i]
+                if first_word in brand_trie:
+                    for bc, original in brand_trie[first_word]:
+                        if sub_text.startswith(bc) and (len(sub_text) == len(bc) or not sub_text[len(bc)].isalnum()):
+                            return original
+                if words[i] not in _SKIP_PREFIX_TOKENS:
+                    break
+            return None
+
+        gen["Detected_Brand"] = [detect(n) for n in gen["NAME"].values]
+        title_flagged = gen[gen["Detected_Brand"].notna()].copy()
+        if not title_flagged.empty:
+            title_flagged["Comment_Detail"] = (
+                "Brand field '"
+                + title_flagged["_brand_lower"].str.title()
+                + "' but title claims brand: "
+                + title_flagged["Detected_Brand"]
+            )
+            flagged_list.append(title_flagged)
+
+    if not flagged_list:
         return pd.DataFrame(columns=data.columns)
-    # Pre-clean the brands and organize them into an O(1) dictionary lookup by their first word
-    brand_trie = {}
-    for b in brands_list:
-        if not b: continue
-        bc = re.sub(r"\s+", " ", re.sub(r"['\.\-]", " ", str(b).lower())).strip()
-        if not bc: continue
-        first_word = bc.split()[0]
-        if first_word not in brand_trie:
-            brand_trie[first_word] = []
-        brand_trie[first_word].append((bc, b.title()))
-        
-    # Sort within each bucket by length descending so longer matches (like 'Apple Watch') match before shorter ones ('Apple')
-    for fw in brand_trie:
-        brand_trie[fw].sort(key=lambda x: len(x[0]), reverse=True)
 
-    def detect(n):
-        nc = re.sub(r"\s+", " ", re.sub(r"['\.\-]", " ", str(n).lower())).strip()
-        words = nc.split()
-        if not words: return None
-        first_word = words[0]
-        if first_word in brand_trie:
-            for bc, original in brand_trie[first_word]:
-                if nc.startswith(bc) and (len(nc) == len(bc) or not nc[len(bc)].isalnum()):
-                    return original
-        return None
+    combined = pd.concat(flagged_list, ignore_index=True)
+    return combined.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
-    gen["Detected_Brand"] = [detect(n) for n in gen["NAME"].values]
-    flagged = gen[gen["Detected_Brand"].notna()].copy()
-    if not flagged.empty:
-        flagged["Comment_Detail"] = (
-            "Brand field '"
-            + flagged["_brand_lower"].str.title()
-            + "' but name starts with: "
-            + flagged["Detected_Brand"]
-        )
-    return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
 @st.cache_data(show_spinner=False)
@@ -3473,6 +4374,305 @@ def check_missing_color(
     return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
+# Compound phrases where a color word is part of the product identity, ingredient, or flavor, not its physical color
+_COLOR_COMPOUND_PHRASES = re.compile(
+    r"\b(?:"
+    # Tea & Coffee & Wine & Beverages
+    r"green\s+tea|black\s+tea|white\s+tea|red\s+tea|herbal\s+tea|earl\s+grey|"
+    r"tea(?:\s+(?:kettles?|pots?|makers?|infusers?|bags?|cups?|sets?|tree(?:\s+oil)?))?|"
+    r"coffee(?:\s+(?:tables?|makers?|machines?|pots?|mugs?|cups?|beans?|grinders?|sets?|press|filters?|scoops?))?|"
+    r"wine(?:\s+(?:glasses?|glass|openers?|bottles?|racks?|coolers?|chillers?|cellars?|aerators?|stoppers?|pourers?|accessories|sets?|totes?|bags?|corkscrews?|refrigerators?))?|"
+    r"red\s+wine|white\s+wine|green\s+coffee|green\s+gram|"
+    # Seeds, Spices, Food, Pantry
+    r"black\s+seed|black\s+soap|african\s+black\s+soap|black\s+pepper|black\s+garlic|"
+    r"pink\s+salt|himalayan\s+pink\s+salt|brown\s+sugar|white\s+sugar|brown\s+rice|white\s+rice|"
+    r"red\s+beans|black\s+beans|white\s+beans|yellow\s+(?:peas?|lentils?|corn)|"
+    r"olive\s+(?:oil(?:\s+(?:dispensers?|bottles?|sprayers?|pourers?|cruets?|cans?|pots?|jars?))?|leaf|extract|branch|pitter|tapenade)|"
+    r"lemon\s+(?:juice|squeezers?|zesters?|extract|oil|grass|lemongrass|tea|soap|fresh|bleach|dishwashing|press|slices?)|"
+    r"lime\s+(?:juice|squeezers?|extract|oil|tea|press|fresh)|key\s+lime|soda\s+lime|quick\s+lime|"
+    r"orange\s+(?:juice|oil|peel|extract|blossom|peelers?|squeezers?|press|marmalade)|blood\s+orange|sweet\s+orange|"
+    r"peach\s+(?:extract|tea|blossom|juice|slices?|jam|gum)|"
+    r"apricot\s+(?:scrub|oil|kernel|extract|jam)|"
+    r"plum\s+(?:sauce|jam|extract|blossom|oil)|dark\s+plum|sugar\s+plum|"
+    r"caramel\s+(?:sauce|syrup|candy|popcorn|extract|coloring|colouring)|salted\s+caramel|"
+    r"mustard\s+(?:seeds?|oil|sauce|paste|powder)|dijon\s+mustard|yellow\s+mustard|"
+    r"mint\s+(?:condition|tea|cand(?:y|ies)|gum|toothpaste|leaves?|oil|extract)|peppermint(?:\s+oil)?|spearmint(?:\s+oil)?|fresh\s+mint|cool\s+mint|"
+    r"chocolate(?:\s+(?:mou?lds?|fountains?|syrups?|bars?|powders?|cand(?:y|ies)|melters?|cookies?|biscuits?|wafers?|chips?|spread|cakes?|cereals?|pastes?|drops?|shakes?))?|"
+    r"(?:cereal|breakfast|protein|powder|bar|shake|drink|flavor|flavoured|taste|cookies?|biscuits?|wafers?|snack|syrup|ice\s*cream|whey|hot|dark|milk|white)\s+chocolate|"
+    r"(?:shea|body|cocoa|peanut|almond|cashew|mango)\s+butter|butter\s+(?:dish(?:es)?|knives|knife|crock)|"
+    r"(?:body|cleansing|face|coconut|almond|oat|soy)\s+milk|milk\s+(?:frothers?|pitchers?|bottles?|jugs?|cartons?|maker|creamer)|"
+    r"honey(?:\s+(?:jars?|dippers?|pots?|dispensers?|straws?|balms?|extract|syrup|scent|comb))?|raw\s+honey|pure\s+honey|"
+    r"ice(?:\s+(?:makers?|machines?|trays?|buckets?|crushers?|mou?lds?|packs?|shavers?|cubes?|scrapers?))|ice\s*cream|"
+    r"ginger(?:\s+(?:tea|powder|oil|garlic|root|extract|cand(?:y|ies)|chews?|beer))|"
+    r"cherry(?:\s+(?:blossom|lip|balm|pie|extract|syrup|pitter))|"
+    # Personal Care, Cosmetics, Formulations
+    r"rose\s+(?:water|oil|hip|rosehip|petals?|extract|essence|mist|toner|serum|masks?|flowers?|floral|bouquet|quartz)|"
+    r"(?:face|body|hand|eye|skin|hair|foot|shaving|ice|cold|anti[- ]aging|moisturi[sz]ing|whipped|bb|cc|night|day)\s+cream|"
+    r"cream\s+(?:lotion|moisturi[sz]er|jar|tub|dispenser|maker|separator|formula)|"
+    r"(?:nipple|face|body|hand|skin|eye|day|night|anti[- ]?aging|anti[- ]?wrinkle|moisturiz(?:ing|er)|bb|cc|cold|whitening|lightening|brightening|bleaching|sun|sunscreen|shaving|aftershave|barrier|massage|lanolin|stretch\s*mark|acne|repair|cleansing|hydrocortisone|curling|curl|firming|lifting|collagen|retinol|hyaluronic|cica|nourishing|hydrating|depilatory|removal|pain\s+relief|analgesic|fungal|antifungal|diaper|nappy|rash|healing|soothing)\s+cream|"
+    r"cream\s+(?:for\b|\d+\s*(?:ml|g|oz|kg|fl\s*oz)|gel|lotion|serum|paste|ointment|balm|foundation|contour|blush|bronzer|cleanser|soap|wash)|"
+    r"(?:lanolin|moisturizer|lotion|ointment|balm|salve)\s+(?:cream\b)?|"
+    r"cr[eè]me\s+(?:hydratante|visage|corps|mains?|solaire|anti[- ]rides|blanchissante|[eé]claircissante|de\s+marrons|fra[iî]che|pour\b)|"
+    r"(?:powder|liquid|cream|cheek|face|mineral|matte|shimmer|baked)?\s*blush(?:er)?(?:\s+(?:palette|brush|powder|stick|makeup|duo|trio|compact|pot|wand|tint))?|"
+    r"(?:activated|bamboo)?\s*charcoal(?:\s+(?:masks?|peels?|soaps?|toothpastes?|powders?|scrubs?|cleansers?|grills?|briquettes?|filters?|pencils?|drawings?|bags?|shampoo|sponge|toothbrush(?:es)?))?|"
+    r"(?:anti[- ]?)?gr[ea]y\s+hair(?:\s+(?:darkening|reversal|cover|coverage|treatment|shampoo|soap|bar|dye|removal))?|"
+    r"black\s*heads?(?:\s+(?:remover|vacuum|extractor|strips?|masks?|nose|suction|cleanser|needles?|tools?))?|"
+    r"(?:self|sun|de|spray|fake)?\s*tan(?:ning)?\s*(?:oil|lotion|cream|spray|scrub|remover|removal|pack|foam|mousse|drops|accelerator|booster|towel)\b|"
+    # Technology, Optics, Hardware
+    r"anti[- ]?blue(?:[- ]?light)?|blue[- ]?light(?:\s+(?:blocking|blocker|filter|cut|protective|screen|glasses|protection|shield|lenses?))?|"
+    r"blue\s*tooth|bluetooth|"
+    r"blue\s+ray|blu\s+ray|blu-ray|"
+    r"water\s+jet|jet\s+(?:flame|torch|lighter|nozzle|flosser|cleaner|engine|washer)|ink\s*jet|turbo\s*jet|"
+    r"ash\s*(?:tray|trays|bin|bins|bucket|blonde)|"
+    r"anti[- ]?rust|rust[- ]?(?:proof|resistant)|rust\s+(?:remover|cleaner|prevention|inhibitor|converter|treatment|protection)|"
+    r"black\s*out\s*(?:curtains?|drapes?|shades?|blinds?|eye\s*mask|fabric)|"
+    r"white\s+board|black\s+board|chalkboard|white\s+noise|"
+    # Materials, Gems, Stones, Wood
+    r"(?:solid|natural|real|teak|pine|oak|cedar|sandal|drift|fire|balsa|ply|hard|bamboo)?\s*wood(?:en)?(?:\s+(?:handles?|grips?|spoons?|tables?|chairs?|furniture|cutting\s+board|frames?|racks?|trays?|cabinets?|doors?|boxes?|hangers?|signs?|welcome\s+sign|decor|crafts?|utensils?|bases?|stands?|legs?|lids?|tops?|beads?|toys?|blocks?|kitchenware|kitchen|board|boards|plaque|plaques|sticks?|carvings?|cutters?|sculptures?|pulp|veneer|dowels?|panels?|cases?|watch(?:es)?|clocks?|lamps?|bowls?|plates?|coasters?|chess|puzzles?|wicks?|burning|seasoning|polish|slices?|pellets?|chips?))?|"
+    r"with\s+wood(?:en)?\s+\w+|wood(?:en)?(?!\s+(?:colou?r|paint|dye|finish|hue|tint))|"
+    r"(?:en\s+)?bois(?!\s+(?:colou?r|peinture))|"
+    r"(?:freshwater|baroque|mother\s+of|faux|imitation|cultured|natural|tapioca|boba|white)?\s*pearls?(?:\s+(?:necklaces?|earrings?|bracelets?|rings?|pendants?|brooch(?:es)?|beads?|chokers?|chains?|jewelry|jewellery|hair(?:\s*(?:pins?|clips?|bands?|accessories))?|buttons?|buckles?|belts?|powders?|extracts?|essence|creams?|masks?|serums?|drops?|shells?|barley|couscous|onions?|dials?|watches?))?|"
+    r"amber\s+(?:glass|bottles?|jars?|droppers?|vials?|containers?|spray|resin|fossil|teething|perfume|oil|fragrance|scents?)|"
+    r"jade\s+(?:rollers?|gua\s*sha|stones?|bracelets?|bangles?|pendants?|necklaces?|rings?|carvings?|beads?|comb|massagers?)|"
+    r"onyx\s+(?:stone|ring|marble)|slate\s+(?:coasters?|cheese\s+board|stones?|tiles?|labels?|pencils?)|"
+    r"snow\s+(?:boots?|chains?|shovel|spray|foam|globe|tires?|jackets?|coats?|pants?|flakes?|white)|snowflake|"
+    r"coral\s+(?:fleece|velvet|reef|calcium)|"
+    r"(?:18k|14k|24k|rose\s+gold|white\s+gold|yellow\s+gold|gold|silver|rhodium|platinum|chrome)\s+(?:plated|plating|filled)|"
+    r"925\s+(?:sterling\s+)?silver|sterling\s+silver|"
+    r"stainless\s+steel|titanium\s+steel|"
+    # Brands, Proper Nouns, Specific Compound Names
+    r"black\s*(&|\+|and)\s*decker|silver\s*crest|silvercrest|redragon|redmi|blackview|orange\s+money|"
+    r"black\s+panther|red\s+bull|blue\s+band|golden\s+penny|white\s+star|red\s+star|black\s+horse|white\s+pearl|green\s+forest|"
+    r"red\s+label|black\s+label|gold\s+label|blue\s+label|white\s+label|"
+    r"sky\s+(?:view|worth|high|line|pro|star|run|way|fall|walk|fly|box|net|tech|land|flag|wing|wave)|sky(?!\s*(?:blue|bleu))|"
+    r"blanche\s+\d+|(?:luxury|women'?s?|men'?s?|quartz|watch|montre)\s+blanche|mont\s*blanc|"
+    r"drakkar\s+noir|film\s+noir|cafe\s+noir|pinot\s+noir|savon\s+noir|"
+    r"rouge\s+a\s+l[eè]vres|rouge\s+à\s+l[eè]vres|moulin\s+rouge|baton\s+de\s+rouge|"
+    r"th[eé]\s+vert|argile\s+verte?|point\s+vert|"
+    r"(?:tempered\s+)?glass(?:\s+(?:screen\s+protector|film|bottles?|jars?|cups?|mugs?|tables?|doors?))"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_COLOR_MISMATCH_PATTERN = re.compile(
+    r"\b(?:" + "|".join(re.escape(k) for k in sorted(COLOR_VARIANT_TO_BASE.keys(), key=lambda x: (-len(x), x)) if k.lower() not in ("coffee", "wine")) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def check_color_title_mismatch(
+    data: pd.DataFrame,
+    color_categories: Optional[List[str]] = None,
+    **kwargs,
+) -> pd.DataFrame:
+    """
+    Flags products where a specific color declared in the product title (NAME)
+    contradicts / differs from the color declared in the COLOR column.
+
+    Follows color validation rules:
+    - Only checks categories that require / are checked for color (using color_categories).
+    - Excludes categories that do not require color, such as groceries/food/supermarket.
+    - Excludes 'coffee' and 'wine' (catching food/drinks, tables, glasses, openers, makers, etc.).
+    - Treats 'graphite' and 'black' as the same color.
+    - Treats 'stainless steel' and 'silver' as the same color.
+    - Handles color equivalences: Rose Gold = Pink/Gold, Charcoal = Black/Gray, Midnight = Black/Blue,
+      Beige/Khaki/Nude = Brown/Cream, Teal/Turquoise = Blue/Green, Coral/Peach = Pink/Orange.
+    """
+    if not {"NAME", "COLOR"}.issubset(data.columns):
+        return pd.DataFrame(columns=data.columns)
+
+    target = data
+
+    # Follow color validation rules: ONLY check products in color-required categories.
+    # Products outside color_categories are never checked for color mismatches,
+    # regardless of whether they have a color in the title or COLOR column.
+    if "CATEGORY_CODE" in target.columns and color_categories:
+        if "_cat_clean" not in target.columns:
+            target = target.copy()
+            target["_cat_clean"] = target["CATEGORY_CODE"].apply(clean_category_code)
+        _cats = set(clean_category_code(c) for c in color_categories if c)
+        target = target[target["_cat_clean"].isin(_cats)]
+    elif color_categories:
+        # No CATEGORY_CODE column — cannot determine category; skip the check entirely
+        return pd.DataFrame(columns=data.columns)
+
+    if target.empty:
+        return pd.DataFrame(columns=data.columns)
+
+
+    # Safeguard: exclude groceries, food, beverages, books that do not require color
+    _EXCLUDED_CAT_KEYWORDS = re.compile(
+        r"\b(?:grocery|groceries|supermarket|food|beverage|beverages|drinks?|pantry|snacks?|candy|candies|confectionery|livres?|books?)\b",
+        re.IGNORECASE,
+    )
+    for cat_col in ["CATEGORY", "Initial_Category_Path", "Category_Path"]:
+        if cat_col in target.columns:
+            target = target[~target[cat_col].astype(str).str.contains(_EXCLUDED_CAT_KEYWORDS, na=False)]
+
+    if target.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    target = target[target["NAME"].notna() & target["COLOR"].notna()]
+    if target.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    null_like = {"", "nan", "none", "null", "n/a", "na", "-", "undefined"}
+    _c_series = target["COLOR"].astype(str).str.strip()
+    target = target[~_c_series.str.lower().isin(null_like)]
+    if target.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    # High-performance vectorized pre-filter: only process rows where title actually contains a color candidate
+    _name_str = target["NAME"].astype(str)
+    has_color_in_name = _name_str.str.contains(_COLOR_MISMATCH_PATTERN, na=False)
+    target = target[has_color_in_name]
+    if target.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    has_brand = "BRAND" in target.columns
+    _COLOR_ROOTS = (
+        "silver", "gold", "rose", "orange", "black", "pink", "brown", "white", "blue", "green", "red",
+        "grey", "gray", "yellow", "purple", "graphite", "stainless steel", "steel", "charcoal", "midnight",
+        "beige", "khaki", "nude", "bronze", "copper", "teal", "turquoise", "coral", "peach", "navy",
+        "champagne", "rust", "terracotta", "wood", "inox", "acier", "chrome", "titanium", "maroon", "burgundy"
+    )
+
+    def _expand_color_bases(matches: List[str], raw_str: str) -> Set[str]:
+        bases = {COLOR_VARIANT_TO_BASE.get(m.lower()) for m in matches if COLOR_VARIANT_TO_BASE.get(m.lower())}
+        lower_matches = [m.lower() for m in matches]
+        lower_raw = raw_str.lower()
+
+        # 1. Graphite = Black & Gray
+        if any(m == "graphite" for m in lower_matches) or "graphite" in lower_raw:
+            bases.update(["black", "gray"])
+
+        # 2. Stainless steel, Inox, Acier, Chrome, Titanium, Platinum, Silver = Gray / Silver
+        _METALLIC_WORDS = ("stainless steel", "stainless-steel", "steel", "silver", "inox", "acier", "chrome", "titanium", "platinum", "platine", "gunmetal", "anthracite")
+        if any(m in _METALLIC_WORDS for m in lower_matches) or any(t in lower_raw for t in ("stainless", "silver", "inox", "acier", "chrome", "titanium")):
+            bases.update(["gray", "black"])
+
+        # 3. Charcoal = Black & Gray
+        if any(m == "charcoal" for m in lower_matches) or "charcoal" in lower_raw:
+            bases.update(["black", "gray"])
+
+        # 4. Rose Gold = Pink & Gold (Yellow)
+        if any("rose gold" in m or "rosegold" in m for m in lower_matches) or "rose gold" in lower_raw or "rosegold" in lower_raw:
+            bases.update(["pink", "yellow"])
+
+        # 5. Midnight = Black & Blue / Navy
+        if any(m == "midnight" for m in lower_matches) or "midnight" in lower_raw:
+            bases.update(["black", "blue"])
+
+        # 6. Navy = Blue & Black
+        if any(m == "navy" for m in lower_matches) or "navy" in lower_raw:
+            bases.update(["blue", "black"])
+
+        # 7. Earth tones: Beige, Khaki, Nude, Tan = Brown & White (Cream)
+        if any(m in ("beige", "khaki", "nude", "tan") for m in lower_matches) or any(t in lower_raw for t in ("beige", "khaki", "nude", "tan")):
+            bases.update(["brown", "white"])
+
+        # 8. Teal, Turquoise, Cyan, Aqua = Blue & Green
+        if any(m in ("teal", "turquoise", "cyan", "aqua") for m in lower_matches) or any(t in lower_raw for t in ("teal", "turquoise", "cyan", "aqua")):
+            bases.update(["blue", "green"])
+
+        # 9. Coral, Peach, Apricot, Salmon = Pink & Orange
+        if any(m in ("coral", "peach", "apricot", "salmon") for m in lower_matches) or any(t in lower_raw for t in ("coral", "peach", "apricot", "salmon")):
+            bases.update(["pink", "orange"])
+
+        # 10. Maroon & Burgundy = Red & Brown & Purple
+        if any(m in ("maroon", "burgundy", "bordeaux") for m in lower_matches) or any(t in lower_raw for t in ("maroon", "burgundy", "bordeaux")):
+            bases.update(["red", "brown", "purple"])
+
+        # 11. Champagne = White & Yellow (Gold) & Brown (Beige)
+        if any(m == "champagne" for m in lower_matches) or "champagne" in lower_raw:
+            bases.update(["white", "yellow", "brown"])
+
+        # 12. Rust & Terracotta = Orange & Brown & Red
+        if any(m in ("rust", "terracotta") for m in lower_matches) or any(t in lower_raw for t in ("rust", "terracotta")):
+            bases.update(["orange", "brown", "red"])
+
+        # 13. Wood / Wooden / Natural = Brown
+        if any(m in ("wood", "wooden", "bois") for m in lower_matches) or any(t in lower_raw for t in ("wood", "wooden", "bois", "natural")):
+            bases.update(["brown"])
+
+        # 14. Bronze & Copper = Brown & Orange
+        if any(m in ("bronze", "copper") for m in lower_matches) or any(t in lower_raw for t in ("bronze", "copper")):
+            bases.update(["brown", "orange"])
+
+        # 15. Wine in declared color = Red
+        if "wine" in lower_raw:
+            bases.add("red")
+
+        # 16. Clear & Transparent = White
+        if any(m in ("clear", "transparent") for m in lower_matches) or any(t in lower_raw for t in ("clear", "transparent")):
+            bases.add("white")
+
+        # 17. Multicolor
+        if "multi" in lower_raw:
+            bases.add("multicolor")
+
+        return bases
+
+    comments = {}
+
+    for row in target.itertuples(index=True):
+        c_raw = str(getattr(row, "COLOR", "")).strip()
+        if not c_raw or c_raw.lower() in null_like:
+            continue
+
+        raw_name = str(getattr(row, "NAME", ""))
+        clean_name = raw_name
+
+        # Mask brand from name if present and brand contains a color word (e.g. brand 'Silver Crest')
+        if has_brand:
+            b_val = str(getattr(row, "BRAND", "")).strip().lower()
+            if b_val and b_val not in {"generic", "fashion", "nan", "none", "null", "unknown brand"}:
+                if any(cr in b_val for cr in _COLOR_ROOTS):
+                    clean_name = re.sub(r"\b" + re.escape(b_val) + r"\b", " ", clean_name, flags=re.IGNORECASE)
+
+        # Mask compound terms where color word is ingredient/product type (masks coffee, wine glasses/openers, face cream, olive oil, etc.)
+        clean_name = _COLOR_COMPOUND_PHRASES.sub(" ", clean_name)
+        clean_name = re.sub(r"\bcoffee\b", " ", clean_name, flags=re.IGNORECASE)
+        clean_name = re.sub(r"\bwine\b(?!\s*red\b)", " ", clean_name, flags=re.IGNORECASE)
+
+        title_matches = [m.group(0) for m in _COLOR_MISMATCH_PATTERN.finditer(clean_name) if m.group(0).lower() not in ("coffee", "wine")]
+        if not title_matches:
+            continue
+
+        title_bases = _expand_color_bases(title_matches, clean_name)
+        if not title_bases:
+            continue
+
+        dec_matches = [m.group(0) for m in _COLOR_MISMATCH_PATTERN.finditer(c_raw) if m.group(0).lower() not in ("coffee", "wine")]
+        dec_bases = _expand_color_bases(dec_matches, c_raw)
+
+        if not dec_bases:
+            continue
+
+        # If either title or declared color represents multicolor, no strict contradiction
+        if "multicolor" in title_bases or "multicolor" in dec_bases:
+            continue
+
+        # If there is an overlap in color families (e.g. Title says 'Black & Red', COLOR is 'Black') -> passes
+        if not title_bases.isdisjoint(dec_bases):
+            continue
+
+        # Mismatch detected: title specifies one color family, but COLOR column specifies a completely different one
+        title_words_str = ", ".join(sorted(set(w.capitalize() for w in title_matches)))
+        comments[row.Index] = (
+            f"Color mismatch: Title specifies '{title_words_str}' but COLOR column is '{c_raw}'."
+        )
+
+    if not comments:
+        return pd.DataFrame(columns=data.columns)
+
+    flagged = data.loc[list(comments.keys())].copy()
+    flagged["Comment_Detail"] = flagged.index.map(comments)
+    if "PRODUCT_SET_SID" in flagged.columns:
+        return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
+    return flagged
+
+
 def check_weight_volume_in_name(
     data: pd.DataFrame, weight_category_codes: List[str]
 ) -> pd.DataFrame:
@@ -3530,6 +4730,10 @@ def check_incomplete_smartphone_name(
     ].copy()
     if target.empty:
         return pd.DataFrame(columns=data.columns)
+    # Exclude non-phone products from being flagged for incomplete smartphone specs
+    target = target[~target["NAME"].astype(str).apply(_is_non_phone_product)]
+    if target.empty:
+        return pd.DataFrame(columns=data.columns)
     pat = re.compile(r"\b\d+\s*(?:gb|tb)\b", re.IGNORECASE)
     flagged = target[~target["_name_lower"].str.contains(pat, na=False)].copy()
     if not flagged.empty:
@@ -3542,6 +4746,12 @@ _SPEC_ANY_RE = re.compile(r"\d+\s*(?:gb|tb)\b", re.IGNORECASE)
 _SPEC_CATEGORY_KEYWORDS_RE = re.compile(
     r"phone|smartphone|tablet|laptop|desktop|computer|notebook|macbook|chromebook",
     re.IGNORECASE,
+)
+_PHONE_TABLET_PAT = re.compile(
+    r"phone|smartphone|tablet|ipad|mobile\s*phone|cellular", re.IGNORECASE
+)
+_LAPTOP_COMP_PAT = re.compile(
+    r"laptop|notebook|macbook|chromebook|desktop|computer|all-in-one|pc\b|workstation", re.IGNORECASE
 )
 _SPEC_RAM_RE1 = re.compile(r"(\d+)\s*gb\s*ram\b", re.IGNORECASE)
 # The colon/dash is REQUIRED (not optional) here — that's what distinguishes
@@ -3577,6 +4787,16 @@ _SPEC_MEMORY_RE = re.compile(
 )
 _MEMORY_IS_RAM_MAX_GB = 64
 _SPEC_COMBO_RE = re.compile(r"\b(\d+)\s*(?:gb)?\s*[/+]\s*(\d+)\s*gb\b", re.IGNORECASE)
+# Virtual / extended RAM notation used by budget phones (Tecno, Infinix, Itel):
+#   "8GB RAM(4+4)GB"  — total 8GB stated, 4GB physical + 4GB virtual/extended
+#   "Upto 8GB RAM(4+4)GB+128GB Storage"
+# The outer total and both addends are captured so the description's "4GB RAM"
+# (the physical part) is not flagged as a mismatch against the title's "8GB".
+# Group 1 = physical_A, Group 2 = extended_B  (sum = stated total)
+_SPEC_VIRTUAL_RAM_RE = re.compile(
+    r"(?:\d+\s*gb\s*ram|ram\s*[:\-]?\s*\d+\s*gb)\s*[\(\[\{]?\s*(\d+)\s*\+\s*(\d+)\s*[\)\]\}]?\s*gb",
+    re.IGNORECASE,
+)
 
 # Operating system, for laptops and desktops. Same failure as RAM and storage
 # and from the same cause — a description reused from another SKU — but with a
@@ -3612,7 +4832,12 @@ def _extract_os(text: str) -> set:
     return out
 
 
-def _extract_ram_storage(text: str, allow_combo: bool = False) -> tuple:
+def _extract_ram_storage(
+    text: str,
+    allow_combo: bool = False,
+    max_ram: int = 64,
+    max_memory_as_ram: int = 32,
+) -> tuple:
     """Pulls every RAM/Storage value mentioned in `text` (already lowercased),
     normalized to GB. Returns (ram_values, storage_values) as sets — a set
     (not a single value) because a field can legitimately state more than one
@@ -3624,16 +4849,20 @@ def _extract_ram_storage(text: str, allow_combo: bool = False) -> tuple:
     prose, where "Available in 4GB/8GB RAM variants" would otherwise be
     misread as RAM=4/Storage=8 instead of two RAM options — so callers only
     pass allow_combo=True for the NAME field.
+
+    max_ram bounds the plausible RAM size (24GB for phones, 64GB for laptops).
+    Any extracted RAM value above max_ram (e.g. 64GB/256GB stated as RAM) is
+    impossible as RAM and is reassigned to storage if >= 16GB, or dropped.
     """
     ram = {int(m.group(1)) for m in _SPEC_RAM_RE1.finditer(text)}
     ram |= {int(m.group(1)) for m in _SPEC_RAM_RE2.finditer(text)}
     storage = {int(m.group(1)) for m in _SPEC_STORAGE_GB_RE1.finditer(text)}
     storage |= {int(m.group(1)) * 1024 for m in _SPEC_STORAGE_TB_RE1.finditer(text)}
     storage |= {int(m.group(1)) for m in _SPEC_STORAGE_RE2.finditer(text)}
-    # "N GB memory" — RAM at consumer sizes, storage above. See the constant.
+    # "N GB memory" — RAM at consumer sizes, storage above.
     for m in _SPEC_MEMORY_RE.finditer(text):
         _v = int(m.group(1) or m.group(2))
-        (ram if _v <= _MEMORY_IS_RAM_MAX_GB else storage).add(_v)
+        (ram if _v <= max_memory_as_ram else storage).add(_v)
     if allow_combo:
         for m in _SPEC_COMBO_RE.finditer(text):
             _a, _b = int(m.group(1)), int(m.group(2))
@@ -3647,6 +4876,25 @@ def _extract_ram_storage(text: str, allow_combo: bool = False) -> tuple:
                 _a, _b = _b, _a
             ram.add(_a)
             storage.add(_b)
+        # Virtual/extended RAM notation: "8GB RAM(4+4)GB" — the title states the
+        # total (8) which is already captured by _SPEC_RAM_RE1, but the description
+        # correctly says the physical portion (4GB). Add both addends to name_ram
+        # so that the description's physical value passes the intersection check.
+        for m in _SPEC_VIRTUAL_RAM_RE.finditer(text):
+            phys = int(m.group(1))
+            ext = int(m.group(2))
+            if phys <= max_ram:
+                ram.add(phys)
+            if ext <= max_ram:
+                ram.add(ext)
+
+    # Reassign impossible RAM values (> max_ram) to storage if plausible, otherwise drop
+    impossible_ram = {v for v in ram if v > max_ram}
+    if impossible_ram:
+        ram -= impossible_ram
+        # Values >= 16GB erroneously parsed or stated as RAM are almost certainly storage (e.g. 64GB, 128GB, 256GB)
+        storage |= {v for v in impossible_ram if v >= 16}
+
     return ram, storage
 
 
@@ -3702,7 +4950,26 @@ def check_specs_inconsistency(
 
     comments: dict = {}
     for idx in target.index:
-        name_ram, name_storage = _extract_ram_storage(name_lower.loc[idx], allow_combo=True)
+        cat_str = str(target.at[idx, "CATEGORY"]) if "CATEGORY" in target.columns else ""
+        cat_clean_str = str(target.at[idx, "_cat_clean"]) if "_cat_clean" in target.columns else ""
+        name_str = str(target.at[idx, "NAME"]) if "NAME" in target.columns else ""
+        combined_dev_text = f"{cat_str} {cat_clean_str} {name_str}".lower()
+
+        # Classify device type for RAM limits
+        is_phone_tablet = bool(_PHONE_TABLET_PAT.search(combined_dev_text)) and not bool(_LAPTOP_COMP_PAT.search(combined_dev_text))
+        if is_phone_tablet:
+            row_max_ram = 24           # Maximum 24GB RAM for phones/tablets
+            row_max_memory_as_ram = 24
+        else:
+            row_max_ram = 64           # Maximum 64GB RAM for laptops/computers
+            row_max_memory_as_ram = 32 # Ambiguous "64GB Memory" on laptops is flash/eMMC/SSD storage
+
+        name_ram, name_storage = _extract_ram_storage(
+            name_lower.loc[idx],
+            allow_combo=True,
+            max_ram=row_max_ram,
+            max_memory_as_ram=row_max_memory_as_ram,
+        )
         name_os = _extract_os(name_lower.loc[idx])
         if not name_ram and not name_storage and not name_os:
             continue
@@ -3711,24 +4978,26 @@ def check_specs_inconsistency(
             text = col_text[c].loc[idx]
             if not text.strip():
                 continue
-            f_ram, f_storage = _extract_ram_storage(text, allow_combo=False)
+            f_ram, f_storage = _extract_ram_storage(
+                text,
+                allow_combo=False,
+                max_ram=row_max_ram,
+                max_memory_as_ram=row_max_memory_as_ram,
+            )
             f_os = _extract_os(text)
-            # No consumer laptop or phone stores its files in 6GB — but
-            # 6GB of RAM is normal, and "6GB" in a description was being
-            # compared to a 256GB storage title as if it were storage.
-            # Same reasoning as _SPEC_MEMORY_RE: below a threshold it can
-            # only be RAM. Applied to the description-side numbers so a
-            # bare "6GB" or "8GB" cannot masquerade as storage.
-            _ram_threshold = _MEMORY_IS_RAM_MAX_GB
-            _f_storage_plausible = {v for v in f_storage if v > _ram_threshold}
+
+            # Modern phones and laptops store files in at least 16GB.
+            # Numbers smaller than 16GB (e.g. 4GB, 6GB, 8GB) parsed as storage
+            # cannot be storage — they are almost certainly mislabeled RAM.
+            # Real storage of 16GB, 32GB, 64GB+ is completely valid and must NOT be demoted to RAM.
+            _MIN_STORAGE_GB = 16
+            _f_storage_plausible = {v for v in f_storage if v >= _MIN_STORAGE_GB}
             _demoted = f_storage - _f_storage_plausible
             if _demoted:
                 # Move to RAM only if RAM was not itself already stated for
-                # the field. Kept out of the ram comparison otherwise, so a
-                # description saying "8GB RAM, 6GB storage" still reads
-                # RAM=8 and simply drops the impossible storage figure.
+                # the field and within plausible RAM size.
                 if not f_ram:
-                    f_ram = f_ram | _demoted
+                    f_ram = f_ram | {v for v in _demoted if v <= row_max_ram}
                 f_storage = _f_storage_plausible
 
             if name_ram and f_ram and not (name_ram & f_ram):
@@ -3840,12 +5109,41 @@ def _extract_size_key(name: str) -> str:
     return "+".join(sorted(set(tokens))) if tokens else ""
 
 
+_RING_FILLER_WORDS = {
+    "portable", "rechargeable", "high", "capacity", "mobile", "phone",
+    "pack", "battery", "with", "for", "and", "the", "a", "an",
+    "charging", "charger", "fast", "quick", "support", "compatible",
+}
+
+
+def _norm_ring_name_tokens(name: str) -> frozenset:
+    """Normalise a product name to a frozenset of meaningful tokens."""
+    s = str(name).lower()
+    # Collapse numeric formatting: 20,000 -> 20000
+    s = re.sub(r'(\d),(\d)', r'\1\2', s)
+    # Strip all non-alphanumeric characters
+    s = re.sub(r'[^a-z0-9\s]', ' ', s)
+    tokens = s.split()
+    # Drop single-char tokens and filler words
+    tokens = [t for t in tokens if len(t) > 1 and t not in _RING_FILLER_WORDS]
+    return frozenset(tokens)
+
+
+def _ring_token_jaccard(a: frozenset, b: frozenset) -> float:
+    if not a or not b:
+        return 0.0
+    union = len(a | b)
+    return len(a & b) / union if union else 0.0
+
+
 def check_duplicate_products(
     data: pd.DataFrame,
     exempt_categories: List[str] = None,
     similarity_threshold: float = 0.70,
     known_colors: List[str] = None,
     full_data: pd.DataFrame = None,
+    ring_sellers: dict = None,
+    _progress_callback=None,
     **kwargs,
 ) -> pd.DataFrame:
     # Duplicates are a property of the batch, not of a row, so this has to see
@@ -3891,34 +5189,41 @@ def check_duplicate_products(
     if not {"NAME", "SELLER_NAME", "BRAND"}.issubset(data.columns):
         return pd.DataFrame(columns=data.columns)
     d = data.copy()
-    if exempt_categories and "CATEGORY_CODE" in d.columns:
-        d = d[
-            ~d["_cat_clean"].isin(
-                set(clean_category_code(c) for c in exempt_categories)
-            )
-        ]
+    for _c, _src in (
+        ("_brand_lower", "BRAND"),
+        ("_seller_lower", "SELLER_NAME"),
+        ("_name_lower", "NAME"),
+    ):
+        if _c not in d.columns and _src in d.columns:
+            d[_c] = d[_src].astype(str).str.lower().str.strip().fillna("")
+
+    # The full-upload duplicate path can receive a frame that has not gone
+    # through the normal validation preprocessing pass. Always derive the
+    # normalized category key before applying category exemptions.
+    if "_cat_clean" not in d.columns:
+        if "CATEGORY_CODE" in d.columns:
+            d["_cat_clean"] = d["CATEGORY_CODE"].astype(str).map(clean_category_code)
+        else:
+            # Some ZIP/QC exports do not include category codes. They cannot
+            # match an exempt-category list, but they must still be valid for
+            # duplicate detection.
+            d["_cat_clean"] = ""
+
+    if exempt_categories:
+        _category_key = d["_cat_clean"] if "_cat_clean" in d.columns else pd.Series("", index=d.index)
+        _exempt_keys = set(clean_category_code(c) for c in exempt_categories)
+        d = d[~_category_key.isin(_exempt_keys)]
     if d.empty:
         return pd.DataFrame(columns=data.columns)
 
-    _color_pat = (
-        re.compile(
-            r"\b("
-            + "|".join(
-                re.escape(c) for c in sorted(known_colors, key=len, reverse=True)
-            )
-            + r")\b",
-            re.IGNORECASE,
-        )
-        if known_colors
-        else None
-    )
+    _color_pat = compile_regex_patterns(known_colors) if known_colors else None
 
     _size_keys = [_extract_size_key(str(n)) for n in d["NAME"].values]
     d["_size_key"] = _size_keys
 
     _names_lower = d["NAME"].astype(str).str.lower()
-    if _color_pat:
-        _from_name = _names_lower.str.extract(_color_pat.pattern, flags=re.IGNORECASE, expand=False).str.lower().str.strip().fillna("")
+    if _color_pat and _color_pat.pattern:
+        _from_name = _names_lower.str.extract(f"({_color_pat.pattern})", flags=re.IGNORECASE, expand=False).str.lower().str.strip().fillna("")
     else:
         _from_name = pd.Series("", index=d.index)
     _fallback = pd.Series("", index=d.index)
@@ -3932,36 +5237,64 @@ def check_duplicate_products(
     if "_norm_name" not in d.columns:
         _nn = d["NAME"].astype(str).str.lower()
         _nn = _nn.str.replace(r"\b(new|sale|original|genuine|authentic|official|premium|quality|best|hot|2024|2025)\b", "", regex=True)
+        # Also strip freebie/gift text from the norm name so products that differ
+        # only in what gift they include get different _freebie_key values, not
+        # the same _norm_name. Without this, "TV + Free Bracket" and "TV + Free
+        # HDMI Cable" collapse to the same key and look like duplicates.
+        _nn = _nn.str.replace(
+            r"(?:[\+&]|\b(?:with|plus|including|includes|and)\b)\s*(?:(?:a|an|the|1)\s+)?(?:free|gift|gifts|freebie|freebies|bonus)\b.*$"
+            r"|\b(?:free|gift|gifts|freebie|freebies|bonus)\s*[:\-]?\s*.+$",
+            "", regex=True,
+        )
         _nn = _nn.str.replace(r"[^\w\s]", "", regex=True)
         _nn = _nn.str.replace(r"\s+", "", regex=True)
         d["_norm_name"] = _nn
 
-    # Two model key strategies:
-    # 1. _model_key: used for IMAGE dedup — uses first word when no digits so different-named
-    #    products sharing a stock image are never false-flagged.
-    # 2. _seo_model_key: used for SEO dedup — ONLY returns a key when real digit-based model
-    #    numbers exist. Without digits, returns "" so the SEO check is skipped entirely and
-    #    the text key (full name match) acts as the sole guard.
-    def _extract_model_key(name):
-        words = str(name).split()
-        digit_words = [re.sub(r'[^a-zA-Z0-9]', '', w).lower() for w in words if any(char.isdigit() for char in w)]
+    # Pre-compile the freebie regex once rather than once-per-row
+    _freebie_re_compiled = re.compile(
+        r"(?:[\+&]|(?:\b(?:with|plus|including|includes|and)\b))\s*(?:(?:a|an|the|1)\s+)?(?:free|gift|gifts|freebie|freebies|bonus)\s+([^,\-\u2013|\(\)]+)"
+        r"|\b(?:free|gift|gifts|freebie|freebies|bonus)\s*[:\-]?\s*([^,\-\u2013|\(\)]+)",
+        re.IGNORECASE,
+    )
+    _freebie_clean_re = re.compile(r'[^a-zA-Z0-9]')
+    _freebie_stopwords = frozenset((
+        "free", "gift", "gifts", "bonus", "a", "an", "the", "with", "plus",
+        "and", "of", "for", "to", "original", "new",
+    ))
+
+    def _extract_freebie_key(name):
+        m = _freebie_re_compiled.search(str(name))
+        if m:
+            val = m.group(1) or m.group(2) or ""
+            tokens = [
+                w for w in _freebie_clean_re.sub(' ', val).lower().split()
+                if w not in _freebie_stopwords
+            ]
+            return "-".join(sorted(tokens))
+        return ""
+
+    # Series used by .map() calls below — avoids a Python loop per row
+    _name_words_s = d["NAME"].astype(str)
+
+    def _mk(name):
+        words = name.split()
+        digit_words = [re.sub(r'[^a-zA-Z0-9]', '', w).lower()
+                       for w in words if any(c.isdigit() for c in w)]
         if digit_words:
             return "-".join(digit_words)
-        # Fallback: first word only (distinguishes 'vuik ceiling light' from 'vasar ceiling light')
         if words:
             return re.sub(r'[^a-zA-Z0-9]', '', words[0]).lower()
         return ""
 
-    def _extract_seo_model_key(name):
-        """Only returns a model key when explicit digit model numbers are present.
-        Without digits, returns '' so SEO dedup is skipped — preventing false positives
-        where different products share the same first word (e.g. 'Malaika Cream' vs 'Malaika Lotion')."""
-        words = str(name).split()
-        digit_words = [re.sub(r'[^a-zA-Z0-9]', '', w).lower() for w in words if any(char.isdigit() for char in w)]
+    def _sk(name):
+        words = name.split()
+        digit_words = [re.sub(r'[^a-zA-Z0-9]', '', w).lower()
+                       for w in words if any(c.isdigit() for c in w)]
         return "-".join(digit_words) if digit_words else ""
 
-    d["_model_key"] = [_extract_model_key(n) for n in d["NAME"].values]
-    d["_seo_model_key"] = [_extract_seo_model_key(n) for n in d["NAME"].values]
+    d["_freebie_key"] = [_extract_freebie_key(n) for n in d["NAME"].values]
+    d["_model_key"] = _name_words_s.map(_mk)
+    d["_seo_model_key"] = _name_words_s.map(_sk)
 
     flagged_indices: dict = {}
 
@@ -3989,6 +5322,8 @@ def check_duplicate_products(
                     + hash_d["_size_key"]
                     + "|"
                     + hash_d["_model_key"]  # Ensures different-named products with same image are not duped
+                    + "|"
+                    + hash_d["_freebie_key"]  # Products with different freebies are exempted
                 )
                 img_dup_mask = hash_d.duplicated(subset=["_img_key"], keep="first")
                 if img_dup_mask.any():
@@ -3998,6 +5333,8 @@ def check_duplicate_products(
                     _img_dups = hash_d[img_dup_mask]
                     for idx, k in zip(_img_dups.index, _img_dups["_img_key"]):
                         flagged_indices[idx] = f"Duplicate (same image): '{str(_first_img.get(k, ''))[:40]}'"
+    if _progress_callback:
+        _progress_callback("image duplicate keys complete")
 
     d["_text_key"] = (
         d["_seller_lower"]
@@ -4009,6 +5346,8 @@ def check_duplicate_products(
         + d["_color_key"]
         + "|"
         + d["_size_key"]
+        + "|"
+        + d["_freebie_key"]
     )
     text_dup_mask = d.duplicated(subset=["_text_key"], keep="first")
     if text_dup_mask.any():
@@ -4017,6 +5356,8 @@ def check_duplicate_products(
         for idx, k in zip(_txt_dups.index, _txt_dups["_text_key"]):
             if idx not in flagged_indices: 
                 flagged_indices[idx] = f"Duplicate: '{str(_first_text.get(k, ''))[:40]}'"
+    if _progress_callback:
+        _progress_callback("exact text duplicate keys complete")
 
 
     # _seo_model_key already computed above — digits only, empty string when no model number
@@ -4030,6 +5371,8 @@ def check_duplicate_products(
         + d["_color_key"]
         + "|"
         + d["_size_key"]
+        + "|"
+        + d["_freebie_key"]
     )
 
     # SEO dup check only fires when a real digit-based model number was found.
@@ -4044,7 +5387,36 @@ def check_duplicate_products(
         for idx, k in zip(_seo_dups.index, _seo_dups["_seo_key"]):
             if idx not in flagged_indices: 
                 flagged_indices[idx] = f"Duplicate (SEO variant): '{str(_first_seo.get(k, ''))[:40]}'"
+    if _progress_callback:
+        _progress_callback("SEO duplicate keys complete")
 
+    # ── Ring-seller strict duplicate check ───────────────────────────────────
+    # Ring sellers are handled with a stricter exact composite key. The old
+    # fuzzy all-pairs comparison was O(n²) and could dominate large uploads.
+    if ring_sellers:
+        ring_lower = {k.lower(): v for k, v in ring_sellers.items()}
+        _seller_ring = d["_seller_lower"].map(ring_lower)
+        ring_mask = _seller_ring.notna()
+        if ring_mask.any():
+            ring_d = d[ring_mask].copy()
+            ring_d["_ring_id"] = _seller_ring[ring_mask]
+            ring_d["_ring_key"] = (
+                ring_d["_ring_id"].astype(str)
+                + "|" + ring_d["_brand_lower"]
+                + "|" + ring_d["_norm_name"]
+                + "|" + ring_d["_color_key"]
+                + "|" + ring_d["_size_key"]
+                + "|" + ring_d["_model_key"]
+                + "|" + ring_d["_freebie_key"]
+            )
+            ring_dup_mask = ring_d.duplicated(subset=["_ring_key"], keep="first")
+            if ring_dup_mask.any():
+                _first_ring = ring_d.drop_duplicates("_ring_key", keep="first").set_index("_ring_key")["NAME"].to_dict()
+                for idx, key in zip(ring_d[ring_dup_mask].index, ring_d.loc[ring_dup_mask, "_ring_key"]):
+                    if idx not in flagged_indices:
+                        flagged_indices[idx] = f"Duplicate (strict ring seller): '{str(_first_ring.get(key, ''))[:40]}'"
+    if _progress_callback:
+        _progress_callback("strict ring-seller keys complete")
 
     if not flagged_indices:
         return pd.DataFrame(columns=data.columns)
@@ -4060,6 +5432,22 @@ def check_duplicate_products(
             _out["PRODUCT_SET_SID"].astype(str).str.strip().isin(_subset_sids)
         ]
     return _out
+
+
+def check_ring_seller_duplicates(
+    data: pd.DataFrame,
+    ring_sellers: dict = None,
+    full_data: pd.DataFrame = None,
+    **kwargs,
+) -> pd.DataFrame:
+    """Convenience wrapper delegating to check_duplicate_products."""
+    return check_duplicate_products(
+        data=data,
+        ring_sellers=ring_sellers,
+        full_data=full_data,
+        **kwargs,
+    )
+
 
 
 if _reg is not None:
@@ -4086,11 +5474,15 @@ if _reg is not None:
             "check_wrong_variation": check_wrong_variation,
             "check_generic_with_brand_in_name": check_generic_with_brand_in_name,
             "check_missing_color": check_missing_color,
+            "check_color_title_mismatch": check_color_title_mismatch,
             "check_weight_volume_in_name": check_weight_volume_in_name,
             "check_incomplete_smartphone_name": check_incomplete_smartphone_name,
             "check_specs_inconsistency": check_specs_inconsistency,
             "check_duplicate_products": check_duplicate_products,
+            "check_ring_seller_duplicates": check_ring_seller_duplicates,
             "check_fda": check_fda,
+            "check_refurbished_products": check_refurbished_products,
+            "check_out_of_market_devices": check_out_of_market_devices,
         }
     )
 
@@ -4105,6 +5497,7 @@ def validate_products(
     on_progress: Optional[callable] = None,
     full_batch: Optional[pd.DataFrame] = None,
 ):
+    _pipeline_started = time.perf_counter()
     data = data.copy()
     # ROW_LEVEL_VALIDATORS map a check's result back onto `data` by index label,
     # which is only meaningful when labels are unique (a concat of per-file
@@ -4112,6 +5505,23 @@ def validate_products(
     if not data.index.is_unique:
         data = data.reset_index(drop=True)
     data["PRODUCT_SET_SID"] = data["PRODUCT_SET_SID"].astype(str).str.strip()
+
+    # Build the review/validation lookup maps once per upload instead of
+    # repeatedly scanning the full frame for each SID or seller. Validators
+    # and the iframe can reuse these maps without changing verdict semantics.
+    _lookup_source = full_batch if isinstance(full_batch, pd.DataFrame) and not full_batch.empty else data
+    # The review UI can build its detail maps after validation.  Materialising
+    # every row with ``to_dict('records')`` and grouping every seller here was
+    # a large, repeated cost for each validation chunk, while none of those
+    # maps are read by the validators themselves.
+    st.session_state["_validation_lookup_maps"] = {
+        "sid_to_report": {},
+        "sid_to_flags": {},
+        "sid_to_comment": {},
+        "url_to_phash": dict(st.session_state.get("_image_phash_by_url", {})),
+        "phash_to_sids": {},
+        "seller_to_sids": {},
+    }
 
     if "_name_lower" not in data.columns:
         data["_name_lower"] = data["NAME"].astype(str).str.lower().fillna("")
@@ -4129,6 +5539,8 @@ def validate_products(
         data["_name_norm"] = _normalize_series(data["NAME"])
     if "_seller_norm" not in data.columns:
         data["_seller_norm"] = _normalize_series(data["SELLER_NAME"])
+    if "CATEGORY_CODE" not in data.columns:
+        data["CATEGORY_CODE"] = ""
     if "_cat_clean" not in data.columns:
         data["_cat_clean"] = data["CATEGORY_CODE"].apply(clean_category_code)
     if "_sid_clean" not in data.columns:
@@ -4136,6 +5548,7 @@ def validate_products(
     
     if "_norm_name" not in data.columns:
         data["_norm_name"] = _normalize_series(data["NAME"])
+    st.session_state.setdefault("validation_stage_timings", {})["Read and normalize"] = round(time.perf_counter() - _pipeline_started, 3)
 
     validations = [
         (
@@ -4159,6 +5572,7 @@ def validate_products(
                 "code_to_path": support_files.get("code_to_path", {}),
             },
         ),
+
         (
             "Suspected Fake product",
             check_suspected_fake_products,
@@ -4171,11 +5585,22 @@ def validate_products(
             },
         ),
         (
+            "Out of market devices",
+            check_out_of_market_devices,
+            {"code_to_path": support_files.get("code_to_path", {})},
+        ),
+        (
+            "Refurbished products rule",
+            check_refurbished_products,
+            {"code_to_path": support_files.get("code_to_path", {})},
+        ),
+        (
             "Seller Not approved to sell Refurb",
             check_refurb_seller_approval,
             {
                 "refurb_data": support_files.get("refurb_data", {}),
                 "country_code": country_validator.code,
+                "code_to_path": support_files.get("code_to_path", {}),
             },
         ),
         (
@@ -4199,6 +5624,15 @@ def validate_products(
                 "books_data": support_files.get("books_data", {}),
                 "country_code": country_validator.code,
                 "book_category_codes": support_files.get("book_category_codes", []),
+            },
+        ),
+        (
+            "Seller Not Approved to Sell Alcohol",
+            check_seller_approved_for_alcohol,
+            {
+                "alcohol_data": support_files.get("alcohol_data", {}),
+                "country_code": country_validator.code,
+                "code_to_path": support_files.get("code_to_path", {}),
             },
         ),
         (
@@ -4243,6 +5677,7 @@ def validate_products(
             {
                 "jerseys_data": support_files.get("jerseys_data", {}),
                 "country_code": country_validator.code,
+                "code_to_path": support_files.get("code_to_path", {}),
             },
         ),
         (
@@ -4330,6 +5765,13 @@ def validate_products(
             },
         ),
         (
+            "Color Mismatch: Title vs COLOR Column",
+            check_color_title_mismatch,
+            {
+                "color_categories": support_files.get("color_categories", []),
+            },
+        ),
+        (
             "Missing Weight/Volume",
             check_weight_volume_in_name,
             {"weight_category_codes": support_files.get("weight_category_codes", [])},
@@ -4361,13 +5803,20 @@ def validate_products(
                 # The whole upload, so a duplicate split across the ZIP and the
                 # other file is still seen. None when this is the only pass.
                 "full_data": full_batch,
+                "ring_sellers": (
+                    support_files.get("ring_sellers", {})
+                    if country_validator.code == "KE"
+                    else None
+                ),
             },
         ),
+
         ("Image Stretched", check_image_stretched, {}),
         ("Image Blurry", check_image_blurry, {}),
         ("Image Mismatch", check_image_mismatch, {}),
         ("Image Infringing", check_image_infringing, {}),
         ("Image Too Many things displayed", check_image_too_many_things, {}),
+
         (
             "Discount too high",
             check_wrong_price,
@@ -4379,7 +5828,14 @@ def validate_products(
             {"country_code": country_validator.code},
         ),
         ("ALL CAPS Product Name", check_all_caps_name, {}),
-        ("Product Name Too Short", check_name_too_short, {}),
+        (
+            "Product Name Too Short",
+            check_name_too_short,
+            {
+                "code_to_path": support_files.get("code_to_path", {}),
+                "book_category_codes": support_files.get("book_category_codes", []),
+            },
+        ),
         ("Variation Name Mismatch", check_variation_name_consistency_polars, {}),
     ]
 
@@ -4397,9 +5853,29 @@ def validate_products(
         ]
     if country_validator.code in ("KE", "UG", "GH", "SN", "CI", "EG", "MA"):
         validations += [("Powerbank Not Authorized", check_generic_powerbanks, {})]
+    if country_validator.code in ("KE", "UG"):
+        validations.append(("Animal Health - Banned Products", check_animal_health_banned_products, {}))
+        validations.append(("Animal Health - Prohibited Products", check_animal_health_prohibited_products, {}))
+        validations.append(("Animal Health - Banned Category", check_animal_health_banned_category, {}))
+        validations.append(("Animal Health - Prohibited Category", check_animal_health_prohibited_category, {}))
+    # Invalid brand names are a global validation. Placeholder/category values
+    # such as "Other" must be rejected consistently in every marketplace.
+    validations.append(("Invalid Brand Name", check_invalid_brand_name, {"code_to_path": support_files.get("code_to_path", {})}))
+
     if country_validator.code == "KE":
         validations.append(("KEBS Banned Products", check_kebs_banned_products, {}))
         validations.append(("KEBS FDA", check_kebs_fda, {}))
+        # Evasion check: pseudo-brand + restricted product-line in title — KE only
+        # (signatures sourced exclusively from KE restricted brands catalog)
+        validations.append((
+            "Potential Restricted Brand",
+            check_potential_restricted_brand,
+            {
+                "country_rules": support_files.get("restricted_brands_all", {}).get(country_validator.country, []),
+                "code_to_path": support_files.get("code_to_path", {}),
+            },
+        ))
+
     if country_validator.code == "MA":
         _ma = load_morocco_qc_rules()
         validations = [v for v in validations if v[0] != "Restricted brands"]
@@ -4423,6 +5899,36 @@ def validate_products(
         validations += _general_validators(support_files, country_validator.code)
     except Exception:
         logger.exception("general_rules failed to load — its rules are skipped")
+
+    # Build the learned URL/pHash lookup once for this upload. Both the
+    # fingerprint validator and report derivation reuse this immutable map;
+    # rebuilding it for every chunk/pass made large catalogs look like a
+    # second validation run.
+    try:
+        from learned_rules import RULES_PATH as _learned_rules_path
+        _learned_rules_mtime = _learned_rules_path.stat().st_mtime_ns
+    except OSError:
+        _learned_rules_mtime = 0
+    _learned_map_cache = st.session_state.get("_learned_image_rule_map_cache")
+    if not isinstance(_learned_map_cache, dict) or _learned_map_cache.get("mtime") != _learned_rules_mtime:
+        _learned_map_cache = {
+            "mtime": _learned_rules_mtime,
+            "map": merge_learned_image_rules({}),
+        }
+        st.session_state["_learned_image_rule_map_cache"] = _learned_map_cache
+    _learned_image_rule_map = _learned_map_cache.get("map", {})
+
+    # Fingerprint check runs LAST so it only touches products that cleared every
+    # other check. It is also in EXPENSIVE_VALIDATORS so already-rejected SIDs
+    # are filtered out before the URL/hash lookup loop runs.
+    validations.append((
+        "Poor images - Blocked Fingerprint",
+        check_blocked_image_fingerprints,
+        {
+            "blocked_map": _learned_image_rule_map,
+            "country_code": country_validator.code,
+        },
+    ))
 
     results = {}
     rejected_sids: set = set()
@@ -4452,7 +5958,7 @@ def validate_products(
         "colors.txt", "color_cats.txt", "brands.txt", "blacklisted.txt",
         "Books_sellers.xlsx", "Books_cat.txt", "Jersey_validation.xlsx",
         "Sneakers_Cat.txt", "Sneakers_Sensitive.txt", "Fashion_cat.txt",
-        "fashion brands.xlsx", "duplicate_exempt.txt", "unnecessary.txt",
+        "fashion brands.xlsx", "duplicate_exempt.txt", "ring_sellers.xlsx", "unnecessary.txt",
         "variation.txt", "weight.txt", "smartphones.txt", "warranty.txt",
         "sensitive_words.txt", "category_qc_weighted.json",
         "Nigeria_QC_Rules.xlsx", "Morocco_rules.xlsx", "ghana_rules.py",
@@ -4466,7 +5972,7 @@ def validate_products(
     EXPENSIVE_VALIDATORS = {
         "Image Stretched", "Image Blurry", "Image Mismatch", "Image Infringing",
         "Image Too Many things displayed", "Duplicate product", "Wrong Category",
-        "Variation Name Mismatch"
+        "Variation Name Mismatch",
     }
     # Validators whose verdict is per-ROW, not per-PRODUCT_SET_SID. The normal
     # path below re-selects every row sharing a flagged SID (so a check can
@@ -4479,54 +5985,30 @@ def validate_products(
     _skip_set = {s.lower() for s in (skip_validators or [])}
     if not data_has_warranty_cols:
         _skip_set.add("product warranty")
-    # Build the image dimension/hash cache HERE, on the main thread, and hand it
-    # to the image validators. _fetch_all_image_dimensions reads the uploaded ZIP
-    # out of st.session_state, which is unreachable from a worker thread — called
-    # from inside run_batch it saw an empty store and silently skipped every
-    # ZIP-sourced image. Doing it once up front also stops Stretched and Blurry
-    # each triggering their own network pass.
-    _image_validators = {check_image_stretched, check_image_blurry}
-    _needs_image_cache = any(
-        v[0].lower() not in _skip_set
-        and not country_validator.should_skip_validation(v[0])
-        and v[1] in _image_validators
-        for v in validations
-    )
-    _shared_image_cache = None
-    if _needs_image_cache:
-        try:
-            _shared_image_cache = _fetch_all_image_dimensions(data)
-        except Exception as _img_err:
-            logger.warning("Image dimension prefetch failed: %s", _img_err)
-    if _shared_image_cache:
-        validations = [
-            (name, func, ({**kw, "_image_cache": _shared_image_cache} if func in _image_validators else kw))
-            for name, func, kw in validations
-        ]
-
-    # Rules from general_rules.py are never skipped by the prefetch skip list.
-    #
-    # That list is keyed on FLAG name, and the hand-written category rules
-    # deliberately file under the built-in "Wrong Category" flag so they land in
-    # the same QC bucket. The ZIP ships a Category_Check_Status column, which
-    # puts "Wrong Category" in the skip set — so "the ZIP already ran its
-    # category check" silently disabled every rule in general_rules.py on
-    # exactly the batches they exist for. The Titan Gel / DVD / Small Appliances
-    # rules only ever ran when no ZIP was loaded.
-    #
-    # These rules are cheap string and regex work on columns already in memory,
-    # and their entire purpose is to catch verdicts the ZIP's AI got wrong, so
-    # there is nothing to save by trusting the ZIP here.
+    # Image preparation is deliberately deferred until after the cheap text and
+    # category stage below.  Prefetching every image before those checks meant
+    # a large upload downloaded and hashed products that had already been
+    # rejected, which made the initial validation appear stuck at preparation.
     def _skipped(name: str, func) -> bool:
-        if getattr(func, "_rule_id", ""):
+        if getattr(func, "_rule_id", "") or func is check_blocked_image_fingerprints:
             return country_validator.should_skip_validation(name)
         return name.lower() in _skip_set or country_validator.should_skip_validation(name)
+
+    _image_validators = {check_image_stretched, check_image_blurry, check_blocked_image_fingerprints}
+    _shared_image_cache = None
 
     total_tasks = len([v for v in validations if not _skipped(v[0], v[1])])
     processed_count = 0
     restricted_keys = {}
     validation_errors = []
+    evaluated_sids_by_flag = {}
+    validation_timings = {}
     _last_progress_t = 0.0
+
+    # Duplicate detection is batch-wide, but it is deferred until after cheap
+    # checks so a clearly rejected upload does not spend time building duplicate
+    # groups before its primary validation results are available.
+    _duplicate_precomputed = None
 
     def _emit_progress(name: str, i: int, total: int):
         nonlocal _last_progress_t
@@ -4562,6 +6044,7 @@ def validate_products(
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=_val_workers) as executor:
             future_to_name = {}
+            future_started = {}
             for name, func, kwargs in v_list:
                 if _skipped(name, func):
                     continue
@@ -4575,6 +6058,10 @@ def validate_products(
                         processed_count += 1
                         _emit_progress(name, processed_count, total_tasks)
                         continue
+
+                evaluated_sids_by_flag[name] = set(
+                    working_data["PRODUCT_SET_SID"].astype(str).str.strip()
+                ) if "PRODUCT_SET_SID" in working_data.columns else set()
 
                 ckwargs = {"data": working_data, **kwargs}
                 # Empty for the built-in checks, so their cache keys are
@@ -4597,10 +6084,17 @@ def validate_products(
                 cache_path = flag_cache_path(
                     name, digests, country_validator.code, _rules_sig, _key_extra,
                 )
-                future_to_name[executor.submit(run_cached_check, func, cache_path, ckwargs)] = name
+                _curr_ctx = get_script_run_ctx() if get_script_run_ctx else None
+                if name == "Duplicate product" and _duplicate_precomputed is not None:
+                    _future = executor.submit(lambda _result=_duplicate_precomputed: _result)
+                else:
+                    _future = executor.submit(_run_with_ctx, _curr_ctx, run_cached_check, func, cache_path, ckwargs)
+                future_to_name[_future] = name
+                future_started[_future] = time.perf_counter()
 
             for future in concurrent.futures.as_completed(future_to_name):
                 name = future_to_name[future]
+                validation_timings.setdefault(name, []).append(time.perf_counter() - future_started.get(future, time.perf_counter()))
                 processed_count += 1
                 _emit_progress(name, processed_count, total_tasks)
                 try:
@@ -4619,7 +6113,10 @@ def validate_products(
 
                         _sids = set(res["PRODUCT_SET_SID"].unique())
                         _expanded = set()
-                        for _s in _sids: _expanded.update(dup_groups.get(_s, [_s]))
+                        if name == "Duplicate product":
+                            _expanded = _sids
+                        else:
+                            for _s in _sids: _expanded.update(dup_groups.get(_s, [_s]))
 
                         if name in ROW_LEVEL_VALIDATORS:
                             # Keep exactly the rows the check matched. No SID
@@ -4640,6 +6137,21 @@ def validate_products(
                             if "Reason" in res.columns:
                                 _r = res.set_index("PRODUCT_SET_SID")["Reason"].to_dict()
                                 final_res["Reason"] = final_res["PRODUCT_SET_SID"].astype(str).map(_r)
+                            # Propagate _blocked_flag so check_blocked_image_fingerprints
+                            # results survive the rebuild from `data` and the post-
+                            # processing guard at the end of run_batch can read it.
+                            if "_blocked_flag" in res.columns:
+                                _bf = res.set_index("PRODUCT_SET_SID")["_blocked_flag"].to_dict()
+                                final_res["_blocked_flag"] = final_res["PRODUCT_SET_SID"].astype(str).map(_bf)
+                            if "_blocked_source" in res.columns:
+                                _bs = res.set_index("PRODUCT_SET_SID")["_blocked_source"].to_dict()
+                                final_res["_blocked_source"] = final_res["PRODUCT_SET_SID"].astype(str).map(_bs)
+                            if "_blocked_rule_url" in res.columns:
+                                _bru = res.set_index("PRODUCT_SET_SID")["_blocked_rule_url"].to_dict()
+                                final_res["_blocked_rule_url"] = final_res["PRODUCT_SET_SID"].astype(str).map(_bru)
+                            if "_blocked_rule_phash" in res.columns:
+                                _brp = res.set_index("PRODUCT_SET_SID")["_blocked_rule_phash"].to_dict()
+                                final_res["_blocked_rule_phash"] = final_res["PRODUCT_SET_SID"].astype(str).map(_brp)
 
                         # Merge, not overwrite. Two checks can share a flag —
                         # a general rule filed under "Wrong Category" runs
@@ -4659,13 +6171,196 @@ def validate_products(
                 except Exception as e:
                     logger.error(f"Validation error in '{name}': {e}")
                     validation_errors.append((name, str(e)))
-        return batch_results
+        # Futures complete in timing order, but report construction must stay
+        # deterministic. Restore the declared validator order before the
+        # caller merges cheap/expensive stages and chunk results.
+        return {
+            name: batch_results.get(name, pd.DataFrame(columns=data.columns))
+            for name, _func, _kwargs in v_list
+            if name in batch_results
+        }
 
     cheap_v = [v for v in validations if v[0] not in EXPENSIVE_VALIDATORS]
-    expensive_v = [v for v in validations if v[0] in EXPENSIVE_VALIDATORS]
 
+    _validator_stage_started = time.perf_counter()
     results.update(run_batch(cheap_v, data))
+
+    def _prepare_duplicate_precomputed():
+        """Build the batch-wide duplicate result after image hashes are ready."""
+        nonlocal _duplicate_precomputed
+        _duplicate_source = full_batch if full_batch is not None else data
+        _duplicate_rows = data
+        # A product already rejected by a cheap validator cannot improve the
+        # final status of a surviving product. Excluding those SIDs keeps the
+        # expensive duplicate grouping focused on candidates while retaining
+        # cross-file duplicate detection among the remaining products.
+        if rejected_sids and isinstance(_duplicate_source, pd.DataFrame) and "PRODUCT_SET_SID" in _duplicate_source.columns:
+            _duplicate_source = _duplicate_source[
+                ~_duplicate_source["PRODUCT_SET_SID"].astype(str).isin(rejected_sids)
+            ]
+            _duplicate_rows = data[
+                ~data["PRODUCT_SET_SID"].astype(str).isin(rejected_sids)
+            ]
+        if _duplicate_source.empty or _duplicate_rows.empty:
+            return
+        try:
+            _duplicate_batch_sig = df_hash(_duplicate_source)
+        except Exception:
+            _duplicate_batch_sig = f"rows-{len(_duplicate_source)}"
+        # Bump this when the duplicate stage's prerequisites change. The v2
+        # key prevents an older cache entry (created before image preparation)
+        # from hiding image-based duplicates.
+        _duplicate_cache_key = f"dup-v3:{_duplicate_batch_sig}:{len(_duplicate_source)}"
+        _duplicate_cache = st.session_state.setdefault("_duplicate_validation_cache", {})
+        _duplicate_spec = next((item for item in validations if item[0] == "Duplicate product"), None)
+        if not _duplicate_spec or _skipped(_duplicate_spec[0], _duplicate_spec[1]):
+            return
+        _duplicate_precomputed = _duplicate_cache.get(_duplicate_cache_key)
+        if _duplicate_precomputed is not None:
+            return
+        _duplicate_started = time.perf_counter()
+        _duplicate_name, _duplicate_func, _duplicate_kwargs = _duplicate_spec
+
+        def _duplicate_detail_progress(_stage):
+            st.session_state["duplicate_progress_detail"] = str(_stage)
+            if on_progress:
+                on_progress(f"Duplicate product · {_stage}", processed_count, total_tasks)
+
+        _duplicate_call_kwargs = dict(_duplicate_kwargs)
+        _duplicate_call_kwargs["full_data"] = _duplicate_source
+        _duplicate_precomputed = _duplicate_func(
+            _duplicate_rows,
+            **_duplicate_call_kwargs,
+            _progress_callback=_duplicate_detail_progress,
+        )
+        _duplicate_cache[_duplicate_cache_key] = _duplicate_precomputed
+        while len(_duplicate_cache) > 4:
+            _duplicate_cache.pop(next(iter(_duplicate_cache)))
+        validation_timings.setdefault("Duplicate product", []).append(time.perf_counter() - _duplicate_started)
+
+    # Only now prepare image dimensions and pHashes, and only for products that
+    # survived the cheap stage. This preserves the same image verdicts while
+    # avoiding network/decode work for products already rejected by text,
+    # category, seller, or brand rules.
+    _needs_image_cache = any(
+        not _skipped(v[0], v[1]) and v[1] in _image_validators
+        for v in validations
+    )
+    if _needs_image_cache:
+        _image_stage_started = time.perf_counter()
+        try:
+            _image_candidates = data
+            if rejected_sids and "PRODUCT_SET_SID" in data.columns:
+                _image_candidates = data[
+                    ~data["PRODUCT_SET_SID"].astype(str).isin(rejected_sids)
+                ]
+
+            def _image_progress_detail(_stage):
+                st.session_state["image_validation_progress_detail"] = str(_stage)
+                if on_progress:
+                    on_progress(f"Image preparation · {_stage}", 0, 1)
+
+            _shared_image_cache = _fetch_all_image_dimensions(
+                _image_candidates, progress_callback=_image_progress_detail
+            )
+        except Exception as _img_err:
+            logger.warning("Image dimension prefetch failed: %s", _img_err)
+        st.session_state.setdefault("validation_stage_timings", {})["Image validation setup"] = round(time.perf_counter() - _image_stage_started, 3)
+    if _shared_image_cache:
+        validations = [
+            (name, func, ({**kw, "_image_cache": _shared_image_cache} if func in _image_validators else kw))
+            for name, func, kw in validations
+        ]
+
+    # Duplicate image keys depend on the same pHash cache as image validators.
+    # Run this after image preparation so moving the duplicate stage later does
+    # not silently lose image-based duplicate matches.
+    _prepare_duplicate_precomputed()
+
+    expensive_v = [v for v in validations if v[0] in EXPENSIVE_VALIDATORS]
     results.update(run_batch(expensive_v, data))
+    st.session_state.setdefault("validation_stage_timings", {})["Text/category validation"] = round(time.perf_counter() - _validator_stage_started, 3)
+    try:
+        st.session_state["validation_timings"] = {
+            name: {"seconds": round(sum(values), 3), "runs": len(values)}
+            for name, values in validation_timings.items()
+        }
+    except Exception:
+        pass
+
+    # ── Post-process Blocked Image Fingerprint results ──────────────────────
+    # check_blocked_image_fingerprints stores the real FLAG in _blocked_flag so
+    # each row gets recorded under the correct validation key (Poor images,
+    # Restricted brands, etc.) and inherits all downstream handling for that
+    # flag — severity, cascade, comment formatting — automatically.
+    _bif_res = results.pop("Poor images - Blocked Fingerprint", None)
+    if _bif_res is None:
+        _bif_res = results.pop("Blocked Image Fingerprint", None)
+    if _bif_res is not None and not _bif_res.empty and "_blocked_flag" in _bif_res.columns:
+        for _real_flag, _grp in _bif_res.groupby("_blocked_flag"):
+            _grp = _grp.drop(columns=["_blocked_flag"], errors="ignore").copy()
+            _prev = results.get(_real_flag)
+            if _prev is not None and not _prev.empty:
+                _grp = pd.concat([_prev, _grp], ignore_index=True)
+                if "PRODUCT_SET_SID" in _grp.columns:
+                    _grp = _grp.drop_duplicates(subset=["PRODUCT_SET_SID"])
+            results[_real_flag] = _grp
+            rejected_sids.update(_grp["PRODUCT_SET_SID"].astype(str).str.strip().unique())
+
+
+    # Post-process Brand Image Mismatch: Apple detected on cases/covers accessories for phones/tablets/laptops
+    # is overturned and auto-approved.
+    if "Brand Image Mismatch" in results and not results["Brand Image Mismatch"].empty:
+        bim = results["Brand Image Mismatch"]
+        _APPLE_ACC_RE = re.compile(
+            r"\b(?:case|cases|cover|covers|sleeve|sleeves|pouch|pouches|screen.?protector|housing|skin)\b",
+            re.IGNORECASE,
+        )
+        _det_col = "Brand_Detected_On_Product" if "Brand_Detected_On_Product" in bim.columns else None
+        _reason_col = "Brand_Image_Check_Reason" if "Brand_Image_Check_Reason" in bim.columns else None
+        _cd_col = "Comment_Detail" if "Comment_Detail" in bim.columns else None
+
+        _det_is_apple = pd.Series(False, index=bim.index)
+        if _det_col:
+            _det_is_apple |= bim[_det_col].fillna("").astype(str).str.strip().str.lower().eq("apple")
+        if _reason_col:
+            _det_is_apple |= bim[_reason_col].fillna("").astype(str).str.lower().str.contains(r"visible on the product is ['\"]?apple['\"]?", regex=True, na=False)
+        if _cd_col:
+            _det_is_apple |= bim[_cd_col].fillna("").astype(str).str.lower().str.contains(r"image shows ['\"]?apple['\"]?|restricted brand ['\"]?apple['\"]?", regex=True, na=False)
+
+        _cat_col = "CATEGORY" if "CATEGORY" in bim.columns else None
+        _name_col = "NAME" if "NAME" in bim.columns else None
+        _is_acc = pd.Series(False, index=bim.index)
+        if _cat_col:
+            _is_acc |= bim[_cat_col].fillna("").astype(str).str.contains(_APPLE_ACC_RE, na=False)
+        if _name_col:
+            _is_acc |= bim[_name_col].fillna("").astype(str).str.contains(_APPLE_ACC_RE, na=False)
+
+        overturn_mask = _det_is_apple & _is_acc
+        if overturn_mask.any():
+            overturned = bim[overturn_mask].copy()
+            results["Brand Image Mismatch"] = bim[~overturn_mask].copy()
+            overturned["Comment_Detail"] = "Rejection overturned: Apple brand detected on cases/covers accessory image -- product approved."
+            results["Brand Image - Apple Acc Overturned"] = pd.concat(
+                [results.get("Brand Image - Apple Acc Overturned", pd.DataFrame()), overturned],
+                ignore_index=True
+            ).drop_duplicates(subset=["PRODUCT_SET_SID"])
+
+    # Drain Apple-accessories overturn staging (set by check_brand_image_mismatch).
+    if _APPLE_ACC_OVERTURNED_STAGING:
+        try:
+            _ov_sids = list(_APPLE_ACC_OVERTURNED_STAGING.keys())
+            _ov_df = data[data["PRODUCT_SET_SID"].astype(str).isin(_ov_sids)].copy()
+            if not _ov_df.empty:
+                _cd_map = {sid: r.get("Comment_Detail", "") for sid, r in _APPLE_ACC_OVERTURNED_STAGING.items()}
+                _ov_df["Comment_Detail"] = _ov_df["PRODUCT_SET_SID"].astype(str).map(_cd_map).fillna("")
+                results["Brand Image - Apple Acc Overturned"] = _ov_df.drop_duplicates(subset=["PRODUCT_SET_SID"])
+        except Exception as _ov_err:
+            logger.warning("Could not drain Apple-acc overturn staging: %s", _ov_err)
+        finally:
+            _APPLE_ACC_OVERTURNED_STAGING.clear()
+
+
 
     # Drain the low-resolution advisory staged by check_image_blurry's worker
     # thread. We are back on the main thread here, so session_state writes stick.
@@ -4694,30 +6389,218 @@ def validate_products(
                 [results.get(fname, pd.DataFrame()), extra]
             ).drop_duplicates(subset=["PRODUCT_SET_SID"])
 
-    return derive_status_report(data, results, support_files, country_validator)
+    _learnable_flags = {
+        "Poor images", "Image Stretched", "Image Blurry", "Image Mismatch",
+        "Image Infringing", "Image Too Many things displayed",
+        "Restricted brands", "Suspected Fake product", "Prohibited products",
+        "FDA", "Brand Image Mismatch", "Counterfeit Sneakers",
+        "Suspected counterfeit Jerseys",
+    }
+
+    # JSON-learned matches are evidence for future runs, not a reason to keep
+    # themselves alive forever. If the underlying validator no longer rejects
+    # the image, discard the JSON-only result now; Excel rules remain intact.
+    for _self_healing_flag in _learnable_flags:
+        _self_healing_res = results.get(_self_healing_flag)
+        if not isinstance(_self_healing_res, pd.DataFrame) or _self_healing_res.empty:
+            continue
+        if "_blocked_source" not in _self_healing_res.columns:
+            continue
+        _source_json = _self_healing_res["_blocked_source"].astype(str).str.casefold().eq("json")
+        if not _source_json.any():
+            continue
+        _non_json_sids = set(
+            _self_healing_res.loc[~_source_json, "PRODUCT_SET_SID"].astype(str).str.strip()
+        )
+        _keep = (~_source_json) | _self_healing_res["PRODUCT_SET_SID"].astype(str).str.strip().isin(_non_json_sids)
+        results[_self_healing_flag] = _self_healing_res[_keep].copy()
+
+    # Stage confirmed validator findings. They are committed only when the
+    # user clicks Generate Reports, so a preview/re-run cannot teach the
+    # catalog before the result is final.
+    _learn_hashes = st.session_state.get("_image_phash_by_url", {})
+    _pending_learning = {}
+    for _learn_flag in _learnable_flags:
+        _learn_res = results.get(_learn_flag)
+        if not isinstance(_learn_res, pd.DataFrame):
+            continue
+        _learn_sids = (
+            _learn_res["PRODUCT_SET_SID"].astype(str).str.strip().unique()
+            if "PRODUCT_SET_SID" in _learn_res.columns else []
+        )
+        _learn_reason = str((support_files.get("flags_mapping", {}).get(_learn_flag) or {}).get("reason", ""))
+        _pending_learning[_learn_flag] = {
+            "sids": list(_learn_sids),
+            "evaluated_sids": list(evaluated_sids_by_flag.get(_learn_flag, [])),
+            "reason": _learn_reason,
+        }
+    st.session_state["_pending_validation_learning"] = {
+        "data": data,
+        "hash_by_url": _learn_hashes,
+        "flags": _pending_learning,
+    }
+    try:
+        _maps = st.session_state.get("_validation_lookup_maps", {})
+        _sid_flags, _sid_comments = {}, {}
+        for _flag_name, _flag_frame in results.items():
+            if not isinstance(_flag_frame, pd.DataFrame) or "PRODUCT_SET_SID" not in _flag_frame.columns:
+                continue
+            _flag_sid = _flag_frame["PRODUCT_SET_SID"].astype(str).str.strip()
+            _flag_comment_by_sid = {}
+            if "Comment_Detail" in _flag_frame.columns:
+                _flag_comment_by_sid = (
+                    pd.DataFrame({"_sid": _flag_sid, "_comment": _flag_frame["Comment_Detail"]})
+                    .drop_duplicates("_sid", keep="first")
+                    .set_index("_sid")["_comment"]
+                    .astype(str)
+                    .to_dict()
+                )
+            for _sid in _flag_sid.unique():
+                _sid_flags.setdefault(_sid, []).append(_flag_name)
+                _sid_comments.setdefault(_sid, []).append(_flag_comment_by_sid.get(_sid, ""))
+        _maps["sid_to_flags"] = _sid_flags
+        _maps["sid_to_comment"] = _sid_comments
+        _maps["phash_to_sids"] = {}
+        if "MAIN_IMAGE" in _lookup_source.columns:
+            for _, _lookup_row in _lookup_source[["PRODUCT_SET_SID", "MAIN_IMAGE"]].drop_duplicates().iterrows():
+                _phash = _maps.get("url_to_phash", {}).get(str(_lookup_row["MAIN_IMAGE"]).strip(), "")
+                if _phash:
+                    _maps["phash_to_sids"].setdefault(_phash, []).append(str(_lookup_row["PRODUCT_SET_SID"]).strip())
+        st.session_state["_validation_lookup_maps"] = _maps
+    except Exception:
+        logger.debug("Could not finalize validation lookup maps", exc_info=True)
+
+    _report_started = time.perf_counter()
+    _derived = derive_status_report(data, results, support_files, country_validator)
+    st.session_state.setdefault("validation_stage_timings", {})["Report generation"] = round(time.perf_counter() - _report_started, 3)
+    st.session_state.setdefault("validation_stage_timings", {})["Pipeline total"] = round(time.perf_counter() - _pipeline_started, 3)
+    return _derived
+
+
+def commit_pending_validation_learning():
+    """Commit staged validator findings after Generate Reports is clicked."""
+    pending = st.session_state.pop("_pending_validation_learning", None)
+    if not pending:
+        return 0
+    data = pending.get("data")
+    hash_by_url = pending.get("hash_by_url", {})
+    committed = 0
+    _new_rule_batches = []
+    for flag, item in pending.get("flags", {}).items():
+        try:
+            reconcile_image_rules(
+                data,
+                item.get("sids", []),
+                flag,
+                hash_by_url=hash_by_url,
+                evaluated_sids=item.get("evaluated_sids", []),
+            )
+            if item.get("sids"):
+                _new_rule_batches.append({
+                    "data": data,
+                    "sids": item.get("sids", []),
+                    "flag": flag,
+                    "reason": item.get("reason", ""),
+                    "source": "validation",
+                    "hash_by_url": hash_by_url,
+                })
+            committed += 1
+        except Exception:
+            logger.exception("Could not commit learned image rules for %s", flag)
+    if _new_rule_batches:
+        # The bulk writer filters URL/pHash/flag identities against the
+        # existing catalog and writes only new findings from this file once.
+        learn_image_rejections_bulk(_new_rule_batches)
+    st.session_state["_validation_learning_committed"] = True
+    return committed
 
 
 def derive_status_report(data, results, support_files, country_validator):
     flags_mapping = support_files.get("flags_mapping", {})
     target_lang = "fr" if country_validator.country == "Morocco" else "en"
-    
+
+    # Only products that were actually in the uploaded ZIP/QC file can be
+    # "overturned" — the system made a specific decision on them. Products
+    # that were never in the ZIP have no prior decision to overturn.
+    try:
+        _zip_idx = st.session_state.get("_zip_sid_index")
+        _zip_sids: set = set(_zip_idx.index.astype(str).str.strip()) if _zip_idx is not None else set()
+    except Exception:
+        _zip_sids = set()
+
+    # Check all products in the upload for matches against learned blocked image catalog
+    _blocked_img_matches = {}
+    _learned_display_matches = {}
+    _all_learned_matches = {}
+    try:
+        _bmap = st.session_state.get("_learned_image_rule_map_cache", {}).get("map")
+        if not isinstance(_bmap, dict):
+            _bmap = merge_learned_image_rules({})
+        _all_learned_matches = get_blocked_image_matches(data, _bmap)
+        # Keep the learned provenance visible for Uganda even when a
+        # restricted-image match is being used only for brand consistency.
+        _learned_display_matches = {
+            _sid: _match for _sid, _match in _all_learned_matches.items()
+            if _match.get("decision", "reject") == "reject"
+        }
+        if country_validator.code == "UG" and _learned_display_matches and "BRAND" in data.columns:
+            _brand_by_sid = dict(zip(
+                data["PRODUCT_SET_SID"].astype(str).str.strip(),
+                data["BRAND"].fillna("").astype(str).str.strip(),
+            ))
+            _learned_display_matches = {
+                _sid: _match for _sid, _match in _learned_display_matches.items()
+                if _match.get("flag") != "Restricted brands"
+                or not _learned_brands_agree(
+                    _brand_by_sid.get(str(_sid).strip(), ""),
+                    _match.get("brand", ""),
+                )
+            }
+        _blocked_img_matches = {
+            _sid: _match for _sid, _match in _all_learned_matches.items()
+            if _match.get("decision", "reject") == "reject"
+            and not (country_validator.code == "UG" and _match.get("flag") == "Restricted brands")
+        }
+        st.session_state["_learned_review_matches"] = {
+            _sid: _match for _sid, _match in _all_learned_matches.items()
+            if _match.get("decision") == "review"
+        }
+        _touch_key = tuple(sorted(str(_sid) for _sid in _all_learned_matches))
+        if _touch_key and st.session_state.get("_learned_match_touch_key") != _touch_key:
+            st.session_state["_learned_match_touch_key"] = _touch_key
+            try:
+                record_learned_image_matches_async(_all_learned_matches)
+            except Exception:
+                logger.debug("Could not update learned match timestamps", exc_info=True)
+    except Exception as _e:
+        logger.warning("Could not compute learned image matches in derive_status_report: %s", _e)
+
     rows = []
     processed_sids = set()
-    
+    # Collect overturned cases here so the targeted audit can surface them.
+    _overturned_for_audit: list = []
+
     p_sku_map = data.set_index("PRODUCT_SET_SID")["PARENTSKU"].to_dict() if "PARENTSKU" in data.columns else {}
     s_name_map = data.set_index("PRODUCT_SET_SID")["SELLER_NAME"].to_dict() if "SELLER_NAME" in data.columns else {}
     
     known_flags = [
-        "Wrong Category", "Restricted brands", "Suspected Fake product", 
-        "Seller Not approved to sell Refurb", "Product Warranty", "Seller Approve to sell books",
+        "Brand Image - Apple Acc Overturned",
+        "Refurbished Brand - Overturned",
+        "Color - Overturned",
+        "Wrong Category", "Restricted brands", "Potential Restricted Brand", "Suspected Fake product", 
+        "Out of market devices", "Seller Not approved to sell Refurb", "Product Warranty", "Seller Approve to sell books",
+        "Seller Not Approved to Sell Alcohol",
         "Seller Approved to Sell Perfume", "Perfume Tester", "Counterfeit Sneakers",
         "Suspected counterfeit Jerseys", "Prohibited products", "Unnecessary words in NAME",
         "Single-word NAME", "Generic BRAND Issues", "Fashion brand issues", "BRAND name repeated in NAME",
         "Wrong Variation", "Generic branded products with genuine brands", "Missing COLOR",
+        "Color Mismatch: Title vs COLOR Column",
         "Missing Weight/Volume", "Incomplete Smartphone Name", "Specs Inconsistency", "Duplicate product", "Discount too high",
         "Suspicious Discount", "NG - Gift Card Seller", "NG - TV Brand Seller", "NG - HP Toners Seller",
         "NG - Apple Seller", "NG - Xmas Tree Seller", "NG - Rice Brand Seller", "GH - Smart Glasses with Camera",
-        "MA - Marque Interdite", "Powerbank Not Authorized"
+        "MA - Marque Interdite", "Powerbank Not Authorized",
+        "Poor images", "Image Stretched", "Image Blurry", "Image Mismatch", "Image Infringing", "Image Too Many things displayed",
+        "Brand Image - Apple Acc Overturned"
     ]
     all_flags = known_flags + [f for f in results.keys() if f not in known_flags]
 
@@ -4772,7 +6655,54 @@ def derive_status_report(data, results, support_files, country_validator):
                 })
                 continue
 
+            _OVERTURNED_FLAGS = {
+                "Brand Image - Apple Acc Overturned": ("apple_acc", "Rejection overturned: Apple brand detected on cases/covers accessory image -- product approved."),
+                "Color - Overturned": ("color", "Rejection overturned: Color accepted -- product approved."),
+            }
+
+            if name in _OVERTURNED_FLAGS:
+                _ov_tag, _ov_default_cmt = _OVERTURNED_FLAGS[name]
+                _cmt = det_str or _ov_default_cmt
+                # Only flag as "Overturned" if this product was in the ZIP
+                # (i.e. the system originally made a decision on it).
+                # Products not in the ZIP are simply approved quietly.
+                _is_zip_product = (not _zip_sids) or (sid in _zip_sids)
+                if _is_zip_product:
+                    rows.append({
+                        "ProductSetSid": sid, "ParentSKU": p_sku_map.get(sid, ""),
+                        "Status": "Approved",
+                        "Reason": "",
+                        "Comment": _cmt,
+                        "FLAG": name,
+                        "SellerName": s_name_map.get(sid, ""), "CAT_MAX_PRICE": "",
+                        "zip_override": _ov_tag,
+                        "overturn_direction": "to_approval",
+                    })
+                    # Record for the targeted audit.
+                    _overturned_for_audit.append({
+                        "sid": sid,
+                        "flag": name,
+                        "tag": _ov_tag,
+                        "comment": _cmt,
+                        "seller": s_name_map.get(sid, ""),
+                    })
+                else:
+                    # Not a ZIP product — just mark approved without overturn badge.
+                    rows.append({
+                        "ProductSetSid": sid, "ParentSKU": p_sku_map.get(sid, ""),
+                        "Status": "Approved",
+                        "Reason": "", "Comment": _cmt,
+                        "FLAG": name, "SellerName": s_name_map.get(sid, ""), "CAT_MAX_PRICE": "",
+                    })
+                continue
+
             comment_str = det_str if len(det_str) > 60 else (f"{base_comment} ({det_str})" if det_str else base_comment)
+            if sid in _blocked_img_matches:
+                _bim = _blocked_img_matches[sid]
+                _match_note = f"Image fingerprint matched known blocked image ({_bim['brand']})" if _bim.get("brand") else "Image fingerprint matched known blocked image"
+                if "image fingerprint" not in comment_str.lower() and "known blocked image" not in comment_str.lower():
+                    comment_str = f"{comment_str} | {_match_note}"
+
             rows.append({
                 "ProductSetSid": sid, "ParentSKU": p_sku_map.get(sid, ""), "Status": "Rejected",
                 "Reason": row_reason if row_reason else rinfo["reason"], "Comment": comment_str,
@@ -4784,18 +6714,110 @@ def derive_status_report(data, results, support_files, country_validator):
     approved_sids = [s for s in all_sids if s not in processed_sids]
     
     for sid in approved_sids:
-        rows.append({
-            "ProductSetSid": sid, "ParentSKU": p_sku_map.get(sid, ""), "Status": "Approved",
-            "Reason": "", "Comment": "", "FLAG": "", "SellerName": s_name_map.get(sid, ""), "CAT_MAX_PRICE": ""
-        })
+        if sid in _blocked_img_matches:
+            _bim = _blocked_img_matches[sid]
+            _flag = _bim.get("flag", "Poor images")
+            _rinfo = flags_mapping.get(
+                _flag,
+                {"reason": "1000007 - Poor image quality", "en": "Poor quality image", "fr": "Image de mauvaise qualité", "ar": "صورة ذات جودة رديئة"}
+            )
+            _cmt = f"{_bim['detail']} (image fingerprint match)"
+            rows.append({
+                "ProductSetSid": sid, "ParentSKU": p_sku_map.get(sid, ""), "Status": "Rejected",
+                "Reason": _rinfo.get("reason", "1000007 - Poor image quality"),
+                "Comment": _cmt,
+                "FLAG": _flag, "SellerName": s_name_map.get(sid, ""), "CAT_MAX_PRICE": ""
+            })
+        else:
+            rows.append({
+                "ProductSetSid": sid, "ParentSKU": p_sku_map.get(sid, ""), "Status": "Approved",
+                "Reason": "", "Comment": "", "FLAG": "", "SellerName": s_name_map.get(sid, ""), "CAT_MAX_PRICE": ""
+            })
 
     final_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["ProductSetSid", "Status", "Reason", "Comment", "FLAG", "SellerName", "CAT_MAX_PRICE"])
+
+    # A learned image match is a rejection regardless of whether another
+    # validator matched this SID first. Make the learned issue the primary
+    # flag/reason while retaining the earlier validator's explanation.
+    if _blocked_img_matches and "ProductSetSid" in final_df.columns:
+        _report_sids = final_df["ProductSetSid"].astype(str).str.strip()
+        for _sid, _match in _blocked_img_matches.items():
+            _row_mask = _report_sids.eq(str(_sid).strip())
+            if not _row_mask.any():
+                continue
+            _learned_flag = _match.get("flag", "Poor images")
+            _learned_info = flags_mapping.get(
+                _learned_flag,
+                {"reason": "1000007 - Poor image quality"},
+            )
+            _learned_comment = f"{_match.get('detail', 'Image matched known blocked image.')} (image fingerprint match)"
+            _prior_row = final_df.loc[_row_mask].iloc[0]
+            _prior_flag = str(_prior_row.get("FLAG", "") or "").strip()
+            _prior_comment = str(_prior_row.get("Comment", "") or "").strip()
+            if _prior_flag and _prior_flag != _learned_flag and _prior_comment:
+                _learned_comment += f" | Other validation ({_prior_flag}): {_prior_comment}"
+            final_df.loc[_row_mask, "Comment"] = _learned_comment
+            final_df.loc[_row_mask, "Status"] = "Rejected"
+            final_df.loc[_row_mask, "FLAG"] = _learned_flag
+            final_df.loc[_row_mask, "Reason"] = _learned_info.get(
+                "reason", "1000007 - Poor image quality"
+            )
+
     final_df["PRODUCT_SET_SID"] = final_df["ProductSetSid"]
-    
+    # Display-only provenance used by the validation expanders. A true value
+    # means the product was rejected by an active learned JSON fingerprint.
+    final_df["Learned Match"] = final_df["ProductSetSid"].astype(str).str.strip().isin(
+        {str(_sid).strip() for _sid in _learned_display_matches}
+    )
+    final_df["Learned Match Method"] = final_df["ProductSetSid"].astype(str).str.strip().map(
+        {str(_sid).strip(): str(_match.get("match_method", "")) for _sid, _match in _learned_display_matches.items()}
+    ).fillna("")
+    final_df["Learned Match Distance"] = final_df["ProductSetSid"].astype(str).str.strip().map(
+        {str(_sid).strip(): _match.get("phash_distance") for _sid, _match in _learned_display_matches.items()}
+    )
+    final_df["Learned Rule URL"] = final_df["ProductSetSid"].astype(str).str.strip().map(
+        {str(_sid).strip(): str(_match.get("matched_rule_url", "") or "").strip() for _sid, _match in _learned_display_matches.items()}
+    ).fillna("")
+    final_df["Learned Rule pHash"] = final_df["ProductSetSid"].astype(str).str.strip().map(
+        {str(_sid).strip(): str(_match.get("matched_rule_phash", "") or "").strip() for _sid, _match in _learned_display_matches.items()}
+    ).fillna("")
+    final_df["Learned Confidence"] = final_df["ProductSetSid"].astype(str).str.strip().map(
+        {str(_sid).strip(): _match.get("confidence") for _sid, _match in _learned_display_matches.items()}
+    )
+    final_df["Learned Decision"] = final_df["ProductSetSid"].astype(str).str.strip().map(
+        {str(_sid).strip(): _match.get("decision", "reject") for _sid, _match in _learned_display_matches.items()}
+    ).fillna("")
+    _review_matches = {
+        str(_sid).strip(): _match
+        for _sid, _match in _all_learned_matches.items()
+        if _match.get("decision") == "review"
+    }
+    _review_match_sids = set(_review_matches)
+    final_df["Learned Review Match"] = final_df["ProductSetSid"].astype(str).str.strip().isin(
+        {str(_sid).strip() for _sid in _review_match_sids}
+    )
+    def _review_map(key, default=""):
+        _series = final_df["ProductSetSid"].astype(str).str.strip().map(
+            {sid: match.get(key, default) for sid, match in _review_matches.items()}
+        )
+        return _series if default is None else _series.fillna(default)
+    final_df["Learned Review Detail"] = _review_map("detail")
+    final_df["Learned Review Method"] = _review_map("match_method")
+    final_df["Learned Review Distance"] = _review_map("phash_distance", None)
+    final_df["Learned Review Brand"] = _review_map("brand")
+
     for _bool_col in ("Is_Zip", "Is_Manual"):
         if _bool_col not in final_df.columns:
             final_df[_bool_col] = False
-            
+
+    # Publish overturned cases so the targeted audit can surface them as
+    # False Rejections. This is written on every derive_status_report call
+    # so stale data from a previous batch never survives a re-run.
+    try:
+        st.session_state["_pipeline_overturned_cases"] = _overturned_for_audit
+    except Exception:
+        pass
+
     return country_validator.ensure_status_column(final_df), results
 
 
@@ -4805,6 +6827,7 @@ def cached_validate_products(
     _support_files: Dict,
     country_code: str,
     data_has_warranty_cols: bool,
+    learned_rules_revision: float = 0.0,
     skip_validators: Optional[List[str]] = None,
     _on_progress: Optional[callable] = None,
     _full_batch: Optional[pd.DataFrame] = None,
@@ -4829,7 +6852,118 @@ def cached_validate_products(
     )
 
 
+def validate_in_chunks(data, support_files, country_validator, data_has_warranty,
+                      *, cache_prefix, skip_validators=None, on_progress=None,
+                      full_batch=None, rules_revision=0.0, manifest=None,
+                      batch_prefix="batch", chunk_size=1000):
+    """Run validation in bounded SID chunks and checkpoint each completed chunk."""
+    if data is None or data.empty:
+        return pd.DataFrame(), {}
+    sids = data["PRODUCT_SET_SID"].astype(str).str.strip().drop_duplicates().tolist()
+    frames, result_parts = [], []
+    pending_flags = {}
+    aggregate_timings = {}
+    aggregate_stages = {}
+    if manifest is not None:
+        try:
+            if on_progress:
+                on_progress(f"Starting validation chunk {batch_prefix}…", 0, 1)
+            # Keep the normalized input available independently of validator
+            # artifacts so a restart does not need to rebuild the frame before
+            # resuming completed chunks.
+            _stage_path = manifest.get("stage_paths", {}).get("normalized")
+            if not _stage_path or not os.path.exists(_stage_path):
+                save_stage_frame(manifest, "normalized", data)
+            manifest["validation_name"] = "initial_validation"
+            manifest["row_count"] = int(len(data))
+            manifest["updated_at"] = datetime.now().isoformat()
+            from processing_automation import save_manifest as _save_validation_manifest
+            _save_validation_manifest(manifest)
+        except Exception:
+            logger.debug("Could not persist normalized stage artifact", exc_info=True)
+    pending_data = data
+    pending_hashes = st.session_state.get("_image_phash_by_url", {})
+    # Larger chunks reduce repeated validator setup and dataframe hashing for
+    # large uploads while retaining checkpoint recovery for smaller batches.
+    if len(sids) > 20_000 and chunk_size < 10_000:
+        chunk_size = 10_000
+    elif len(sids) > 5_000 and chunk_size < 5_000:
+        chunk_size = 5_000
+    total = max(1, (len(sids) + chunk_size - 1) // chunk_size)
+    done = completed_batches(manifest or {})
+    for index in range(total):
+        batch_id = f"{batch_prefix}-{index + 1}"
+        chunk_sids = set(sids[index * chunk_size:(index + 1) * chunk_size])
+        chunk = data[data["PRODUCT_SET_SID"].astype(str).str.strip().isin(chunk_sids)].copy()
+        # A manifest is only resumable when its completed artifact is loaded
+        # back into the merge. If the JSON says complete but a Parquet file is
+        # missing/corrupt, fall through and recompute that chunk safely.
+        if batch_id in done and manifest is not None:
+            saved = load_chunk_results(manifest, batch_id)
+            if saved is not None:
+                saved_report, saved_results = saved
+                frames.append(saved_report)
+                result_parts.append(saved_results)
+                # Rebuild staged learning candidates from the restored
+                # result frames as well; a process restart has no in-memory
+                # _pending_validation_learning state to reuse.
+                for _flag, _saved_frame in saved_results.items():
+                    if not isinstance(_saved_frame, pd.DataFrame) or _saved_frame.empty or "PRODUCT_SET_SID" not in _saved_frame.columns:
+                        continue
+                    _candidate = pending_flags.setdefault(_flag, {"sids": [], "evaluated_sids": [], "reason": ""})
+                    _candidate["sids"] = list(dict.fromkeys(_candidate["sids"] + _saved_frame["PRODUCT_SET_SID"].astype(str).str.strip().tolist()))
+                    _candidate["evaluated_sids"] = list(dict.fromkeys(_candidate["evaluated_sids"] + list(chunk_sids)))
+                continue
+        if manifest is not None:
+            mark_batch(manifest, batch_id, status="running", rows=len(chunk), index=index + 1, total=total)
+        try:
+            if on_progress:
+                on_progress(f"Preparing validation chunk {index + 1}/{total}", index, total)
+            fr_chunk, result_chunk = cached_validate_products(
+                f"{cache_prefix}|{batch_id}|{df_hash(chunk)}",
+                chunk, support_files, country_validator.code, data_has_warranty,
+                learned_rules_revision=rules_revision,
+                skip_validators=skip_validators,
+                _on_progress=on_progress,
+                _full_batch=full_batch,
+            )
+            for _v_name, _v_info in st.session_state.get("validation_timings", {}).items():
+                aggregate_timings.setdefault(_v_name, {"seconds": 0.0, "runs": 0})
+                aggregate_timings[_v_name]["seconds"] += float(_v_info.get("seconds", 0))
+                aggregate_timings[_v_name]["runs"] += int(_v_info.get("runs", 0))
+            for _stage_name, _stage_seconds in st.session_state.get("validation_stage_timings", {}).items():
+                aggregate_stages[_stage_name] = aggregate_stages.get(_stage_name, 0.0) + float(_stage_seconds)
+            frames.append(fr_chunk)
+            result_parts.append(result_chunk)
+            _pending = st.session_state.get("_pending_validation_learning", {})
+            for _flag, _item in (_pending.get("flags", {}) if isinstance(_pending, dict) else {}).items():
+                _existing = pending_flags.setdefault(_flag, {"sids": [], "evaluated_sids": [], "reason": _item.get("reason", "")})
+                _existing["sids"] = list(dict.fromkeys(_existing["sids"] + list(_item.get("sids", []))))
+                _existing["evaluated_sids"] = list(dict.fromkeys(_existing["evaluated_sids"] + list(_item.get("evaluated_sids", []))))
+            if manifest is not None:
+                save_chunk_results(manifest, batch_id, fr_chunk, result_chunk)
+                mark_batch(manifest, batch_id, status="complete", rows=len(chunk))
+        except Exception:
+            if manifest is not None:
+                mark_batch(manifest, batch_id, status="failed", rows=len(chunk))
+            raise
+    combined = {}
+    for part in result_parts:
+        for flag, frame in part.items():
+            combined[flag] = frame if flag not in combined else pd.concat([combined[flag], frame], ignore_index=True)
+    st.session_state["_pending_validation_learning"] = {"data": pending_data, "hash_by_url": pending_hashes, "flags": pending_flags}
+    st.session_state["validation_timings"] = {
+        _name: {"seconds": round(_info["seconds"], 3), "runs": _info["runs"]}
+        for _name, _info in aggregate_timings.items()
+    }
+    st.session_state["validation_stage_timings"] = {
+        _name: round(_seconds, 3) for _name, _seconds in aggregate_stages.items()
+    }
+    return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), combined
+
+
 try:
+    register_learning_commit(commit_pending_validation_learning)
     register_direct_pipeline(
         country_validator_cls=CountryValidator,
         validate_products_fn=validate_products,
@@ -4870,7 +7004,7 @@ if "intersection_count" not in st.session_state:
 if "grid_page" not in st.session_state:
     st.session_state.grid_page = 0
 if "grid_items_per_page" not in st.session_state:
-    st.session_state.grid_items_per_page = 50
+    st.session_state.grid_items_per_page = 200
 if "main_toasts" not in st.session_state:
     st.session_state.main_toasts = []
 if "exports_cache" not in st.session_state:
@@ -4926,6 +7060,40 @@ st.markdown(
             padding: 0 !important; margin: -1px !important; overflow: hidden !important;
             clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important;
             border: 0 !important; opacity: 0 !important; z-index: -9999 !important;
+        }}
+        /* Prevent flag selector iframe container collapse and flicker during processing/reruns */
+        div.st-key-country_flag_bar_container div[data-testid="stElementContainer"]:has(iframe) {{
+            min-height: 85px !important;
+            contain: layout paint;
+        }}
+        div.st-key-country_flag_bar_container,
+        div.st-key-country_flag_bar_container div[data-testid="stElementContainer"] {{
+            min-height: 85px !important;
+            height: 85px !important;
+            overflow: hidden !important;
+        }}
+        div.st-key-country_flag_bar_container iframe {{
+            min-height: 85px !important;
+            height: 85px !important;
+        }}
+        [data-stale="true"]:has(iframe),
+        [data-stale="true"] iframe {{
+            opacity: 1 !important;
+            visibility: visible !important;
+            transition: none !important;
+        }}
+        /* Keep the visual review dialog visible during Streamlit reruns
+           (e.g. after Batch Reject). Streamlit marks its elements
+           data-stale="true" while Python re-executes, which can flash
+           the dialog blank. Pinning opacity + visibility here keeps the
+           grid in view throughout the processing window. */
+        /* Smooth fade during in-modal processing, without pinning closing dialogs */
+        [data-testid="stDialog"]:has(iframe)[data-stale="true"] {{
+            opacity: 0.95;
+            transition: opacity 0.15s ease;
+        }}
+        [data-testid="stDialogContent"] {{
+            min-height: 300px;
         }}
         @import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined');
         {_app_css}
@@ -5078,7 +7246,68 @@ with st.sidebar:
                 icon=":material/error:",
             )
     st.markdown("---")
+    # ── Blocked Image Fingerprints status ─────────────────────────────────
+    with st.expander("Blocked image fingerprints", icon=":material/fingerprint:"):
+        try:
+            # The catalog shown to reviewers is the JSON catalog. Excel is
+            # only a migration/legacy input and is not used for these counts.
+            _json_rules = [
+                r for r in load_learned_image_rules()
+                if str(r.get("status", "active")).casefold() == "active"
+            ]
+            _json_fingerprints = {
+                (str(r.get("image_url", "")).strip(), str(r.get("phash", "")).strip())
+                for r in _json_rules
+                if str(r.get("image_url", "")).strip() or str(r.get("phash", "")).strip()
+            }
+            _bfp_loaded = len(_json_fingerprints)
+            import json as _bfp_json
+            _bfp_cache: dict = {}
+            if os.path.exists(_BLOCKED_IMG_CACHE):
+                try:
+                    with open(_BLOCKED_IMG_CACHE, "r", encoding="utf-8") as _bfp_f:
+                        _bfp_cache = _bfp_json.load(_bfp_f)
+                    _bfp_cache.pop("_excel_mtime", None)
+                except Exception:
+                    pass
+            _bfp_failed = []
+            _bfp_skipped = []
+            _bfp_total_rows = len(_json_rules)
+            _bc1, _bc2 = st.columns(2)
+            _bc1.metric("Loaded ✅", _bfp_loaded,
+                help="Unique image fingerprints successfully hashed and ready for matching")
+            _bc2.metric("Failed ⚠️", len(_bfp_failed),
+                help="URLs that could not be downloaded — fingerprint matching won't work for them")
+            if _bfp_total_rows == 0:
+                st.info("No active JSON image rules yet. Generate a report or reject an image in the iframe to teach one.", icon="ℹ️")
+            else:
+                st.caption(
+                    f"{_bfp_total_rows} JSON rules · "
+                    f"{_bfp_loaded} unique fingerprints · "
+                    f"{len(_bfp_failed)} fetch-failed · "
+                    f"{len(_bfp_skipped)} skipped"
+                )
+            if _bfp_failed:
+                st.warning("These URLs could not be downloaded:", icon="⚠️")
+                for _u in _bfp_failed[:8]:
+                    st.code(_u, language=None)
+                if len(_bfp_failed) > 8:
+                    st.caption(f"… and {len(_bfp_failed) - 8} more")
+                if st.button("Retry failed URLs", key="retry_blocked_fp", icon=":material/refresh:",
+                        help="Clears the failure cache so they are re-attempted next validation run"):
+                    try:
+                        if os.path.exists(_BLOCKED_IMG_CACHE):
+                            os.remove(_BLOCKED_IMG_CACHE)
+                        st.cache_resource.clear()
+                        st.toast("Cache cleared — failed URLs will be retried on next run.", icon=":material/refresh:")
+                        st.rerun()
+                    except Exception as _re:
+                        st.error(f"Could not clear cache: {_re}")
+        except Exception as _bfp_e:
+            st.error(f"Could not read fingerprint status: {_bfp_e}")
+    st.markdown("---")
     st.header(_t("display_settings"))
+
     new_mode = ("wide" if "Wide" in st.radio("Layout Mode", ["Centered", "Wide"], index=1 if st.session_state.get("layout_mode", "wide") == "wide" else 0) else "centered")
     if new_mode != st.session_state.get("layout_mode", "wide"):
         st.session_state.layout_mode = new_mode
@@ -5093,7 +7322,7 @@ with st.sidebar:
     # a category from suggestions for one product name).
     if _CAT_MATCHER_AVAILABLE:
         st.markdown("---")
-        st.header("🧠 AI Learning")
+        st.header("AI Learning", anchor=False)
         _learn_engine = _get_cat_matcher_engine()
         _n_corr, _n_neg = _learn_engine.counts()
         _lc1, _lc2 = st.columns(2)
@@ -5225,7 +7454,12 @@ function selectCountry(name) {{
 }}
 </script>
 """
-st.iframe(_flag_selector_html, height=85)
+@st.fragment
+def _render_flag_selector_bar():
+    with st.container(key="country_flag_bar_container"):
+        st.iframe(_flag_selector_html, height=85)
+
+_render_flag_selector_bar()
 
 def _reset_report_state(*, clear_uploaded_files: bool = False, clear_zip_cache: bool = False, extra_key_prefixes: tuple = ()):
     """Resets validation results/grid state. Used by every "start fresh" action
@@ -5343,7 +7577,7 @@ if _has_files:
                 st.session_state.confirm_clear_files = False
                 st.rerun()
 
-uploaded_files = st.file_uploader("Upload files", type=["csv", "xlsx", "zip"], accept_multiple_files=True, key=f"daily_files_{st.session_state.uploader_key}", label_visibility="collapsed")
+uploaded_files = st.file_uploader("Dpload files", type=["csv", "xlsx", "zip"], accept_multiple_files=True, key=f"daily_files_{st.session_state.uploader_key}", label_visibility="collapsed")
 
 if uploaded_files:
     _new_cache = []
@@ -5465,6 +7699,7 @@ if st.session_state.get("last_processed_files") != process_signature:
             _restored = apply_manual_decisions(
                 st.session_state.final_report, load_manual_decisions(process_signature)
             )
+            st.session_state["_manual_journal_mtime"] = manual_decisions_mtime(process_signature)
             if _restored:
                 st.toast(f"Restored {_restored} manual decision(s)", icon=":material/history:")
         else:
@@ -5477,19 +7712,53 @@ if st.session_state.get("last_processed_files") != process_signature:
                         if "Is_Manual" in _fr0.columns:
                             _manual_approvals = set(_fr0[(_fr0["Status"] == "Approved") & (_fr0["Is_Manual"] == True)]["ProductSetSid"].astype(str).str.strip().unique())
 
+                    _file_read_t0 = time.perf_counter()
                     all_dfs: list = []
                     file_sids_sets: list = []
                     has_zip_source = False
                     st.session_state.zip_image_store = {}
-                    st.session_state.zip_image_index = {}
-                    st.session_state.zip_image_source_bytes = None
+                    _accumulated_zip_qc_dfs = []
+                    _accumulated_zip_img_index = {}
+                    _accumulated_zip_source_bytes = []
+                    _accumulated_pim_verdicts = []
+                    _accumulated_rejection_reasons = []
                     st.session_state.zip_qc_results = pd.DataFrame()
                     st.session_state.pop("_zip_sid_index", None)
                     st.session_state.pop("_zip_status_cols", None)
                     st.session_state.pop("_zip_prefetch_map", None)
                     _sid_col_qc: str | None = None
 
-                    for uf in _files_for_processing:
+                    # Independent plain uploads can be parsed concurrently.
+                    # ZIP/QC files stay on the main thread because their
+                    # indexes and PIM verdicts are merged into shared session
+                    # state below. Parsing is bounded so several large Excel
+                    # files do not exhaust memory or disk handles.
+                    _plain_uploads = [
+                        (_idx, _uf) for _idx, _uf in enumerate(_files_for_processing)
+                        if not _uf["name"].lower().endswith(".zip")
+                        and not any(k in _uf["name"].lower() for k in ("qc_results", "qc_result"))
+                    ]
+
+                    def _read_plain_upload(item):
+                        _idx, _uf = item
+                        _buf = BytesIO(_uf["bytes"])
+                        _name = _uf["name"].lower()
+                        if _name.endswith((".xlsx", ".xls")):
+                            _frame = pd.read_excel(_buf, engine="openpyxl" if _name.endswith(".xlsx") else None, dtype=str)
+                        else:
+                            _frame = _detect_and_read_csv(_buf)
+                        return _idx, _frame
+
+                    _plain_frames = {}
+                    if len(_plain_uploads) > 1:
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(_plain_uploads))) as _read_pool:
+                            for _idx, _frame in _read_pool.map(_read_plain_upload, _plain_uploads):
+                                _plain_frames[_idx] = _frame
+                    elif _plain_uploads:
+                        _idx, _frame = _read_plain_upload(_plain_uploads[0])
+                        _plain_frames[_idx] = _frame
+
+                    for _uf_index, uf in enumerate(_files_for_processing):
                         _buf = BytesIO(uf["bytes"])
                         raw_data = pd.DataFrame()
                         if uf["name"].lower().endswith(".zip"):
@@ -5498,10 +7767,9 @@ if st.session_state.get("last_processed_files") != process_signature:
                                 members = zf.infolist()
                                 qc_files = [info for info in members if "qc_results" in info.filename.lower() and info.filename.lower().endswith((".xlsx", ".xls", ".csv"))]
                                 if qc_files:
-                                    qc_dfs = []
                                     for qcf in qc_files:
                                         qc_data = zf.read(qcf)
-                                        qdf = (pd.read_csv(BytesIO(qc_data), dtype=str) if qcf.filename.lower().endswith(".csv") else pd.read_excel(BytesIO(qc_data), dtype=str))
+                                        qdf = (_detect_and_read_csv(BytesIO(qc_data)) if qcf.filename.lower().endswith(".csv") else pd.read_excel(BytesIO(qc_data), dtype=str))
                                         
                                         if "QC_Skip_Reason" in qdf.columns:
                                             qdf["QC_Skip_Reason"] = qdf["QC_Skip_Reason"].astype(str).replace(
@@ -5518,27 +7786,9 @@ if st.session_state.get("last_processed_files") != process_signature:
                                             if "Manual_Review" not in qdf.columns:
                                                 qdf["Manual_Review"] = "True"
                                         
-                                        qc_dfs.append(qdf)
-                                    
-                                    if qc_dfs:
-                                        st.session_state.zip_qc_results = pd.concat(qc_dfs, ignore_index=True)
-                                        _build_zip_sid_index(st.session_state.zip_qc_results)
-                                        raw_data = st.session_state.zip_qc_results.copy()
+                                        _accumulated_zip_qc_dfs.append(qdf)
 
                                 # ── PIM_QC_Result.xlsx ────────────────────
-                                # Skipped until now: the filter above matches
-                                # "qc_results" (plural) and this file is
-                                # "PIM_QC_Result" (singular), so it never
-                                # qualified. It is read separately rather than
-                                # concatenated because its schema is nothing
-                                # like the CSVs' — 5 columns against 182 —
-                                # and merging them would corrupt zip_qc_results.
-                                #
-                                # What it gives us: the platform's own verdict
-                                # for every SID (508 = 490 complete + 18
-                                # incomplete, verified), already resolved to
-                                # Status/Reason/Comment, plus the live list of
-                                # rejection reason codes.
                                 _pim = next(
                                     (
                                         i for i in members
@@ -5555,37 +7805,49 @@ if st.session_state.get("last_processed_files") != process_signature:
                                         if "ProductSets" in _xl.sheet_names:
                                             _verd = _xl.parse("ProductSets", dtype=str).fillna("")
                                             _verd.columns = [str(c).strip() for c in _verd.columns]
-                                            st.session_state.zip_pim_verdicts = _verd
+                                            _accumulated_pim_verdicts.append(_verd)
                                         if "RejectionReasons" in _xl.sheet_names:
                                             _rr = _xl.parse("RejectionReasons", dtype=str).fillna("")
-                                            st.session_state.zip_rejection_reasons = (
+                                            _rr_list = (
                                                 _rr.iloc[:, 0].astype(str).str.strip()
                                                 .loc[lambda s: s.ne("")].tolist()
                                             )
-                                        logger.info(
-                                            "PIM_QC_Result loaded: %s verdicts, %s reason codes",
-                                            len(st.session_state.get("zip_pim_verdicts", [])),
-                                            len(st.session_state.get("zip_rejection_reasons", [])),
-                                        )
+                                            _accumulated_rejection_reasons.extend(_rr_list)
                                     except Exception as _pim_err:
                                         logger.warning("PIM_QC_Result read failed: %s", _pim_err)
-                                st.session_state.zip_image_index = _index_zip_images(zf)
-                                st.session_state.zip_image_source_bytes = uf["bytes"]
+
+                                _zip_idx = _index_zip_images(zf)
+                                if _zip_idx:
+                                    _accumulated_zip_img_index.update(_zip_idx)
+                                    _accumulated_zip_source_bytes.append(uf["bytes"])
                         elif any(k in uf["name"].lower() for k in ("qc_results", "qc_result")):
                             has_zip_source = True
-                            st.session_state.zip_qc_results = _detect_and_read_csv(_buf) if uf["name"].lower().endswith(".csv") else pd.read_excel(_buf, engine="openpyxl", dtype=str)
-                            _build_zip_sid_index(st.session_state.zip_qc_results)
-                            raw_data = st.session_state.zip_qc_results.copy()
-                        elif uf["name"].lower().endswith(".xlsx"):
-                            raw_data = pd.read_excel(_buf, engine="openpyxl", dtype=str)
+                            qdf_direct = _detect_and_read_csv(_buf) if uf["name"].lower().endswith(".csv") else pd.read_excel(_buf, engine="openpyxl", dtype=str)
+                            _accumulated_zip_qc_dfs.append(qdf_direct)
                         else:
-                            raw_data = _detect_and_read_csv(_buf)
+                            raw_data = _plain_frames.get(_uf_index, pd.DataFrame())
                         if not raw_data.empty:
                             raw_data = _repair_mojibake(raw_data)
                             all_dfs.append(raw_data)
 
+                    if _accumulated_zip_qc_dfs:
+                        st.session_state.zip_qc_results = pd.concat(_accumulated_zip_qc_dfs, ignore_index=True)
+                        _build_zip_sid_index(st.session_state.zip_qc_results)
+                        zip_raw_data = _repair_mojibake(st.session_state.zip_qc_results.copy())
+                        all_dfs.append(zip_raw_data)
+
+                    if _accumulated_pim_verdicts:
+                        st.session_state.zip_pim_verdicts = pd.concat(_accumulated_pim_verdicts, ignore_index=True)
+                    if _accumulated_rejection_reasons:
+                        # Keep unique ordered reasons
+                        st.session_state.zip_rejection_reasons = list(dict.fromkeys(_accumulated_rejection_reasons))
+
+                    st.session_state.zip_image_index = _accumulated_zip_img_index
+                    st.session_state.zip_image_source_bytes = _accumulated_zip_source_bytes if _accumulated_zip_source_bytes else None
+
                     st.session_state.no_computation_zip = has_zip_source
                     if not all_dfs: raise ValueError("No data could be read from the uploaded file(s).")
+                    st.session_state.setdefault("validation_stage_timings", {})["File reading"] = round(time.perf_counter() - _file_read_t0, 3)
 
                     _file_mode = "pre_qc"
                     try: _file_mode = detect_file_type(all_dfs[0]) if "detect_file_type" in dir() or "detect_file_type" in globals() else "pre_qc"
@@ -5748,6 +8010,8 @@ if st.session_state.get("last_processed_files") != process_signature:
 
                         final_report_parts: list = []
                         results_parts: list = []
+                        _rules_revision = os.path.getmtime("learned_image_rules.json") if os.path.exists("learned_image_rules.json") else 0.0
+                        _validation_manifest = load_manifest(sig_hash)
 
                         if non_zip_sids:
                             data_non_zip = data[data["PRODUCT_SET_SID"].isin(non_zip_sids)].copy()
@@ -5759,7 +8023,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                             # edit that leaves shape and columns unchanged — so a different
                             # file could be served the previous batch's results. Removing a
                             # file and uploading another is exactly when that shows up.
-                            fr_non_zip, res_non_zip = cached_validate_products(sig_hash + "|" + df_hash(data_non_zip) + country_validator.code, data_non_zip, support_files, country_validator.code, data_has_warranty, skip_validators=fast_skip_list, _on_progress=_on_flag_done, _full_batch=data)
+                            fr_non_zip, res_non_zip = validate_in_chunks(data_non_zip, support_files, country_validator, data_has_warranty, cache_prefix=sig_hash + "|nonzip", skip_validators=fast_skip_list, on_progress=_on_flag_done, full_batch=data, rules_revision=_rules_revision, manifest=_validation_manifest, batch_prefix="nonzip")
                             _prog.empty()
                             final_report_parts.append(fr_non_zip)
                             results_parts.append(res_non_zip)
@@ -5767,9 +8031,13 @@ if st.session_state.get("last_processed_files") != process_signature:
                         if zip_sids:
                             data_zip = data[data["PRODUCT_SET_SID"].isin(zip_sids)].copy()
                             skip_list = sorted(set(_derive_prefetched_skip_list(qc_zip)) | set(fast_skip_list))
+                            st.caption(
+                                f"ZIP validators skipped from QC: {len(skip_list):,}"
+                                + (f" · {', '.join(skip_list)}" if skip_list else " · none detected")
+                            )
                             _prog_zip = st.progress(0, text="Preparing ZIP validation...")
                             def _on_flag_done_zip(flag_name: str, i: int, total: int): _prog_zip.progress(int(i / total * 100), text=f"Checking (ZIP): {flag_name}")
-                            fr_zip, res_zip = cached_validate_products(sig_hash + "|" + df_hash(data_zip) + country_validator.code + "_zip_optimized", data_zip, support_files, country_validator.code, data_has_warranty, skip_validators=skip_list, _on_progress=_on_flag_done_zip, _full_batch=data)
+                            fr_zip, res_zip = validate_in_chunks(data_zip, support_files, country_validator, data_has_warranty, cache_prefix=sig_hash + "|zip", skip_validators=skip_list, on_progress=_on_flag_done_zip, full_batch=data, rules_revision=_rules_revision, manifest=_validation_manifest, batch_prefix="zip")
                             _prog_zip.empty()
                             final_report_parts.append(fr_zip)
                             results_parts.append(res_zip)
@@ -5908,7 +8176,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                             status_cols = [c for c in qc_zip.columns if "status" in c.lower()]
                             melted = qc_zip[[_sid_col_qc] + status_cols].melt(id_vars=_sid_col_qc, var_name="col", value_name="val")
                             melted["val_lower"] = melted["val"].astype(str).str.lower().str.strip()
-                            rejected_entries = melted[melted["val_lower"] == "rejected"]
+                            rejected_entries = melted[melted["val_lower"].isin(["rejected", "block"])]
                             rejected_sids_set = set(rejected_entries[_sid_col_qc])
 
                             if engine:
@@ -5923,7 +8191,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                                 # to — those categories are never re-suggested, and
                                 # re-listings under them get auto-flagged.
                                 if "Category_Check_Status" in status_cols and {"NAME", "CATEGORY"}.issubset(qc_zip.columns):
-                                    _cat_rej_sids = set(rejected_entries.loc[rejected_entries["col"] == "Category_Check_Status", _sid_col_qc])
+                                    _cat_rej_sids = set(rejected_entries.loc[(rejected_entries["col"] == "Category_Check_Status") & (rejected_entries["val_lower"] == "rejected"), _sid_col_qc])
                                     if _cat_rej_sids:
                                         _rej_rows = qc_zip[qc_zip[_sid_col_qc].isin(_cat_rej_sids)]
                                         _rsn_series = (_rej_rows["Category_Check_Rejection_Reason"]
@@ -5932,6 +8200,45 @@ if st.session_state.get("last_processed_files") != process_signature:
                                         for _name, _cat, _rsn in zip(_rej_rows["NAME"], _rej_rows["CATEGORY"], _rsn_series):
                                             engine.add_negative_correction(str(_name).strip(), str(_cat).strip(), str(_rsn).strip(), auto_save=False)
                                             _learned_count += 1
+
+                            _APPLE_ACC_RE = re.compile(
+                                r"\b(?:case|cases|cover|covers|sleeve|sleeves|pouch|pouches|screen.?protector|housing|skin)\b",
+                                re.IGNORECASE,
+                            )
+                            _zip_valid_colors = load_valid_colors()
+                            _MULTICOLOR_VARIANTS_ZIP = {
+                                "multicolor", "multicolour", "multicolored", "multicoloured",
+                                "multi colour", "multi color", "multi-colour", "multi-color",
+                                "multicolors", "multicolours",
+                            }
+                            _SPLIT_COMPOSITE_RE = re.compile(r"[,/&|]|\s+and\s+|\s+or\s+|\s+with\s+")
+
+                            def _zip_color_recognised(color_val: str, valid_set: set) -> bool:
+                                """Return True only if color_val is in colors.txt (or a multicolor variant)."""
+                                c = color_val.strip().lower()
+                                if c in _MULTICOLOR_VARIANTS_ZIP:
+                                    return True
+                                if not valid_set:
+                                    return False
+                                parts = _SPLIT_COMPOSITE_RE.split(c)
+                                for part in parts:
+                                    part = part.strip()
+                                    if not part:
+                                        continue
+                                    if part in valid_set or part in _MULTICOLOR_VARIANTS_ZIP:
+                                        return True
+                                    tokens = part.split()
+                                    for token in tokens:
+                                        if token in valid_set:
+                                            return True
+                                return False
+
+                            _sid_to_color = {}
+                            if "PRODUCT_SET_SID" in data.columns and "COLOR" in data.columns:
+                                _c_valid = data[["PRODUCT_SET_SID", "COLOR"]].dropna()
+                                for _s, _c in zip(_c_valid["PRODUCT_SET_SID"].astype(str).str.strip(), _c_valid["COLOR"].astype(str).str.strip()):
+                                    if _s not in _sid_to_color and _c.lower() not in {"nan", "none", "", "n/a", "-", "null"}:
+                                        _sid_to_color[_s] = _c.lower()
 
                             qc_zip_indexed = qc_zip.set_index(_sid_col_qc)
                             for mrow in rejected_entries.to_dict("records"):
@@ -5945,9 +8252,9 @@ if st.session_state.get("last_processed_files") != process_signature:
                                 _flag_pf = f"{_flag} (Prefetched)"
                                 _comment = _prefetch_reason_from_row(_r, _col, qc_zip.columns)
                                 _mapped = fmap.get(_flag, {})
-                                _reason_code = _mapped.get("reason", "1000007 - Other Reason")
-                                _default_cmt = _mapped.get("comment", "Rejected")
-                                _final_cmt = _comment if (_comment and _comment.lower() != "rejected") else _default_cmt
+                                _reason_code = _mapped.get("reason", "1000033 - Keywords in your content/ Product name / description has been blacklisted" if "restricted" in _base_key else "1000007 - Other Reason")
+                                _default_cmt = _mapped.get("comment", "Listing contains restricted or blacklisted keywords." if "restricted" in _base_key else "Rejected")
+                                _final_cmt = _comment if (_comment and _comment.lower() not in ("rejected", "block", "nan")) else _default_cmt
                                 if _flag in ("Wrong Category", "Category Check") and "Category_Check_Rejection_Reason" in qc_zip.columns:
                                     _cr = str(_r["Category_Check_Rejection_Reason"]).strip()
                                     if _cr and _cr.lower() not in ("nan", "rejected"):
@@ -5975,8 +8282,36 @@ if st.session_state.get("last_processed_files") != process_signature:
                                     _tl_sub_bucket = _classify_title_language_sub_bucket(_tl_reason)
                                     _flag = _tl_sub_bucket
                                     _flag_pf = f"{_tl_sub_bucket} (Prefetched)"
+
+                                if _flag in fmap:
+                                    _mapped = fmap.get(_flag, {})
+                                    _reason_code = _mapped.get("reason", _reason_code)
+                                    _default_cmt = _mapped.get("comment", _default_cmt)
+                                    if not _final_cmt or _final_cmt.lower() in ("rejected", "block", "nan"):
+                                        _final_cmt = _default_cmt
+
                                 _fidx = _fr_sid_to_idx.get(_sid)
                                 if _fidx is not None:
+                                    if "brand_image" in _base_key.lower():
+                                        _det_b = str(_r.get("Brand_Detected_On_Product", "")).strip().lower()
+                                        _r_reason = str(_r.get("Brand_Image_Check_Reason", "")).lower()
+                                        _name_val = str(_r.get("NAME", "")).lower()
+                                        _cat_val = str(_r.get("CATEGORY", "")).lower()
+                                        _is_apple_detected = (
+                                            _det_b == "apple"
+                                            or "visible on the product is 'apple'" in _r_reason
+                                            or "visible on the product is \"apple\"" in _r_reason
+                                            or "brand detected on product: apple" in _r_reason
+                                        )
+                                        _is_case_cover = bool(_APPLE_ACC_RE.search(_cat_val) or _APPLE_ACC_RE.search(_name_val))
+                                        if _is_apple_detected and _is_case_cover:
+                                            _clear_zip_complaint(
+                                                _fidx, _sid,
+                                                "Rejection overturned: Apple brand detected on cases/covers accessory image -- product approved.",
+                                                "apple_acc",
+                                            )
+                                            continue
+
                                     if "warranty" in _base_key.lower():
                                         _wval = str(_r.get("PRODUCT_WARRANTY", "")).strip()
                                         if _wval and _wval.lower() not in ("nan", "none"):
@@ -5995,67 +8330,36 @@ if st.session_state.get("last_processed_files") != process_signature:
 
                                     if "color" in _base_key.lower():
                                         missing_col_df = res_zip.get("Missing COLOR") if res_zip else None
-                                        # To override a color rejection, the product must pass the main
-                                        # validation AND have a COLOR value that is recognised in colors.txt.
-                                        passed_main_validation = missing_col_df is None or missing_col_df.empty or _sid not in missing_col_df["PRODUCT_SET_SID"].astype(str).values
+                                        mismatch_col_df = res_zip.get("Color Mismatch: Title vs COLOR Column") if res_zip else None
 
-                                        _has_explicit_color = False
-                                        _explicit_color_value = ""
-                                        _temp_grp = _data_by_sid.get(_sid)
-                                        if _temp_grp is not None and not _temp_grp.empty:
-                                            _color_col_name = next((c for c in _temp_grp.columns if str(c).strip().upper() == "COLOR"), None)
-                                            if _color_col_name:
-                                                _c_vals = _temp_grp[_color_col_name].astype(str).str.strip()
-                                                _null_vals = {"nan", "none", "", "n/a", "-", "null"}
-                                                _non_null = [v for v in _c_vals if v.lower() not in _null_vals]
-                                                if _non_null:
-                                                    _explicit_color_value = _non_null[0].lower()
-                                                    _has_explicit_color = True
-
-                                        # Validate against colors.txt — the single source of truth for
-                                        # recognised colors. A color must appear in colors.txt (supports
-                                        # multi-part values like "Red/Blue" — at least one part must match).
-                                        # If colors.txt is empty/missing, fall back to the junk-list check.
-                                        _zip_valid_colors = load_valid_colors()
-                                        _MULTICOLOR_VARIANTS_ZIP = {
-                                            "multicolor", "multicolour", "multicolored", "multicoloured",
-                                            "multi colour", "multi color", "multi-colour", "multi-color",
-                                            "multicolors", "multicolours",
-                                        }
-
-                                        def _zip_color_recognised(color_val: str, valid_set: set) -> bool:
-                                            """Return True only if color_val is in colors.txt (or a multicolor variant)."""
-                                            c = color_val.strip().lower()
-                                            if c in _MULTICOLOR_VARIANTS_ZIP:
-                                                return True
-                                            if not valid_set:
-                                                # colors.txt unavailable — reject ambiguous values to be safe
-                                                return False
-                                            # Split composite values: "Red/Blue", "Black & Gold", etc.
-                                            parts = re.split(r"[,/&|]|\s+and\s+|\s+or\s+|\s+with\s+", c)
-                                            for part in parts:
-                                                part = part.strip()
-                                                if not part:
-                                                    continue
-                                                if part in valid_set or part in _MULTICOLOR_VARIANTS_ZIP:
-                                                    return True
-                                                # Allow modifier + base color: "dark blue", "light grey"
-                                                tokens = part.split()
-                                                for token in tokens:
-                                                    if token in valid_set:
-                                                        return True
-                                            return False
-
-                                        _color_is_valid = (
-                                            _has_explicit_color
-                                            and _zip_color_recognised(_explicit_color_value, _zip_valid_colors)
+                                        # Never overturn if the zip rejected for color mismatch, or our check flagged a mismatch!
+                                        _col_rej_reason = str(_r.get("Color_Rejection_Reason", "")).lower()
+                                        _is_mismatch_in_zip = (
+                                            "mismatch" in _col_rej_reason
+                                            or "title says" in _col_rej_reason
+                                            or "please make them match" in _col_rej_reason
+                                            or (mismatch_col_df is not None and not mismatch_col_df.empty and _sid in mismatch_col_df["PRODUCT_SET_SID"].astype(str).values)
                                         )
+                                        if _is_mismatch_in_zip:
+                                            pass
+                                        else:
+                                            # To override a color rejection, the product must pass the main
+                                            # validation AND have a COLOR value that is recognised in colors.txt.
+                                            passed_main_validation = missing_col_df is None or missing_col_df.empty or _sid not in missing_col_df["PRODUCT_SET_SID"].astype(str).values
 
-                                        if passed_main_validation and _color_is_valid:
-                                            _clear_zip_complaint(
-                                                _fidx, _sid, "Approved by user for Color", "color",
+                                            _explicit_color_value = _sid_to_color.get(_sid, "")
+                                            _has_explicit_color = bool(_explicit_color_value)
+
+                                            _color_is_valid = (
+                                                _has_explicit_color
+                                                and _zip_color_recognised(_explicit_color_value, _zip_valid_colors)
                                             )
-                                            continue
+
+                                            if passed_main_validation and _color_is_valid:
+                                                _clear_zip_complaint(
+                                                    _fidx, _sid, "Rejection overturned: Color accepted -- product approved.", "color",
+                                                )
+                                                continue
 
                                     final_report.at[_fidx, "Status"] = "Rejected"
                                     final_report.at[_fidx, "FLAG"] = _flag_pf
@@ -6128,20 +8432,24 @@ if st.session_state.get("last_processed_files") != process_signature:
                                 
                                 fr_sids = final_report["ProductSetSid"].astype(str).str.strip()
                                 update_mask = fr_sids.isin(rej_sids) & (final_report["Status"] == "Approved")
-                                
+
                                 if update_mask.any():
                                     flag_map = rej_first.set_index(rej_first["ProductSetSid"].astype(str).str.strip())["FLAG"].to_dict()
                                     cmt_series = rej_first.get("Comment", pd.Series("", index=rej_first.index))
                                     if "Comment_Detail" in rej_first.columns:
                                         cmt_series = cmt_series.where(cmt_series != "", rej_first["Comment_Detail"])
                                     cmt_map = pd.Series(cmt_series.values, index=rej_first["ProductSetSid"].astype(str).str.strip()).to_dict()
-                                    
+
                                     sids_to_update = fr_sids[update_mask]
                                     final_report.loc[update_mask, "Status"] = "Rejected"
                                     final_report.loc[update_mask, "FLAG"] = sids_to_update.map(flag_map)
                                     final_report.loc[update_mask, "Comment"] = sids_to_update.map(cmt_map)
                                     final_report.loc[update_mask, "Reason"] = final_report.loc[update_mask, "FLAG"].astype(str).map(lambda f: fmap.get(f, {}).get("reason", "1000007 - Other Reason"))
-                                    
+                                    # Mark as overturn-to-rejection ONLY if product was in the ZIP file and AI previously approved it
+                                    if has_zip_source and zip_sids:
+                                        _ov_mask = update_mask & fr_sids.isin(zip_sids)
+                                        final_report.loc[_ov_mask, "overturn_direction"] = "to_rejection"
+
                                     _rej_in_app = update_mask.sum()
                                     st.write(f"App validation found {_rej_in_app} additional rejections.")
 
@@ -6272,8 +8580,32 @@ if st.session_state.get("last_processed_files") != process_signature:
                         _restored = apply_manual_decisions(
                             final_report, load_manual_decisions(process_signature)
                         )
+                        st.session_state["_manual_journal_mtime"] = manual_decisions_mtime(process_signature)
                         if _restored:
                             st.write(f"Restored {_restored} manual decision(s) from a previous session.")
+
+                        # The ZIP/report merge above starts from a compact
+                        # status frame, so provenance columns produced by the
+                        # learned-image matcher can otherwise disappear before
+                        # the validation expanders build their labels.
+                        _learned_source_report = final_report_subset
+                        if isinstance(_learned_source_report, pd.DataFrame) and not _learned_source_report.empty:
+                            _learned_sid = _learned_source_report["ProductSetSid"].astype(str).str.strip()
+                            _learned_maps = {
+                                _col: dict(zip(_learned_sid, _learned_source_report[_col]))
+                                for _col in ("Learned Match", "Learned Match Method", "Learned Match Distance")
+                                if _col in _learned_source_report.columns
+                            }
+                            _final_sid = final_report["ProductSetSid"].astype(str).str.strip()
+                            final_report["Learned Match"] = _final_sid.map(_learned_maps.get("Learned Match", {})).fillna(False).map(
+                                lambda value: value is True or str(value).strip().casefold() in {"true", "1", "yes", "y"}
+                            )
+                            final_report["Learned Match Method"] = _final_sid.map(_learned_maps.get("Learned Match Method", {})).fillna("")
+                            final_report["Learned Match Distance"] = _final_sid.map(_learned_maps.get("Learned Match Distance", {}))
+                        else:
+                            final_report["Learned Match"] = False
+                            final_report["Learned Match Method"] = ""
+                            final_report["Learned Match Distance"] = pd.Series(index=final_report.index, dtype="float64")
 
                         st.session_state.final_report = final_report
                         st.session_state.all_data_map = data
@@ -6316,6 +8648,34 @@ if st.session_state.get("last_processed_files") != process_signature:
                 with st.expander("Technical details (for support)", expanded=False, type="compact"):
                     st.code(traceback.format_exc())
                 st.session_state.last_processed_files = "error"
+
+
+# ── Cross-tab manual decision refresh ──────────────────────────────────────
+# Each browser tab has its own Streamlit session, but manual decisions are
+# journalled by the upload signature on disk.  The normal processing gate is
+# intentionally skipped when the same file is uploaded again, so without this
+# small mtime check a second tab would keep showing stale statuses until the
+# file was changed.  Re-apply only when the journal changed; validation,
+# image work, and report rebuilding are not repeated.
+if (
+    process_signature != "empty"
+    and st.session_state.get("last_processed_files") == process_signature
+    and isinstance(st.session_state.get("final_report"), pd.DataFrame)
+    and not st.session_state.final_report.empty
+):
+    _journal_mtime = manual_decisions_mtime(process_signature)
+    _seen_journal_mtime = int(st.session_state.get("_manual_journal_mtime", 0) or 0)
+    if _journal_mtime != _seen_journal_mtime:
+        _external_decisions = load_manual_decisions(process_signature)
+        _external_count = apply_manual_decisions(
+            st.session_state.final_report, _external_decisions
+        )
+        st.session_state["_manual_journal_mtime"] = _journal_mtime
+        if _external_count:
+            st.toast(
+                f"Updated {_external_count:,} manual decision(s) from another tab",
+                icon=":material/sync:",
+            )
 
 
 # ── Carry decisions forward when the upload grows ──────────────────────────
@@ -6400,7 +8760,87 @@ if _offer:
             st.rerun()
 
 
-@st.fragment
+@st.fragment(run_every="0.5s")
+def _drain_review_batch_queue():
+    """Commit a visual-review batch in short slices.
+
+    The iframe can keep handling page navigation between slices.  The worker
+    deliberately runs on Streamlit's script thread (rather than mutating
+    session state from a Python thread), but each slice is bounded so a large
+    batch never monopolises the bridge request.
+    """
+    _queue = st.session_state.get("_review_batch_queue")
+    if not isinstance(_queue, list) or not _queue:
+        return
+
+    st.caption("Saving the previous batch in the background. Page navigation remains available.")
+
+    _job = _queue[0]
+    _groups = _job.get("groups", []) if isinstance(_job, dict) else []
+    _cursor = int(_job.get("cursor", 0) or 0) if isinstance(_job, dict) else 0
+    _offset = int(_job.get("offset", 0) or 0) if isinstance(_job, dict) else 0
+    _slice_size = 180
+    _processed = 0
+
+    while _cursor < len(_groups) and _processed < _slice_size:
+        _group = _groups[_cursor]
+        _sids = list(_group.get("sids", [])) if isinstance(_group, dict) else []
+        _flag = str(_group.get("flag", "Other Reason (Custom)"))
+        _code = str(_group.get("code", "1000007 - Other Reason"))
+        _comment = str(_group.get("comment", ""))
+        _remaining = _slice_size - _processed
+        _part = _sids[_offset:_offset + _remaining]
+        if _part:
+            # The queue is already grouped by comment.  One dataframe update
+            # per group is substantially cheaper than one update per SKU.
+            apply_status_change(
+                _part,
+                status="Rejected",
+                reason=_code,
+                comment=_comment,
+                flag=_flag,
+                is_manual=True,
+                is_zip=False,
+                snapshot=False,
+                checkpoint=False,
+                clear_caches=False,
+                # Run sibling propagation once at the start of each reason
+                # group; later slices only perform the cheap dataframe write.
+                propagate_siblings=(_offset == 0),
+            )
+            _processed += len(_part)
+            _offset += len(_part)
+        if _offset >= len(_sids):
+            _cursor += 1
+            _offset = 0
+        elif not _part:
+            # Defensive guard for malformed queue entries.
+            _cursor += 1
+            _offset = 0
+
+    if isinstance(_job, dict):
+        _job["cursor"] = _cursor
+        _job["offset"] = _offset
+
+    if _cursor >= len(_groups):
+        # Checkpoint once for the complete batch, rather than once for every
+        # selected group.  This is the expensive disk/report operation.
+        checkpoint_final_report(st.session_state.final_report)
+        _clear_result_caches(clear_streamlit_cache=False)
+        _fr = st.session_state.get("final_report")
+        if isinstance(_fr, pd.DataFrame):
+            _fr.attrs.pop("__pim_hash__", None)
+            _fr.attrs.pop("__pim_hash_stamp__", None)
+        _queue.pop(0)
+        st.session_state["_grid_pending_report_sync"] = True
+        st.session_state.setdefault("main_toasts", []).append(
+            f"Rejected {int(_job.get('total', _processed)):,} product(s)"
+        )
+        st.session_state["_review_batch_active"] = bool(_queue)
+    else:
+        st.session_state["_review_batch_active"] = True
+
+
 def handle_jtbridge():
     _bridge_val = st.text_input(
         "jtbridge",
@@ -6419,12 +8859,17 @@ def handle_jtbridge():
                     if "pending_auto_comments" not in st.session_state: st.session_state.pending_auto_comments = {}
                     st.session_state.pending_auto_comments.update(_ac)
             elif _msg.get("action") == "reject":
-                _payload = _msg.get("payload", {})
-                _auto_comments = st.session_state.pop("pending_auto_comments", {})
+                _raw_payload = _msg.get("payload", {})
+                if isinstance(_raw_payload, dict) and "sids" in _raw_payload:
+                    _payload = _raw_payload.get("sids", {})
+                    _auto_comments = _raw_payload.get("comments", {})
+                else:
+                    _payload = _raw_payload
+                    _auto_comments = st.session_state.pop("pending_auto_comments", {})
                 if isinstance(_payload, dict) and _payload:
                     _rgroups = {}
                     for _sid, _rkey in _payload.items(): _rgroups.setdefault(_rkey, []).append(_sid)
-                    _total = 0
+                    _queue_groups = []
                     for _rkey, _sids in _rgroups.items():
                         if _rkey.startswith("Other Reason (Custom): "):
                             _flag = "Other Reason (Custom)"
@@ -6437,20 +8882,39 @@ def handle_jtbridge():
                             _code = _rinfo["reason"]
                             _cmt_lang = "fr" if st.session_state.selected_country == "Morocco" else "en"
                             _cmt = _rinfo.get(_cmt_lang, _rinfo.get("en"))
-                        # --- Performance fix: group by comment so we call apply_status_change
-                        #     once per unique (reason, comment) pair instead of once per SID.
-                        #     This eliminates the N+1 DataFrame-copy / GC / column-scan pattern.
+                        # Keep comments exact while grouping all SIDs that can
+                        # share one dataframe update.
                         _sids_by_comment: dict = {}
                         for _sid in _sids:
                             _sid_cmt = _auto_comments.get(_sid, _cmt)
                             _sids_by_comment.setdefault(_sid_cmt, []).append(_sid)
                         for _cmt_val, _sid_group in _sids_by_comment.items():
-                            apply_status_change(_sid_group, status="Rejected", reason=_code, comment=_cmt_val, flag=_flag, is_manual=True, is_zip=False)
-                        _total += len(_sids)
-                    st.session_state.main_toasts.append(f"Rejected {_total} product(s)")
+                            _queue_groups.append({
+                                "sids": list(_sid_group),
+                                "flag": _flag,
+                                "code": _code,
+                                "comment": _cmt_val,
+                            })
+                    _total = sum(len(g["sids"]) for g in _queue_groups)
+                    # Reflect the decision in the server-side review state
+                    # immediately.  If the reviewer turns the page before the
+                    # next queue tick, the new page still receives the same
+                    # committed indicator instead of briefly showing the old
+                    # status.
+                    _quick = st.session_state.setdefault("quick_rejects", {})
+                    for _group in _queue_groups:
+                        for _sid in _group["sids"]:
+                            _quick[str(_sid).strip()] = _group["flag"]
+                    _queue = st.session_state.setdefault("_review_batch_queue", [])
+                    _queue.append({"groups": _queue_groups, "cursor": 0, "total": _total})
+                    st.session_state["_review_batch_active"] = True
+                    # The optimistic iframe update has already happened.  Do
+                    # not synchronously write 500+ rows or rebuild the grid;
+                    # the short polling fragment drains the queue in slices.
                     st.session_state["main_bridge_counter"] = st.session_state.get("main_bridge_counter", 0) + 1
                     st.session_state.do_scroll_top = False
-                    st.rerun()
+                    # Intentionally no st.rerun(): it would destroy/recreate
+                    # the iframe and block page navigation during batching.
             elif _msg.get("action") == "undo":
                 _payload = _msg.get("payload", {})
                 _total_restored = 0
@@ -6459,6 +8923,14 @@ def handle_jtbridge():
                         restore_single_item(_sid)
                         _total_restored += 1
                 if _total_restored > 0:
+                    _fr_jt = st.session_state.get("final_report")
+                    if isinstance(_fr_jt, pd.DataFrame):
+                        _fr_jt.attrs.pop("__pim_hash__", None)
+                        _fr_jt.attrs.pop("__pim_hash_stamp__", None)
+                    # The validation caches are independent of a reviewer
+                    # undo. Clearing Streamlit's entire cache here forced the
+                    # next interaction to rebuild file reads, category data,
+                    # and validator results for the whole batch.
                     st.session_state["main_bridge_counter"] = st.session_state.get("main_bridge_counter", 0) + 1
                     st.session_state.do_scroll_top = False
                     st.rerun()
@@ -6470,6 +8942,38 @@ def handle_jtbridge():
                 st.session_state.grid_filter_flag = _msg.get("payload", "")
                 st.session_state["main_bridge_counter"] = st.session_state.get("main_bridge_counter", 0) + 1
                 st.rerun()
+            elif _msg.get("action") == "grid_load_more":
+                _fr_more = st.session_state.get("final_report", pd.DataFrame())
+                _ipp_more = min(500, int(st.session_state.get("grid_items_per_page", 200) or 200))
+                _total_more = len(_fr_more) if isinstance(_fr_more, pd.DataFrame) else 0
+                _max_page_more = max(0, (_total_more - 1) // max(1, _ipp_more))
+                _current_page_more = int(st.session_state.get("grid_page", 0) or 0)
+                if _current_page_more < _max_page_more:
+                    st.session_state.grid_page = _current_page_more + 1
+                    st.session_state["main_bridge_counter"] = st.session_state.get("main_bridge_counter", 0) + 1
+                    st.rerun()
+            elif _msg.get("action") == "remove_learned_rule":
+                _sid = str(_msg.get("payload", "")).strip()
+                _dm = st.session_state.get("all_data_map", pd.DataFrame())
+                _removed_rules = []
+                if isinstance(_dm, pd.DataFrame) and not _dm.empty and "PRODUCT_SET_SID" in _dm.columns:
+                    _row = _dm[_dm["PRODUCT_SET_SID"].astype(str).str.strip().eq(_sid)]
+                    if not _row.empty:
+                        _img = str(_row.iloc[0].get("MAIN_IMAGE", "")).strip()
+                        _removed_rules = [r for r in load_learned_image_rules() if str(r.get("image_url", "")).strip() == _img]
+                if _removed_rules:
+                    _deleted = delete_learned_image_rules(_removed_rules)
+                    _undo_history = st.session_state.setdefault("_learned_rule_undo_history", [])
+                    _undo_history.append(_removed_rules)
+                    del _undo_history[:-10]
+                    # Keep the old single-batch key for compatibility with
+                    # the Dashboard while exposing the full ten-step stack.
+                    st.session_state["_learned_rule_undo"] = _removed_rules
+                    st.session_state.main_toasts.append(f"Removed {_deleted:,} learned rule(s). Undo is available on the Learned Rules page.")
+                    # Learned-rule deletion is reflected through the rule
+                    # revision/cache key; do not flush every unrelated cache.
+                    st.session_state["main_bridge_counter"] = st.session_state.get("main_bridge_counter", 0) + 1
+                    st.rerun()
             elif _msg.get("action") == "grid_cols_per_row":
                 # Clamped to the range the buttons actually offer: this value
                 # drives the grid's CSS column count and the wide-dialog
@@ -6481,14 +8985,37 @@ def handle_jtbridge():
                     st.session_state.grid_cols_per_row = 4
                 st.session_state["main_bridge_counter"] = st.session_state.get("main_bridge_counter", 0) + 1
                 st.rerun()
+            elif _msg.get("action") == "close_review":
+                st.session_state.show_review_modal = False
+                st.session_state.pop("_grid_pending_report_sync", None)
+                st.session_state["main_bridge_counter"] = st.session_state.get("main_bridge_counter", 0) + 1
+                st.session_state["_grid_closing"] = True
+                _fr_jt = st.session_state.get("final_report")
+                if isinstance(_fr_jt, pd.DataFrame):
+                    _fr_jt.attrs.pop("__pim_hash__", None)
+                    _fr_jt.attrs.pop("__pim_hash_stamp__", None)
+                # Closing only changes the review visibility. Keep validation
+                # caches warm; clearing the global cache here made closing a
+                # large batch trigger unnecessary recomputation on the next
+                # page render.
+                st.rerun()
         except Exception as _e:
             logger.error(f"Bridge parse error: {_e}")
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, hash_funcs={pd.DataFrame: df_hash})
 def get_enriched_results(fr_df, data_df):
-    if fr_df.empty: return pd.DataFrame()
-    return pd.merge(fr_df, data_df[["PRODUCT_SET_SID", "SELLER_NAME", "BRAND"]], left_on="ProductSetSid", right_on="PRODUCT_SET_SID", how="left")
+    if fr_df.empty: 
+        return pd.DataFrame()
+    # Explicitly pull ONLY required columns to prevent cloning wide datasets
+    needed_cols = [c for c in ["PRODUCT_SET_SID", "SELLER_NAME", "BRAND"] if c in data_df.columns]
+    return pd.merge(
+        fr_df, 
+        data_df[needed_cols], 
+        left_on="ProductSetSid", 
+        right_on="PRODUCT_SET_SID", 
+        how="left"
+    )
 
 
 @st.cache_data(show_spinner=False, hash_funcs={pd.DataFrame: df_hash})
@@ -6558,6 +9085,25 @@ def render_main_results():
     # analytical deep-dive, not the orientation) had equal billing. Swapped:
     # KPIs always on, charts behind the disclosure.
     render_summary_header(fr)
+    _timing_rows = []
+    for _stage_name, _stage_seconds in sorted(
+        st.session_state.get("validation_stage_timings", {}).items(),
+        key=lambda item: float(item[1]), reverse=True,
+    ):
+        _timing_rows.append({"Validator": f"Stage · {_stage_name}", "Seconds": float(_stage_seconds), "Runs": 1})
+    for _name, _info in sorted(
+        st.session_state.get("validation_timings", {}).items(),
+        key=lambda item: float(item[1].get("seconds", 0)), reverse=True,
+    ):
+        _timing_rows.append({
+            "Validator": _name,
+            "Seconds": float(_info.get("seconds", 0)),
+            "Runs": int(_info.get("runs", 0)),
+        })
+    if _timing_rows:
+        with st.expander("Validation diagnostics", expanded=False):
+            st.caption("Measured validator time for the current validation run.")
+            st.dataframe(pd.DataFrame(_timing_rows), hide_index=True, width="stretch")
     # Only renders when something has actually been waived, so it costs a dict
     # lookup on a normal run.
     render_override_history()
@@ -6739,23 +9285,58 @@ def render_main_results():
                 render_severity_group_header(_level, len(_titles), _group_skus)
 
                 for _i, title in enumerate(_titles):
-                    df_flagged = rej_df[rej_df["FLAG"] == title]
+                    df_flagged = rej_df[rej_df["FLAG"] == title].copy()
                     is_zip = "(Prefetched)" in title
-                    # The expander summary is what a reviewer scans, so it
-                    # carries the readable label and the severity mark. The
-                    # raw FLAG stays the key for state and exports.
-                    # flag_label() strips the "(Prefetched)" suffix, which is
-                    # part of the raw FLAG and was previously visible in the
-                    # expander title. Renaming the checks was not meant to
-                    # remove the provenance, so it goes back on explicitly:
-                    # a reviewer needs to see at a glance which findings came
-                    # from the QC system's own ZIP and which this tool ran.
-                    exp_label = (
-                        f"{SEVERITY[_level]['mark']}  {len(df_flagged):,}"
-                        f"   {flag_label(title)}"
-                    )
+
+                    # =========================================================
+                    # MEMORY OPTIMIZATION FIX
+                    # =========================================================
+                    # 1. Downcast object types & convert repetitive strings to category
+                    df_flagged = df_flagged.infer_objects()
+                    for col in df_flagged.select_dtypes(include=["object"]).columns:
+                        if df_flagged[col].nunique() / max(len(df_flagged), 1) < 0.5:
+                            df_flagged[col] = df_flagged[col].astype("category")
+
+                    # 2. Keep only essential columns to stop passing 6,000+ wide columns
+                    keep_cols = [
+                        c for c in [
+                            "ProductSetSid", "PRODUCT_SET_SID", "ParentSKU", "Status", 
+                            "FLAG", "Comment", "Comment_Detail", "Reason", "SellerName", 
+                            "SELLER_NAME", "BRAND", "NAME", "Is_Zip", "Is_Manual", 
+                            "overturn_direction", "zip_override", "Learned Match",
+                            "Learned Match Method", "Learned Match Distance",
+                            "Learned Rule URL", "Learned Rule pHash"
+                        ] if c in df_flagged.columns
+                    ]
+                    if keep_cols:
+                        df_flagged = df_flagged[keep_cols]
+
+                    # 3. Force garbage collection before the UI fragment renders
+                    gc.collect()
+                    # =========================================================
+
+                    # Build the expander label showing severity mark, validation title, and product count
+                    _n_flagged = len(df_flagged)
+                    _mark = SEVERITY.get(_level, {}).get("mark", "•")
+                    _prod_label = f"{_n_flagged:,} {'product' if _n_flagged == 1 else 'products'}"
+                    exp_label = f"{_mark}  {title} ({_prod_label})"
+
+                    _ov_cnt = 0
+                    if "overturn_direction" in df_flagged.columns:
+                        _ov_raw = df_flagged["overturn_direction"]
+                        if isinstance(_ov_raw, pd.DataFrame):  # duplicate column name guard
+                            _ov_raw = _ov_raw.iloc[:, 0]
+                        _ov_series = _ov_raw.astype(str).replace({"nan": "", "None": "", "<NA>": ""})
+                        _ov_cnt = int((_ov_series == "to_rejection").sum())
+                    if _ov_cnt > 0:
+                        exp_label += f"  •  🔓 {_ov_cnt:,} Overturned"
+                    _learned_cnt = 0
+                    if "Learned Match" in df_flagged.columns:
+                        _learned_cnt = int(df_flagged["Learned Match"].fillna(False).astype(bool).sum())
+                    if _learned_cnt > 0:
+                        exp_label += f"  •  🧠 {_learned_cnt:,} Learned"
                     if is_zip:
-                        exp_label += "  (Prefetched)  ⚡ ZIP"
+                        exp_label += "  (Prefetched)  :material/archive: ZIP"
 
                     # ZIP/prefetched flags keep their orange treatment — it was
                     # doing real work telling the two sources apart. It comes
@@ -6772,7 +9353,70 @@ def render_main_results():
     else:
         st.success("All products passed validation — no rejections found.")
 
+    if "final_report" in st.session_state and not st.session_state.final_report.empty:
+        _fr_all = st.session_state.final_report
+
+        # Overturned-to-Rejection: AI approved but system re-rejected
+        _ov_rej_mask = (
+            _fr_all.get("overturn_direction", pd.Series("", index=_fr_all.index))
+            .fillna("").astype(str).eq("to_rejection")
+        )
+        _df_ov_rej = _fr_all[_ov_rej_mask].copy()
+
+        # Overturned-to-Approval: AI rejected but policy approved
+        _ov_app_mask = (
+            _fr_all.get("overturn_direction", pd.Series("", index=_fr_all.index))
+            .fillna("").astype(str).eq("to_approval")
+            | (
+                _fr_all.get("zip_override", pd.Series("", index=_fr_all.index)).fillna("").astype(str).ne("")
+                & _fr_all.get("overturn_direction", pd.Series("", index=_fr_all.index)).fillna("").astype(str).ne("to_rejection")
+            )
+        )
+        _df_ov_app = _fr_all[_ov_app_mask].copy()
+
+        # Show overturned-to-rejection in summary expander
+        if not _df_ov_rej.empty:
+            with st.expander(f"\U0001f6a8 Overturned to Rejection ({len(_df_ov_rej):,} products — AI False Approvals)", expanded=False):
+                st.markdown(
+                    "The following products were **approved by AI** but **overturned to rejection** "
+                    "by QC validation rules. They also appear in their respective validation sections above."
+                )
+                _ov_rej_disp = _df_ov_rej[[
+                    c for c in ["ProductSetSid", "ParentSKU", "SellerName", "FLAG", "Comment"]
+                    if c in _df_ov_rej.columns
+                ]].copy()
+                _ov_rej_disp.rename(columns={
+                    "ProductSetSid": "Product Set SID",
+                    "ParentSKU": "Parent SKU",
+                    "SellerName": "Seller",
+                    "FLAG": "Overturn Reason",
+                    "Comment": "Details",
+                }, inplace=True)
+                try:
+                    if "PRODUCT_SET_SID" in data.columns:
+                        _lookup_dedup = data.drop_duplicates(subset=["PRODUCT_SET_SID"])
+                        _extra_cols = [c for c in ["NAME", "COLOR", "BRAND"] if c in _lookup_dedup.columns]
+                        if _extra_cols:
+                            _merge_src = _lookup_dedup[["PRODUCT_SET_SID"] + _extra_cols].rename(
+                                columns={"PRODUCT_SET_SID": "Product Set SID"}
+                            )
+                            _ov_rej_disp = _ov_rej_disp.merge(_merge_src, on="Product Set SID", how="left")
+                            _preferred_order = ["Product Set SID", "Parent SKU", "NAME", "BRAND", "COLOR", "Overturn Reason", "Details", "Seller"]
+                            _ov_rej_disp = _ov_rej_disp[[c for c in _preferred_order if c in _ov_rej_disp.columns]]
+                except Exception:
+                    pass
+                st.dataframe(_ov_rej_disp, width='stretch', hide_index=True)
+
+        # Note about overturned-to-approval (shown in main iframe)
+        if not _df_ov_app.empty:
+            st.info(
+                f"\U0001f513 **{len(_df_ov_app):,} product(s) overturned to Approved** "
+                "(AI rejected \u2192 policy approved) are shown in the main results table above "
+                "with their overturn reason in the comment."
+            )
+
     render_manual_review_buttons(support_files)
+
     render_image_grid(support_files)
     render_exports_section(support_files, country_validator)
 
@@ -6794,6 +9438,13 @@ with _rail_slot:
             else 0
         ),
     )
+
+handle_jtbridge()
+
+# Keep batch persistence in its own short-lived fragment.  This fragment is
+# independent from the review iframe, so Next/Previous can be used while the
+# prior page is still being committed.
+_drain_review_batch_queue()
 
 render_main_results()
 
@@ -6817,8 +9468,6 @@ if _lang_bridge_val:
                 st.rerun()
     except Exception as e:
         logger.error(f"Lang bridge error: {e}")
-
-handle_jtbridge()
 
 # Page is rendered; drop the closing overlay. A later stylesheet wins, so this
 # needs no rerun — see end_grid_closing_overlay().

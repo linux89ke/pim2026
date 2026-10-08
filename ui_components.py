@@ -10,6 +10,7 @@ import html as html_lib
 import json
 import logging
 import re
+import time
 import zipfile
 from collections import OrderedDict
 from io import BytesIO
@@ -23,6 +24,7 @@ from PIL import Image
 
 from constants import (
     GRID_COLS, JUMIA_COLORS,
+    PHASH_MATCH_MAX_DISTANCE,
     SNEAKER_BRAND_ALIASES as _SNEAKER_ALIASES,
     # Shared with check_image_stretched: the grid badges the band the server
     # does NOT reject, so the two have to be defined against each other.
@@ -30,6 +32,8 @@ from constants import (
     ASPECT_ADVISORY_WIDE as _ASPECT_ADVISORY_WIDE,
     ASPECT_REJECT_TALL as _ASPECT_REJECT_TALL,
     ASPECT_REJECT_WIDE as _ASPECT_REJECT_WIDE,
+    PREFETCH_MAP,
+    _prefetch_key_from_status_col,
 )
 from design_tokens import (
     COLORS as DT,
@@ -49,9 +53,30 @@ from data_utils import (
     save_manual_decisions,
 )
 from export_utils import generate_smart_export, prepare_full_data_merged
+from learned_rules import (
+    learn_image_rejections_async,
+    load_learned_image_rules,
+    delete_learned_image_rules,
+)
+import importlib
+import targeted_audit as _ta_mod
+try:
+    importlib.reload(_ta_mod)
+except Exception:
+    pass
 from targeted_audit import targeted_audit_modal
 
 logger = logging.getLogger(__name__)
+
+# Registered by streamlit_app after its pipeline functions are defined. Calling
+# back through this hook avoids importing/re-executing streamlit_app from
+# inside a fragment, which can trigger Streamlit's outside-container error.
+_commit_learning_callback = None
+
+
+def register_learning_commit(callback):
+    global _commit_learning_callback
+    _commit_learning_callback = callback
 
 # Securely encoded Base64 placeholder (No Image fallback)
 _SVG_RAW = "<svg xmlns='http://www.w3.org/2000/svg' width='150' height='150'><rect width='150' height='150' fill='#f0f0f0'/><text x='75' y='75' text-anchor='middle' dominant-baseline='central' font-size='12' font-family='sans-serif' fill='#999'>No Image</text></svg>"
@@ -79,6 +104,13 @@ PREFETCH_DISPLAY_COLUMNS = {
         "warranty_address",
     ],
     "Missing COLOR": [
+        "Color_Check_Status",
+        "Color_Rejection_Reason",
+        "Color_AI_Normalized",
+        "color",
+        "color_family",
+    ],
+    "Color Mismatch: Title vs COLOR Column": [
         "Color_Check_Status",
         "Color_Rejection_Reason",
         "Color_AI_Normalized",
@@ -380,6 +412,57 @@ def flag_pill_header(flag_name: str, count: int, is_zip: bool = False) -> str:
     cfg = SEVERITY[level]
     label = flag_label(flag_name)
 
+    # A compact, consistent icon set gives reviewers a second visual cue while
+    # keeping the severity colour reserved for urgency. These are inline SVGs
+    # so they render identically in Streamlit's HTML renderer and never depend
+    # on an external icon font loading.
+    _name = str(flag_name).casefold()
+    if any(k in _name for k in ("image", "photo", "duplicate")):
+        _icon_path = '<rect x="4" y="5" width="16" height="14" rx="2"/><circle cx="9" cy="10" r="1.5"/><path d="m5 17 4-4 3 3 2-2 5 4"/>'
+    elif any(k in _name for k in ("brand", "perfume", "generic")):
+        _icon_path = '<path d="M4 8h16v11H4z"/><path d="M8 8V5h8v3M8 12h8M8 16h5"/>'
+    elif any(k in _name for k in ("category", "variation")):
+        _icon_path = '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/><path d="M10 7h4a2 2 0 0 1 2 2v5"/>'
+    elif any(k in _name for k in ("fake", "counterfeit", "prohibited", "restricted", "fda", "seller")):
+        _icon_path = '<path d="M12 3 20 6v5c0 5-3.4 8.2-8 10-4.6-1.8-8-5-8-10V6z"/><path d="m9 12 2 2 4-4"/>'
+    elif any(k in _name for k in ("contact", "website")):
+        _icon_path = '<path d="M10 13a5 5 0 0 0 7.1.1l1.4-1.4a5 5 0 0 0-7.1-7.1L10 6"/><path d="M14 11a5 5 0 0 0-7.1-.1l-1.4 1.4a5 5 0 0 0 7.1 7.1L14 18"/>'
+    elif any(k in _name for k in ("price", "warranty", "weight", "volume")):
+        _icon_path = '<circle cx="12" cy="12" r="8"/><path d="M12 7v10M15 9.5c-.7-.8-1.6-1.2-3-1.2-1.5 0-2.5.8-2.5 1.8s1 1.6 2.5 1.9 2.5.8 2.5 1.9-1 1.8-2.5 1.8c-1.4 0-2.4-.4-3-1.2"/>'
+    else:
+        _icon_path = '<path d="M5 4h14v16H5z"/><path d="M8 8h8M8 12h8M8 16h5"/>'
+    # A small emoji cue makes the long validation list scannable at a glance.
+    # The SVG remains the professional, severity-coded icon; the emoji adds a
+    # quick semantic hint without replacing the accessible text label.
+    if "wrong category" in _name or "category" in _name:
+        _emoji = "🗂️"
+    elif "image" in _name or "photo" in _name:
+        _emoji = "🖼️"
+    elif "duplicate" in _name:
+        _emoji = "📑"
+    elif any(k in _name for k in ("fake", "counterfeit", "prohibited", "restricted", "fda")):
+        _emoji = "🛡️"
+    elif "contact" in _name or "website" in _name:
+        _emoji = "🔗"
+    elif "warranty" in _name:
+        _emoji = "🧾"
+    elif "seller" in _name or "refurb" in _name:
+        _emoji = "🏷️"
+    elif "price" in _name or "discount" in _name:
+        _emoji = "💰"
+    elif "animal" in _name or "pet" in _name:
+        _emoji = "🐾"
+    elif "alcohol" in _name:
+        _emoji = "🍷"
+    else:
+        _emoji = "📋"
+    _icon = (
+        f'<span aria-hidden="true" style="display:inline-flex;align-items:center;'
+        f'justify-content:center;width:30px;height:30px;border-radius:9px;'
+        f'background:{cfg["wash"]};color:{cfg["color"]};border:1px solid {cfg["spine"]}55;flex:0 0 auto;">'
+        f'<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{_icon_path}</svg></span>'
+    )
+
     # The ZIP badge stays as it was: this is how a reviewer tells a result the
     # QC system already produced from one this tool computed itself, and the
     # blue reads as "different source" rather than as a severity. Only the
@@ -397,11 +480,13 @@ def flag_pill_header(flag_name: str, count: int, is_zip: bool = False) -> str:
     return (
         f'<div style="display:flex;align-items:center;gap:10px;padding:4px 0 12px;'
         f'border-left:3px solid {cfg["spine"]};padding-left:12px;margin-bottom:4px;">'
+        f'{_icon}'
         f'<span style="background:{cfg["wash"]};color:{cfg["color"]};'
         f'border:1px solid {cfg["spine"]}33;border-radius:6px;padding:3px 10px;'
         f'font-family:var(--font-mono);font-variant-numeric:tabular-nums slashed-zero;'
         f'font-size:13px;font-weight:600;">{count:,}</span>'
-        f'<span style="font-size:15px;font-weight:600;color:{DT["ink"]};">{label}</span>'
+        f'<span aria-hidden="true" style="font-size:17px;line-height:1;">{_emoji}</span>'
+        f'<span style="font-size:15px;line-height:1.25;font-weight:700;letter-spacing:-.01em;color:{DT["ink"]};">{label}</span>'
         f'{zip_badge}</div>'
     )
 
@@ -684,7 +769,7 @@ _cache_clear_count: int = 0
 _GC_COLLECT_INTERVAL: int = 50  # run gc.collect() at most once per 50 status changes
 
 
-def _clear_result_caches(*, batch_gc: bool = False) -> None:
+def _clear_result_caches(*, batch_gc: bool = False, clear_streamlit_cache: bool = True) -> None:
     """Clear display/export caches after a status change.
 
     ``gc.collect()`` is intentionally NOT called on every invocation — doing so
@@ -694,10 +779,21 @@ def _clear_result_caches(*, batch_gc: bool = False) -> None:
     * Call it immediately when ``batch_gc=True`` (e.g. after a large batch op).
     """
     global _cache_clear_count
-    st.session_state.exports_cache.clear()
-    st.session_state.display_df_cache.clear()
+    if "exports_cache" in st.session_state:
+        st.session_state.exports_cache.clear()
+    if "display_df_cache" in st.session_state:
+        st.session_state.display_df_cache.clear()
     st.session_state.pop("_grid_review_data_cache", None)
     st.session_state.pop("_grid_warm_urls", None)
+    _fr = st.session_state.get("final_report")
+    if isinstance(_fr, pd.DataFrame):
+        _fr.attrs.pop("__pim_hash__", None)
+        _fr.attrs.pop("__pim_hash_stamp__", None)
+    if clear_streamlit_cache:
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
     _cache_clear_count += 1
     if batch_gc or (_cache_clear_count % _GC_COLLECT_INTERVAL == 0):
         gc.collect()
@@ -776,6 +872,94 @@ def _get_image_maps(all_data):
             st.session_state["_image_maps_df_id"] = id(all_data)
     return st.session_state["_image_maps"]
 
+
+def _get_sid_name_map(all_data):
+    """sid -> normalised lowercase name, cached against id(all_data)."""
+    if (
+        "_sid_name_map" in st.session_state
+        and st.session_state.get("_sid_name_map_df_id") == id(all_data)
+    ):
+        return st.session_state["_sid_name_map"]
+    if all_data is None or "PRODUCT_SET_SID" not in all_data.columns or "NAME" not in all_data.columns:
+        st.session_state["_sid_name_map"] = {}
+        st.session_state["_sid_name_map_df_id"] = id(all_data)
+        return {}
+    m = dict(zip(
+        all_data["PRODUCT_SET_SID"].astype(str).str.strip(),
+        all_data["NAME"].astype(str).str.lower().str.strip(),
+    ))
+    st.session_state["_sid_name_map"] = m
+    st.session_state["_sid_name_map_df_id"] = id(all_data)
+    return m
+
+
+def _get_sid_category_maps(all_data):
+    """Return cached SID maps for canonical category codes and category names."""
+    if (
+        "_sid_category_maps" in st.session_state
+        and st.session_state.get("_sid_category_maps_df_id") == id(all_data)
+    ):
+        return st.session_state["_sid_category_maps"]
+    code_map, name_map = {}, {}
+    if all_data is not None and "PRODUCT_SET_SID" in getattr(all_data, "columns", []):
+        sids = all_data["PRODUCT_SET_SID"].astype(str).str.strip()
+        if "CATEGORY_CODE" in all_data.columns:
+            for sid, code in zip(sids, all_data["CATEGORY_CODE"]):
+                cleaned = str(clean_category_code(code)).strip().casefold()
+                if cleaned and cleaned not in {"nan", "none", "n/a"}:
+                    code_map[sid] = cleaned
+        for _category_col in ("FULL_CATEGORY_PATH", "CATEGORY"):
+            if _category_col not in all_data.columns:
+                continue
+            for sid, category in zip(sids, all_data[_category_col]):
+                value = str(category).strip().casefold()
+                if (
+                    sid not in name_map
+                    and value
+                    and value not in {"nan", "none", "n/a"}
+                ):
+                    name_map[sid] = value
+    maps = (code_map, name_map)
+    st.session_state["_sid_category_maps"] = maps
+    st.session_state["_sid_category_maps_df_id"] = id(all_data)
+    return maps
+
+
+def _same_category_sids(sid_a, sid_b, category_maps):
+    """Require matching category codes, falling back to equal category names."""
+    code_map, name_map = category_maps
+    a, b = str(sid_a).strip(), str(sid_b).strip()
+    code_a, code_b = code_map.get(a, ""), code_map.get(b, "")
+    if code_a and code_b:
+        return code_a == code_b
+    name_a, name_b = name_map.get(a, ""), name_map.get(b, "")
+    return bool(name_a and name_b and name_a == name_b)
+
+
+def _names_match_sids(sid_a, sid_b, name_map, threshold=0.6):
+    """True when the two SIDs share enough name tokens to be the same product.
+
+    Uses token-Jaccard similarity so minor wording differences ("16GB"
+    vs "16 GB", extra adjectives) don't block the cascade, while completely
+    different products ("Samsung TV" vs "Nokia Charger") are kept separate.
+    A threshold of 0.6 works well in practice: it allows ~40% of tokens to
+    differ while still requiring clear shared substance.
+
+    Returns True if either name is missing — when we can't check we cascade
+    and let the reviewer undo if needed.
+    """
+    na = name_map.get(str(sid_a).strip(), "")
+    nb = name_map.get(str(sid_b).strip(), "")
+    if not na or not nb:
+        return True  # no name data — default to cascade, reviewer can undo
+    ta = set(na.split())
+    tb = set(nb.split())
+    union = ta | tb
+    if not union:
+        return True
+    return len(ta & tb) / len(union) >= threshold
+
+
 def _get_phash_maps(all_data):
     """(sid_to_phash, phash_to_sids) — the same photo, whoever listed it.
 
@@ -790,9 +974,9 @@ def _get_phash_maps(all_data):
     id(all_data) exactly like _get_image_maps, so it is built once per dataset
     and every later lookup is a dictionary hit.
 
-    Exact equality only. Hamming-distance matching would be all-pairs, which
-    is a billion comparisons on a 50k batch; exact match already catches the
-    overwhelming majority.
+    The map stores each unique image signature once. A BK-tree built from its
+    keys lets the cascade find near hashes within the shared conservative
+    distance threshold without comparing every product pair.
     """
     if (
         "_phash_maps" in st.session_state
@@ -826,8 +1010,68 @@ def _get_phash_maps(all_data):
     return maps
 
 
+def _get_phash_bktree(phash_to_sids, all_data):
+    """Build/cache a BK-tree over unique 64-bit image hashes."""
+    if (
+        "_phash_bktree" in st.session_state
+        and st.session_state.get("_phash_bktree_df_id") == id(all_data)
+    ):
+        return st.session_state["_phash_bktree"]
+
+    root = None
+    for hash_text in phash_to_sids:
+        try:
+            value = int(str(hash_text), 16)
+        except (TypeError, ValueError):
+            continue
+        if root is None:
+            root = {"text": str(hash_text), "value": value, "children": {}}
+            continue
+        node = root
+        while True:
+            distance = (value ^ node["value"]).bit_count()
+            if distance == 0:
+                break
+            child = node["children"].get(distance)
+            if child is None:
+                node["children"][distance] = {
+                    "text": str(hash_text), "value": value, "children": {}
+                }
+                break
+            node = child
+
+    st.session_state["_phash_bktree"] = root
+    st.session_state["_phash_bktree_df_id"] = id(all_data)
+    return root
+
+
+def _query_phash_bktree(tree, hash_text, max_distance=PHASH_MATCH_MAX_DISTANCE):
+    """Return catalog hashes within the Hamming-distance radius."""
+    if tree is None:
+        return set()
+    try:
+        query = int(str(hash_text), 16)
+    except (TypeError, ValueError):
+        return set()
+
+    found = set()
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        distance = (query ^ node["value"]).bit_count()
+        if distance <= max_distance:
+            found.add(node["text"])
+        low = distance - max_distance
+        high = distance + max_distance
+        stack.extend(
+            child for edge, child in node["children"].items()
+            if low <= edge <= high
+        )
+    return found
+
+
 def find_same_photo_siblings(sids, exclude_rejected: bool = True) -> dict:
-    """Other products carrying the identical photo of the ones just actioned.
+    """Other products carrying the same or a near-identical photo.
 
     Returns {sid: [sibling_sid, ...]} for siblings outside `sids`. Already
     rejected siblings are dropped by default: re-rejecting them is a no-op
@@ -839,16 +1083,39 @@ def find_same_photo_siblings(sids, exclude_rejected: bool = True) -> dict:
         return {}
 
     src = {str(s).strip() for s in sids}
+    phash_tree = _get_phash_bktree(phash_to_sids, all_data)
+    neighbor_cache = {}
 
     # Candidates first — pure dict work, no pandas.
     candidates = {}
+    # Exact URL matches do not depend on an image download or pHash.  Include
+    # them first so a failed/slow image fetch cannot prevent same-image
+    # propagation across sellers.
+    try:
+        _sid_to_img, _img_to_sids = _get_image_maps(all_data)
+        for _sid in src:
+            _img = _sid_to_img.get(_sid)
+            if _img is not None and str(_img).strip():
+                _others = set(_img_to_sids.get(_img, set())) - src
+                if _others:
+                    candidates[_sid] = _others
+    except Exception:
+        pass
     for sid in src:
         ph = sid_to_phash.get(sid)
         if not ph:
             continue
-        others = (phash_to_sids.get(ph) or set()) - src
+        if ph not in neighbor_cache:
+            # Keep the same safety boundary as learned-image decisions:
+            # exact/near distance 1–4 may cascade; distance 5–6 remains
+            # review-only and must never reject another seller automatically.
+            neighbor_cache[ph] = _query_phash_bktree(phash_tree, ph, max_distance=4)
+        others = set()
+        for matched_hash in neighbor_cache[ph]:
+            others.update(phash_to_sids.get(matched_hash, set()))
+        others -= src
         if others:
-            candidates[sid] = others
+            candidates.setdefault(sid, set()).update(others)
     if not candidates:
         return {}
 
@@ -885,12 +1152,39 @@ def render_sibling_prompt():
     """
     _cascaded = st.session_state.pop("_sibling_cascaded", None)
     if _cascaded:
-        st.info(
-            f"Also rejected **{_cascaded['count']}** identical listing"
-            f"{'s' if _cascaded['count'] != 1 else ''} from other sellers — "
-            f"*{flag_label(_cascaded['flag'])}* applies to the product itself, "
-            "not to who is selling it.",
-            icon=":material/content_copy:",
+        _seller_pills = []
+        for _seller, _count in _cascaded.get("by_seller", [])[:8]:
+            _seller_pills.append(
+                "<span style='display:inline-flex;align-items:center;gap:6px;"
+                "padding:5px 10px;border:1px solid #dbe3ee;border-radius:999px;"
+                "background:#f8fafc;color:#334155;font-size:12px;font-weight:650'>"
+                f"{html_lib.escape(str(_seller))} · {_count:,} SKU"
+                f"{'s' if _count != 1 else ''} rejected</span>"
+            )
+        if len(_cascaded.get("by_seller", [])) > 8:
+            _other_sellers = len(_cascaded["by_seller"]) - 8
+            _seller_pills.append(
+                "<span style='display:inline-flex;align-items:center;padding:5px 10px;"
+                "border:1px solid #dbe3ee;border-radius:999px;background:#f8fafc;"
+                f"color:#475569;font-size:12px;font-weight:650'>+{_other_sellers} more sellers</span>"
+            )
+        _pill_html = " ".join(_seller_pills)
+        st.markdown(
+            "<div style='display:flex;flex-wrap:wrap;align-items:center;gap:7px;"
+            "padding:10px 12px;border:1px solid #bfdbfe;border-radius:12px;"
+            "background:#eff6ff;margin:4px 0 8px'>"
+            f"<strong style='color:#1e3a8a;font-size:13px'>Also rejected · "
+            f"{_cascaded['count']:,} SKUs</strong>{_pill_html}</div>",
+            unsafe_allow_html=True,
+        )
+        _cascade_scope = (
+            " and the category matched"
+            if _cascaded["flag"] in {"Wrong Category", "Category Check"}
+            else ""
+        )
+        st.caption(
+            f"The same or a near-identical image matched {flag_label(_cascaded['flag'])}"
+            f"{_cascade_scope}; these listings were rejected automatically."
         )
 
     prompt = st.session_state.get("_sibling_prompt")
@@ -903,7 +1197,7 @@ def render_sibling_prompt():
     with st.container(border=True):
         st.markdown(
             f"**{len(sids)} other listing{'s' if len(sids) != 1 else ''} "
-            f"use the same photo.**"
+            f"use the same or a near-identical photo.**"
         )
         st.caption(
             f"You rejected {prompt['from_count']} product"
@@ -998,8 +1292,23 @@ def apply_status_change(
     is_zip: bool = False,
     sync_quick_rejects: bool = True,
     propagate_siblings: bool = True,
+    checkpoint: bool = True,
+    snapshot: bool = True,
+    clear_caches: bool = True,
 ) -> int:
     sid_set = _normalize_sid_set(sids)
+    _source_sids = set(sid_set)
+    _auto_cascade = False
+    _is_image_rej = (
+        status == "Rejected"
+        and any(
+            token in str(flag).lower()
+            for token in (
+                "image", "stretched", "blurry", "poor", "mismatch",
+                "infringing", "brand image",
+            )
+        )
+    )
 
     # ── Same photo, another seller ────────────────────────────────────────
     #
@@ -1026,14 +1335,38 @@ def apply_status_change(
 
     _sibling_sids = sorted({s for v in _sibling_map.values() for s in v})
     _severity = flag_severity(flag) if _sibling_sids else None
+    _same_category_rule = flag in {"Wrong Category", "Category Check"}
+    _cascadeable = (
+        _severity == "blocker"
+        or flag == "Image Too Many things displayed"
+        or _is_image_rej
+        or _same_category_rule
+    )
 
-    if _sibling_sids and _severity == "blocker":
-        # Compliance reason — apply it to the identical listings too.
-        sid_set.update(_sibling_sids)
-        st.session_state["_sibling_cascaded"] = {
-            "flag": flag,
-            "count": len(_sibling_sids),
-        }
+    if _sibling_sids and _cascadeable:
+        # Product-level rules travel to matching listings. Wrong Category has
+        # the extra safeguard that the listing must still share its category.
+        # Guard with a name-match check: two products sharing a stock photo
+        # but with completely different names should NOT cascade into each other.
+        _all_data = st.session_state.get("all_data_map")
+        _name_map = _get_sid_name_map(_all_data) if _all_data is not None else {}
+        _category_maps = _get_sid_category_maps(_all_data) if _same_category_rule else None
+        # Collect source SIDs before we expanded sid_set with siblings.
+        _src_sids = list(sid_set)  # snapshot of the originally-rejected set
+        _name_matched = [
+            sib for sib in _sibling_sids
+            if any(
+                _names_match_sids(src, sib, _name_map)
+                and (
+                    not _same_category_rule
+                    or _same_category_sids(src, sib, _category_maps)
+                )
+                for src in _src_sids
+            )
+        ]
+        if _name_matched:
+            sid_set.update(_name_matched)
+            _auto_cascade = True
     elif _sibling_sids:
         # Judgement reason — surface it, do not act on it.
         st.session_state["_sibling_prompt"] = {
@@ -1044,14 +1377,28 @@ def apply_status_change(
             "from_count": len(_sibling_map),
         }
 
-    is_image_rej = status == "Rejected" and any(x in str(flag).lower() for x in ["image", "stretched", "blurry", "poor", "mismatch"])
-    if is_image_rej:
+    # Secondary pass: catch same-image products the phash path may have missed
+    # (e.g. two sellers who uploaded the identical file under different URLs but
+    # no phash was computed yet).  Applies the same name-match guard.
+    if _is_image_rej:
         all_data = st.session_state.get("all_data_map")
         if all_data is not None and "PRODUCT_SET_SID" in all_data.columns and "IMAGE1" in all_data.columns:
             sid_to_img, img_to_sids = _get_image_maps(all_data)
-            _target_images = {sid_to_img[sid] for sid in sid_set if sid in sid_to_img and pd.notna(sid_to_img[sid])}
+            _name_map_url = _get_sid_name_map(all_data)
+            # snapshot the set BEFORE expanding so we compare against originals
+            _orig_sids = set(sid_set)
+            _target_images = {
+                sid_to_img[sid] for sid in _orig_sids
+                if sid in sid_to_img and pd.notna(sid_to_img[sid]) and str(sid_to_img[sid]).strip()
+            }
             for img in _target_images:
-                sid_set.update(img_to_sids.get(img, set()))
+                for candidate in img_to_sids.get(img, set()):
+                    if candidate not in sid_set and any(
+                        _names_match_sids(src, candidate, _name_map_url)
+                        for src in _orig_sids
+                    ):
+                        sid_set.add(candidate)
+                        _auto_cascade = True
 
     fr = st.session_state.get("final_report", pd.DataFrame())
     if (
@@ -1066,12 +1413,42 @@ def apply_status_change(
     if not mask.any():
         return 0
 
+    # Record only sibling listings that will actually be updated, grouped by
+    # seller. ProductSetSid is the unique SKU/listing identifier in this data.
+    if _auto_cascade:
+        _applied_sids = set(_get_norm_col(fr, "ProductSetSid" ).loc[mask])
+        _cascaded_sids = (_applied_sids - _source_sids)
+        _all_data = st.session_state.get("all_data_map")
+        _by_seller = []
+        if _cascaded_sids and isinstance(_all_data, pd.DataFrame) and "PRODUCT_SET_SID" in _all_data.columns:
+            _sid_norm = _all_data["PRODUCT_SET_SID"].astype(str).str.strip()
+            _seller_col = "SELLER_NAME" if "SELLER_NAME" in _all_data.columns else None
+            _summary = pd.DataFrame({"sid": _sid_norm[_sid_norm.isin(_cascaded_sids)]})
+            if _seller_col:
+                _summary["seller"] = _all_data.loc[_summary.index, _seller_col].fillna("").astype(str).str.strip()
+            else:
+                _summary["seller"] = "Seller unavailable"
+            _summary["seller"] = _summary["seller"].replace("", "Seller unavailable")
+            _summary = _summary.drop_duplicates(subset=["sid"])
+            _by_seller = [
+                (str(_seller), int(_count))
+                for _seller, _count in _summary.groupby("seller")["sid"].nunique().items()
+            ]
+            _by_seller.sort(key=lambda _item: (-_item[1], _item[0].casefold()))
+        if _cascaded_sids:
+            st.session_state["_sibling_cascaded"] = {
+                "flag": flag,
+                "count": len(_cascaded_sids),
+                "by_seller": _by_seller,
+            }
+
     from datetime import datetime
 
-    st.session_state["undo_snapshot"] = {
-        "final_report": fr.copy(),
-        "timestamp": datetime.now(),
-    }
+    if snapshot:
+        st.session_state["undo_snapshot"] = {
+            "final_report": fr.copy(),
+            "timestamp": datetime.now(),
+        }
 
     fr.loc[mask, ["Status", "Reason", "Comment", "FLAG", "Is_Manual", "Is_Zip"]] = [
         status,
@@ -1081,6 +1458,23 @@ def apply_status_change(
         is_manual,
         is_zip,
     ]
+    # Persist confirmed iframe rejections as reusable image rules. The helper
+    # deduplicates and writes atomically, so cascades remain one fast append.
+    if status == "Rejected" and flag:
+        try:
+            learn_image_rejections_async(
+                st.session_state.get("all_data_map"),
+                sid_set,
+                flag,
+                reason=reason,
+                comment=comment,
+                source="iframe",
+                hash_by_url=st.session_state.get("_image_phash_by_url", {}),
+            )
+        except Exception:
+            logger.exception("Could not persist iframe learned image rule for %s", flag)
+    fr.attrs.pop("__pim_hash__", None)
+    fr.attrs.pop("__pim_hash_stamp__", None)
 
     _drop_sids_from_post_qc_results(sid_set)
     if status == "Rejected" and flag:
@@ -1096,7 +1490,10 @@ def apply_status_change(
                 st.session_state["quick_rejects"].pop(sid, None)
 
     st.session_state.data_version = st.session_state.get("data_version", 0) + 1
-    _clear_result_caches(batch_gc=len(sid_set) >= 20)
+    _clear_result_caches(
+        batch_gc=checkpoint and len(sid_set) >= 20,
+        clear_streamlit_cache=clear_caches,
+    )
 
     if len(sid_set) > 1:
         st.session_state["show_undo_toast"] = {
@@ -1107,7 +1504,8 @@ def apply_status_change(
 
     # Every manual approve/reject funnels through here, so this is the one place
     # a checkpoint is needed to make decisions survive a disconnect.
-    checkpoint_final_report(fr)
+    if checkpoint:
+        checkpoint_final_report(fr)
 
     return int(mask.sum())
 
@@ -1201,7 +1599,58 @@ def render_override_history() -> None:
             st.rerun()
 
 
-@st.dialog("Confirm Bulk Approval", icon=":material/check_circle:")
+_STANDARD_REJECTION_REASONS = [
+    "Wrong Category", "Restricted brands", "Potential Restricted Brand", "Suspected Fake product", "Seller Not approved to sell Refurb",
+    "Product Warranty", "Seller Approve to sell books", "Seller Approved to Sell Perfume", "Counterfeit Sneakers",
+    "Suspected counterfeit Jerseys", "Prohibited products", "Unnecessary words in NAME", "Single-word NAME",
+    "Generic BRAND Issues", "Fashion brand issues", "BRAND name repeated in NAME", "Wrong Variation",
+    "Generic branded products with genuine brands", "Missing COLOR", "Missing Weight/Volume", "Incomplete Smartphone Name",
+    "Seller Not Approved to Sell Alcohol",
+    "Duplicate product", "Poor images", "Image Stretched", "Image Blurry", "Image Mismatch",
+    "Image Infringing", "Image Too Many things displayed", "Perfume Tester", "NG - Gift Card Seller",
+    "NG - Books Seller", "NG - TV Brand Seller", "NG - HP Toners Seller", "NG - Apple Seller",
+    "NG - Xmas Tree Seller", "NG - Rice Brand Seller", "NG - Powerbank Capacity", "Discount too high",
+    "Category Max Price Exceeded", "Suspicious Discount", "Color Mismatch", "Color Mismatch: Title vs COLOR Column", "FDA", "Category Check", "Warranty Check",
+    "Color Check", "Variation Check", "Brand Image Check", "Title Language Check", "Image Quality Check",
+    "Product Name Brand Name – Brand Repeated In Title",
+    "Product Name Brand Name – Inspired/Alternative Perfume Brand",
+    "Product Name Brand Name – Generic/Placeholder Brand",
+    "Product Name Brand Name – High-End Brand Counterfeit Suspected",
+    "Product Name Brand Name – Other",
+    "Title Language Check - Not In English",
+    "Title Language Check - Other",
+    "Other Reason (Custom)",
+]
+
+
+def _learn_category_corrections(sids_to_process, subset_data):
+    """Update category matcher engine with approved category corrections."""
+    try:
+        from category_matcher_engine import get_engine
+        engine = get_engine()
+        if engine is not None and isinstance(subset_data, pd.DataFrame) and not subset_data.empty:
+            learned = 0
+            for sid in sids_to_process:
+                row = subset_data[
+                    subset_data["PRODUCT_SET_SID"].astype(str).str.strip() == str(sid).strip()
+                ]
+                if row.empty:
+                    continue
+                name = str(row.iloc[0].get("NAME", "")).strip()
+                if not name:
+                    continue
+                engine.set_compiled_rules(st.session_state.get("compiled_json_rules", {}))
+                predicted = engine.get_category_with_boost(name)
+                if predicted and predicted.lower() not in ("nan", "none", "uncategorized", ""):
+                    engine.apply_learned_correction(name, predicted, auto_save=False)
+                    learned += 1
+            if learned:
+                engine.save_learning_db()
+    except Exception as _e:
+        logger.warning("Category learning failed during approval: %s", _e)
+
+
+@st.dialog("Confirm Bulk Approval", width="large", icon=":material/check_circle:")
 def bulk_approve_dialog(
     sids_to_process,
     title,
@@ -1211,186 +1660,123 @@ def bulk_approve_dialog(
     country_validator,
     validation_runner,
 ):
-    try:
-        from category_matcher_engine import get_engine
-
-        _CAT_MATCHER_AVAILABLE = True
-    except ImportError:
-        _CAT_MATCHER_AVAILABLE = False
-
-    # ── Third stage: carry out the choice ─────────────────────────────────
-    # Runs before anything is drawn, using the re-check computed on the first
-    # pass. Deliberately does not re-validate: the answer is already known and
-    # a second run would double the wait for no new information.
-    _run = st.session_state.pop(f"_bulk_run_{title}", None)
-    if _run:
-        _mode = st.session_state.pop(f"_bulk_ack_{title}", "all")
-        _still, _sids_all = _run["still"], _run["sids"]
-        _clean = [s for s in _sids_all if s not in _still]
-        _fm = (support_files or {}).get("flags_mapping", {})
-
-        if _mode == "all":
-            # Waiving the other issues is the whole point of this branch, so
-            # it is logged against each product rather than left implicit in
-            # an "Approved by User" row that mentions none of it.
-            record_overrides(_still, approved_from=title)
-            _n = apply_status_change(
-                _sids_all, status="Approved", reason="", comment="",
-                flag="Approved by User", is_manual=True, is_zip=False,
-            )
-            st.toast(f"Approved {_n} product(s), clearing {len(_still)} with other issues",
-                     icon=":material/check_circle:")
-        else:
-            _n = apply_status_change(
-                _clean, status="Approved", reason="", comment="",
-                flag="Approved by User", is_manual=True, is_zip=False,
-            ) if _clean else 0
-            # The rest move to the issue that still applies, so the expander
-            # they land in is the one that explains why they are still here.
-            _moved = 0
-            for _sid, _flags in _still.items():
-                _nf = _flags[0]
-                _info = _fm.get(_nf, {"reason": "1000007 - Other Reason", "en": _nf})
-                apply_status_change(
-                    [_sid], status="Rejected",
-                    reason=_info.get("reason", "1000007 - Other Reason"),
-                    comment=_info.get("en", _nf), flag=_nf,
-                    is_manual=True, is_zip=False, propagate_siblings=False,
-                )
-                _moved += 1
-            st.toast(f"Approved {_n}; {_moved} kept rejected under their remaining issue",
-                     icon=":material/move_down:")
-        st.session_state.data_version = st.session_state.get("data_version", 0) + 1
-        st.rerun()
-
-    st.warning(
-        f"You are about to approve **{len(sids_to_process)}** items from `{title}`."
-    )
-    _preview_cols = [
-        c
-        for c in ["PRODUCT_SET_SID", "NAME", "BRAND", "SELLER_NAME"]
-        if c in subset_data.columns
-    ]
-    _preview_df = subset_data[subset_data["PRODUCT_SET_SID"].isin(sids_to_process)][
-        _preview_cols
-    ].reset_index(drop=True)
-    with st.expander(
-        f"Preview {len(_preview_df)} item(s) to be approved",
-        expanded=len(_preview_df) <= 10,
-    ):
-        st.dataframe(_preview_df, hide_index=True, width='stretch')
-
-    # ── Second stage: other checks still reject some of these ──────────────
-    # Rendered in place of the approve button rather than after a rerun, so the
-    # validation result computed below is used as-is and never recomputed.
-    _pending = st.session_state.get(f"_bulk_pending_{title}")
-    if _pending:
-        _still = _pending["still"]
-        _sids_all = _pending["sids"]
-        _clean_n = len(_sids_all) - len(_still)
-        st.error(
-            f"**{len(_still)} of {len(_sids_all)} products are still rejected by other checks.** "
-            f"Approving them here would clear those too.",
-            icon=":material/report:",
-        )
-        _by_flag: dict = {}
-        for _s, _fl in _still.items():
-            for _f in _fl:
-                _by_flag[_f] = _by_flag.get(_f, 0) + 1
-        st.dataframe(
-            pd.DataFrame(
-                sorted(_by_flag.items(), key=lambda kv: -kv[1]),
-                columns=["Other issue", "Products"],
-            ),
-            hide_index=True, width="stretch",
-        )
-        _o1, _o2 = st.columns(2)
-        if _o1.button(
-            f"Approve all {len(_sids_all)} anyway",
-            type="primary", width="stretch", key=f"bulk_all_{title}",
-            help="Clears every issue listed above. Recorded so you can revert it.",
-        ):
-            st.session_state[f"_bulk_ack_{title}"] = "all"
-            st.session_state[f"_bulk_run_{title}"] = _pending
-            st.session_state.pop(f"_bulk_pending_{title}", None)
-            st.rerun()
-        if _o2.button(
-            f"Approve only the {_clean_n} clean one(s)",
-            width="stretch", key=f"bulk_clean_{title}",
-            help="The rest stay rejected, under the issue that still applies.",
-        ):
-            st.session_state[f"_bulk_ack_{title}"] = "clean"
-            st.session_state[f"_bulk_run_{title}"] = _pending
-            st.session_state.pop(f"_bulk_pending_{title}", None)
-            st.rerun()
-        if st.button("Cancel", width="stretch", key=f"bulk_cancel_{title}"):
-            st.session_state.pop(f"_bulk_pending_{title}", None)
-            st.rerun()
+    _sids_str = [str(sid).strip() for sid in sids_to_process if str(sid).strip()]
+    if not _sids_str:
+        st.info("No items selected to approve.")
         return
 
-    if st.button(_t("approve_btn"), type="primary", width='stretch'):
-        with st.spinner("Validating…"):
-            _progress = st.progress(0, text="Running validation…")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _executor:
-                data_hash = (
-                    df_hash(subset_data) + country_validator.code + "_skip_" + title
-                )
-                _future = _executor.submit(
-                    validation_runner,
-                    data_hash,
-                    subset_data,
-                    support_files,
-                    country_validator.code,
-                    data_has_warranty_cols_check,
-                    [title],
-                )
-                import time as _time
+    _wanted = set(_sids_str)
+    _fm = (support_files or {}).get("flags_mapping", {})
+    _cmt_lang = "fr" if st.session_state.get("selected_country") == "Morocco" else "en"
+    _norm_title = str(title).replace("(Prefetched)", "").replace("⚡ ZIP", "").strip()
 
-                _elapsed = 0
-                while not _future.done():
-                    _time.sleep(0.1)
-                    _elapsed += 0.1
-                    _progress.progress(
-                        min(0.9, _elapsed / 10), text="Running validation…"
-                    )
-                _res = _future.result()
-            _progress.progress(1.0, text="Done!")
-            _progress.empty()
-            sids_str = [str(sid).strip() for sid in sids_to_process]
+    # ── Build name / brand / SKU map from subset_data ──────────────────────
+    _name_map: dict = {}
+    _brand_map: dict = {}
+    _sku_map: dict = {}
+    if isinstance(subset_data, pd.DataFrame) and not subset_data.empty:
+        for _, _r in subset_data.iterrows():
+            _s = str(_r.get("PRODUCT_SET_SID", "")).strip()
+            if _s:
+                _name_map[_s] = str(_r.get("NAME", "")).strip()
+                _brand_map[_s] = str(_r.get("BRAND", "")).strip()
+                _sku_map[_s] = str(_r.get("SELLER_SKU", _r.get("PARENTSKU", ""))).strip()
 
-            # This validation run already excluded `title`, so whatever it
-            # still rejects is a genuinely different problem. The result used
-            # to be discarded and every product approved regardless — the cost
-            # was paid and the answer thrown away.
-            _still: dict = {}
-            try:
-                _sub_results = _res[1] if isinstance(_res, tuple) and len(_res) > 1 else {}
-                _wanted = {s for s in sids_str}
-                for _flag, _df in (_sub_results or {}).items():
-                    if _flag == title or _df is None or getattr(_df, "empty", True):
-                        continue
-                    if "PRODUCT_SET_SID" not in getattr(_df, "columns", []):
-                        continue
-                    _hit = _df["PRODUCT_SET_SID"].fillna("").astype(str).str.strip()
-                    for _s in set(_hit) & _wanted:
-                        if _flag in overridden_flags(_s):
-                            continue
-                        _still.setdefault(_s, []).append(_flag)
-            except Exception:
-                logger.exception("Re-check after bulk approval failed")
-                _still = {}
+    # ── Collect other rejection reasons per SID ───────────────────────────
+    _known_other: dict = {}
 
-            # One prompt for the whole batch, never one per product: at 200
-            # items with 90 conflicts, per-product confirmation is unusable.
-            if _still:
-                st.session_state[f"_bulk_pending_{title}"] = {
-                    "sids": sids_str, "still": _still, "title": title,
-                }
-                st.rerun()
+    post_qc = st.session_state.get("post_qc_results", {})
+    if isinstance(post_qc, dict):
+        for _flag, _df in post_qc.items():
+            _norm_f = str(_flag).replace("(Prefetched)", "").replace("⚡ ZIP", "").strip()
+            if _norm_f == _norm_title or _df is None or getattr(_df, "empty", True):
+                continue
+            if "PRODUCT_SET_SID" in getattr(_df, "columns", []):
+                _hit = set(_df["PRODUCT_SET_SID"].fillna("").astype(str).str.strip()) & _wanted
+                for _s in _hit:
+                    if _flag not in overridden_flags(_s):
+                        _fl_list = _known_other.setdefault(_s, [])
+                        if _flag not in _fl_list:
+                            _fl_list.append(_flag)
 
-            msg_moved = {}
+    qc_zip = st.session_state.get("zip_qc_results", pd.DataFrame())
+    if isinstance(qc_zip, pd.DataFrame) and not qc_zip.empty:
+        sid_col = next(
+            (c for c in ["PRODUCT_SET_SID", "ProductSetSid", "Product Set SID", "SID"] if c in qc_zip.columns),
+            None,
+        )
+        if sid_col:
+            status_cols = [c for c in qc_zip.columns if "status" in c.lower()]
+            zip_sub = qc_zip[qc_zip[sid_col].astype(str).str.strip().isin(_wanted)]
+            for _, r in zip_sub.iterrows():
+                _sid_val = str(r[sid_col]).strip()
+                for col in status_cols:
+                    if str(r[col]).lower() in ("rejected", "1", "yes", "true"):
+                        col_key = _prefetch_key_from_status_col(col)
+                        flag = PREFETCH_MAP.get(col_key, col_key.replace("_", " ").title())
+                        flag_pre = f"{flag} (Prefetched)"
+                        _norm_flag = flag.replace("(Prefetched)", "").strip()
+                        if _norm_flag != _norm_title:
+                            target_f = flag_pre if flag_pre in (st.session_state.get("post_qc_results", {}) or {}) else flag
+                            if target_f not in overridden_flags(_sid_val):
+                                _fl_list = _known_other.setdefault(_sid_val, [])
+                                if target_f not in _fl_list:
+                                    _fl_list.append(target_f)
+
+    fr = st.session_state.get("final_report", pd.DataFrame())
+    if isinstance(fr, pd.DataFrame) and not fr.empty and "ProductSetSid" in fr.columns and "FLAG" in fr.columns:
+        fr_sub = fr[fr["ProductSetSid"].astype(str).str.strip().isin(_wanted)]
+        for _, r in fr_sub.iterrows():
+            _sid_val = str(r["ProductSetSid"]).strip()
+            _status_val = str(r.get("Status", "")).strip()
+            _flag_val = str(r.get("FLAG", "")).strip()
+            _norm_fr_flag = _flag_val.replace("(Prefetched)", "").replace("⚡ ZIP", "").strip()
+            if _status_val == "Rejected" and _norm_fr_flag and _norm_fr_flag != _norm_title:
+                if _flag_val not in overridden_flags(_sid_val):
+                    _fl_list = _known_other.setdefault(_sid_val, [])
+                    if _flag_val not in _fl_list:
+                        _fl_list.append(_flag_val)
+
+    _still = _known_other
+    _sids_all = _sids_str
+    _clean = [s for s in _sids_all if s not in _still]
+    _dirty = [s for s in _sids_all if s in _still]
+
+    # ── Header summary metrics ─────────────────────────────────────────────
+    _hcol1, _hcol2, _hcol3 = st.columns(3)
+    _hcol1.metric("Selected", len(_sids_all))
+    _hcol2.metric("✅ Clean — will auto-approve", len(_clean))
+    _hcol3.metric("⚠️ Has other issues", len(_dirty))
+    st.divider()
+
+    # ── CASE 1: Everything is clean ────────────────────────────────────────
+    if not _still:
+        st.success(
+            f"All **{len(_sids_str)}** product(s) passed every other check. "
+            "They will be approved immediately.",
+            icon=":material/verified:",
+        )
+        # Compact SKU table
+        _preview_rows = [
+            {
+                "SKU / SID": _sku_map.get(_s, _s),
+                "Product Name": _name_map.get(_s, "—"),
+                "Brand": _brand_map.get(_s, "—"),
+            }
+            for _s in _sids_str
+        ]
+        if _preview_rows:
+            st.dataframe(pd.DataFrame(_preview_rows), hide_index=True, width='stretch')
+
+        _acol1, _acol2 = st.columns([3, 1])
+        if _acol1.button(
+            f"✅ Approve all {len(_sids_str)} product(s)",
+            type="primary",
+            width='stretch',
+            key=f"bulk_app_clean_{title}",
+        ):
             msg_approved = apply_status_change(
-                sids_str,
+                _sids_str,
                 status="Approved",
                 reason="",
                 comment="",
@@ -1398,67 +1784,207 @@ def bulk_approve_dialog(
                 is_manual=True,
                 is_zip=False,
             )
-
             if msg_approved > 0:
                 st.toast(
-                    f"Approved {msg_approved} product(s) successfully!",
+                    f"✅ Approved {msg_approved} product(s) successfully!",
                     icon=":material/check_circle:",
                 )
-            if msg_moved:
-                for f, c in msg_moved.items():
-                    st.toast(
-                        f"{c} product(s) moved to '{f}' (other issues found)",
-                        icon=":material/note:",
-                    )
-
-            if title == "Wrong Category" and _CAT_MATCHER_AVAILABLE:
-                try:
-                    engine = get_engine()
-                    if engine is not None:
-                        learned = 0
-                        for sid in sids_to_process:
-                            row = subset_data[
-                                subset_data["PRODUCT_SET_SID"].astype(str).str.strip()
-                                == str(sid)
-                            ]
-                            if row.empty:
-                                continue
-                            name = str(row.iloc[0].get("NAME", "")).strip()
-                            if not name:
-                                continue
-                            engine.set_compiled_rules(
-                                st.session_state.get("compiled_json_rules", {})
-                            )
-                            predicted = engine.get_category_with_boost(name)
-                            if predicted and predicted.lower() not in (
-                                "nan",
-                                "none",
-                                "uncategorized",
-                                "",
-                            ):
-                                engine.apply_learned_correction(
-                                    name, predicted, auto_save=False
-                                )
-                                learned += 1
-                        if learned:
-                            engine.save_learning_db()
-                            st.session_state.main_toasts.append(
-                                f"Engine learned {learned} correction(s) from your approvals."
-                            )
-                except Exception as _le:
-                    logger.warning("Wrong Category approval learning failed: %s", _le)
-
-            if msg_approved > 0:
-                st.session_state.main_toasts.append(
-                    f"{msg_approved} items successfully Approved!"
-                )
-            for flag, count in msg_moved.items():
-                st.session_state.main_toasts.append(
-                    f"{count} items re-flagged as: {flag}"
-                )
-
+            if title == "Wrong Category":
+                _learn_category_corrections(_sids_str, subset_data)
+            st.session_state.data_version = st.session_state.get("data_version", 0) + 1
             st.session_state[f"exp_{title}"] = True
             _clear_flag_df_selection(title)
+            st.rerun()
+        if _acol2.button("Cancel", width='stretch', key=f"bulk_cancel_clean_{title}"):
+            st.rerun()
+        return
+
+    # ── CASE 2: Some / all products have other rejection reasons ──────────
+
+    def _sev_order(flag: str) -> int:
+        _sev_map = {"blocker": 0, "judgment": 1, "advisory": 2, "resolved": 3}
+        return _sev_map.get(flag_severity(flag), 99)
+
+    _sev_label_map = {
+        "blocker":  "🟥 Blocker",
+        "judgment": "🟧 Judgment",
+        "advisory": "🟦 Advisory",
+        "resolved": "🟩 Resolved",
+    }
+
+    if _clean:
+        st.info(
+            f"**{len(_clean)}** clean product(s) will be approved automatically. "
+            f"**{len(_dirty)}** product(s) below have other issues — "
+            "choose the reason to keep each one rejected under.",
+            icon=":material/info:",
+        )
+    else:
+        st.warning(
+            f"All **{len(_dirty)}** selected product(s) have other rejection issues. "
+            "Select the reason to keep each one rejected under.",
+            icon=":material/warning:",
+        )
+
+    # All detected flags across all dirty products, sorted by severity
+    _all_detected_flags = sorted(
+        {f for flags in _still.values() for f in flags},
+        key=_sev_order,
+    )
+    # Full choice pool: detected first, then standard reasons
+    _choice_pool = (
+        _all_detected_flags
+        + [r for r in _STANDARD_REJECTION_REASONS if r not in _all_detected_flags and r != title]
+    )
+
+    st.markdown("#### Products with other rejection issues")
+    st.caption(
+        "Each dropdown defaults to the **most serious** detected reason for that product. "
+        "Override per product as needed, then click **Apply** below."
+    )
+
+    # Per-product dropdowns in a responsive 2-column layout
+    _per_sid_choice: dict = {}
+    for _idx, _sid in enumerate(_dirty):
+        _prod_flags = sorted(_still.get(_sid, []), key=_sev_order)
+        _top_flag = _prod_flags[0] if _prod_flags else (_choice_pool[0] if _choice_pool else "Other Reason (Custom)")
+        _prod_name = _name_map.get(_sid, "—")
+        _prod_brand = _brand_map.get(_sid, "")
+        _prod_sku = _sku_map.get(_sid, _sid)
+        _top_sev = _sev_label_map.get(flag_severity(_top_flag), "🟧 Judgment")
+
+        with st.container():
+            _c1, _c2 = st.columns([2, 3])
+            with _c1:
+                st.markdown(
+                    f"**{_prod_sku}**  \n"
+                    f"<span style='font-size:12px;color:#6B6560'>"
+                    f"{_prod_name[:60]}{'…' if len(_prod_name) > 60 else ''}"
+                    f"</span>",
+                    unsafe_allow_html=True,
+                )
+                if _prod_brand:
+                    st.caption(f"Brand: {_prod_brand}")
+                if len(_prod_flags) > 1:
+                    st.caption(f"Also flagged: {', '.join(_prod_flags[1:3])}{'…' if len(_prod_flags) > 3 else ''}")
+            with _c2:
+                # Build options: detected flags for this product first (most severe first), then rest of pool
+                _local_detected = _prod_flags
+                _local_opts = _local_detected + [r for r in _choice_pool if r not in _local_detected]
+                _per_sid_choice[_sid] = st.selectbox(
+                    f"{_top_sev} — {len(_prod_flags)} issue(s) detected",
+                    _local_opts,
+                    index=0,  # default = most severe detected reason
+                    key=f"per_sid_rej_{_idx}_{_sid[:8]}",
+                    label_visibility="visible",
+                )
+
+        if _idx < len(_dirty) - 1:
+            st.markdown(
+                "<hr style='margin:3px 0;border-color:#F0EDEA'>",
+                unsafe_allow_html=True,
+            )
+
+    # Custom comment input (shown if any product uses "Other Reason (Custom)")
+    _needs_custom = any(v == "Other Reason (Custom)" for v in _per_sid_choice.values())
+    custom_cmt = ""
+    if _needs_custom:
+        custom_cmt = st.text_area(
+            "Custom rejection comment (applied to all 'Other' selections)",
+            placeholder="Type custom rejection comment…",
+            key=f"bulk_cust_cmt_{title}",
+            height=70,
+        )
+
+    st.divider()
+
+    # ── Action buttons ─────────────────────────────────────────────────────
+    _btn_col1, _btn_col2, _btn_col3 = st.columns([4, 4, 2])
+
+    _apply_label = (
+        f"✅ Approve {len(_clean)} clean  +  🚫 Keep {len(_dirty)} rejected"
+        if _clean
+        else f"🚫 Keep {len(_dirty)} rejected under selected reasons"
+    )
+    if _btn_col1.button(_apply_label, type="primary", width='stretch', key=f"bulk_apply_{title}"):
+        _n_clean = 0
+        if _clean:
+            _n_clean = apply_status_change(
+                _clean,
+                status="Approved",
+                reason="",
+                comment="",
+                flag="Approved by User",
+                is_manual=True,
+                is_zip=False,
+            )
+            if title == "Wrong Category":
+                _learn_category_corrections(_clean, subset_data)
+
+        _moved = 0
+        for _sid, _chosen in _per_sid_choice.items():
+            if _chosen == "Other Reason (Custom)":
+                _final_c = custom_cmt.strip() if custom_cmt.strip() else "Other Reason"
+                apply_status_change(
+                    [_sid], status="Rejected",
+                    reason="1000007 - Other Reason", comment=_final_c,
+                    flag="Other Reason (Custom)", is_manual=True, is_zip=False,
+                    propagate_siblings=False,
+                )
+            else:
+                _info = _fm.get(_chosen, {"reason": "1000007 - Other Reason", "en": _chosen})
+                apply_status_change(
+                    [_sid], status="Rejected",
+                    reason=_info.get("reason", "1000007 - Other Reason"),
+                    comment=_info.get(_cmt_lang, _info.get("en", _chosen)),
+                    flag=_chosen, is_manual=True, is_zip=False,
+                    propagate_siblings=False,
+                )
+            _moved += 1
+
+        if _n_clean:
+            st.toast(f"✅ Approved {_n_clean} clean product(s)", icon=":material/check_circle:")
+        if _moved:
+            st.toast(
+                f"🚫 {_moved} product(s) kept rejected under their selected reasons",
+                icon=":material/move_down:",
+            )
+
+        st.session_state.data_version = st.session_state.get("data_version", 0) + 1
+        st.session_state[f"exp_{title}"] = True
+        _clear_flag_df_selection(title)
+        st.rerun()
+
+    if _btn_col2.button(
+        f"⚡ Force Approve ALL {len(_sids_all)} — clear other reasons",
+        width='stretch',
+        key=f"bulk_force_{title}",
+        help="Approves all selected products completely, recording a waiver on their other rejection reasons.",
+    ):
+        record_overrides(_still, approved_from=title)
+        tracker = st.session_state.setdefault("manual_undone_tracker", {})
+        for _s in _sids_all:
+            tracker.setdefault(str(_s).strip(), set()).update(_still.get(_s, []))
+        _n = apply_status_change(
+            _sids_all,
+            status="Approved",
+            reason="",
+            comment="",
+            flag="Approved by User",
+            is_manual=True,
+            is_zip=False,
+        )
+        if title == "Wrong Category":
+            _learn_category_corrections(_sids_all, subset_data)
+        st.toast(
+            f"⚡ Force-approved {_n} product(s), clearing {len(_still)} other reason(s)",
+            icon=":material/check_circle:",
+        )
+        st.session_state.data_version = st.session_state.get("data_version", 0) + 1
+        st.session_state[f"exp_{title}"] = True
+        _clear_flag_df_selection(title)
+        st.rerun()
+    if _btn_col3.button("Cancel", width='stretch', key=f"bulk_cancel_{title}"):
         st.rerun()
 
 
@@ -1489,7 +2015,8 @@ def _resolve_preview_urls(df: pd.DataFrame) -> list:
         if not empty.any():
             break
         candidate = df[col]
-        usable = empty & candidate.notna() & (candidate.astype(str).str.strip() != "")
+        _candidate_text = candidate.fillna("").astype(str).str.strip()
+        usable = empty & ~_candidate_text.str.casefold().isin({"", "nan", "none", "null"})
         img_s.loc[usable] = candidate[usable]
 
     names = df.get("NAME", pd.Series([""] * len(df), index=df.index)).fillna("").astype(str).values
@@ -1530,10 +2057,11 @@ def render_flag_expander(
     except ImportError:
         _CAT_MATCHER_AVAILABLE = False
 
-    cache_key = f"display_df_{title}_{df_hash(data)}_prefetch_context_v3"
+    cache_key = f"display_df_{title}_{df_hash(data)}_{df_hash(df_flagged_sids)}_prefetch_context_v6_learned_remove"
     base_display_cols = [
         "PRODUCT_SET_SID",
         "NAME",
+        "Overturned",
         "Detected Issue",
         "BRAND",
         "CATEGORY",
@@ -1572,6 +2100,23 @@ def render_flag_expander(
         "IMAGE_URL_1",
         "Image1",
     ]
+    # Reports loaded from older exports can carry the image under IMAGE1 or
+    # IMAGE_URL while MAIN_IMAGE is absent/empty. Canonicalise the value before
+    # building the cached table so the preview toggle and gallery see the
+    # actual URL instead of a column containing literal NaN/blank values.
+    if "MAIN_IMAGE" not in data.columns:
+        data["MAIN_IMAGE"] = ""
+    _main_image = data["MAIN_IMAGE"].fillna("").astype(str).str.strip()
+    for _alias in possible_img_cols:
+        if _alias == "MAIN_IMAGE" or _alias not in data.columns:
+            continue
+        _candidate = data[_alias].fillna("").astype(str).str.strip()
+        _usable = ~_candidate.str.casefold().isin({"", "nan", "none", "null"})
+        _main_image = _main_image.mask(
+            _main_image.str.casefold().isin({"", "nan", "none", "null"}) & _usable,
+            _candidate,
+        )
+    data["MAIN_IMAGE"] = _main_image
     img_col = next((c for c in possible_img_cols if c in data.columns), None)
     if img_col and img_col not in current_display_cols:
         current_display_cols.append(img_col)
@@ -1584,7 +2129,7 @@ def render_flag_expander(
         # data.columns filter below wouldn't otherwise include it — this
         # table previously showed the flag NAME but never the reason a
         # reviewer would need to act on it without opening the grid card.
-        _extra_cols = [c for c in current_display_cols if c in data.columns or c == "Detected Issue"]
+        _extra_cols = [c for c in current_display_cols if c in data.columns or c in ("Detected Issue", "Overturned")]
         if "CATEGORY_CODE" in data.columns and "CATEGORY_CODE" not in _extra_cols:
             _extra_cols.append("CATEGORY_CODE")
 
@@ -1604,8 +2149,9 @@ def render_flag_expander(
         if "Comment" not in df_flagged_sids.columns:
             df_flagged_sids = df_flagged_sids.copy()
             df_flagged_sids["Comment"] = ""
+        _merge_flag_cols = [c for c in ["ProductSetSid", "Is_Zip", "Comment", "overturn_direction", "Learned Match", "Learned Match Method", "Learned Match Distance", "Learned Rule URL", "Learned Rule pHash"] if c in df_flagged_sids.columns]
         df_display = pd.merge(
-            df_flagged_sids[["ProductSetSid", "Is_Zip", "Comment"]].rename(
+            df_flagged_sids[_merge_flag_cols].rename(
                 columns={"Comment": "Detected Issue"}
             ),
             data,
@@ -1613,10 +2159,39 @@ def render_flag_expander(
             right_on="PRODUCT_SET_SID",
             how="left",
         )
+        if "overturn_direction" in df_display.columns:
+            df_display["Overturned"] = df_display["overturn_direction"].apply(
+                lambda x: "Overturned" if str(x).strip() == "to_rejection" else ""
+            )
+        else:
+            df_display["Overturned"] = ""
+
+        # If no items in this flag were overturned, omit the empty column
+        if df_display["Overturned"].eq("").all():
+            _extra_cols = [c for c in _extra_cols if c != "Overturned"]
+        else:
+            # Streamlit/pandas may preserve a categorical dtype here. Cast to
+            # object before replacing so current pandas versions do not emit a
+            # FutureWarning on every validation expander rerun.
+            df_display["Overturned"] = df_display["Overturned"].astype(object).replace(
+                {"Overturned": "🔓 Overturned"}
+            )
+
         _di = df_display["Detected Issue"].astype(str).str.strip()
         df_display["Detected Issue"] = _di.where(
             ~_di.str.lower().isin(["nan", "none", "", "manual rejection", "rejected"]), ""
         )
+        # Make brand-claim findings unmistakable in the audit table. The
+        # validator emits "Casio claimed in DESCRIPTION ..."; normalize that
+        # wording so every such row starts with the same review cue.
+        def _brand_claim_label(value):
+            text = str(value or "").strip()
+            match = re.match(r"^(.+?)\s+claimed\s+in\s+(BRAND|NAME|DESCRIPTION|SHORT_DESCRIPTION)\b(.*)$", text, flags=re.IGNORECASE)
+            if not match:
+                return text
+            brand, surface, remainder = match.groups()
+            return f"Brand claimed: {brand.strip()} in {surface.upper()}{remainder}"
+        df_display["Detected Issue"] = df_display["Detected Issue"].map(_brand_claim_label)
         _extra_cols_cleaned = [c for c in _extra_cols if c in df_display.columns]
         if "IMAGE1_ZIP" in df_display.columns:
             _extra_cols_cleaned.append("IMAGE1_ZIP")
@@ -1661,6 +2236,11 @@ def render_flag_expander(
                 + ["Is_Zip"]
             )
         )
+        if "Learned Match" in df_display.columns and "Learned Match" not in _final_cols:
+            _final_cols.append("Learned Match")
+        for _learned_col in ("Learned Match Method", "Learned Match Distance", "Learned Rule URL", "Learned Rule pHash"):
+            if _learned_col in df_display.columns and _learned_col not in _final_cols:
+                _final_cols.append(_learned_col)
         df_display = df_display[_final_cols]
         if "NAME" in df_display.columns:
             df_display["NAME"] = df_display["NAME"].apply(
@@ -1807,9 +2387,17 @@ def render_flag_expander(
         df_view = df_view.iloc[_lo:_hi].reset_index(drop=True)
 
     def style_rows(row):
+        _styles = [""] * len(row)
+        if "Detected Issue" in row.index and re.search(r"^Brand claimed:", str(row.get("Detected Issue", "")), flags=re.IGNORECASE):
+            _styles[list(row.index).index("Detected Issue")] = "font-weight: 800; color: #0f172a;"
+        _learned_value = row.get("Learned Match", False)
+        if _learned_value is True or str(_learned_value).strip().casefold() in {"true", "1", "yes", "y"}:
+            return [f"{value}background-color: #e6f4ff;" for value in _styles]
+        if "overturned" in str(row.get("Overturned", "")).casefold():
+            return [f"{value}background-color: rgba(239, 68, 68, 0.08); font-weight: 600;" for value in _styles]
         if row.get("Is_Zip"):
-            return ["color: #ff4b4b; font-weight: 900;"] * len(row)
-        return [""] * len(row)
+            return [f"{value}color: #ff4b4b; font-weight: 900;" for value in _styles]
+        return _styles
 
     # Page number is part of the selection key so a positional selection made
     # on one page can never silently target different products on another page.
@@ -1844,6 +2432,11 @@ def render_flag_expander(
                 help="Product Set SID — pinned so it stays reachable while the row scrolls",
             ),
             "NAME": st.column_config.TextColumn("Product Name", width="medium"),
+            "Overturned": st.column_config.TextColumn(
+                "Overturned",
+                width="small",
+                help="Indicates if AI approved this product but QC validation overturned it to Rejected",
+            ),
             "Detected Issue": st.column_config.TextColumn(
                 "Detected Issue",
                 width="large",
@@ -1872,6 +2465,13 @@ def render_flag_expander(
                 help="AI predicted correct category path",
             ),
             "Is_Zip": None,
+            "Learned Match": None,
+            "Learned Match Method": st.column_config.TextColumn(
+                "Image Match", help="URL, exact pHash, or near-pHash match"
+            ),
+            "Learned Match Distance": st.column_config.NumberColumn(
+                "pHash Distance", help="Hamming distance out of 64; lower is closer"
+            ),
         }
 
     # The raw image column — image1 / MAIN_IMAGE / IMAGE1_ZIP, whichever the
@@ -1900,24 +2500,133 @@ def render_flag_expander(
                 "image URL, and no matching image was found in the uploaded ZIP."
             )
 
-    # A pandas Styler renders every cell as text, which stops ImageColumn from
-    # drawing anything — so with previews on, the table goes through unstyled
-    # and loses style_rows' red tint for ZIP rows. That costs nothing: the tint
-    # only ever encoded Is_Zip, which the expander label ("⚡ ZIP") and the flag
-    # header badge both state in text — the accessible way to carry it anyway.
-    if show_table_images:
-        event = st.dataframe(
-            df_view,
-            **df_kwargs,
-            column_config=_col_cfg,
-        )
-    else:
-        df_styled = df_view.style.apply(style_rows, axis=1)
-        event = st.dataframe(
-            df_styled,
-            **df_kwargs,
-            column_config=_col_cfg,
-        )
+    if show_table_images and any(_preview_urls):
+        # Keep the table for selection, and add a readable gallery for normal
+        # review. It is limited to the current page to avoid extra network work.
+        st.markdown("**Image gallery**")
+        _gallery_learned_rules = load_learned_image_rules()
+        _gallery_rules_by_url = {
+            str(_r.get("image_url", "")).strip(): _r
+            for _r in _gallery_learned_rules
+            if isinstance(_r, dict)
+            and str(_r.get("status", "active")).casefold() == "active"
+            and str(_r.get("image_url", "")).strip()
+        }
+        _gallery_rules_by_phash = {
+            str(_r.get("phash", "")).strip(): _r
+            for _r in _gallery_learned_rules
+            if isinstance(_r, dict)
+            and str(_r.get("status", "active")).casefold() == "active"
+            and str(_r.get("phash", "")).strip()
+        }
+        _gallery_limit = min(len(df_view), 40)
+        for _gallery_start in range(0, _gallery_limit, 4):
+            _gallery_cols = st.columns(4, gap="small")
+            for _gallery_col, _gallery_idx in zip(
+                _gallery_cols, range(_gallery_start, min(_gallery_start + 4, _gallery_limit))
+            ):
+                with _gallery_col:
+                    _gallery_row = df_view.iloc[_gallery_idx]
+                    _gallery_sid = str(_gallery_row.get("PRODUCT_SET_SID", "")).strip()
+                    _gallery_name = str(_gallery_row.get("NAME", "")).strip()
+                    _gallery_issue = str(_gallery_row.get("Detected Issue", "")).strip()
+                    if _gallery_issue.casefold() in {"nan", "none", "rejected", "manual rejection"}:
+                        _gallery_issue = ""
+                    _gallery_brand = str(_gallery_row.get("BRAND", "")).strip()
+                    _gallery_learned = _gallery_row.get("Learned Match", False)
+                    _gallery_tag = "Learned rule" if _gallery_learned is True or str(_gallery_learned).casefold() in {"true", "1", "yes"} else ""
+                    _gallery_overturned = str(_gallery_row.get("Overturned", "")).strip().casefold() in {"overturned", "🔓 overturned"}
+                    _gallery_rule = None
+                    if _gallery_tag:
+                        _gallery_rule_url = str(_gallery_row.get("Learned Rule URL", "") or "").strip()
+                        _gallery_rule_phash = str(_gallery_row.get("Learned Rule pHash", "") or "").strip()
+                        _gallery_rule = (
+                            _gallery_rules_by_url.get(_gallery_rule_url)
+                            or _gallery_rules_by_phash.get(_gallery_rule_phash)
+                        )
+                        if _gallery_rule is None:
+                            _gallery_image_url = str(_gallery_row.get("MAIN_IMAGE", "") or "").strip()
+                            _gallery_rule = _gallery_rules_by_url.get(_gallery_image_url)
+                    _gallery_url = _preview_urls[_gallery_idx]
+                    if _gallery_url:
+                        st.image(_gallery_url, width=220)
+                    else:
+                        st.markdown(
+                            "<div style='height:220px;display:flex;align-items:center;justify-content:center;"
+                            "border:1px solid #e5e7eb;border-radius:10px;background:#f8fafc;color:#94a3b8;"
+                            "font-size:12px;'>Image unavailable</div>",
+                            unsafe_allow_html=True,
+                        )
+                    _name_html = html_lib.escape(_gallery_name or "Unnamed product")
+                    _issue_html = html_lib.escape(_gallery_issue or "No detected issue text")
+                    _brand_html = html_lib.escape(_gallery_brand)
+                    _tag_html = (
+                        "<span style='display:inline-block;margin-left:5px;padding:2px 6px;border-radius:999px;"
+                        "background:#dbeafe;color:#1e3a8a;font-size:10px;font-weight:700;'>🧠 Learned rule</span>"
+                        if _gallery_tag else ""
+                    )
+                    _overturned_html = (
+                        "<span style='display:inline-block;margin-left:5px;padding:2px 6px;border-radius:999px;"
+                        "background:#dcfce7;color:#166534;font-size:10px;font-weight:700;'>🔓 Overturned</span>"
+                        if _gallery_overturned else ""
+                    )
+                    _issue_block = (
+                        "<div style='margin-top:5px;font-size:11px;color:#9f1239;line-height:1.3;"
+                        "display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;' "
+                        "title='" + _issue_html + "'>" + _issue_html + "</div>"
+                        if _gallery_issue else ""
+                    )
+                    _brand_block = (
+                        "<div style='margin-top:5px;font-size:11px;color:#475569;'><strong>Brand:</strong> "
+                        + _brand_html + "</div>"
+                        if _gallery_brand and _gallery_brand.casefold() not in {"nan", "none"} else ""
+                    )
+                    if _gallery_tag and _gallery_rule:
+                        _remove_key = "remove_learned_preview_" + hashlib.md5(
+                            f"{title}|{_gallery_sid}".encode("utf-8", "ignore")
+                        ).hexdigest()[:12]
+                        if st.button(
+                            "Remove learned rule",
+                            key=_remove_key,
+                            type="secondary",
+                            icon=":material/delete:",
+                            help="Remove the exact learned image rule matched by this product.",
+                        ):
+                            _removed = delete_learned_image_rules([_gallery_rule])
+                            if _removed:
+                                st.session_state.display_df_cache = {}
+                                st.session_state.pop("_learned_image_rule_map_cache", None)
+                                st.toast(
+                                    "Learned image rule removed. Run validation again to refresh this product's verdict.",
+                                    icon=":material/check_circle:",
+                                )
+                                st.rerun()
+                    st.markdown(
+                        f"<div style='margin-top:7px;padding:8px 9px;border:1px solid #e5e7eb;"
+                        f"border-radius:9px;background:#fff;min-height:88px;'>"
+                        f"<div style='font-size:11px;color:#64748b;font-family:var(--font-mono);"
+                        f"white-space:nowrap;overflow:hidden;text-overflow:ellipsis;' title='{html_lib.escape(_gallery_sid)}'>"
+                        f"{html_lib.escape(_gallery_sid)}{_tag_html}{_overturned_html}</div>"
+                        f"<div style='margin-top:4px;font-size:13px;line-height:1.3;font-weight:700;"
+                        f"color:#1e293b;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;"
+                        f"' title='{_name_html}'>{_name_html}</div>"
+                        f"{_issue_block}{_brand_block}"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+        if len(df_view) > _gallery_limit:
+            st.caption(f"Showing {_gallery_limit:,} gallery images from this page; use pagination to view more.")
+
+    # Apply the provenance tint in both table modes. Learned rows must remain
+    # identifiable while image previews are enabled; previously the image
+    # branch bypassed Styler entirely, so those rows lost their blue shading.
+    # Streamlit preserves the ImageColumn configuration alongside the Styler.
+    df_styled = df_view.style.apply(style_rows, axis=1)
+    event = st.dataframe(
+        df_styled,
+        **df_kwargs,
+        column_config=_col_cfg,
+    )
 
     raw_selected = list(event.selection.rows)
     selected_indices = [i for i in raw_selected if i < len(df_view)]
@@ -1932,27 +2641,7 @@ def render_flag_expander(
     )
 
     _fm = support_files["flags_mapping"]
-    _reason_options = [
-        "Wrong Category", "Restricted brands", "Suspected Fake product", "Seller Not approved to sell Refurb",
-        "Product Warranty", "Seller Approve to sell books", "Seller Approved to Sell Perfume", "Counterfeit Sneakers",
-        "Suspected counterfeit Jerseys", "Prohibited products", "Unnecessary words in NAME", "Single-word NAME",
-        "Generic BRAND Issues", "Fashion brand issues", "BRAND name repeated in NAME", "Wrong Variation",
-        "Generic branded products with genuine brands", "Missing COLOR", "Missing Weight/Volume", "Incomplete Smartphone Name",
-        "Duplicate product", "Poor images", "Image Stretched", "Image Blurry", "Image Mismatch",
-        "Image Infringing", "Image Too Many things displayed", "Perfume Tester", "NG - Gift Card Seller",
-        "NG - Books Seller", "NG - TV Brand Seller", "NG - HP Toners Seller", "NG - Apple Seller",
-        "NG - Xmas Tree Seller", "NG - Rice Brand Seller", "NG - Powerbank Capacity", "Discount too high",
-        "Category Max Price Exceeded", "Suspicious Discount", "Color Mismatch", "FDA", "Category Check", "Warranty Check",
-        "Color Check", "Variation Check", "Brand Image Check", "Title Language Check", "Image Quality Check",
-        "Product Name Brand Name – Brand Repeated In Title",
-        "Product Name Brand Name – Inspired/Alternative Perfume Brand",
-        "Product Name Brand Name – Generic/Placeholder Brand",
-        "Product Name Brand Name – High-End Brand Counterfeit Suspected",
-        "Product Name Brand Name – Other",
-        "Title Language Check - Not In English",
-        "Title Language Check - Other",
-        "Other Reason (Custom)",
-    ]
+    _reason_options = _STANDARD_REJECTION_REASONS
 
     btn_col1, btn_col2 = st.columns(2)
     with btn_col1:
@@ -2194,6 +2883,7 @@ def build_fast_grid_html(
     items_per_page=50,
 ):
     if support_files is None: support_files = {}
+    _thumbnail_map = st.session_state.get("_image_thumbnail_by_url", {}) or {}
 
     from translations import get_translation
     lang = st.session_state.get("ui_lang", "en")
@@ -2376,8 +3066,30 @@ def build_fast_grid_html(
     for row in page_data.to_dict("records"):
         sid = str(row.get("PRODUCT_SET_SID", "")).strip()
         img_url = str(row.get("MAIN_IMAGE", "")).strip()
+        full_img_url = img_url
+        thumbnail_missing = False
         if img_url.startswith("http"):
             img_url = img_url.replace("http://", "https://", 1)
+            full_img_url = img_url
+            # The validator downloads each unique URL once and publishes a
+            # compact cached thumbnail. Cards use it when available, while
+            # the zoom viewer still resolves the original URL on demand.
+            _thumb = _thumbnail_map.get(img_url, "")
+            if _thumb:
+                img_url = _thumb
+            else:
+                # Keep the source URL as a fallback while the thumbnail cache
+                # is cold or a thumbnail download failed. Replacing it with
+                # the placeholder here made valid remote images appear to be
+                # missing in the validation grid even though the URL was
+                # usable (and the zoom viewer could still open it).
+                # Do not mark this as missing: the card still has a usable
+                # source URL and the browser can load it directly. Marking
+                # every cache miss as missing caused a "Load image" button to
+                # appear on every card before the first image request even
+                # though nothing had failed. A retry control is added by
+                # onImgError only after both direct and proxy loading fail.
+                thumbnail_missing = False
         elif img_url:
             name = str(row.get("NAME", "")).strip()
             brand = str(row.get("BRAND", "")).strip()
@@ -2466,11 +3178,31 @@ def build_fast_grid_html(
             _ai_n = _norm_colour(color_ai)
             _dec_n = _norm_colour(color_val)
             _both_multi = _ai_n.startswith("multi") and _dec_n.startswith("multi")
+            _graphite_black = {_ai_n, _dec_n}.issubset({"graphite", "black"})
+            _metallic_compat = bool({"stainlesssteel", "silver", "inox", "acier", "chrome", "titanium", "gunmetal", "anthracite"}.intersection({_ai_n, _dec_n})) and {_ai_n, _dec_n}.issubset({"stainlesssteel", "silver", "gray", "grey", "steel", "inox", "acier", "chrome", "titanium", "gunmetal", "anthracite", "black"})
+            _rosegold_compat = bool({"rosegold", "rosegold"}.intersection({_ai_n, _dec_n})) and {_ai_n, _dec_n}.issubset({"rosegold", "pink", "gold", "yellow"})
+            _charcoal_compat = "charcoal" in {_ai_n, _dec_n} and {_ai_n, _dec_n}.issubset({"charcoal", "black", "gray", "grey"})
+            _midnight_compat = "midnight" in {_ai_n, _dec_n} and {_ai_n, _dec_n}.issubset({"midnight", "black", "blue", "navy"})
+            _teal_compat = bool({"teal", "turquoise", "cyan", "aqua"}.intersection({_ai_n, _dec_n})) and {_ai_n, _dec_n}.issubset({"teal", "turquoise", "cyan", "aqua", "blue", "green"})
+            _coral_compat = bool({"coral", "peach", "salmon", "apricot"}.intersection({_ai_n, _dec_n})) and {_ai_n, _dec_n}.issubset({"coral", "peach", "salmon", "apricot", "pink", "orange"})
+            _champagne_compat = "champagne" in {_ai_n, _dec_n} and {_ai_n, _dec_n}.issubset({"champagne", "white", "gold", "yellow", "beige", "cream"})
+            _wood_compat = bool({"wood", "wooden", "bois", "natural"}.intersection({_ai_n, _dec_n})) and {_ai_n, _dec_n}.issubset({"wood", "wooden", "bois", "natural", "brown"})
             if (not _both_multi
+                    and not _graphite_black
+                    and not _metallic_compat
+                    and not _rosegold_compat
+                    and not _charcoal_compat
+                    and not _midnight_compat
+                    and not _teal_compat
+                    and not _coral_compat
+                    and not _champagne_compat
+                    and not _wood_compat
+                    and not {"coffee", "wine"}.intersection({_ai_n, _dec_n})
                     and _ai_n != _dec_n and _ai_n not in _dec_n and _dec_n not in _ai_n):
                 color_mismatch = f"AI: '{color_ai}' vs declared: '{color_val}'"
         elif color_ai and not color_val:
-            color_mismatch = f"AI detected color: '{color_ai}' (none declared)"
+            if color_ai.lower().strip() not in ("coffee", "wine"):
+                color_mismatch = f"AI detected color: '{color_ai}' (none declared)"
 
         dup_raw = str(row.get("Duplicate_Flag", "")).strip()
         is_duplicate = dup_raw.lower() not in ("", "nan", "none", "false")
@@ -2512,6 +3244,12 @@ def build_fast_grid_html(
             {
                 "sid": sid,
                 "img": img_url if show_images else _PLACEHOLDER_SVG,
+                "full_img": full_img_url if full_img_url.startswith("http") else "",
+                "thumbnail_missing": bool(thumbnail_missing and show_images),
+                "image_cluster_key": str(
+                    st.session_state.get("_image_phash_by_url", {}).get(full_img_url, "")
+                    or full_img_url
+                ),
                 "name": str(row.get("NAME", "")),
                 "brand": str(row.get("BRAND", "Unknown Brand")),
                 "cat": str(row.get("Initial_Category_Path", row.get("CATEGORY", "Unknown Category"))),
@@ -2557,6 +3295,27 @@ def build_fast_grid_html(
                 "zip_override": str(_zip_override_map.get(sid, "")),
                 "brand_claim": _brand_claims.get(sid, ""),
                 "perfume_claim": str(_perfume_claims.get(sid, "")),
+                "learned_match": (
+                    row.get("Learned Match", False) is True
+                    or str(row.get("Learned Match", False)).strip().casefold()
+                    in {"true", "1", "yes", "y"}
+                ),
+                "learned_match_method": str(row.get("Learned Match Method", "")),
+                "learned_match_distance": row.get("Learned Match Distance", None),
+                "learned_confidence": row.get("Learned Confidence", None),
+                "learned_decision": str(row.get("Learned Decision", "")),
+                "learned_review_match": (
+                    row.get("Learned Review Match", False) is True
+                    or str(row.get("Learned Review Match", False)).strip().casefold()
+                    in {"true", "1", "yes", "y"}
+                ),
+                "learned_review_detail": str(row.get("Learned Review Detail", "") or "").strip(),
+                "learned_review_method": str(row.get("Learned Review Method", "") or "").strip(),
+                "learned_review_distance": row.get("Learned Review Distance", None),
+                "learned_review_brand": str(row.get("Learned Review Brand", "") or "").strip(),
+                "learned_review": str(row.get("Learned Review", "Unreviewed")),
+                "learned_source": str(row.get("Learned Source", "")),
+                "same_image_count": int(row.get("Same Image Count", 0) or 0),
             }
         )
 
@@ -2601,55 +3360,32 @@ def build_fast_grid_html(
 
     def _sel(val, curr): return "selected" if val == curr else ""
     sort_html = f'''
-  <select class="reason-sel sort-sel" id="sort-sel-top" onchange="sendMsg('grid_sort_issue', this.value)" style="max-width:170px;" title="{labels_dict.get('sort_by_issue', 'Sort')}">
+  <select class="reason-sel sort-sel" id="sort-sel-top" onchange="applySort(this.value)" style="max-width:170px;" title="{labels_dict.get('sort_by_issue', 'Sort')}">
     <option value="" {_sel('', curr_sort)}>{labels_dict.get('sort_by_issue', 'Sort')}</option>
     <option value="most_flagged" {_sel('most_flagged', curr_sort)}>{labels_dict.get('most_flagged', 'Most Flagged')}</option>
-    <option value="no_issue" {_sel('no_issue', curr_sort)}>{labels_dict.get('no_issue_first', 'No Issue')}</option>
     <option disabled>── {labels_dict.get('grp_image', 'Image')} ──</option>
     <option value="low_res" {_sel('low_res', curr_sort)}>{labels_dict.get('sort_low_res', 'Low Res')}</option>
     <option value="tall" {_sel('tall', curr_sort)}>{labels_dict.get('sort_tall', 'Tall')}</option>
     <option value="wide" {_sel('wide', curr_sort)}>{labels_dict.get('sort_wide', 'Wide')}</option>
     <option value="broken" {_sel('broken', curr_sort)}>{labels_dict.get('sort_broken', 'Broken')}</option>
-    <option disabled>── {labels_dict.get('grp_qc_flags', 'QC')} ──</option>
-    <option value="Wrong Category" {_sel('Wrong Category', curr_sort)}>{labels_dict.get('sort_wrong_cat', 'Wrong Cat')}</option>
-    <option value="Restricted brands" {_sel('Restricted brands', curr_sort)}>{labels_dict.get('sort_restr_brand', 'Restricted')}</option>
-    <option value="Suspected Fake product" {_sel('Suspected Fake product', curr_sort)}>{labels_dict.get('sort_fake', 'Fake')}</option>
-    <option value="Missing COLOR" {_sel('Missing COLOR', curr_sort)}>{labels_dict.get('sort_missing_color', 'Color')}</option>
-    <option value="Product Warranty" {_sel('Product Warranty', curr_sort)}>{labels_dict.get('sort_warranty', 'Warranty')}</option>
-    <option value="Duplicate product" {_sel('Duplicate product', curr_sort)}>{labels_dict.get('sort_duplicates', 'Duplicate')}</option>
-    <option disabled>── {labels_dict.get('grp_prefetch', 'Prefetch')} ──</option>
-    <option value="Category Check" {_sel('Category Check', curr_sort)}>Category Check</option>
-    <option value="Warranty Check" {_sel('Warranty Check', curr_sort)}>Warranty Check</option>
-    <option value="FDA" {_sel('FDA', curr_sort)}>FDA</option>
-    <option value="Color Check" {_sel('Color Check', curr_sort)}>Color Check</option>
-    <option value="Variation Check" {_sel('Variation Check', curr_sort)}>Variation Check</option>
-    <option value="Brand Image Check" {_sel('Brand Image Check', curr_sort)}>Brand Image Check</option>
-    <option value="Title Language Check" {_sel('Title Language Check', curr_sort)}>Title Language Check</option>
-    <option value="Image Quality Check" {_sel('Image Quality Check', curr_sort)}>Image Quality Check</option>
   </select>
 '''
     filter_html = f'''
-  <select class="reason-sel sort-sel" id="filter-sel-top" onchange="sendMsg('grid_filter_flag', this.value)" style="max-width:180px;" title="{labels_dict.get('filter_by_flag', 'Filter')}">
+  <select class="reason-sel sort-sel" id="filter-sel-top" onchange="applyFilter(this.value)" style="max-width:180px;" title="{labels_dict.get('filter_by_flag', 'Filter')}">
     <option value="" {_sel('', curr_flag)}>{labels_dict.get('filter_by_flag', 'Filter')}</option>
     <option value="brand_ocr" {_sel('brand_ocr', curr_flag)}>{labels_dict.get('filter_brand_ocr', 'Brand OCR')}</option>
     <option value="duplicates" {_sel('duplicates', curr_flag)}>{labels_dict.get('filter_duplicates', 'Duplicates')}</option>
     <option value="manual_review" {_sel('manual_review', curr_flag)}>{labels_dict.get('filter_manual', 'Manual Review')}</option>
     <option value="color_mismatch" {_sel('color_mismatch', curr_flag)}>{labels_dict.get('filter_color_mis', 'Color Mis')}</option>
+    <option value="learned_only" {_sel('learned_only', curr_flag)}>Learned matches only</option>
+    <option value="direct_only" {_sel('direct_only', curr_flag)}>Direct validation only</option>
+    <option value="overturned_only" {_sel('overturned_only', curr_flag)}>Overturned only</option>
+    <option value="review_unreviewed" {_sel('review_unreviewed', curr_flag)}>Unreviewed learned</option>
+    <option value="review_confirmed" {_sel('review_confirmed', curr_flag)}>Confirmed learned</option>
+    <option value="near_phash" {_sel('near_phash', curr_flag)}>Near-pHash matches</option>
+    <option value="multi_seller" {_sel('multi_seller', curr_flag)}>Multi-product images</option>
     <option value="committed" {_sel('committed', curr_flag)}>{labels_dict.get('all_rejected', 'All Rejected')}</option>
-    <option value="no_flags" {_sel('no_flags', curr_flag)}>{labels_dict.get('clean_no_flags', 'Clean')}</option>
-    <option disabled>── {labels_dict.get('grp_qc_flags', 'QC')} ──</option>
-    <option value="Wrong Category" {_sel('Wrong Category', curr_flag)}>{labels_dict.get('sort_wrong_cat', 'Wrong Cat')}</option>
-    <option value="Restricted brands" {_sel('Restricted brands', curr_flag)}>{labels_dict.get('sort_restr_brand', 'Restricted')}</option>
-    <option value="Suspected Fake product" {_sel('Suspected Fake product', curr_flag)}>{labels_dict.get('sort_fake', 'Fake')}</option>
-    <option value="Missing COLOR" {_sel('Missing COLOR', curr_flag)}>{labels_dict.get('sort_missing_color', 'Color')}</option>
-    <option value="Product Warranty" {_sel('Product Warranty', curr_flag)}>{labels_dict.get('sort_warranty', 'Warranty')}</option>
-    <option value="Duplicate product" {_sel('Duplicate product', curr_flag)}>{labels_dict.get('sort_duplicates', 'Duplicate')}</option>
-    <option value="BRAND name repeated in NAME" {_sel('BRAND name repeated in NAME', curr_flag)}>{labels_dict.get('filter_brand_name', 'Brand Name')}</option>
-    <option value="Unnecessary words" {_sel('Unnecessary words', curr_flag)}>{labels_dict.get('filter_unneeded', 'Unneeded')}</option>
-    <option value="Prohibited Words" {_sel('Prohibited Words', curr_flag)}>{labels_dict.get('filter_prohibited', 'Prohibited')}</option>
-    <option value="Brand Image Mismatch" {_sel('Brand Image Mismatch', curr_flag)}>Brand Image Mismatch</option>
-    <option value="Off-Platform Contact" {_sel('Off-Platform Contact', curr_flag)}>Off-Platform Contact</option>
-    <option value="Specs Inconsistency" {_sel('Specs Inconsistency', curr_flag)}>Specs Inconsistency</option>
+    <option value="unresolved" {_sel('unresolved', curr_flag)}>Unresolved only</option>
     <option disabled>── {labels_dict.get('grp_prefetch', 'Prefetch')} ──</option>
     <option value="Category Check" {_sel('Category Check', curr_flag)}>Category Check</option>
     <option value="Warranty Check" {_sel('Warranty Check', curr_flag)}>Warranty Check</option>
@@ -2698,6 +3434,7 @@ def build_fast_grid_html(
     <option value="REJECT_SMARTPHONE_NAME">Incomplete Smartphone Name</option>
     <option value="REJECT_SPECS_INCONSISTENCY">Specs Inconsistency</option>
     <option value="REJECT_WEIGHT_VOL">Missing Weight/Volume</option>
+    <option value="REJECT_COLOR_MISMATCH">Color Mismatch (Title vs COLOR)</option>
     <option value="REJECT_TITLE_LANG">Title Not in English</option>
     <option value="REJECT_OFFPLATFORM">Off-Platform Contact</option>
     </optgroup>
@@ -2775,10 +3512,8 @@ def build_fast_grid_html(
     /* --grid-top-h is measured in JS because the toolbar wraps to two rows
        on narrow screens; the fallback covers the first paint. */
     max-height:calc(100vh - var(--grid-top-h, 0px) - 16px);
-    /* Measured, not fixed: the bottom bar now also carries language,
-       sort and filter, so it wraps to two rows on narrow screens and
-       a hardcoded 84px would let it cover the last row of cards. */
-    padding-bottom:calc(var(--grid-bot-h, 84px) + 14px);
+    /* Measured padding for the bottom bar so it clears the cards without excessive dead space */
+    padding-bottom:calc(var(--grid-bot-h, 50px) + 12px);
     scroll-behavior:smooth;
   }}
   /* Every numeric in a card — SID, price, dimensions — in tabular mono so a
@@ -2794,7 +3529,7 @@ def build_fast_grid_html(
       transition-duration:.01ms !important;
     }}
   }}
-  body{{background:var(--bg);color:var(--text);padding:8px 8px 80px 8px;overflow-x:hidden;width:100%;transition:background .2s, color .2s;}}
+  body{{background:var(--bg);color:var(--text);padding:6px 6px 0 6px;overflow-x:hidden;width:100%;transition:background .2s, color .2s;}}
 
   .ctrl-bar{{position:-webkit-sticky;position:sticky;top:0;z-index:99999;display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 12px;background:var(--card);backdrop-filter:blur(8px);border-bottom:2px solid var(--accent);border-radius:4px;margin-bottom:12px;box-shadow:0 4px 16px rgba(0,0,0,0.15);}}
   /* The .ctrl-bar.top-bar rules that were here — nowrap plus a horizontal
@@ -2949,6 +3684,18 @@ def build_fast_grid_html(
   .top-btn:hover {{background: #000; color: white;}}
 
   .grid{{display:grid;grid-template-columns:repeat({cols_per_row},minmax(0,1fr));gap:12px;width:100%;}}
+  /* Reviewer-controlled density modes. These change only presentation; they
+     never change which products are loaded or validated. */
+  body.density-compact .grid{{gap:6px;}}
+  body.density-compact .card{{min-height:245px;padding:6px;border-radius:7px;}}
+  body.density-compact .card-img-wrap{{min-height:72px;max-height:125px;border-radius:6px;}}
+  body.density-compact .meta{{margin-top:5px;gap:2px;font-size:10px;line-height:1.2;}}
+  body.density-compact .meta .nm{{font-size:11px;}}
+  body.density-compact .warn-badge{{font-size:9px;padding:2px 5px;}}
+  body.density-image .grid{{gap:10px;}}
+  body.density-image .card{{min-height:0;padding:6px;}}
+  body.density-image .card-img-wrap{{max-height:none;min-height:150px;aspect-ratio:1/1;}}
+  body.density-image .meta{{display:none;}}
   .card{{border:2px solid var(--border);border-radius:10px;padding:10px;background:var(--card);position:relative;z-index:1;min-width:0;word-wrap:break-word;display:flex;flex-direction:column;min-height:360px;outline:none;
     transition:border-color .18s ease,box-shadow .18s ease,transform .18s cubic-bezier(.2,.8,.3,1);}}
   /* min-height, not height: a 360px floor forced every card to reserve
@@ -2977,6 +3724,11 @@ def build_fast_grid_html(
   .card.selected{{border-color:{O};box-shadow:0 0 0 5px rgba(255,136,0,.35);background:rgba(255,136,0,.04);}}
   .card.staged-rej{{border-color:{R};box-shadow:0 0 0 4px rgba(231,60,23,.3);background:rgba(231,60,23,.04);}}
   .card.committed-rej{{border-color:#bbb;opacity:.6;}}
+  /* Learned-file rejections are a provenance cue. Keep the light-blue tint
+     visible even when the card is also dimmed as a committed rejection. */
+  .card.learned-rej{{background:#e6f4ff;border-color:#93c5fd;}}
+  .card.committed-rej.learned-rej{{background:#e6f4ff;border-color:#60a5fa;opacity:.82;}}
+  .card.committed-rej.learned-rej .rej-overlay{{background:rgba(219,234,254,.88) !important;}}
   .card.manual-review{{border-color:#dc2626;box-shadow:0 0 0 3px rgba(220,38,38,0.25);}}
   .card.zip-card{{border-left:4px solid #3b82f6;box-shadow:-4px 0 8px rgba(59,130,246,0.20);}}
   .card.zip-card.selected{{border-left:4px solid #3b82f6;box-shadow:-4px 0 8px rgba(59,130,246,0.20),0 0 0 5px rgba(255,136,0,.35);}}
@@ -2994,6 +3746,8 @@ def build_fast_grid_html(
   .card-img-placeholder{{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;z-index:1;}}
   .card-img{{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;z-index:2;opacity:0;transition:opacity .4s ease;}}
   .card-img.img-loaded{{opacity:1;}}
+  .retry-img-btn{{position:absolute;left:50%;bottom:8px;transform:translateX(-50%);z-index:30;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#334155;padding:4px 8px;font-size:10px;font-weight:700;cursor:pointer;box-shadow:0 2px 6px rgba(15,23,42,.16);}}
+  .retry-img-btn:hover{{background:#eff6ff;border-color:#60a5fa;}}
   .card.committed-rej .card-img{{filter:grayscale(80%);}}
 
   .warn-wrap{{position:absolute;top:8px;right:8px;display:flex;flex-direction:column;gap:6px;z-index:10;pointer-events:none;max-width:calc(100% - 16px);}}
@@ -3069,6 +3823,10 @@ def build_fast_grid_html(
   .card.committed-rej.brand-image-rej .rej-badge {{ background: #2E7D32 !important; }}
   .card.committed-rej.brand-image-rej .rej-label {{ color: #2E7D32 !important; }}
   .card.committed-rej.brand-image-rej .rej-overlay {{ background: rgba(232, 245, 233, 0.6) !important; }}
+
+  .card.committed-rej.pot-restricted-rej .rej-badge {{ background: #d97706 !important; }}
+  .card.committed-rej.pot-restricted-rej .rej-label {{ color: #b45309 !important; }}
+  .card.committed-rej.pot-restricted-rej .rej-overlay {{ background: rgba(254, 243, 199, 0.75) !important; }}
 
   /* 🧠 Highlights */
   .hlt {{ background: #fee2e2; color: #b91c1c; font-weight: 800; border-radius: 2px; padding: 0 2px; }}
@@ -3164,8 +3922,8 @@ def build_fast_grid_html(
   }}
   .tooltip-close {{
     position: absolute;
-    top: -12px;
-    right: -12px;
+    top: 8px;
+    right: 8px;
     background: #333;
     color: #fff;
     border-radius: 50%;
@@ -3179,6 +3937,7 @@ def build_fast_grid_html(
     align-items: center;
     justify-content: center;
     box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+    z-index: 10;
   }}
   .tooltip-close:hover {{ background: #000; }}
 
@@ -3312,15 +4071,22 @@ def build_fast_grid_html(
   <button class="desel-btn" onclick="doDeselAll()">{labels_dict["deselect_all"]}</button>
   {sort_html}
   {filter_html}
-  <span class="cols-group">
+<span class="cols-group">
     <span class="cols-label">Cards per row</span>
     {_cols_btns}
+</span>
+  <span class="cols-group density-group">
+    <span class="cols-label">Density</span>
+    <button class="desel-btn density-btn" data-density="compact" onclick="setGridDensity('compact')" title="Compact cards">Compact</button>
+    <button class="desel-btn density-btn" data-density="comfortable" onclick="setGridDensity('comfortable')" title="Comfortable cards">Comfortable</button>
+    <button class="desel-btn density-btn" data-density="image" onclick="setGridDensity('image')" title="Image-focused cards">Images</button>
   </span>
   <button class="icon-btn" style="margin-left:auto;" onclick="gridScrollTo('top')" title="Back to top" aria-label="Back to top">{_ICON_TOP}</button>
   <button class="bar-toggle" id="bar-float-btn" onclick="toggleBarFloat()" aria-pressed="false"
           title="Float the bar over the cards" aria-label="Float the bar over the cards">&#9679;</button>
   <button class="bar-toggle" id="bar-collapse-btn" onclick="toggleBarCollapse()" aria-expanded="true"
           title="Collapse the bar" aria-label="Collapse the bar">&#9660;</button>
+  <button class="desel-btn" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;font-weight:700;margin-left:6px;padding:4px 10px;font-size:12px;" onclick="closeVisualReview()" title="Close Visual Review">✖ Close</button>
 </div>
 
 <div id="zoom-backdrop" onclick="closeZoom()"></div>
@@ -3340,7 +4106,10 @@ def build_fast_grid_html(
 
 function escapeHtml(u){{return(u||"").toString().replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");}}
 window.__IS_GRID_IFRAME__ = true;
-var CARDS = [];
+// Bootstrap the first page directly in the iframe.  The broadcaster still
+// synchronises later pages, but a cold iframe can now paint cards immediately
+// even if the first GRID_READY message races the listener.
+var CARDS = {cards_json};
 var COMMITTED = {{}};
 var POOR_IMG_SIDS = new Set();
 var PREFETCH_URLS = {{}};
@@ -3349,7 +4118,7 @@ var _lastCardsSig = null;
 // Base64 ZIP images, keyed by SID and kept out of the card records so the card
 // payload stays small. Retained across syncs: paging back to a visited page
 // costs nothing because the bytes are already here.
-var IMAGES = {{}};
+var IMAGES = {images_json};
 // Single resolution point for a card's image source, so callers never have to
 // know whether it came inline (http URL) or from the IMAGES store (ZIP).
 function imgFor(card) {{
@@ -3443,10 +4212,54 @@ var PAGE_SIZE_OPTIONS = [20, 50, 100, 200, 500];
 var PAGE_STATE = {{
   pageSize: DEFAULT_PAGE_SIZE,
   page: 1,
+  autoPages: 1,
+  autoLoad: true,
   search: '',
   sellers: [],
   categories: []
 }};
+window._gridDensity = (function() {{
+  try {{ return sessionStorage.getItem('pim_grid_density') || 'comfortable'; }} catch(e) {{ return 'comfortable'; }}
+}})();
+window.setGridDensity = function(mode) {{
+  mode = ['compact','comfortable','image'].includes(mode) ? mode : 'comfortable';
+  window._gridDensity = mode;
+  document.body.classList.remove('density-compact','density-comfortable','density-image');
+  document.body.classList.add('density-' + mode);
+  document.querySelectorAll('.density-btn').forEach(function(btn) {{
+    var active = btn.dataset.density === mode;
+    btn.style.background = active ? 'var(--accent)' : '#fff';
+    btn.style.color = active ? 'var(--ink-on-accent)' : 'var(--text)';
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }});
+  try {{ sessionStorage.setItem('pim_grid_density', mode); }} catch(e) {{}}
+}};
+setTimeout(function() {{ window.setGridDensity(window._gridDensity); }}, 0);
+// Preserve the iframe's own view state when Streamlit replaces the document
+// after a server-page turn.  Without this, returning from a filter or moving
+// back a page silently recreated the JS state with empty filters and made the
+// two pagers appear to disagree.
+(function restoreGridViewState() {{
+  try {{
+    var saved = JSON.parse(sessionStorage.getItem('pim_grid_view_state') || 'null');
+    if (saved && typeof saved === 'object') {{
+      PAGE_STATE.search = typeof saved.search === 'string' ? saved.search : '';
+      PAGE_STATE.sellers = Array.isArray(saved.sellers) ? saved.sellers : [];
+      PAGE_STATE.categories = Array.isArray(saved.categories) ? saved.categories : [];
+      PAGE_STATE.pageSize = parseInt(saved.pageSize, 10) || DEFAULT_PAGE_SIZE;
+    }}
+  }} catch(e) {{}}
+}})();
+function saveGridViewState() {{
+  try {{
+    sessionStorage.setItem('pim_grid_view_state', JSON.stringify({{
+      search: PAGE_STATE.search || '',
+      sellers: PAGE_STATE.sellers || [],
+      categories: PAGE_STATE.categories || [],
+      pageSize: _pageSizeValue()
+    }}));
+  }} catch(e) {{}}
+}}
 
 window._gridSelected = window._gridSelected || {{}};
 window._stagedRejections = window._stagedRejections || {{}};
@@ -3462,7 +4275,16 @@ CARDS.forEach(c => {{
     c.warnings.forEach(w => {{ if (!window._imageIssues[c.sid].includes(w)) window._imageIssues[c.sid].push(w); }});
   }}
 }});
-window._currentSort = window._currentSort || '';
+window._currentSort = window._currentSort || (function() {{ try {{ return sessionStorage.getItem('pim_grid_sort') || ''; }} catch(e) {{ return ''; }} }})();
+window._currentFilter = window._currentFilter || (function() {{ try {{ return sessionStorage.getItem('pim_grid_filter') || ''; }} catch(e) {{ return ''; }} }})();
+setTimeout(function() {{
+  ['sort-sel-top','sort-sel-bottom'].forEach(function(id) {{ var el = document.getElementById(id); if (el) el.value = window._currentSort || ''; }});
+  ['filter-sel-top','filter-sel-bottom'].forEach(function(id) {{ var el = document.getElementById(id); if (el) el.value = window._currentFilter || ''; }});
+  var s = document.getElementById('grid-search');
+  if (s && PAGE_STATE.search) s.value = PAGE_STATE.search;
+  _setMultiSelectValues('seller-filter', PAGE_STATE.sellers);
+  _setMultiSelectValues('category-filter', PAGE_STATE.categories);
+}}, 0);
 
 window._pendingUndos = window._pendingUndos || {{}};
 window._undoTimer = null;
@@ -3471,16 +4293,17 @@ var selected = window._gridSelected;
 var staged = window._stagedRejections;
 
 function showGhostOverlay(msgText, autoHideMs) {{
-  var ghost = document.createElement('div');
-  ghost.id = '__grid_ghost__';
-  ghost.style.cssText = 'position:fixed;z-index:99999;inset:0;background:rgba(255,255,255,0.85);display:flex;align-items:center;justify-content:center;font-family:sans-serif;color:#FF8800;transition:opacity 0.4s ease;';
-  ghost.innerHTML = '<div style="font-size:22px;font-weight:bold;">' + msgText + '</div>';
   var existing = document.getElementById('__grid_ghost__');
   if (existing) existing.remove();
+  var ghost = document.createElement('div');
+  ghost.id = '__grid_ghost__';
+  // This is a non-blocking status toast.  A full-screen overlay made the
+  // iframe feel frozen and prevented paging while a batch was being saved.
+  ghost.style.cssText = 'position:fixed;z-index:99999;top:16px;right:16px;max-width:360px;padding:14px 18px;border:1px solid #d9e2ec;border-radius:10px;background:rgba(255,255,255,0.97);box-shadow:0 8px 28px rgba(15,23,42,.16);font-family:sans-serif;color:#b45309;transition:opacity 0.4s ease;pointer-events:none;';
+  ghost.innerHTML = '<div style="font-size:15px;font-weight:700;">' + msgText + '<div style="font-size:12px;font-weight:normal;color:#64748b;margin-top:5px;">You can continue reviewing other pages.</div></div>';
+  ghost.onclick = closeGhostOverlay;
   document.body.appendChild(ghost);
-  // Default auto-hide: short overlays (notifications) use 4s, long ops use the caller's value.
-  // For batch ops we use a long timeout so the overlay stays until Streamlit reloads the page.
-  var hideDelay = (typeof autoHideMs === 'number') ? autoHideMs : 4000;
+  var hideDelay = (typeof autoHideMs === 'number') ? Math.min(autoHideMs, 8000) : 4000;
   setTimeout(function() {{
     var g = document.getElementById('__grid_ghost__');
     if (g) {{ g.style.opacity = '0'; setTimeout(function() {{ if(g && g.parentNode) g.remove(); }}, 400); }}
@@ -3492,10 +4315,76 @@ function closeGhostOverlay() {{
   if (g) {{ g.style.opacity = '0'; setTimeout(function() {{ if(g && g.parentNode) g.remove(); }}, 400); }}
 }}
 
+function closeVisualReview() {{
+  // 1. Auto-commit any staged or selected cards before closing so user work is never lost
+  var hasStaged = typeof staged !== 'undefined' && Object.keys(staged).length > 0;
+  var hasSelected = typeof selected !== 'undefined' && Object.keys(selected).length > 0;
+  if (hasStaged || hasSelected) {{
+    var sel = document.getElementById('batch-reason-bottom');
+    var br = (sel && sel.value) ? sel.value : 'REJECT_POOR_IMAGE';
+    if (typeof _applyBatchReject === 'function') {{
+      _applyBatchReject(br);
+    }}
+    setTimeout(_doCloseModal, 350);
+    return;
+  }}
+  _doCloseModal();
+}}
+
+function _doCloseModal() {{
+  // 1. Click the Streamlit Python Close button in the footer (triggers session state update & clean rerun)
+  try {{
+    var par = window.parent;
+    var btn = par.document.querySelector('.st-key-close_bot_fallback button');
+    if (btn && !btn.disabled) {{
+      btn.click();
+      return;
+    }}
+  }} catch(e) {{}}
+
+  // 2. Dispatch to fragment-scoped close bridge
+  try {{
+    var par = window.parent;
+    var inputs = par.document.querySelectorAll('input');
+    var bridge = null;
+    for (var i = 0; i < inputs.length; i++) {{
+      if (inputs[i].placeholder === 'GRID_CLOSE_BRIDGE_DO_NOT_USE') {{ bridge = inputs[i]; break; }}
+    }}
+    if (bridge) {{
+      var setter = Object.getOwnPropertyDescriptor(par.HTMLInputElement.prototype, 'value').set;
+      setter.call(bridge, String(Date.now()));
+      bridge.dispatchEvent(new par.Event('input', {{bubbles: true}}));
+      bridge.dispatchEvent(new par.Event('change', {{bubbles: true}}));
+      bridge.focus({{preventScroll: true}});
+      bridge.dispatchEvent(new par.KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:'Enter',keyCode:13}}));
+      bridge.dispatchEvent(new par.KeyboardEvent('keyup',   {{bubbles:true,cancelable:true,key:'Enter',keyCode:13}}));
+      bridge.blur();
+      return;
+    }}
+  }} catch(e) {{}}
+
+  // 3. Fallback: sendMsg to jtbridge
+  sendMsg('close_review', true);
+}}
+
+// Intercept clicks on the native dialog "X" button so closing via "X" also saves pending work
+try {{
+  var _par = window.parent;
+  var _nativeClose = _par.document.querySelector('[data-testid="stDialog"] [data-testid="stDialogCloseButton"], [data-testid="stDialog"] button[aria-label="Close"]');
+  if (_nativeClose && !_nativeClose.__pim_bound) {{
+    _nativeClose.__pim_bound = true;
+    _nativeClose.addEventListener('click', function(ev) {{
+      ev.preventDefault();
+      ev.stopPropagation();
+      closeVisualReview();
+    }}, true);
+  }}
+}} catch(e) {{}}
+
 function sendMsg(type, payload) {{
   try {{
     var par = window.parent;
-    var inputs = par.document.querySelectorAll('input[type="text"]');
+    var inputs = par.document.querySelectorAll('input');
     var bridge = null;
     var targetPlaceholder = (type === 'change_lang') ? 'LANG_BRIDGE_DO_NOT_USE' : 'JTBRIDGE_UNIQUE_DO_NOT_USE';
     for (var i = 0; i < inputs.length; i++) {{
@@ -3508,6 +4397,7 @@ function sendMsg(type, payload) {{
     var nativeInputValueSetter = Object.getOwnPropertyDescriptor(par.HTMLInputElement.prototype, 'value').set;
     nativeInputValueSetter.call(bridge, msg);
     bridge.dispatchEvent(new par.Event('input', {{bubbles: true}}));
+    bridge.dispatchEvent(new par.Event('change', {{bubbles: true}}));
     bridge.focus({{preventScroll: true}});
     bridge.dispatchEvent(new par.KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:'Enter',keyCode:13}}));
     bridge.dispatchEvent(new par.KeyboardEvent('keyup',   {{bubbles:true,cancelable:true,key:'Enter',keyCode:13}}));
@@ -3610,9 +4500,23 @@ function onImgError(img, sid) {{
   var debugDiv = document.getElementById('debug-' + escapeHtml(sid));
   if (debugDiv) {{
     debugDiv.style.display = 'block';
-    debugDiv.innerHTML = "<b>FAILED URL:</b><br>" + escapeHtml(realSrc);
+    debugDiv.innerHTML = "<b>Image unavailable</b><br>" + escapeHtml(realSrc) + '<br><button class="retry-img-btn" data-sid="' + escapeHtml(sid) + '" onclick="event.stopPropagation();retryImage(this.dataset.sid)">Retry</button>';
   }}
 }}
+
+window.retryImage = function(sid) {{
+  var card = CARDS.find(function(c) {{ return c.sid === sid; }});
+  var el = document.querySelector('#card-' + escapeHtml(sid) + ' img.card-img');
+  if (!card || !el) return;
+  var src = card.full_img || imgFor(card);
+  if (!src) return;
+  el.onerror = function() {{ onImgError(el, sid); }};
+  el.dataset.triedProxy = '';
+  el.classList.remove('img-loaded');
+  el.src = src + (src.indexOf('?') >= 0 ? '&' : '?') + 'retry=' + Date.now();
+  var debugDiv = document.getElementById('debug-' + escapeHtml(sid));
+  if (debugDiv) {{ debugDiv.style.display = 'none'; debugDiv.innerHTML = ''; }}
+}};
 
 function addWarnings(sid, warns) {{
   var wrap = document.querySelector('#card-' + escapeHtml(sid) + ' .warn-wrap');
@@ -3634,8 +4538,11 @@ function buildCardActionsHtml(safeSid, warnings, cardData) {{
     'Category Check':         ['REJECT_WRONG_CAT',     LABELS.wrong_cat],
     'Missing COLOR':          ['REJECT_COLOR',          LABELS.missing_color],
     'Color Check':            ['REJECT_COLOR',          LABELS.missing_color],
+    'Color Mismatch: Title vs COLOR Column': ['REJECT_COLOR_MISMATCH', 'Color Mismatch (Title vs COLOR)'],
+    'Color Mismatch':         ['REJECT_COLOR_MISMATCH', 'Color Mismatch'],
     'Restricted Brand':       ['REJECT_BRAND',          LABELS.restr_brand],
     'Restricted brands':      ['REJECT_BRAND',          LABELS.restr_brand],
+    'Potential Restricted Brand': ['REJECT_POT_RESTRICTED', 'Potential Restricted Brand'],
     'Prohibited':             ['REJECT_PROHIBITED',     LABELS.prohibited],
     'Prohibited products':    ['REJECT_PROHIBITED',     LABELS.prohibited],
     'Wrong Brand':            ['REJECT_WRONG_BRAND',    LABELS.wrong_brand],
@@ -3711,6 +4618,7 @@ function buildCardActionsHtml(safeSid, warnings, cardData) {{
     ['REJECT_GENERIC_BRAND', 'Generic Brand Issues'],
     ['REJECT_FASHION_BRAND', 'Fashion Brand Issues'],
     ['REJECT_WEIGHT_VOL',    'Missing Weight/Volume'],
+    ['REJECT_COLOR_MISMATCH','Color Mismatch: Title vs COLOR Column'],
     ['REJECT_SMARTPHONE_NAME','Incomplete Smartphone Name'],
     ['REJECT_SPECS_INCONSISTENCY', 'Specs Inconsistency'],
     ['REJECT_WARRANTY',      'Product Warranty'],
@@ -3779,8 +4687,10 @@ function renderCard(card) {{
   var isSelected = sid in selected;
   var isPoorImgRej = isCommitted && POOR_IMG_SIDS.has(sid);
   var isBrandImgRej = isCommitted && (String(COMMITTED[sid]).includes('Brand Image Check'));
+  var isPotRestrictedRej = isCommitted && (String(COMMITTED[sid]).includes('Potential Restricted Brand'));
   var cls = 'card'
-    + (isCommitted ? ' committed-rej' + (isPoorImgRej ? ' poor-img-rej' : '') + (isBrandImgRej ? ' brand-image-rej' : '') : isStaged ? ' staged-rej' : '')
+    + (isCommitted ? ' committed-rej' + (isPoorImgRej ? ' poor-img-rej' : '') + (isBrandImgRej ? ' brand-image-rej' : '') + (isPotRestrictedRej ? ' pot-restricted-rej' : '') : isStaged ? ' staged-rej' : '')
+    + (card.learned_match ? ' learned-rej' : '')
     + (card.is_manual_review && !isCommitted && !isStaged && !isSelected ? ' manual-review' : '')
     + (isSelected ? ' selected' : '')
     + (card.is_zip ? ' zip-card' : '');
@@ -3796,8 +4706,23 @@ function renderCard(card) {{
   // one that changed the verdict. Both badges together mean the two agree.
   if (card.sys_duplicate) warnHtml += `<span class="warn-badge" style="background:#1d4ed8;color:#fff;font-weight:800;" title="${{card.is_duplicate ? 'Rejected by our duplicate check — the ZIP flagged it too.' : 'Rejected by our duplicate check. The ZIP did not flag this one.'}} One listing per group is kept; the rest are rejected.">⧉ DUPLICATE — system</span>`;
   if (card.is_manual_review) {{
-    var mrText = card.qc_skip_reason ? `👁 MANUAL REVIEW: ${{escapeHtml(card.qc_skip_reason)}}` : `👁 MANUAL REVIEW`;
+    var mrText = card.qc_skip_reason ? `👁 Manual validation: ${{escapeHtml(card.qc_skip_reason)}}` : `👁 Manual validation`;
     warnHtml += `<span class="warn-badge" style="background:#dc2626;color:#fff;font-weight:800;" title="${{escapeHtml(card.qc_skip_reason || 'Manual Review')}}">${{mrText}}</span>`;
+  }}
+  if (card.learned_match) {{
+    var _methodLabels = {{url:'Exact URL match', phash:'Exact pHash match', 'near-phash':'Near-pHash match'}};
+    var _matchLabel = _methodLabels[card.learned_match_method] || 'Learned rule';
+    if (card.learned_match_method === 'near-phash' && card.learned_match_distance !== null && card.learned_match_distance !== undefined && card.learned_match_distance !== '') _matchLabel += ': distance ' + card.learned_match_distance + '/64';
+    if (card.learned_confidence !== null && card.learned_confidence !== undefined && card.learned_confidence !== '') _matchLabel += ' · confidence ' + Math.round(Number(card.learned_confidence) * 100) + '%';
+    warnHtml += `<span class="warn-badge" style="background:#dbeafe;color:#1e3a8a;font-weight:800;" title="${{escapeHtml(card.learned_source || 'learned_image_rules.json')}}">🧠 ${{escapeHtml(_matchLabel)}}</span>`;
+    warnHtml += `<button class="warn-badge" style="background:#fff7ed;color:#9a3412;font-weight:800;border:0;cursor:pointer;" onclick="event.stopPropagation();removeLearnedRule('${{safeSid}}')" title="Remove the learned rule after confirmation">Remove learned rule</button>`;
+  }}
+  if (card.learned_review_match) {{
+    var _reviewText = card.learned_review_detail || 'Near-pHash match requires review';
+    warnHtml += `<span class="warn-badge" style="background:#fef3c7;color:#92400e;font-weight:800;" title="${{escapeHtml(_reviewText)}}">Review only: ${{escapeHtml(_reviewText.length > 110 ? _reviewText.slice(0,110) + '…' : _reviewText)}}</span>`;
+  }}
+  if (Number(card.same_image_count || 0) > 1) {{
+    warnHtml += `<button class="warn-badge" style="background:#f1f5f9;color:#334155;font-weight:800;border:0;cursor:pointer;" onclick="event.stopPropagation();showSameImage('${{safeSid}}')" title="Show products using the same image">Same image: ${{card.same_image_count}}</button>`;
   }}
   if (card.color_mismatch) warnHtml += `<span class="warn-badge" style="background:#b45309;color:#fff;" title="${{escapeHtml(card.color_mismatch)}}">⚠ Color Mismatch</span>`;
   // Several colours on one listing usually means one photo showing several
@@ -3812,6 +4737,7 @@ function renderCard(card) {{
   if (card.perfume_claim) warnHtml += `<span class="warn-badge" style="background:#7e22ce;color:#fff;" title="${{escapeHtml(card.perfume_claim)}} — check the bottle: the matched word may just be this house's own product name">🧴 Perfume?</span>`;
   var priceText = String(card.price || '').trim();
   var priceHtml = priceText ? `<div class="price-badge">${{escapeHtml(priceText)}}</div>` : '';
+  var thumbnailMissingHtml = card.thumbnail_missing ? `<button class="retry-img-btn" onclick="event.stopPropagation();retryImage('${{safeSid}}')">Load image</button>` : '';
 
   var colorLabel = card.is_manual_review ? 'Color-M' : 'Color';
   var colorHtml = card.color ? `<div class="co" title="${{colorLabel}}: ${{escapeHtml(card.color)}}">${{colorLabel}}: ${{escapeHtml(card.color)}}</div>` : '';
@@ -3823,15 +4749,62 @@ function renderCard(card) {{
   // Mismatch, Off-Platform Contact, Restricted Brands, etc) — only shown when
   // the richer category-specific reason above isn't already covering it, so
   // reviewers can see WHY a card is flagged without opening the flag table.
+  var cmtIsOv = (card.flag_comment && card.flag_comment.toLowerCase().includes('overturned')) || (card.zip_override && card.zip_override.includes('apple'));
+  var cmtStyle = cmtIsOv ? 'color:#047857;background:#ecfdf5;border:1px solid #a7f3d0;padding:2px 6px;border-radius:4px;font-weight:600;' : 'color:#b91c1c;';
   var flagCommentHtml = (!catReasonHtml && card.flag_comment) ?
-    `<div class="co" style="color:#b91c1c;font-size:10px;white-space:normal;line-height:1.3;" title="${{escapeHtml(card.flag_comment)}}">${{escapeHtml(card.flag_comment.length > 90 ? card.flag_comment.slice(0,90)+'…' : card.flag_comment)}}</div>` : '';
+    `<div class="co" style="${{cmtStyle}}font-size:10px;white-space:normal;line-height:1.3;" title="${{escapeHtml(card.flag_comment)}}">${{escapeHtml(card.flag_comment.length > 90 ? card.flag_comment.slice(0,90)+'…' : card.flag_comment)}}</div>` : '';
   var suggestedCatHtml = card.suggested_cat ? `<div class="co" style="color:#0369a1;" title="AI suggests: ${{escapeHtml(card.suggested_cat)}}">→ ${{escapeHtml(card.suggested_cat.length > 50 ? card.suggested_cat.slice(0,50)+'…' : card.suggested_cat)}}</div>` : '';
   var aiBrandHtml = (card.brand_detected && card.brand_detected.toLowerCase() !== card.brand.toLowerCase()) ? `<div class="ai-brand-pill" title="AI detected brand: ${{escapeHtml(card.brand_detected)}}">🏷 AI Brand: ${{escapeHtml(card.brand_detected)}}</div>` : '';
   var brandDetectedHtml = (isBrandImgRej && card.brand_detected) ? '<div class="co" style="background:#E8F5E9;color:#2E7D32;border:1px solid #C8E6C9;" title="Brand Detected: ' + escapeHtml(card.brand_detected) + '">Detected Brand: ' + escapeHtml(card.brand_detected) + '</div>' : '';
+  var isOverturned = Boolean((card.flag_comment && card.flag_comment.toLowerCase().includes('overturned')) || card.zip_override);
   var zipBadgeHtml = card.is_zip ? '<span style="background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:#fff;font-size:10px;font-weight:900;padding:2px 8px;border-radius:6px;box-shadow:0 2px 4px rgba(0,0,0,0.15);margin-left:8px;display:inline-block;">ZIP</span>' : '';
   if (card.zip_override) {{
-    var overrideType = card.zip_override === 'color' ? 'Color' : (card.zip_override === 'volume' ? 'Weight/Volume' : 'Warranty');
-    zipBadgeHtml += '<span style="background:linear-gradient(135deg,#10b981,#059669);color:#fff;font-size:10px;font-weight:900;padding:2px 8px;border-radius:6px;box-shadow:0 2px 4px rgba(0,0,0,0.15);margin-left:4px;display:inline-block;" title="Auto-approved by main ' + overrideType.toLowerCase() + ' check">🔓 ' + overrideType + ' Overridden</span>';
+    var ot = card.zip_override.toLowerCase();
+    var isAppleOv = ot.includes('apple');
+    var overrideType = 'Overridden';
+    var overrideTitle = 'Rejection overturned -- product approved';
+    var badgeLabel = '🔓 Overturned';
+
+    if (isAppleOv) {{
+      overrideType = 'Apple Accessory';
+      overrideTitle = 'Rejection overturned: Apple brand detected on cases/covers accessory image -- product approved';
+      badgeLabel = '🔓 Apple Accessory Overturned';
+    }} else if (ot === 'refurb_brand') {{
+      overrideType = 'Refurbished Brand';
+      overrideTitle = 'Rejection overturned: Refurbished device allowed under original brand -- product approved';
+      badgeLabel = '🔓 Refurbished Brand Overturned';
+    }} else if (ot === 'fda_wellness') {{
+      overrideType = 'Sexual Wellness';
+      overrideTitle = 'Rejection overturned: Sexual wellness product approved without FDA registration';
+      badgeLabel = '🔓 Sexual Wellness Overturned';
+    }} else if (ot === 'appliances_cat') {{
+      overrideType = 'Small Appliances';
+      overrideTitle = 'Rejection overturned: Small Appliances parent category placement permitted -- product approved';
+      badgeLabel = '🔓 Small Appliances Overturned';
+    }} else if (ot === 'dvds_cat') {{
+      overrideType = 'DVDs Category';
+      overrideTitle = 'Rejection overturned: DVDs category placement permitted -- product approved';
+      badgeLabel = '🔓 DVDs Category Overturned';
+    }} else if (ot === 'color') {{
+      overrideType = 'Color';
+      overrideTitle = 'Rejection overturned: Color accepted -- product approved';
+      badgeLabel = '🔓 Color Overturned';
+    }} else if (ot === 'volume') {{
+      overrideType = 'Weight/Volume';
+      overrideTitle = 'Auto-approved by weight/volume check';
+      badgeLabel = '🔓 Weight/Volume Overridden';
+    }} else if (ot === 'warranty') {{
+      overrideType = 'Warranty';
+      overrideTitle = 'Auto-approved by warranty check';
+      badgeLabel = '🔓 Warranty Overridden';
+    }} else if (ot === 'pot_restricted') {{
+      overrideType = 'Potential Restricted Brand';
+      overrideTitle = 'Potential restricted brand — reviewer approved, not confirmed evasion';
+      badgeLabel = '🔓 Pot. Restricted Approved';
+    }}
+    zipBadgeHtml += '<span style="background:linear-gradient(135deg,#10b981,#059669);color:#fff;font-size:10px;font-weight:900;padding:2px 8px;border-radius:6px;box-shadow:0 2px 4px rgba(0,0,0,0.15);margin-left:4px;display:inline-block;" title="' + overrideTitle + '">' + badgeLabel + '</span>';
+  }} else if (isOverturned) {{
+    zipBadgeHtml += '<span style="background:linear-gradient(135deg,#10b981,#059669);color:#fff;font-size:10px;font-weight:900;padding:2px 8px;border-radius:6px;box-shadow:0 2px 4px rgba(0,0,0,0.15);margin-left:4px;display:inline-block;" title="Rejection overturned -- product approved">🔓 Rejection Overturned</span>';
   }}
 
   var zoomHtml = `<button class="zoom-btn" onclick="event.stopPropagation();showZoom('${{safeSid}}', event)" title="Preview">
@@ -3860,13 +4833,13 @@ function renderCard(card) {{
   var overlayHtml = '', actHtml = '';
     if (isCommitted) {{
       var rejReason = (COMMITTED[sid]||'').replace(/_/g,' ');
-      var actionLabel = isBrandImgRej ? LABELS.approve : LABELS.undo;
+      var actionLabel = (isBrandImgRej || isPotRestrictedRej) ? LABELS.approve : LABELS.undo;
       var extraInfo = '';
       if (isBrandImgRej && card.brand_detected) {{
         extraInfo = `<div style="margin-top:auto; padding:6px 8px; background:rgba(211,47,47,0.75); border-radius:0 0 8px 8px; color:#fff; font-weight:800; font-size:12px; width:100%; text-align:center; position:absolute; bottom:0; left:0;">Detected Brand: ${{escapeHtml(card.brand_detected)}}</div>`;
       }}
 
-      if (isBrandImgRej) {{
+      if (isBrandImgRej || isPotRestrictedRej) {{
         overlayHtml = `<div class="rej-overlay">
           <div class="rej-badge">${{escapeHtml(LABELS.rejected)}}</div>
           <div class="rej-label">${{escapeHtml(rejReason)}}</div>
@@ -3902,6 +4875,7 @@ function renderCard(card) {{
       <img class="card-img-placeholder" src="${{PLACEHOLDER}}" alt="">
       <img class="card-img${{loadedCls}}" ${{imgSrcAttr}} decoding="async" loading="${{loadingAttr}}" ${{priorityAttr}} referrerpolicy="no-referrer"
             onload="onImgLoad(this,'${{safeSid}}')" onerror="onImgError(this,'${{safeSid}}')">
+      ${{thumbnailMissingHtml}}
       ${{zoomHtml}}
       ${{overlayHtml}}
       <div class="tick">\u2714</div>
@@ -3936,7 +4910,7 @@ window.showZoom = function(sid, event) {{
   var card = CARDS.find(c => c.sid === sid);
   if (!card) return;
   var img = document.getElementById('tooltip-img');
-  img.src = imgFor(card);
+  img.src = card.full_img || imgFor(card);
   img.onerror = function() {{ img.src = PLACEHOLDER; img.onerror = null; }};
   document.getElementById('zoom-backdrop').style.display = 'block';
   tooltip.style.display = 'block';
@@ -3993,7 +4967,7 @@ function updateSelCount() {{
   updateParentPagination();
 }}
 
-window._currentFilter = window._currentFilter || '';
+window._currentFilter = window._currentFilter || (function() {{ try {{ return sessionStorage.getItem('pim_grid_filter') || ''; }} catch(e) {{ return ''; }} }})();
 
 function _shortText(text, maxLen) {{
   var t = String(text || '').trim();
@@ -4013,6 +4987,71 @@ function _setMultiSelectValues(id, values) {{
   var set = new Set(values || []);
   Array.from(el.options).forEach(function(opt) {{ opt.selected = set.has(opt.value); }});
 }}
+
+window.showSameImage = function(sid) {{
+  var target = CARDS.find(function(c) {{ return String(c.sid) === String(sid); }});
+  if (!target) return;
+  var targetKey = target.image_cluster_key || imgFor(target);
+  if (!targetKey) return;
+  var matches = CARDS.filter(function(c) {{ return (c.image_cluster_key || imgFor(c)) === targetKey; }}).map(function(c) {{ return c.sid; }});
+  window._currentFilter = '';
+  PAGE_STATE.search = '';
+  var search = document.getElementById('grid-search');
+  if (search) search.value = '';
+  document.querySelectorAll('.card').forEach(function(card) {{
+    card.style.display = matches.includes(card.id.replace('card-', '')) ? '' : 'none';
+  }});
+  var count = document.getElementById('grid-count');
+  var sellerCount = new Set(matches.map(function(id) {{
+    var card = CARDS.find(function(c) {{ return String(c.sid) === String(id); }});
+    return card && card.seller ? String(card.seller) : '';
+  }}).filter(Boolean)).size;
+  if (count) count.textContent = matches.length + ' same-image products · ' + sellerCount + ' sellers';
+  var old = document.getElementById('same-image-action');
+  if (old) old.remove();
+  if (matches.length > 1) {{
+    var host = count && count.parentElement ? count.parentElement : document.body;
+    var panel = document.createElement('span');
+    panel.id = 'same-image-action';
+    panel.style.cssText = 'display:inline-flex;align-items:center;gap:6px;margin-left:8px;';
+    var action = document.createElement('button');
+    action.className = 'batch-btn';
+    action.textContent = 'Review individually (' + matches.length + ')';
+    action.title = 'Select this image cluster so each product can be reviewed individually';
+    var selectCluster = function() {{
+      matches.forEach(function(id) {{ selected[id] = selected[id] || 'cluster'; }});
+      updateSelCount();
+      renderAll();
+      panel.remove();
+    }};
+    action.onclick = selectCluster;
+    var reject = document.createElement('button');
+    reject.className = 'desel-btn';
+    reject.textContent = 'Reject cluster';
+    reject.title = 'Select the cluster and apply the reason currently chosen in the batch toolbar';
+    reject.onclick = function() {{
+      selectCluster();
+      setTimeout(function() {{ if (typeof doBatchReject === 'function') doBatchReject('bottom'); }}, 0);
+    }};
+    var approve = document.createElement('button');
+    approve.className = 'desel-btn';
+    approve.textContent = 'Approve cluster';
+    approve.title = 'Approve every product in this image cluster';
+    approve.onclick = function() {{
+      selectCluster();
+      setTimeout(function() {{ if (typeof batchApprove === 'function') batchApprove(); }}, 0);
+    }};
+    panel.appendChild(action); panel.appendChild(reject); panel.appendChild(approve);
+    host.appendChild(panel);
+  }}
+}};
+
+window.removeLearnedRule = function(sid) {{
+  var card = CARDS.find(function(c) {{ return String(c.sid) === String(sid); }});
+  var affected = card ? Number(card.same_image_count || 1) : 1;
+  if (!confirm('Remove this learned rule? It affects ' + affected + ' product(s) using this image.')) return;
+  sendMsg('remove_learned_rule', String(sid));
+}};
 
 function _pageSizeValue() {{
   return Math.max(1, parseInt(PAGE_STATE.pageSize || DEFAULT_PAGE_SIZE, 10) || DEFAULT_PAGE_SIZE);
@@ -4039,6 +5078,7 @@ function getBaseFilteredCards() {{
   var f = window._currentFilter;
   if (f) {{
     if (f === 'committed') cards = cards.filter(function(c) {{ return c.sid in COMMITTED; }});
+    else if (f === 'unresolved') cards = cards.filter(function(c) {{ return !(c.sid in COMMITTED) && !(c.sid in staged); }});
     else if (f === 'brand_ocr') cards = cards.filter(function(c) {{ return c.sid in COMMITTED && (COMMITTED[c.sid]||'').includes('Brand Image Check'); }});
     else if (f === 'no_flags') cards = cards.filter(function(c) {{ return !(c.warnings||[]).length && !(c.sid in COMMITTED) && !(c.sid in staged); }});
     // Either source — filtering to the ZIP's observation alone would hide the
@@ -4046,6 +5086,13 @@ function getBaseFilteredCards() {{
     else if (f === 'duplicates') cards = cards.filter(function(c) {{ return c.is_duplicate || c.sys_duplicate; }});
     else if (f === 'manual_review') cards = cards.filter(function(c) {{ return c.is_manual_review; }});
     else if (f === 'color_mismatch') cards = cards.filter(function(c) {{ return !!c.color_mismatch; }});
+    else if (f === 'learned_only') cards = cards.filter(function(c) {{ return !!c.learned_match; }});
+    else if (f === 'direct_only') cards = cards.filter(function(c) {{ return !c.learned_match; }});
+    else if (f === 'overturned_only') cards = cards.filter(function(c) {{ return String(c.flag_comment||'').toLowerCase().includes('overturned') || !!c.zip_override; }});
+    else if (f === 'review_unreviewed') cards = cards.filter(function(c) {{ return !!c.learned_match && (c.learned_review || 'Unreviewed') === 'Unreviewed'; }});
+    else if (f === 'review_confirmed') cards = cards.filter(function(c) {{ return !!c.learned_match && (c.learned_review || '') === 'Confirmed'; }});
+    else if (f === 'near_phash') cards = cards.filter(function(c) {{ return c.learned_match_method === 'near-phash'; }});
+    else if (f === 'multi_seller') cards = cards.filter(function(c) {{ return Number(c.same_image_count||0) > 1; }});
     else cards = cards.filter(function(c) {{
       var inWarnings = (c.warnings||[]).some(function(w) {{ return w === f; }});
       var inCommitted = c.sid in COMMITTED && (COMMITTED[c.sid]||'').replace(/_/g,' ').toLowerCase() === f.replace(/_/g,' ').toLowerCase();
@@ -4076,6 +5123,7 @@ function getDisplayCards() {{
   var totalPages = Math.max(1, Math.ceil(cards.length / pageSize));
   if (PAGE_STATE.page > totalPages) PAGE_STATE.page = totalPages;
   if (PAGE_STATE.page < 1) PAGE_STATE.page = 1;
+  if (PAGE_STATE.autoLoad) return cards.slice(0, pageSize * Math.max(1, PAGE_STATE.autoPages || 1));
   var start = (PAGE_STATE.page - 1) * pageSize;
   return cards.slice(start, start + pageSize);
 }}
@@ -4119,6 +5167,8 @@ window.goPage = function(delta) {{
   var total = getBaseFilteredCards().length;
   var totalPages = Math.max(1, Math.ceil(total / _pageSizeValue()));
   PAGE_STATE.page = Math.max(1, Math.min(totalPages, PAGE_STATE.page + delta));
+  PAGE_STATE.autoPages = PAGE_STATE.page;
+  saveGridViewState();
   renderAll();
 }};
 
@@ -4127,6 +5177,8 @@ window.resetAllFilters = function() {{
   PAGE_STATE.sellers = [];
   PAGE_STATE.categories = [];
   PAGE_STATE.page = 1;
+  PAGE_STATE.autoPages = 1;
+  saveGridViewState();
   _setMultiSelectValues('seller-filter', []);
   _setMultiSelectValues('category-filter', []);
   var searchEl = document.getElementById('grid-search');
@@ -4141,18 +5193,23 @@ window._syncFilterState = function() {{
   var pageSizeSel = document.getElementById('page-size-sel');
   if (pageSizeSel) PAGE_STATE.pageSize = parseInt(pageSizeSel.value, 10) || DEFAULT_PAGE_SIZE;
   PAGE_STATE.page = 1;
+  saveGridViewState();
   renderAll();
 }};
 
 window.applySort = function(val) {{
   window._currentSort = val;
+  try {{ sessionStorage.setItem('pim_grid_sort', val); }} catch(e) {{}}
   ['sort-sel-top','sort-sel-bottom'].forEach(function(id) {{ var el=document.getElementById(id); if(el) el.value=val; }});
+  saveGridViewState();
   renderAll();
 }};
 
 window.applyFilter = function(val) {{
   window._currentFilter = val;
+  try {{ sessionStorage.setItem('pim_grid_filter', val); }} catch(e) {{}}
   ['filter-sel-top','filter-sel-bottom'].forEach(function(id) {{ var el=document.getElementById(id); if(el) el.value=val; }});
+  saveGridViewState();
   renderAll();
 }};
 
@@ -4171,7 +5228,7 @@ function renderAll() {{
 
   if (cards.length === 0) {{
     var hasFilters = !!(PAGE_STATE.search || '').trim() || (PAGE_STATE.sellers||[]).length || (PAGE_STATE.categories||[]).length || window._currentFilter;
-    grid.innerHTML = '<div class="empty-state"><div><div class="title">No products match your filters</div>' +
+      grid.innerHTML = '<div class="empty-state"><div><div class="title">No products match your filters</div>' +
       '<div class="desc">' + (hasFilters ? 'Try clearing the search, seller, or category filters.' : 'There are no products to show here.') + '</div></div>' +
       (hasFilters ? '<div class="actions"><button class="toolbar-btn small" onclick="window.resetAllFilters()">Clear filters</button></div>' : '') +
       '</div>';
@@ -4196,6 +5253,38 @@ function renderAll() {{
       requestAnimationFrame(buildChunk);
     }} else {{
       grid.innerHTML = parts.join('');
+      var totalBase = getBaseFilteredCards().length;
+      var shown = cards.length;
+      if (PAGE_STATE.autoLoad && shown < totalBase) {{
+        var sentinel = document.createElement('div');
+        sentinel.id = 'load-more-sentinel';
+        sentinel.className = 'empty-state';
+        sentinel.style.cssText = 'min-height:44px;padding:10px;justify-content:center;';
+        sentinel.textContent = 'Scroll for more products';
+        grid.appendChild(sentinel);
+        if (window._moreObserver) window._moreObserver.disconnect();
+        window._moreObserver = new IntersectionObserver(function(entries) {{
+          if (!entries.some(function(e) {{ return e.isIntersecting; }})) return;
+          var maxPages = Math.max(1, Math.ceil(totalBase / _pageSizeValue()));
+          if ((PAGE_STATE.autoPages || 1) < maxPages) {{
+            PAGE_STATE.autoPages += 1;
+            renderAll();
+          }}
+        }}, {{root: grid, rootMargin: '320px'}});
+        window._moreObserver.observe(sentinel);
+      }} else if (PAGE_STATE.autoLoad && totalBase > 0 && !window._serverMoreRequested) {{
+        // The current server window is exhausted. Ask Streamlit for the next
+        // bounded window automatically instead of requiring the reviewer to
+        // press Next.
+        var requestMore = document.createElement('div');
+        requestMore.id = 'load-more-sentinel';
+        requestMore.className = 'empty-state';
+        requestMore.style.cssText = 'min-height:44px;padding:10px;justify-content:center;';
+        requestMore.textContent = 'Loading more products…';
+        grid.appendChild(requestMore);
+        window._serverMoreRequested = true;
+        sendMsg('grid_load_more', {{}});
+      }}
       activateLazyImages();
       updateSelCount();
     }}
@@ -4228,10 +5317,22 @@ window.doSelectAll = function() {{
 window.toggleSelect = function(sid, e) {{
   var t = e && e.target;
   if (t && (t.tagName === 'SELECT' || t.tagName === 'OPTION' || t.tagName === 'BUTTON' || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.closest('select,button,input,textarea,a'))) return;
-  if (sid in staged) delete staged[sid];
-  else if (sid in selected) delete selected[sid];
-  else selected[sid] = true;
-  replaceCard(sid); updateSelCount();
+  var cardEl = document.getElementById('card-' + escapeHtml(sid));
+  if (sid in staged) {{
+    delete staged[sid];
+    if (cardEl) {{
+      cardEl.classList.remove('staged-rej');
+      var overlay = cardEl.querySelector('.rej-overlay.staged');
+      if (overlay) overlay.remove();
+    }}
+  }} else if (sid in selected) {{
+    delete selected[sid];
+    if (cardEl) cardEl.classList.remove('selected');
+  }} else {{
+    selected[sid] = true;
+    if (cardEl) cardEl.classList.add('selected');
+  }}
+  updateSelCount();
 }};
 
 window.stageRejectWithComment = function(sid, r) {{
@@ -4244,13 +5345,34 @@ window.stageRejectWithComment = function(sid, r) {{
   window.stageReject(sid, r);
 }};
 
+// Token-Jaccard name similarity — mirrors the Python _names_match_sids logic.
+// Returns true if the two names share enough tokens to be the same product,
+// or if either name is empty (unknown → default to cascade).
+function _namesMatch(a, b, threshold) {{
+  threshold = threshold || 0.6;
+  if (!a || !b) return true;
+  var ta = a.toLowerCase().split(/[^\\w]+/).filter(function(w) {{ return w.length > 1; }});
+  var tb = b.toLowerCase().split(/[^\\w]+/).filter(function(w) {{ return w.length > 1; }});
+  if (!ta.length || !tb.length) return true;
+  var setB = {{}};
+  tb.forEach(function(w) {{ setB[w] = true; }});
+  var inter = ta.filter(function(w) {{ return setB[w]; }}).length;
+  var unionSet = {{}};
+  ta.forEach(function(w) {{ unionSet[w] = true; }});
+  tb.forEach(function(w) {{ unionSet[w] = true; }});
+  var unionSize = Object.keys(unionSet).length;
+  return unionSize > 0 && (inter / unionSize) >= threshold;
+}}
+
 window.stageReject = function(sid, r) {{
   var currentCard = CARDS.find(c => c.sid === sid);
   var toStage = [sid];
 
   if (currentCard && (r === 'REJECT_POOR_IMAGE' || r.startsWith('REJECT_IMG_'))) {{
       CARDS.forEach(c => {{
-          if (c.sid !== sid && (imgFor(c) === imgFor(currentCard) || (c.hash && c.hash === currentCard.hash))) {{
+          if (c.sid !== sid &&
+              (imgFor(c) === imgFor(currentCard) || (c.hash && c.hash === currentCard.hash)) &&
+              _namesMatch(c.name, currentCard.name)) {{
               toStage.push(c.sid);
           }}
       }});
@@ -4318,7 +5440,7 @@ window.undoReject = function(sid) {{
   var cardEl = document.getElementById('card-' + escapeHtml(sid));
 
   if (cardEl) {{
-      cardEl.classList.remove('committed-rej', 'poor-img-rej');
+      cardEl.classList.remove('committed-rej', 'poor-img-rej', 'brand-image-rej', 'pot-restricted-rej');
 
       var overlay = cardEl.querySelector('.rej-overlay');
       if (overlay) overlay.remove();
@@ -4400,7 +5522,6 @@ function _applyBatchReject(br) {{
   }}
   var commentPayload = {{}};
   for (var s in payload) {{ if (autoC[s]) commentPayload[s] = autoC[s]; }}
-  if (Object.keys(commentPayload).length) sendMsg('reject_comments', commentPayload);
   if (count === 0) {{
     for (var s in selected) delete selected[s];
     for (var s in staged) delete staged[s];
@@ -4410,11 +5531,10 @@ function _applyBatchReject(br) {{
   var allSids = Object.assign({{}}, selected, staged);
   for (var s in payload) {{ COMMITTED[s] = payload[s]; }}
   for (var s in allSids) {{ delete selected[s]; delete staged[s]; }}
-  // Show overlay — keep it up for 90 s so it stays visible while Streamlit processes.
-  // The page will reload (st.rerun) when done, which naturally removes the overlay.
+  // Show a non-blocking status toast while the queued commit drains.
   showGhostOverlay('Applying rejections…', 90000);
   // Update card classes directly instead of full renderAll() to avoid blocking the
-  // main thread for 500 cards. Streamlit will do a full page reload after processing.
+  // main thread for 500 cards. The queue is persisted by a background fragment.
   var grid = document.getElementById('card-grid');
   for (var s in payload) {{
     var el = grid ? grid.querySelector('#card-' + escapeHtml(s)) : null;
@@ -4434,7 +5554,7 @@ function _applyBatchReject(br) {{
     }});
   }}
   updateSelCount();
-  sendMsg('reject', payload);
+  sendMsg('reject', {{ sids: payload, comments: commentPayload }});
 }}
 
 var _customReasonCallback = null;
@@ -4482,7 +5602,20 @@ window.doBatchUndo = function() {{
   sendMsg('undo', payload);
 }};
 
-window.doDeselAll = function() {{ for (var k in selected) delete selected[k]; for (var k in staged) delete staged[k]; renderAll(); updateSelCount(); }};
+window.doDeselAll = function() {{
+  for (var k in selected) delete selected[k];
+  for (var k in staged) delete staged[k];
+  var grid = document.getElementById('card-grid');
+  if (grid) {{
+    grid.querySelectorAll('.card.selected').forEach(function(c) {{ c.classList.remove('selected'); }});
+    grid.querySelectorAll('.card.staged-rej').forEach(function(c) {{
+      c.classList.remove('staged-rej');
+      var o = c.querySelector('.rej-overlay.staged');
+      if (o) o.remove();
+    }});
+  }}
+  updateSelCount();
+}};
 
 (function() {{
   if (!PREFETCH_URLS || !PREFETCH_URLS.length) return;
@@ -4495,7 +5628,10 @@ window.doDeselAll = function() {{ for (var k in selected) delete selected[k]; fo
     img.referrerPolicy = "no-referrer";
     img.onload = img.onerror = function() {{
       done++;
-      if (statusEl) statusEl.textContent = 'Prefetched ' + done + '/' + total;
+      // Prefetch is background warming, not review work. Do not leave a
+      // persistent progress message that makes the iframe look busy after
+      // the current page is already usable.
+      if (statusEl && done >= total) statusEl.textContent = '';
       loadNext();
     }};
     img.src = url;
@@ -4894,30 +6030,26 @@ window.fitToViewport = function(force) {{
   if (!fe) return;                                            // not embedded
   var pw = window.parent, wrap = fe.parentElement;
 
-  /* Bail out before touching layout unless the viewport actually changed.
-     innerWidth/innerHeight are plain property reads; getBoundingClientRect
-     below forces a synchronous layout, which on a 500-card grid measures
-     3ms — 6ms/s at two ticks a second, sustained for as long as the modal is
-     open, and 20ms/s while the DOM is being mutated. Gating on the cheap
-     reads takes the idle cost of the timer to roughly nothing while still
-     catching every resize. Callers that know the geometry moved for another
-     reason — the open animation, a re-render clobbering our styles — pass
-     force and skip the gate. */
   if (!force && pw.innerWidth === _lastFitW && pw.innerHeight === _lastFitH) return;
   _lastFitW = pw.innerWidth; _lastFitH = pw.innerHeight;
 
   var top = fe.getBoundingClientRect().top;
 
-  /* Whatever the dialog puts below the grid — the close row, its padding —
-     measured as the gap between the wrapper's bottom and the panel's. Taken
-     from current geometry so it stays correct when those rows change height,
-     and it is a distance between two elements that both move together, so it
-     does not drift as this function resizes things. */
-  var below = 0;
+  /* Measure space needed below the grid: pagination footer buttons + dialog padding.
+     Target the actual footer row element so we never measure or preserve dead space gaps. */
+  var below = 60;
   try {{
     var panel = pw.document.querySelector('[data-testid="stDialog"] section[role="dialog"]');
-    if (panel) below = Math.max(0, panel.getBoundingClientRect().bottom
-                                   - (wrap || fe).getBoundingClientRect().bottom);
+    var footerEl = pw.document.querySelector('[data-testid="stDialog"] .st-key-close_bot_fallback');
+    var footerRow = footerEl ? footerEl.closest('[data-testid="stHorizontalBlock"]') : null;
+    if (footerRow && panel) {{
+      var fHeight = footerRow.getBoundingClientRect().height || 42;
+      var pPadBottom = parseFloat(pw.getComputedStyle(panel).paddingBottom) || 12;
+      below = Math.ceil(fHeight + pPadBottom + 6);
+    }} else if (panel) {{
+      var rawBelow = panel.getBoundingClientRect().bottom - (wrap || fe).getBoundingClientRect().bottom;
+      below = (rawBelow > 0 && rawBelow <= 95) ? Math.round(rawBelow) : 60;
+    }}
   }} catch (e) {{}}
 
   var h = Math.round(pw.innerHeight - top - below - GAP);
@@ -4927,14 +6059,6 @@ window.fitToViewport = function(force) {{
     fe.style.setProperty('height', px, 'important');
     fe.style.setProperty('max-height', px, 'important');
   }}
-  /* The wrapper needs flex-basis, not just height. Streamlit gives it
-     flex: 0 0 <python height>px inside a column flex container, where the
-     basis is the main size and wins over the height property outright —
-     setting height alone left a 356px iframe in a 620px wrapper with the
-     inline rule marked !important and losing anyway. Setting both collapses
-     the wrapper with the iframe, which is what lets the dialog shrink:
-     measured overflow 296px -> 32px, and the 32px that remains is the
-     backdrop's own padding, not hidden content. */
   if (wrap && wrap.style.height !== px) {{
     wrap.style.setProperty('flex', '0 0 ' + px, 'important');
     wrap.style.setProperty('height', px, 'important');
@@ -4971,13 +6095,19 @@ window.fitToViewport = function(force) {{
      Without that gate this cost 3ms of forced layout per tick on a 500-card
      grid — 6ms/s idle and 20ms/s while the DOM was being mutated, for as long
      as the modal stayed open. */
-  setInterval(poll, 500);
+  setInterval(poll, 1000);
+  var _moTimer = null;
   try {{
     var fe = window.frameElement;
     if (fe && window.MutationObserver) {{
-      // React clobbering our inline styles leaves the viewport unchanged, so
-      // this has to force — the gate would otherwise swallow the recovery.
-      var mo = new MutationObserver(force);
+      // Debounce the observer so synchronous reflow measurements don't loop
+      var mo = new MutationObserver(function() {{
+        if (_moTimer) return;
+        _moTimer = setTimeout(function() {{
+          _moTimer = null;
+          force();
+        }}, 150);
+      }});
       mo.observe(fe, {{attributes: true, attributeFilter: ['style']}});
       if (fe.parentElement) mo.observe(fe.parentElement, {{attributes: true, attributeFilter: ['style']}});
     }}
@@ -4985,7 +6115,7 @@ window.fitToViewport = function(force) {{
   /* The dialog animates open, so the first measurement can land before the
      panel has settled. These force for the same reason: the viewport is not
      changing, the panel underneath it is. Four reads over the first second. */
-  [60, 180, 400, 800].forEach(function(t) {{ setTimeout(force, t); }});
+  [60, 150, 300, 500, 900, 1800].forEach(function(t) {{ setTimeout(force, t); }});
 }})();
 
 // The page no longer scrolls, the grid does — so the nav buttons have to
@@ -5053,7 +6183,7 @@ try {{
 
 
 @st.dialog(
-    " ", width="large", dismissible=False
+    " ", width="large", dismissible=True
 )
 def visual_review_modal(support_files):
     scroll_top_flag = st.session_state.get("do_scroll_top", False)
@@ -5158,6 +6288,8 @@ def visual_review_modal(support_files):
         st.session_state["grid_filter_sellers"] = []
     def _clear_grid_filter_categories():
         st.session_state["grid_filter_categories"] = []
+    def _clear_grid_filter_brands():
+        st.session_state["grid_filter_brands"] = []
     def _clear_grid_filter_flag():
         st.session_state["grid_filter_flag"] = ""
     def _clear_grid_sort_issue():
@@ -5181,22 +6313,67 @@ def visual_review_modal(support_files):
         .str.strip()
         .unique()
     )
+    pot_restricted_rej_sids = set(
+        fr[
+            (fr["Status"] == "Rejected")
+            & (
+                fr["FLAG"].str.contains("Potential Restricted Brand", na=False, case=False)
+                | fr["Comment"].str.contains("Potential Restricted Brand", na=False, case=False)
+            )
+        ]["ProductSetSid"]
+        .astype(str)
+        .str.strip()
+        .unique()
+    )
     valid_grid_df = fr[
         (fr["Status"] == "Approved")
         | (fr["ProductSetSid"].isin(committed_rej_sids))
         | (fr["ProductSetSid"].isin(poor_img_rej_sids))
+        | (fr["ProductSetSid"].isin(pot_restricted_rej_sids))
     ]
 
+    # Standardised uploads normally expose MAIN_IMAGE, but older reports and
+    # manually imported files use several historical image column names. If
+    # we create an empty MAIN_IMAGE before resolving those aliases, every card
+    # gets a placeholder and the validator appears to have lost its images.
+    _image_aliases = (
+        "IMAGE1", "image1", "IMAGE_URL", "MAIN_IMAGE_URL", "IMAGE",
+        "MainImage", "Image", "IMAGE_URL_1", "Image1", "main_image",
+    )
     if "MAIN_IMAGE" not in data.columns:
-        data["MAIN_IMAGE"] = ""
+        _source_image_col = next((c for c in _image_aliases if c in data.columns), None)
+        data["MAIN_IMAGE"] = (
+            data[_source_image_col].fillna("").astype(str).str.strip()
+            if _source_image_col else ""
+        )
+    else:
+        # Coalesce a legacy alias into MAIN_IMAGE when standardisation left
+        # blank values behind. This is safe for normal rows and fixes mixed
+        # files where only some products use the legacy column.
+        _main = data["MAIN_IMAGE"].fillna("").astype(str).str.strip()
+        for _alias in _image_aliases:
+            if _alias not in data.columns:
+                continue
+            _candidate = data[_alias].fillna("").astype(str).str.strip()
+            _main = _main.mask(_main.eq(""), _candidate)
+        data["MAIN_IMAGE"] = _main
 
     _cached_review = st.session_state.get("_grid_review_data_cache")
     _cache_valid = (
         _cached_review is not None
         and not committed_rej_sids
         and not poor_img_rej_sids
+        and not pot_restricted_rej_sids
         and len(_cached_review) > 0
     )
+    # Do not reuse a pre-alias cache created while MAIN_IMAGE was blank.
+    # Older sessions could therefore keep showing empty image cells after
+    # the source URL had been recovered from IMAGE1/IMAGE_URL.
+    if _cache_valid and "MAIN_IMAGE" in _cached_review.columns:
+        _cache_valid = bool(
+            _cached_review["MAIN_IMAGE"].fillna("").astype(str).str.strip().ne("").any()
+            or data["MAIN_IMAGE"].fillna("").astype(str).str.strip().eq("").all()
+        )
     if _cache_valid:
         review_data = _cached_review.copy()
     else:
@@ -5219,14 +6396,56 @@ def visual_review_modal(support_files):
             review_data = review_data.copy()
             review_data["CATEGORY"] = resolve_category_paths(review_data, _code_to_path)
 
+    # Carry learned-rule provenance into the iframe without changing verdicts.
+    _fr_sid_key = fr["ProductSetSid"].astype(str).str.strip()
+    _learned_map = dict(zip(_fr_sid_key, fr.get("Learned Match", pd.Series(False, index=fr.index)).fillna(False).astype(bool)))
+    review_data["Learned Match"] = review_data["ProductSetSid"].astype(str).str.strip().map(_learned_map).fillna(False).astype(bool)
+    _learned_method_map = dict(zip(_fr_sid_key, fr.get("Learned Match Method", pd.Series("", index=fr.index)).fillna("")))
+    review_data["Learned Match Method"] = review_data["ProductSetSid"].astype(str).str.strip().map(_learned_method_map).fillna("")
+    _learned_distance_map = dict(zip(_fr_sid_key, fr.get("Learned Match Distance", pd.Series(index=fr.index, dtype="float64"))))
+    review_data["Learned Match Distance"] = review_data["ProductSetSid"].astype(str).str.strip().map(_learned_distance_map)
+    for _review_col, _default in (
+        ("Learned Review Match", False),
+        ("Learned Review Detail", ""),
+        ("Learned Review Method", ""),
+        ("Learned Review Distance", None),
+        ("Learned Review Brand", ""),
+    ):
+        _review_source = fr.get(_review_col, pd.Series(_default, index=fr.index))
+        _review_values = dict(zip(_fr_sid_key, _review_source))
+        review_data[_review_col] = review_data["ProductSetSid"].astype(str).str.strip().map(_review_values)
+        if _default is not None:
+            review_data[_review_col] = review_data[_review_col].fillna(_default)
+    review_data["Learned Review Match"] = review_data["Learned Review Match"].fillna(False).astype(bool)
+    _learned_rules = load_learned_image_rules()
+    _learned_by_url = {
+        str(r.get("image_url", "")).strip(): r for r in _learned_rules
+        if str(r.get("image_url", "")).strip()
+    }
+    if "MAIN_IMAGE" in review_data.columns:
+        _rule_meta = review_data["MAIN_IMAGE"].astype(str).str.strip().map(_learned_by_url)
+        review_data["Learned Review"] = _rule_meta.map(lambda r: str(r.get("review_state", "Unreviewed")) if isinstance(r, dict) else "Unreviewed")
+        review_data["Learned Source"] = _rule_meta.map(lambda r: str(r.get("source", "")) if isinstance(r, dict) else "")
+    else:
+        review_data["Learned Review"] = "Unreviewed"
+        review_data["Learned Source"] = ""
+    _phash_by_url = st.session_state.get("_image_phash_by_url", {})
+    _image_url_series = review_data.get("MAIN_IMAGE", pd.Series("", index=review_data.index)).astype(str).str.strip()
+    _image_key_series = _image_url_series.map(lambda u: str(_phash_by_url.get(u, "")) or u)
+    _image_counts = _image_key_series.value_counts()
+    review_data["Same Image Count"] = _image_key_series.map(_image_counts).where(_image_key_series.ne(""), 0).fillna(0).astype(int)
+
     curr_search_n = st.session_state.get("grid_search_n", "")
     curr_sellers = st.session_state.get("grid_filter_sellers", [])
     curr_categories = st.session_state.get("grid_filter_categories", [])
+    curr_brands = st.session_state.get("grid_filter_brands", [])
 
     seller_base_df = review_data
     if curr_categories and "CATEGORY" in seller_base_df.columns:
         seller_base_df = seller_base_df[seller_base_df["CATEGORY"].astype(str).isin(curr_categories)]
-    
+    if curr_brands and "BRAND" in seller_base_df.columns:
+        seller_base_df = seller_base_df[seller_base_df["BRAND"].astype(str).isin(curr_brands)]
+
     seller_opts = sorted(
         {
             str(v).strip()
@@ -5238,7 +6457,9 @@ def visual_review_modal(support_files):
     category_base_df = review_data
     if curr_sellers and "SELLER_NAME" in category_base_df.columns:
         category_base_df = category_base_df[category_base_df["SELLER_NAME"].astype(str).isin(curr_sellers)]
-    
+    if curr_brands and "BRAND" in category_base_df.columns:
+        category_base_df = category_base_df[category_base_df["BRAND"].astype(str).isin(curr_brands)]
+
     category_opts = sorted(
         {
             str(v).strip()
@@ -5247,24 +6468,43 @@ def visual_review_modal(support_files):
         }
     )
 
+    # Brand options — cross-filtered by seller and category
+    brand_base_df = review_data
+    if curr_sellers and "SELLER_NAME" in brand_base_df.columns:
+        brand_base_df = brand_base_df[brand_base_df["SELLER_NAME"].astype(str).isin(curr_sellers)]
+    if curr_categories and "CATEGORY" in brand_base_df.columns:
+        brand_base_df = brand_base_df[brand_base_df["CATEGORY"].astype(str).isin(curr_categories)]
+    brand_opts = sorted(
+        {
+            str(v).strip()
+            for v in brand_base_df.get("BRAND", pd.Series(dtype=str)).dropna().astype(str)
+            if str(v).strip() and str(v).strip().lower() not in ("nan", "")
+        }
+    )
+
     for s in curr_sellers:
         if s not in seller_opts: seller_opts.append(s)
     for c in curr_categories:
         if c not in category_opts: category_opts.append(c)
+    for b in curr_brands:
+        if b not in brand_opts: brand_opts.append(b)
     seller_opts.sort()
     category_opts.sort()
+    brand_opts.sort()
 
-    # Search stays inline — it is used constantly. Seller and category move
-    # into a popover: they are set occasionally, and as a permanent row they
-    # cost a full band of a modal that had ~370px left for cards. The button
-    # carries the active count so a hidden filter can never be forgotten.
-    _n_active = len(curr_sellers or []) + len(curr_categories or [])
+    # Search stays inline — it is used constantly. Seller, category and brand
+    # move into a popover: they are set occasionally, and as a permanent row
+    # they cost a full band of a modal that had ~370px left for cards. The
+    # button carries the active count so a hidden filter can never be forgotten.
+    _n_active = len(curr_sellers or []) + len(curr_categories or []) + len(curr_brands or [])
     c1, c2, c4 = st.columns([2.2, 1.2, 0.9], gap="medium", vertical_alignment="bottom")
     with c1:
         c1a, c1b = st.columns([6, 1], vertical_alignment="bottom", gap="small")
         with c1a:
             search_n = st.text_input(
-                "Search by Name, Brand, or SID", placeholder="Product name, brand, SID…", icon=":material/search:",
+                "Search by Name, Brand, or SID",
+                placeholder="Search name, brand, SID… (comma-separate for multiple)",
+                icon=":material/search:",
                 label_visibility="collapsed",
                 key="grid_search_n",
             )
@@ -5273,8 +6513,8 @@ def visual_review_modal(support_files):
     with c2:
         with st.popover(
             f"Filters ({_n_active})" if _n_active else "Filters",
-            use_container_width=True,
-            help="Filter the grid by seller or category",
+            width='stretch',
+            help="Filter the grid by seller, category, or brand",
         ):
             fa, fb = st.columns([6, 1], vertical_alignment="bottom", gap="small")
             with fa:
@@ -5296,9 +6536,32 @@ def visual_review_modal(support_files):
             with gb:
                 st.button("✖", key="clr_categories", help="Clear category filter",
                           on_click=_clear_grid_filter_categories, disabled=not bool(curr_categories))
+            ha, hb = st.columns([6, 1], vertical_alignment="bottom", gap="small")
+            with ha:
+                search_brands = st.multiselect(
+                    "Brand", placeholder="All brands",
+                    options=brand_opts, default=curr_brands,
+                    key="grid_filter_brands",
+                )
+            with hb:
+                st.button("✖", key="clr_brands", help="Clear brand filter",
+                          on_click=_clear_grid_filter_brands, disabled=not bool(curr_brands))
 
     curr_flag = st.session_state.get("grid_filter_flag", "")
     curr_sort = st.session_state.get("grid_sort_issue", "")
+    _allowed_grid_sorts = {"", "most_flagged", "low_res", "tall", "wide", "broken"}
+    _allowed_grid_filters = {
+        "", "brand_ocr", "duplicates", "manual_review", "color_mismatch",
+        "learned_only", "direct_only", "overturned_only", "review_unreviewed",
+        "review_confirmed", "near_phash", "multi_seller", "committed",
+        "unresolved",
+    }
+    if curr_sort not in _allowed_grid_sorts:
+        curr_sort = ""
+        st.session_state.grid_sort_issue = ""
+    if curr_flag not in _allowed_grid_filters:
+        curr_flag = ""
+        st.session_state.grid_filter_flag = ""
 
     with c4:
         # The modal had two close buttons, one here and one under the footer.
@@ -5308,19 +6571,18 @@ def visual_review_modal(support_files):
         # with it. Close Review at the bottom is the survivor.
         #
         # 500 per page is only offered in wide mode (6 or 7 columns). More
-        # columns means smaller cards, so 500 of them stays a sensible page; at
-        # 5 columns the same 500 cards make the grid iframe roughly 36,000px
-        # tall, which is where the browser starts to struggle.
+        # columns means smaller cards, so 500 of them stays a sensible page;
+        # the normal grid keeps the previous 200-card limit.
         _cols_now = st.session_state.get("grid_cols_per_row", 4)
-        _allow_500 = _cols_now in (6, 7)
-        _ipp_opts = [20, 50, 100, 200] + ([500] if _allow_500 else [])
+        _allow_500 = _cols_now >= 6
+        _ipp_opts = [50, 100, 200] + ([500] if _allow_500 else [])
 
         _slider_key = "grid_ipp_slider"
 
         # Anything already selected that this column count no longer allows has
         # to be clamped BEFORE the widget is created — select_slider raises if
         # its stored value is not one of the options.
-        _current_ipp = st.session_state.get("grid_items_per_page", 50)
+        _current_ipp = int(st.session_state.get("grid_items_per_page", 200) or 200)
         if _current_ipp not in _ipp_opts:
             _current_ipp = _ipp_opts[-1]
             st.session_state.grid_items_per_page = _current_ipp
@@ -5338,8 +6600,8 @@ def visual_review_modal(support_files):
         # page size is a setting you change occasionally, not a control you
         # need under the cursor.
         with st.popover(
-            f"View · {st.session_state.get('grid_items_per_page', 50)}",
-            use_container_width=True,
+            f"View · {st.session_state.get('grid_items_per_page', 200)}",
+            width='stretch',
             help="How many products to show per page",
         ):
             st.select_slider(
@@ -5347,32 +6609,45 @@ def visual_review_modal(support_files):
                 options=_ipp_opts,
                 key=_slider_key,
                 on_change=_on_ipp_change,
-                help=("500 per page is available in wide mode (6 or 7 columns)."
-                      if _allow_500 else
-                      "Switch to 6 or 7 columns to unlock 500 per page."),
+            help="The iframe loads up to 100 cards initially and appends more as you scroll.",
             )
-        st.session_state.grid_items_per_page = st.session_state[_slider_key]
+        st.session_state.grid_items_per_page = int(st.session_state[_slider_key])
 
     if "_grid_page_contexts" not in st.session_state:
         st.session_state._grid_page_contexts = {}
+    # Retrieve the brands widget value (widget key kept consistent across reruns)
+    search_brands = st.session_state.get("grid_filter_brands", [])
     _curr_ctx = (
         search_n or "",
         tuple(sorted(search_sellers)) if search_sellers else (),
         tuple(sorted(search_categories)) if search_categories else (),
+        tuple(sorted(search_brands)) if search_brands else (),
         curr_flag,
         curr_sort,
+        int(st.session_state.get("grid_items_per_page", 200) or 200),
     )
-    _prev_ctx = st.session_state.get("_grid_last_ctx", ("", "", "", "", ""))
+    _prev_ctx = st.session_state.get("_grid_last_ctx", ("", (), (), (), "", "", int(st.session_state.get("grid_items_per_page", 200) or 200)))
     if _curr_ctx != _prev_ctx:
         st.session_state._grid_page_contexts[_prev_ctx] = st.session_state.get("grid_page", 0)
         st.session_state.grid_page = st.session_state._grid_page_contexts.get(_curr_ctx, 0)
         st.session_state["_grid_last_ctx"] = _curr_ctx
 
     if search_n:
-        n_mask = review_data["NAME"].astype(str).str.contains(search_n, case=False, na=False)
-        b_mask = review_data.get("BRAND", pd.Series(dtype=str, index=review_data.index)).astype(str).str.contains(search_n, case=False, na=False)
-        s_mask = review_data.get("ProductSetSid", pd.Series(dtype=str, index=review_data.index)).astype(str).str.contains(search_n, case=False, na=False)
-        review_data = review_data[n_mask | b_mask | s_mask]
+        # Support multi-term search: comma or semicolon separated terms, OR-filtered.
+        # Each individual term is trimmed; empty tokens (e.g. trailing comma) are ignored.
+        _raw_terms = [t.strip() for t in search_n.replace(";", ",").split(",") if t.strip()]
+        if _raw_terms:
+            _name_col = review_data["NAME"].astype(str)
+            _brand_col = review_data.get("BRAND", pd.Series(dtype=str, index=review_data.index)).astype(str)
+            _sid_col = review_data.get("ProductSetSid", pd.Series(dtype=str, index=review_data.index)).astype(str)
+            _combined_mask = pd.Series(False, index=review_data.index)
+            for _term in _raw_terms:
+                _combined_mask |= (
+                    _name_col.str.contains(_term, case=False, na=False)
+                    | _brand_col.str.contains(_term, case=False, na=False)
+                    | _sid_col.str.contains(_term, case=False, na=False)
+                )
+            review_data = review_data[_combined_mask]
     if search_sellers:
         review_data = review_data[
             review_data["SELLER_NAME"].astype(str).isin(search_sellers)
@@ -5380,6 +6655,10 @@ def visual_review_modal(support_files):
     if search_categories and "CATEGORY" in review_data.columns:
         review_data = review_data[
             review_data["CATEGORY"].astype(str).isin(search_categories)
+        ]
+    if search_brands and "BRAND" in review_data.columns:
+        review_data = review_data[
+            review_data["BRAND"].astype(str).isin(search_brands)
         ]
 
     # --- Shared warning computation -------------------------------------
@@ -5420,7 +6699,7 @@ def visual_review_modal(support_files):
             if hasattr(zrow, "iloc") and hasattr(zrow, "shape") and len(zrow.shape) == 2:
                 zrow = zrow.iloc[0]
             for zcol in _zip_status_cols:
-                if str(zrow.get(zcol, "")).lower() == "rejected":
+                if str(zrow.get(zcol, "")).lower() in ("rejected", "block"):
                     zflag = _zip_prefetch_map.get(zcol, zcol.replace("_Status", "").replace("_", " ").title())
                     if zflag not in w: w.append(zflag)
         
@@ -5450,6 +6729,27 @@ def visual_review_modal(support_files):
             review_data = review_data[review_data.get("is_manual_review", pd.Series(False, index=review_data.index)).astype(bool)]
         elif curr_flag == "color_mismatch":
             review_data = review_data[review_data.get("color_mismatch", pd.Series(False, index=review_data.index)).astype(bool)]
+        elif curr_flag == "learned_only":
+            review_data = review_data[review_data["Learned Match"] | review_data["Learned Review Match"]]
+        elif curr_flag == "direct_only":
+            review_data = review_data[~(review_data["Learned Match"] | review_data["Learned Review Match"])]
+        elif curr_flag == "overturned_only":
+            review_data = review_data[review_data["ProductSetSid"].astype(str).isin(
+                fr.loc[fr.get("overturn_direction", pd.Series("", index=fr.index)).astype(str).eq("to_rejection"), "ProductSetSid"].astype(str)
+            )]
+        elif curr_flag == "review_unreviewed":
+            review_data = review_data[review_data["Learned Review Match"] & review_data["Learned Review"].eq("Unreviewed")]
+        elif curr_flag == "review_confirmed":
+            review_data = review_data[review_data["Learned Review Match"] & review_data["Learned Review"].eq("Confirmed")]
+        elif curr_flag == "near_phash":
+            review_data = review_data[
+                review_data["Learned Match Method"].eq("near-phash")
+                | review_data["Learned Review Method"].eq("near-phash")
+            ]
+        elif curr_flag == "multi_seller":
+            review_data = review_data[review_data["Same Image Count"] > 1]
+        elif curr_flag == "unresolved":
+            review_data = review_data[~review_data["ProductSetSid"].astype(str).isin(committed_rej_sids)]
         else:
             def has_flag(sid, w):
                 qrs = st.session_state.get("quick_rejects", {})
@@ -5473,7 +6773,7 @@ def visual_review_modal(support_files):
             by=["SELLER_NAME", "NAME"], na_position="last"
         ).reset_index(drop=True)
 
-    ipp = st.session_state.get("grid_items_per_page", 50)
+    ipp = min(500, int(st.session_state.get("grid_items_per_page", 200) or 200))
     total_pages = max(1, (len(review_data) + ipp - 1) // ipp)
     if st.session_state.get("grid_page", 0) >= total_pages:
         # Clamp to the nearest valid page instead of bouncing all the way
@@ -5560,16 +6860,17 @@ def visual_review_modal(support_files):
             st.session_state._prefetch_cache = OrderedDict()
         _prefetch_cache = st.session_state._prefetch_cache
 
-        _prefetch_cache_key = f"{st.session_state.grid_page}_{len(review_data)}_{ipp}"
+        _prefetch_cache_key = f"v2_{st.session_state.grid_page}_{len(review_data)}_{ipp}"
         if _prefetch_cache_key not in _prefetch_cache:
             prefetch_urls = []
             _already_warm = set(st.session_state.get("_grid_warm_urls", []))
             seen_urls = set(_already_warm)
-            for prefetch_page in [
-                st.session_state.grid_page + 1,
-                st.session_state.grid_page + 2,
-                st.session_state.grid_page + 3,
-            ]:
+            # Prefetch only the beginning of the next page. The old three-page
+            # look-ahead downloaded up to 600 images when the page size was
+            # 200 (and 1,500 in wide 500-card mode), leaving the iframe in a
+            # continuous "processing" state while the reviewer was already
+            # working on the current page.
+            for prefetch_page in [st.session_state.grid_page + 1]:
                 if prefetch_page >= total_pages:
                     break
                 p_start = prefetch_page * ipp
@@ -5580,6 +6881,10 @@ def visual_review_modal(support_files):
                     if url.startswith("https") and url not in seen_urls:
                         seen_urls.add(url)
                         prefetch_urls.append(url)
+                        if len(prefetch_urls) >= 100:
+                            break
+                    if len(prefetch_urls) >= 100:
+                        break
             _prefetch_cache[_prefetch_cache_key] = prefetch_urls
             _prefetch_cache.move_to_end(_prefetch_cache_key)
             while len(_prefetch_cache) > _PREFETCH_CACHE_MAX_ENTRIES:
@@ -5598,10 +6903,12 @@ def visual_review_modal(support_files):
         _page_sids = page_data.get(
             "PRODUCT_SET_SID", page_data.get("ProductSetSid", pd.Series())
         ).astype(str)
-        _needs_poor_img_lookup = any(
-            s.strip() in poor_img_rej_sids and s.strip() not in rejected_state for s in _page_sids
+        _needs_status_lookup = any(
+            (s.strip() in poor_img_rej_sids or s.strip() in pot_restricted_rej_sids)
+            and s.strip() not in rejected_state
+            for s in _page_sids
         )
-        if _needs_poor_img_lookup:
+        if _needs_status_lookup:
             # Single stripped-key dict built once for this page instead of a full
             # fr[...] scan repeated per row (was O(page_size * len(fr))).
             _fr_flag_map_stripped = dict(zip(fr["ProductSetSid"].astype(str).str.strip(), fr["FLAG"])) if "FLAG" in fr.columns else {}
@@ -5612,7 +6919,9 @@ def visual_review_modal(support_files):
 
         for _sid_raw in _page_sids:
             _sid = _sid_raw.strip()
-            if _sid in poor_img_rej_sids and _sid not in rejected_state:
+            if _sid in pot_restricted_rej_sids and _sid not in rejected_state:
+                rejected_state[_sid] = "Potential Restricted Brand"
+            elif _sid in poor_img_rej_sids and _sid not in rejected_state:
                 _flag = str(_fr_flag_map_stripped.get(_sid, ""))
                 _comment = str(_fr_comment_map_stripped.get(_sid, ""))
                 if "Brand Image Check" in _flag or "Brand Image Check" in _comment:
@@ -5638,6 +6947,29 @@ def visual_review_modal(support_files):
             curr_flag=curr_flag,
             items_per_page=ipp,
         )
+
+    # Keep the iframe document stable while the reviewer moves between pages.
+    # A page turn only changes the card payload; rebuilding the srcdoc makes the
+    # browser tear down the iframe, discard its DOM, and recreate all image
+    # elements.  The small SYNC_STATE broadcaster below already replaces CARDS
+    # in-place, so reuse the document for page-only changes.  Invalidate it when
+    # controls that are actually embedded in the document change.
+    _grid_template_key = (
+        int(cols_per_row), int(ipp), str(curr_sort or ""), str(curr_flag or ""),
+        str(st.session_state.get("ui_lang", "en")),
+        bool(st.session_state.get("show_images", True)),
+        str(st.session_state.get("process_signature", "")),
+    )
+    _grid_template_store = st.session_state.get("_grid_iframe_template")
+    if not isinstance(_grid_template_store, dict) or _grid_template_store.get("key") != _grid_template_key:
+        st.session_state["_grid_iframe_template"] = {
+            "key": _grid_template_key,
+            "html": grid_html[0],
+        }
+    else:
+        # Keep the freshly-built cards/images JSON for SYNC_STATE, but use the
+        # original srcdoc so Streamlit does not reload the iframe on every page.
+        grid_html = (st.session_state["_grid_iframe_template"]["html"],) + tuple(grid_html[1:])
 
     # Unpack the grid html and its sync data
     (_grid_html_str, _committed_json, _poor_img_sids_json, _prefetch_json,
@@ -5695,81 +7027,99 @@ def visual_review_modal(support_files):
         min-height: 320px !important;
         max-height: 1600px !important;
     }
+    /* Collapse the sync broadcaster completely so it occupies 0px in layout */
+    div.st-key-grid_sync_broadcaster,
+    div.st-key-grid_sync_broadcaster div[data-testid="stElementContainer"],
+    div.st-key-grid_sync_broadcaster iframe {
+        position: absolute !important;
+        width: 1px !important;
+        height: 0px !important;
+        min-height: 0px !important;
+        max-height: 0px !important;
+        margin: 0px !important;
+        padding: 0px !important;
+        border: none !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+        overflow: hidden !important;
+        clip: rect(0, 0, 0, 0) !important;
+        z-index: -9999 !important;
+    }
     </style>
     """, unsafe_allow_html=True)
+
     with st.container(key="grid_iframe_container"):
         _num_cards = len(page_data) if ('page_data' in locals() and isinstance(page_data, pd.DataFrame) and not page_data.empty) else 50
         _cols_n = max(1, st.session_state.get("grid_cols_per_row", 4))
         _num_rows = max(1, (_num_cards + _cols_n - 1) // _cols_n)
         _card_h = 360 if st.session_state.get("show_images", True) else 180
 
-        # The iframe is a window onto the grid, not a container sized to hold
-        # all of it. It used to be max(750, rows*card_h + 150) — a 750px floor
-        # against ~612px of usable height on a 1366x768 laptop, so the grid
-        # could never fit and the position:fixed batch bar sat below the fold.
-        # Now the document inside scrolls (see #card-grid) and this only has to
-        # be a comfortable viewport. Python cannot read the browser height, so
-        # this is sized to fit the smallest screen the tool is used on and
-        # short content still shrinks to fit.
         _GRID_VIEWPORT_H = 620
         _content_h = _num_rows * _card_h + 150
         _dynamic_iframe_h = min(_GRID_VIEWPORT_H, max(420, _content_h))
+        _iframe_t0 = time.perf_counter()
         st.iframe(_grid_html_str, height=_dynamic_iframe_h)
-        # Inject a zero-height broadcaster that pushes state into the iframe via postMessage.
-        # Sending cards via postMessage prevents the entire iframe DOM from being torn down
-        # and rebuilt (which causes severe flickering) when changing pages.
-        # The payload is built ONCE and reused by any retry. The old version
-        # rebuilt this object literal on each of four attempts and posted it to
-        # every frame with no success check — at 500 ZIP-image cards that was
-        # hundreds of MB of structured-clone per render, which is what hung the
-        # browser and dropped the websocket. Now: send, wait for the grid's
-        # SYNC_ACK, and stop. Retries only happen if nothing acknowledged, which
-        # covers the genuine race where the grid iframe has not booted yet.
-        _sync_html = f"""
-        <script>
-        (function() {{
-          var PAYLOAD = {{
-            type: 'SYNC_STATE',
-            committed: {_committed_json},
-            poor_img_sids: {_poor_img_sids_json},
-            prefetch: {_prefetch_json},
-            {_cards_field}
-            {_images_field}
-            cards_sig: {json.dumps(_cards_sig)},
-            scroll_to_top: {'true' if scroll_top_flag else 'false'}
-          }};
-          var acked = false;
-          var timer = null;
-          window.addEventListener('message', function(ev) {{
-            if (!ev.data) return;
-            if (ev.data.type === 'SYNC_ACK') {{
-              acked = true;
-              if (timer) {{ clearTimeout(timer); timer = null; }}
-            }} else if (ev.data.type === 'GRID_READY') {{
-              // The grid finished parsing and is listening. Deliver now
-              // rather than hoping a blind retry coincides with it.
-              send(0);
-            }}
-          }});
-          function send(attemptsLeft) {{
-            if (acked) return;
-            try {{
-              for (var i = 0; i < window.parent.frames.length; i++) {{
-                try {{ window.parent.frames[i].postMessage(PAYLOAD, '*'); }} catch(e2) {{}}
-              }}
-            }} catch(e) {{}}
-            if (attemptsLeft > 0) {{
-              timer = setTimeout(function() {{ send(attemptsLeft - 1); }}, 400);
-            }}
+        st.session_state["validation_stage_timings"] = {
+            **st.session_state.get("validation_stage_timings", {}),
+            "Iframe render preparation": round(time.perf_counter() - _iframe_t0, 3),
+        }
+
+    # Inject a zero-height broadcaster that pushes state into the iframe via postMessage.
+    # Sending cards via postMessage prevents the entire iframe DOM from being torn down
+    # and rebuilt (which causes severe flickering) when changing pages.
+    # The payload is built ONCE and reused by any retry. The old version
+    # rebuilt this object literal on each of four attempts and posted it to
+    # every frame with no success check — at 500 ZIP-image cards that was
+    # hundreds of MB of structured-clone per render, which is what hung the
+    # browser and dropped the websocket. Now: send, wait for the grid's
+    # SYNC_ACK, and stop. Retries only happen if nothing acknowledged, which
+    # covers the genuine race where the grid iframe has not booted yet.
+    _sync_html = f"""
+    <script>
+    (function() {{
+      var PAYLOAD = {{
+        type: 'SYNC_STATE',
+        committed: {_committed_json},
+        poor_img_sids: {_poor_img_sids_json},
+        prefetch: {_prefetch_json},
+        {_cards_field}
+        {_images_field}
+        cards_sig: {json.dumps(_cards_sig)},
+        scroll_to_top: {'true' if scroll_top_flag else 'false'}
+      }};
+      var acked = false;
+      var timer = null;
+      window.addEventListener('message', function(ev) {{
+        if (!ev.data) return;
+        if (ev.data.type === 'SYNC_ACK') {{
+          acked = true;
+          if (timer) {{ clearTimeout(timer); timer = null; }}
+        }} else if (ev.data.type === 'GRID_READY') {{
+          // The grid finished parsing and is listening. Deliver now
+          // rather than hoping a blind retry coincides with it.
+          send(0);
+        }}
+      }});
+      function send(attemptsLeft) {{
+        if (acked) return;
+        try {{
+          for (var i = 0; i < window.parent.frames.length; i++) {{
+            try {{ window.parent.frames[i].postMessage(PAYLOAD, '*'); }} catch(e2) {{}}
           }}
-          // GRID_READY is the real trigger; this is the safety net for the
-          // case where the grid announced itself before this script existed.
-          // 12 attempts at 400ms covers ~5s of cold-start parsing, against
-          // the 750ms the old blind loop allowed.
-          send(12);
-        }})();
-        </script>
-        """
+        }} catch(e) {{}}
+        if (attemptsLeft > 0) {{
+          timer = setTimeout(function() {{ send(attemptsLeft - 1); }}, 400);
+        }}
+      }}
+      // GRID_READY is the real trigger; this is the safety net for the
+      // case where the grid announced itself before this script existed.
+      // 12 attempts at 400ms covers ~5s of cold-start parsing, against
+      // the 750ms the old blind loop allowed.
+      send(12);
+    }})();
+    </script>
+    """
+    with st.container(key="grid_sync_broadcaster"):
         st.iframe(_sync_html, height=1)
 
     # One footer row instead of four stacked bands. Measured on a real batch,
@@ -5787,7 +7137,7 @@ def visual_review_modal(support_files):
         st.button(
             "⬅ Prev",
             key="prev_bot",
-            use_container_width=True,
+            width="stretch",
             disabled=_page_now == 0,
             on_click=_prev_page,
         )
@@ -5807,7 +7157,7 @@ def visual_review_modal(support_files):
         st.button(
             "Next ➡",
             key="next_bot",
-            use_container_width=True,
+            width="stretch",
             disabled=st.session_state.grid_page >= total_pages - 1,
             on_click=_next_page,
         )
@@ -5815,11 +7165,14 @@ def visual_review_modal(support_files):
         st.caption(f"{len(review_data):,} items · page {_page_now + 1} of {total_pages}")
         st.progress(min(1.0, (_page_now + 1) / total_pages))
     with _pg[4]:
-        if st.button("✖ Close", key="close_bot_fallback", use_container_width=True, type="secondary"):
+        if st.button("✖ Close", key="close_bot_fallback", width="stretch", type="secondary"):
             st.session_state.show_review_modal = False
-            # Tells the next run to cover the page while it rebuilds — see
-            # render_grid_closing_overlay(). Cleared at the bottom of that run.
             st.session_state["_grid_closing"] = True
+            _fr = st.session_state.get("final_report")
+            if isinstance(_fr, pd.DataFrame):
+                _fr.attrs.pop("__pim_hash__", None)
+                _fr.attrs.pop("__pim_hash_stamp__", None)
+            _clear_result_caches(clear_streamlit_cache=False)
             st.rerun()
 
 
@@ -5828,6 +7181,49 @@ def render_manual_review_buttons(support_files):
     _fr = st.session_state.get("final_report", pd.DataFrame())
     if _fr.empty or st.session_state.get("file_mode") == "post_qc":
         return
+
+    # -- Self-contained close bridge -----------------------------------------
+    # Handles ONLY the grid iframe's close request. Deliberately separate
+    # from JTBRIDGE_UNIQUE (handle_jtbridge() in streamlit_app.py): that one
+    # only fires on a full top-level script rerun, at the very bottom of a
+    # 7,700+ line file -- a close message could be sitting behind an
+    # exception raised anywhere above it and never take effect.
+    st.markdown(
+        '''
+        <style>
+        div[data-testid="stTextInput"]:has(input[placeholder="GRID_CLOSE_BRIDGE_DO_NOT_USE"]) {
+            position: absolute !important; width: 1px !important; height: 1px !important;
+            padding: 0 !important; margin: -1px !important; overflow: hidden !important;
+            clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important;
+            border: 0 !important; opacity: 0 !important; z-index: -9999 !important;
+        }
+        </style>
+        ''',
+        unsafe_allow_html=True,
+    )
+    if "_grid_close_bridge_counter" not in st.session_state:
+        st.session_state._grid_close_bridge_counter = 0
+    _close_val = st.text_input(
+        "grid_close_bridge",
+        value="",
+        placeholder="GRID_CLOSE_BRIDGE_DO_NOT_USE",
+        key=f"grid_close_bridge_{st.session_state._grid_close_bridge_counter}",
+        label_visibility="collapsed",
+    )
+    if _close_val:
+        st.session_state._grid_close_bridge_counter += 1
+        st.session_state.show_review_modal = False
+        st.session_state["_grid_closing"] = True
+        _fr = st.session_state.get("final_report")
+        if isinstance(_fr, pd.DataFrame):
+            _fr.attrs.pop("__pim_hash__", None)
+            _fr.attrs.pop("__pim_hash_stamp__", None)
+        _clear_result_caches(clear_streamlit_cache=False)
+        # A fragment-only rerun leaves Streamlit's dialog shell mounted. That
+        # produces the stuck dim backdrop/blank white header seen after some
+        # iframe closes. Close must be a full rerun so the dialog component is
+        # unmounted and the native backdrop is removed.
+        st.rerun()
 
     if not _fr.empty and "Status" in _fr.columns and "FLAG" in _fr.columns:
         _rej_count = int((
@@ -5875,6 +7271,14 @@ def render_manual_review_buttons(support_files):
                 # That is what "empty until I change cards per row" was.
                 st.session_state.pop("_grid_last_html_sig", None)
                 st.session_state.pop("_grid_last_sent_sig", None)
+                st.session_state.pop("_grid_iframe_template", None)
+                # Snapshot rejection count for fast-close detection
+                _fr_open = st.session_state.get("final_report", pd.DataFrame())
+                st.session_state["_review_snap_rej_count"] = int(
+                    (_fr_open["Status"] == "Rejected").sum()
+                    if not _fr_open.empty and "Status" in _fr_open.columns
+                    else 0
+                )
         with c3:
             if st.button(
                 _audit_label,
@@ -5911,6 +7315,14 @@ def render_manual_review_buttons(support_files):
                 # That is what "empty until I change cards per row" was.
                 st.session_state.pop("_grid_last_html_sig", None)
                 st.session_state.pop("_grid_last_sent_sig", None)
+                st.session_state.pop("_grid_iframe_template", None)
+                # Snapshot rejection count for fast-close detection
+                _fr_open = st.session_state.get("final_report", pd.DataFrame())
+                st.session_state["_review_snap_rej_count"] = int(
+                    (_fr_open["Status"] == "Rejected").sum()
+                    if not _fr_open.empty and "Status" in _fr_open.columns
+                    else 0
+                )
 
     if st.session_state.get("show_targeted_audit_modal", False):
         targeted_audit_modal(support_files)
@@ -6061,6 +7473,14 @@ def _render_export_card(title, df, desc, func, exports_config):
                 icon=":material/download:",
                 icon_position="left",
             ):
+                # Learning is a final-report action: do it only after the
+                # reviewer explicitly asks for an export.
+                if _commit_learning_callback is not None:
+                    try:
+                        _commit_learning_callback()
+                    except Exception:
+                        logger.exception("Could not commit staged validation learning")
+                _export_t0 = time.perf_counter()
                 with st.spinner("Generating all reports…"):
                     for t2, d2, _, f2 in exports_config:
                         if t2 not in st.session_state.exports_cache:
@@ -6070,6 +7490,7 @@ def _render_export_card(title, df, desc, func, exports_config):
                                 "fname": fname,
                                 "mime": mime,
                             }
+                st.session_state.setdefault("validation_stage_timings", {})["Report export"] = round(time.perf_counter() - _export_t0, 3)
                 st.rerun()
         else:
             cache = st.session_state.exports_cache[title]
@@ -6172,6 +7593,12 @@ def render_exports_section(support_files, country_validator):
         st.success("All reports generated and ready to download.")
     else:
         if st.button("Generate All Reports", type="primary", width='stretch'):
+            if _commit_learning_callback is not None:
+                try:
+                    _commit_learning_callback()
+                except Exception:
+                    logger.exception("Could not commit staged validation learning")
+            _export_t0 = time.perf_counter()
             with st.spinner("Generating all reports…"):
                 for t2, d2, _, f2 in exports_config:
                     if t2 not in st.session_state.exports_cache:
@@ -6181,6 +7608,7 @@ def render_exports_section(support_files, country_validator):
                             "fname": fname,
                             "mime": mime,
                         }
+            st.session_state.setdefault("validation_stage_timings", {})["Report export"] = round(time.perf_counter() - _export_t0, 3)
             st.rerun()
 
     cols_count = 4 if st.session_state.get("layout_mode") == "wide" else 2

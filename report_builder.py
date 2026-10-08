@@ -55,6 +55,13 @@ _REJECTED_FOR = {
     "name_brand": "because the product name and the brand name did not match",
     "image_quality": "because the image quality was too low",
     "brand_image": "because a brand was spotted on the product image",
+    "apple_acc_overturned": "because an Apple brand mark was detected on an accessory",
+    "general_rule": "by a category-specific catalog placement rule",
+    "refurbished": "for a refurbished product policy violation",
+    "suspected_fake": "for suspected counterfeit / fake product",
+    "generic_brand_evasion": "for a brand mismatch or unauthorized brand claim",
+    "specs_inconsistency": "for a smartphone specs or naming inconsistency",
+    "pipeline_overturned": "by an initial QC check that was subsequently overturned",
 }
 
 # What the category's own rule actually says — the contradiction.
@@ -69,6 +76,13 @@ _NOT_REQUIRED = {
     "name_brand": "the name and the brand do match",
     "image_quality": "the image is good enough",
     "brand_image": "there is no brand problem with the image",
+    "apple_acc_overturned": "the product is an accessory for Apple devices where referencing compatible hardware is permitted",
+    "general_rule": "the listing complies with the catalog placement guidelines",
+    "refurbished": "the product complies with refurbished listing guidelines",
+    "suspected_fake": "the price is above the counterfeit ceiling for this brand and category",
+    "generic_brand_evasion": "the listing does not misuse protected brand names or trademarks",
+    "specs_inconsistency": "the smartphone specs are consistent between the title and description",
+    "pipeline_overturned": "re-validation confirmed the listing is compliant and the rejection was overturned",
 }
 
 _IS_REQUIRED = {
@@ -82,6 +96,13 @@ _IS_REQUIRED = {
     "name_brand": "the name and the brand do not match",
     "image_quality": "the image quality is too low",
     "brand_image": "there is a brand on the image that should not be there",
+    "apple_acc_overturned": "Apple brand was wrongly flagged on an accessory",
+    "general_rule": "this listing violates the catalog placement rules for this category",
+    "refurbished": "this product violates refurbished/discontinued listing policy (e.g. brand must be 'Refurbished' or 'Renewed', out-of-market hardware like HP EliteBook G1–G8 or Galaxy Note claimed new, or listing in an ineligible category)",
+    "suspected_fake": "the product price is at or below the counterfeit ceiling for this brand and category, making it a suspected fake",
+    "generic_brand_evasion": "the declared brand is Generic/Fashion/Unbranded, yet the title claims a genuine brand — this is brand hijacking",
+    "specs_inconsistency": "the smartphone specs in the title or description are missing, contradictory, or implausible",
+    "pipeline_overturned": "the rejection was overturned by app validation",
 }
 
 
@@ -116,6 +137,21 @@ def _explain(check_key: str, reason_type: str, verdict: str, n: int) -> str:
         subject, verb, pronoun, obj, needs = f"These {n} products", "were", "They", "them", "need"
 
     if verdict == "False Rejection":
+        if check_key == "refurbished":
+            rt = str(reason_type).lower()
+            if "compliant but rejected" in rt:
+                return (f"{subject} {verb} rejected under refurbished rules, but the listing is fully compliant "
+                        f"with marketplace policy (proper 'Refurbished'/'Renewed' brand and title declaration in an eligible category). "
+                        f"The rejection was wrong — {pronoun.lower()} should have been approved.")
+            elif "non-refurbished" in rt:
+                return (f"{subject} {verb} rejected as refurbished, but the product is not a refurbished device. "
+                        f"The rejection was wrong — {pronoun.lower()} should have been approved.")
+            return (f"{subject} {verb} rejected under refurbished rules, but the file's data shows the rejection "
+                    f"was wrong — {pronoun.lower()} should have been approved.")
+        if check_key == "generic_brand_evasion":
+            return (f"{subject} {verb} rejected for brand evasion, but the brand declaration is legitimate. "
+                    f"The rejection was wrong — {pronoun.lower()} should have been approved.")
+
         why = _REJECTED_FOR.get(check_key, "by this check")
         if "present but rejected" in str(reason_type).lower():
             rule = _VALUE_PRESENT.get(check_key, "the value is actually there in the file")
@@ -128,6 +164,39 @@ def _explain(check_key: str, reason_type: str, verdict: str, n: int) -> str:
                 f"rejection was wrong.")
 
     if verdict == "False Approval":
+        if check_key == "refurbished":
+            rt = str(reason_type).lower()
+            if "discontinued device claimed new" in rt:
+                return (f"{subject} {verb} approved, but the listing claims an out-of-market or "
+                        f"discontinued model (such as legacy HP EliteBook 6xx/7xx/8xx G1–G8, ThinkPad, "
+                        f"Galaxy Note, or out-of-market gaming console) as 'Brand New' or 'Sealed'. "
+                        f"Direct contradiction for end-of-life hardware — {pronoun.lower()} should have been "
+                        f"rejected or reclassified as refurbished.")
+            elif "oem brand instead of refurb" in rt or "generic/blank brand" in rt or "seller name as brand" in rt:
+                return (f"{subject} {verb} approved, but the brand is set to an OEM, Generic, or seller name "
+                        f"instead of the mandatory 'Refurbished' or 'Renewed'. Under marketplace policy, "
+                        f"{pronoun.lower()} should have been rejected or corrected to compliant refurbished branding.")
+            elif "missing 'refurbished' in title" in rt or "misspelled" in rt:
+                return (f"{subject} {verb} approved, but the product title is missing the required 'Refurbished' "
+                        f"designation or contains non-standard terminology. {pronoun} should have been rejected or updated.")
+            elif "ineligible category" in rt:
+                return (f"{subject} {verb} approved, but refurbished listings are not permitted in this category. "
+                        f"{pronoun} should have been rejected.")
+            return (f"{subject} {verb} approved, but the AI missed that {pronoun.lower()} "
+                    f"{'is a' if n == 1 else 'are'} refurbished listing with policy violations. "
+                    f"{pronoun} should have been rejected or updated to compliant refurbished branding.")
+        if check_key == "suspected_fake":
+            return (f"{subject} {verb} approved, but the price is at or below the counterfeit "
+                    f"ceiling for {'its' if n == 1 else 'their'} brand and category. "
+                    f"{pronoun} {'is' if n == 1 else 'are'} likely fake and should have been rejected.")
+        if check_key == "generic_brand_evasion":
+            return (f"{subject} {verb} approved, but the declared brand is Generic, Fashion, or Unbranded, "
+                    f"while the title claims a genuine brand. This is brand hijacking — "
+                    f"{pronoun.lower()} should have been rejected.")
+        if check_key == "specs_inconsistency":
+            return (f"{subject} {verb} approved, but the smartphone specs are missing or contradict "
+                    f"each other between the title and description. "
+                    f"{pronoun} should have been rejected or corrected.")
         rt = str(reason_type).lower()
         if "not recognised" in rt or "invalid" in rt:
             rule = _INVALID_VALUE.get(check_key)
@@ -200,6 +269,13 @@ _DOC_EXTRA_FIELDS = {
     "image_extraction": ["Image"],
     "ai_caption": ["Image"],
     "brand_image": ["Listed Brand", "Brand Detected On Product"],
+    "apple_acc_overturned": ["Brand", "Brand Detected On Product"],
+    "general_rule": ["Brand", "Initial Category Path"],
+    "refurbished": ["Brand", "Seller"],
+    "suspected_fake": ["Brand", "Price"],
+    "generic_brand_evasion": ["Brand"],
+    "specs_inconsistency": ["Brand"],
+    "pipeline_overturned": ["Seller"],
 }
 
 
@@ -274,6 +350,7 @@ _COL_WIDTHS = {
     "Initial Category Path": 0.9,
     "Image Filename": 0.9,
     "Image": 1.2,
+    "Price": 0.7,
     "Detail": 1.6,
 }
 
@@ -351,6 +428,18 @@ def build_docx_report(
     n_dup = int(counts.get("Duplicate", 0))
     n_skip = int(counts.get("Skipped", 0))
 
+    n_missed_refurb = 0
+    n_wrongly_rejected_refurb = 0
+    n_missed_fake = 0
+    n_missed_evasion = 0
+    n_missed_specs = 0
+    if results is not None and not results.empty and "Check" in results.columns and "Verdict" in results.columns:
+        n_missed_refurb = int(((results["Check"] == "refurbished") & (results["Verdict"] == "False Approval")).sum())
+        n_wrongly_rejected_refurb = int(((results["Check"] == "refurbished") & (results["Verdict"] == "False Rejection")).sum())
+        n_missed_fake = int(((results["Check"] == "suspected_fake") & (results["Verdict"] == "False Approval")).sum())
+        n_missed_evasion = int(((results["Check"] == "generic_brand_evasion") & (results["Verdict"] == "False Approval")).sum())
+        n_missed_specs = int(((results["Check"] == "specs_inconsistency") & (results["Verdict"] == "False Approval")).sum())
+
     # Short sentences, one idea each. This was previously a single ~90-word
     # sentence that a reader had to unpick to find the numbers that matter.
     doc.add_paragraph(
@@ -369,6 +458,39 @@ def build_docx_report(
         f"approved when {'it' if n_false_approvals == 1 else 'they'} should have been rejected. "
         f"These are the ones worth acting on first."
     )
+    if n_wrongly_rejected_refurb:
+        doc.add_paragraph(
+            f"Of the false rejections, {_n_products(n_wrongly_rejected_refurb)} {'was' if n_wrongly_rejected_refurb == 1 else 'were'} "
+            f"wrongly rejected under refurbished rules (compliant refurbished listings or non-refurbished items incorrectly flagged). "
+            f"{'This product has' if n_wrongly_rejected_refurb == 1 else 'These products have'} been overturned to approved."
+        )
+    if n_missed_refurb:
+        doc.add_paragraph(
+            f"Of the false approvals, the AI missed {_n_products(n_missed_refurb)} with "
+            f"refurbished listing violations — including out-of-market hardware (such as legacy HP EliteBook/ProBook, "
+            f"Lenovo ThinkPad, Samsung Galaxy Note, or legacy gaming consoles) falsely claimed as brand new/sealed, "
+            f"brand not declared as 'Refurbished' or 'Renewed', or listing in ineligible categories. "
+            f"These require immediate correction or rejection."
+        )
+    if n_missed_fake:
+        doc.add_paragraph(
+            f"The audit also found {_n_products(n_missed_fake)} that {'was' if n_missed_fake == 1 else 'were'} "
+            f"approved despite the price being at or below the counterfeit ceiling for {'its' if n_missed_fake == 1 else 'their'} "
+            f"brand and category. {'This product is' if n_missed_fake == 1 else 'These products are'} "
+            f"suspected fakes and should have been rejected."
+        )
+    if n_missed_evasion:
+        doc.add_paragraph(
+            f"{_n_products(n_missed_evasion)} {'was' if n_missed_evasion == 1 else 'were'} approved with a declared brand of "
+            f"Generic, Fashion, or Unbranded while the product title claims a genuine brand. "
+            f"This is brand hijacking and should have been caught and rejected."
+        )
+    if n_missed_specs:
+        doc.add_paragraph(
+            f"{_n_products(n_missed_specs)} {'was' if n_missed_specs == 1 else 'were'} approved despite having missing or "
+            f"contradictory smartphone specs (RAM, storage, or OS) between the product title and description. "
+            f"{'This product' if n_missed_specs == 1 else 'These products'} should have been corrected or rejected."
+        )
     if n_manual:
         doc.add_paragraph(
             f"Another {_n_products(n_manual)} cannot be settled from the file on their own "

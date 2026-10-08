@@ -7,6 +7,8 @@ constants.py - Shared constants used across all modules
 # now resolve from design_tokens so there is one palette rather than four —
 # see the module docstring there for why the orange had to be split into a
 # fill colour and a (darker) text colour.
+import re
+
 from design_tokens import JUMIA_COLORS_OVERRIDE as _TOKENS
 
 JUMIA_COLORS = {
@@ -93,18 +95,18 @@ NEW_FILE_MAPPING = {
 }
 
 COLOR_PATTERNS = {
-    'red': ['red', 'crimson', 'scarlet', 'maroon', 'burgundy', 'wine', 'ruby'],
-    'blue': ['blue', 'navy', 'royal', 'sky', 'azure', 'cobalt', 'sapphire'],
-    'green': ['green', 'lime', 'olive', 'emerald', 'mint', 'forest', 'jade'],
-    'black': ['black', 'onyx', 'ebony', 'jet', 'charcoal', 'midnight'],
-    'white': ['white', 'ivory', 'cream', 'pearl', 'snow', 'alabaster'],
-    'gray': ['gray', 'grey', 'silver', 'slate', 'ash', 'graphite'],
-    'yellow': ['yellow', 'gold', 'golden', 'amber', 'lemon', 'mustard'],
+    'red': ['red', 'crimson', 'scarlet', 'maroon', 'burgundy', 'ruby', 'rouge', 'bordeaux'],
+    'blue': ['blue', 'navy', 'royal', 'sky', 'azure', 'cobalt', 'sapphire', 'bleu', 'teal', 'cyan', 'turquoise', 'aqua', 'indigo'],
+    'green': ['green', 'lime', 'olive', 'emerald', 'mint', 'forest', 'jade', 'vert'],
+    'black': ['black', 'onyx', 'ebony', 'jet', 'charcoal', 'midnight', 'noir', 'graphite'],
+    'white': ['white', 'ivory', 'cream', 'pearl', 'snow', 'alabaster', 'blanc', 'blanche', 'off-white', 'off white', 'champagne'],
+    'gray': ['gray', 'grey', 'silver', 'slate', 'ash', 'gris', 'grise', 'chrome', 'titanium', 'platinum', 'platine', 'gunmetal', 'anthracite'],
+    'yellow': ['yellow', 'gold', 'golden', 'amber', 'lemon', 'mustard', 'jaune'],
     'orange': ['orange', 'tangerine', 'peach', 'coral', 'apricot'],
-    'pink': ['pink', 'rose', 'magenta', 'fuchsia', 'salmon', 'blush'],
-    'purple': ['purple', 'violet', 'lavender', 'plum', 'mauve', 'lilac'],
-    'brown': ['brown', 'tan', 'beige', 'khaki', 'chocolate', 'coffee', 'bronze'],
-    'multicolor': ['multicolor', 'multicolour', 'multi-color', 'rainbow', 'mixed']
+    'pink': ['pink', 'rose', 'magenta', 'fuchsia', 'salmon', 'blush', 'rose gold', 'rosegold'],
+    'purple': ['purple', 'violet', 'lavender', 'plum', 'mauve', 'lilac', 'pourpre'],
+    'brown': ['brown', 'tan', 'beige', 'khaki', 'chocolate', 'bronze', 'marron', 'camel', 'nude', 'caramel', 'wood', 'wooden', 'bois'],
+    'multicolor': ['multicolor', 'multicolour', 'multi-color', 'multi colour', 'multi-colour', 'rainbow', 'mixed', 'multicolored', 'multicoloured', 'multicolore']
 }
 
 COUNTRY_VALIDATOR_CONFIG = {
@@ -138,9 +140,11 @@ REASON_MAP = {
     "REJECT_WRONG_CAT":      "Wrong Category",
     "REJECT_FAKE":           "Suspected Fake product",
     "REJECT_BRAND":          "Restricted brands",
+    "REJECT_POT_RESTRICTED": "Potential Restricted Brand",
     "REJECT_PROHIBITED":     "Prohibited products",
     "REJECT_NSFW":           "Adult / NSFW content",
     "REJECT_COLOR":          "Missing COLOR",
+    "REJECT_COLOR_MISMATCH": "Color Mismatch: Title vs COLOR Column",
     "REJECT_WRONG_BRAND":    "Generic branded products with genuine brands",
     "REJECT_SUSP_DISCOUNT":  "Discount too high",
     "REJECT_DUPLICATE":      "Duplicate product",
@@ -154,6 +158,7 @@ REASON_MAP = {
     "REJECT_FAKE_PERFUME":   "Suspected Fake Perfume",
     "REJECT_SUSPICIOUS_DISCOUNT": "Suspicious Discount",
     "REJECT_REFURB":         "Seller Not approved to sell Refurb",
+    "REJECT_OUT_OF_MARKET":  "Out of market devices",
     "REJECT_BOOKS_SELLER":   "Seller Approve to sell books",
     "REJECT_PERFUME_SELLER": "Seller Approved to Sell Perfume",
     "REJECT_PERFUME_TESTER": "Perfume Tester",
@@ -169,6 +174,60 @@ REASON_MAP = {
     "REJECT_SPECS_INCONSISTENCY": "Specs Inconsistency",
     "OTHER_CUSTOM":          "Other Reason (Custom)"
 }
+
+# ── Prefetch mappings and helpers ─────────────────────────────────────────
+PREFETCH_MAP = {
+    "poor_images": "Poor images",
+    "wrong_category": "Wrong Category",
+    "restricted_brands": "Restricted brands",
+    "prohibited_products": "Prohibited products",
+    "suspected_fake": "Suspected Fake product",
+    "brand_name_in_name": "BRAND name repeated in NAME",
+    "duplicate_product": "Duplicate product",
+    "wrong_variation": "Wrong Variation",
+    "missing_color": "Missing COLOR",
+    "color_mismatch": "Color Mismatch: Title vs COLOR Column",
+    "unnecessary_words": "Unnecessary words in NAME",
+    "brand_repeated": "BRAND name repeated in NAME",
+    "generic_brand": "Generic BRAND Issues",
+    "incomplete_smartphone": "Incomplete Smartphone Name",
+    "missing_weight": "Missing Weight/Volume",
+    "product_warranty": "Product Warranty",
+    "category_check": "Category Check",
+    "warranty_check": "Warranty Check",
+    "fda_check": "FDA",
+    "color_check": "Color Check",
+    "variation_check": "Variation Check",
+    "product_name_brand_name": "Product Name Brand Name",
+    "title_language_check": "Title Language Check",
+    "image_quality_check": "Image Quality Check",
+    "brand_image_check": "Brand Image Check",
+    "restricted_keyword": "Restricted Keywords",
+}
+
+NAME_BRAND_SUB_FLAGS = [
+    "Product Name Brand Name – Brand Repeated In Title",
+    "Product Name Brand Name – Inspired/Alternative Perfume Brand",
+    "Product Name Brand Name – Generic/Placeholder Brand",
+    "Product Name Brand Name – High-End Brand Counterfeit Suspected",
+    "Product Name Brand Name – Other",
+]
+
+TITLE_LANGUAGE_SUB_FLAGS = [
+    "Title Language Check – Not In English",
+    "Title Language Check – Refurbished Missing in Title",
+    "Title Language Check – Missing Weight/Volume/Count",
+    "Title Language Check – Incomplete Phone/Tablet/Laptop Title",
+    "Title Language Check – Other",
+]
+
+def _prefetch_key_from_status_col(col: str) -> str:
+    return (
+        re.sub(r"[_\s]*status$", "", str(col), flags=re.IGNORECASE)
+        .strip()
+        .lower()
+        .replace(" ", "_")
+    )
 
 SPLIT_LIMIT = 9998
 MULTI_COUNTRY_VALUES = {'MULTIPLE', 'MULTI'}
@@ -190,6 +249,8 @@ FLAG_CACHE_DIR = "app_cache_flags"
 # 1.5 is also an ordinary product photo: a 2:3 portrait shot is 1.5 exactly,
 # so bottles, standing figures and portrait packaging were auto-rejected on
 # shape alone.
+PHASH_MATCH_MAX_DISTANCE = 6  # conservative radius for near-identical 64-bit pHashes
+
 ASPECT_REJECT_TALL = 2.5      # taller than 2.5x its width  -> rejected
 ASPECT_REJECT_WIDE = 0.4      # wider than 2.5x its height  -> rejected
 ASPECT_ADVISORY_TALL = 1.5    # 1.5 - 2.5 -> commentary in the grid only
@@ -361,6 +422,10 @@ CALCULATOR_MODEL_ALIASES = {
     "classwiz": "casio",
 }
 
+try:
+    from brand_catalog_loader import CATALOG_MODEL_ALIASES
+except ImportError:
+    CATALOG_MODEL_ALIASES = {}
 
 # Every model → parent-brand map, merged. `check_suspected_fake_products`
 # iterates this to give a listing that mentions a model but not its brand the
@@ -370,4 +435,6 @@ PRICE_CEILING_MODEL_ALIASES = {
     **AUDIO_MODEL_ALIASES,
     **WATCH_MODEL_ALIASES,
     **CALCULATOR_MODEL_ALIASES,
+    **CATALOG_MODEL_ALIASES,
 }
+

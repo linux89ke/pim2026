@@ -4,6 +4,8 @@ data_utils.py - Data loading, cleaning, transformation and validation helpers
 
 import json
 import re
+import csv
+import warnings
 import hashlib
 import logging
 import os
@@ -285,6 +287,22 @@ def load_manual_decisions(process_signature: str):
     return load_df_parquet(manual_decisions_filename(process_signature))
 
 
+def manual_decisions_mtime(process_signature: str) -> int:
+    """Return the journal's nanosecond mtime for cross-session refreshes.
+
+    Manual decisions are written to a content-addressed parquet journal.  A
+    Streamlit tab can therefore cheaply detect that another tab changed the
+    same upload without re-reading or re-running validation on every rerun.
+    ``0`` also represents a journal that does not exist yet.
+    """
+    if not process_signature or process_signature == "empty":
+        return 0
+    try:
+        return int(os.stat(os.path.join(PARQUET_CACHE_DIR, manual_decisions_filename(process_signature))).st_mtime_ns)
+    except OSError:
+        return 0
+
+
 def apply_manual_decisions(final_report, decisions) -> int:
     """Re-apply journalled decisions onto a report in place. Returns rows changed."""
     if not isinstance(final_report, pd.DataFrame) or final_report.empty:
@@ -490,34 +508,106 @@ def extract_product_attributes(name: str, explicit_color: Optional[str] = None, 
 # -------------------------------------------------
 
 def _detect_and_read_csv(buf) -> pd.DataFrame:
-    _ENCODINGS = ['utf-8-sig', 'utf-8', 'cp1252', 'iso-8859-1']
+    # latin1 never raises UnicodeDecodeError so it acts as the final safe fallback
+    _ENCODINGS = ['utf-8-sig', 'utf-8', 'cp1252', 'iso-8859-1', 'latin1']
+    if hasattr(buf, 'seek'):
+        try:
+            buf.seek(0)
+        except Exception:
+            pass
     raw_bytes = buf.read()
-    
-    # 1. Fast detection using a small chunk
-    best_enc = 'utf-8'
-    best_sep = ','
-    found = False
-    
+    if not raw_bytes:
+        return pd.DataFrame()
+
+    # 1. Fast sniff using Python's csv.Sniffer on the initial chunk
+    sample_bytes = raw_bytes[:16384]
+    detected_enc = None
+    sample_text = None
     for enc in _ENCODINGS:
-        for sep in [',', ';', '\t']:
-            try:
-                df_chunk = pd.read_csv(BytesIO(raw_bytes), sep=sep, encoding=enc, dtype=str, nrows=10)
-                if len(df_chunk.columns) > 1:
-                    best_enc = enc
-                    best_sep = sep
-                    found = True
-                    break
-            except Exception:
-                continue
-        if found:
+        try:
+            sample_text = sample_bytes.decode(enc)
+            detected_enc = enc
             break
-            
-    # 2. Read the full file exactly once with detected parameters
-    if found:
-        return pd.read_csv(BytesIO(raw_bytes), sep=best_sep, encoding=best_enc, dtype=str)
-    
-    # 3. Fallback
-    return pd.read_csv(BytesIO(raw_bytes), sep=None, engine='python', encoding='utf-8', dtype=str)
+        except UnicodeDecodeError:
+            continue
+    if sample_text is None:
+        detected_enc = 'latin1'
+        sample_text = sample_bytes.decode('latin1', errors='replace')
+
+    candidate_seps = [',', ';', '\t']
+    if sample_text:
+        try:
+            sniffer = csv.Sniffer()
+            sniffed_dialect = sniffer.sniff(sample_text, delimiters=[',', ';', '\t', '|'])
+            if sniffed_dialect.delimiter in [',', ';', '\t', '|']:
+                candidate_seps = [sniffed_dialect.delimiter] + [s for s in [',', ';', '\t'] if s != sniffed_dialect.delimiter]
+        except Exception:
+            pass
+
+    # 2. Score candidate encodings and separators without leaking ParserWarnings
+    best_enc = detected_enc or 'latin1'
+    best_sep = candidate_seps[0]
+    best_score = (-1, -1)
+    found = False
+
+    enc_order = [detected_enc] + [e for e in _ENCODINGS if e != detected_enc] if detected_enc else _ENCODINGS
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        for enc in enc_order:
+            for sep in candidate_seps:
+                try:
+                    df_chunk = pd.read_csv(
+                        BytesIO(raw_bytes), sep=sep, encoding=enc,
+                        dtype=str, nrows=20, on_bad_lines='skip'
+                    )
+                    cols_count = len(df_chunk.columns)
+                    rows_count = len(df_chunk)
+                    if cols_count > 1:
+                        score = (cols_count, rows_count)
+                        if score > best_score:
+                            best_score = score
+                            best_enc = enc
+                            best_sep = sep
+                            found = True
+                            if sep == candidate_seps[0] and cols_count > 1 and rows_count >= 5:
+                                break
+                except Exception:
+                    continue
+            if found and best_sep == candidate_seps[0]:
+                break
+
+    # 3. Read the full file with detected parameters
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', pd.errors.ParserWarning)
+        try:
+            return pd.read_csv(
+                BytesIO(raw_bytes), sep=best_sep, encoding=best_enc,
+                dtype=str, on_bad_lines='skip'
+            )
+        except UnicodeDecodeError:
+            pass
+
+    # 4. Hard fallback: latin1 + replace — never raises on any byte sequence
+    for sep in candidate_seps:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', pd.errors.ParserWarning)
+                df = pd.read_csv(
+                    BytesIO(raw_bytes), sep=sep, encoding='latin1',
+                    encoding_errors='replace', dtype=str, on_bad_lines='skip'
+                )
+            if len(df.columns) > 1:
+                return df
+        except Exception:
+            continue
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', pd.errors.ParserWarning)
+        return pd.read_csv(
+            BytesIO(raw_bytes), sep=',', encoding='latin1',
+            encoding_errors='replace', dtype=str, on_bad_lines='skip'
+        )
 
 
 _ILLEGAL_XML_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
@@ -805,18 +895,29 @@ def _load_zip_image_by_key(key: str) -> Optional[str]:
         return None
     try:
         global _ZIP_FILE_CACHE, _ZIP_FILE_BYTES_ID
-        if _ZIP_FILE_CACHE is None or _ZIP_FILE_BYTES_ID != id(source_bytes):
-            _ZIP_FILE_CACHE = zipfile.ZipFile(BytesIO(source_bytes))
-            _ZIP_FILE_BYTES_ID = id(source_bytes)
-        img_bytes = _ZIP_FILE_CACHE.read(member)
-        encoded = base64.b64encode(img_bytes).decode('utf-8')
-        mime = "image/jpeg"
-        if key.endswith(".png"): mime = "image/png"
-        elif key.endswith(".webp"): mime = "image/webp"
-        elif key.endswith(".gif"): mime = "image/gif"
-        data_uri = f"data:{mime};base64,{encoded}"
-        _bounded_store_set(store, key, data_uri)
-        return data_uri
+        source_list = source_bytes if isinstance(source_bytes, list) else [source_bytes]
+        for sb in source_list:
+            if not sb:
+                continue
+            try:
+                if _ZIP_FILE_CACHE is None or _ZIP_FILE_BYTES_ID != id(sb):
+                    _ZIP_FILE_CACHE = zipfile.ZipFile(BytesIO(sb))
+                    _ZIP_FILE_BYTES_ID = id(sb)
+                if member in _ZIP_FILE_CACHE.namelist():
+                    img_bytes = _ZIP_FILE_CACHE.read(member)
+                    encoded = base64.b64encode(img_bytes).decode('utf-8')
+                    mime = "image/jpeg"
+                    if key.endswith(".png"): mime = "image/png"
+                    elif key.endswith(".webp"): mime = "image/webp"
+                    elif key.endswith(".gif"): mime = "image/gif"
+                    data_uri = f"data:{mime};base64,{encoded}"
+                    _bounded_store_set(store, key, data_uri)
+                    return data_uri
+            except KeyError:
+                continue
+            except Exception:
+                continue
+        return None
     except Exception as e:
         logger.warning(f"Failed lazy-loading ZIP image {member}: {e}")
         return None

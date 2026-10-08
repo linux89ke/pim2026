@@ -440,8 +440,35 @@ def load_books_data_from_local() -> Dict:
 
 
 @st.cache_data(ttl=3600)
+def load_alcohol_data_from_local() -> Dict:
+    """Load Kenya's approved alcohol sellers and category roots."""
+    result = {
+        "sellers": {},
+        "category_prefixes": {
+            "grocery / drinks / alcoholic",
+            "grocery / drinks / beer, wine & spirits",
+        },
+    }
+    try:
+        df = safe_excel_read("Alcohol.xlsx", sheet_name=0)
+        if not df.empty:
+            df.columns = [str(c).strip() for c in df.columns]
+            seller_col = next(
+                (c for c in df.columns if "seller" in c.lower()), df.columns[0]
+            )
+            result["sellers"]["KE"] = set(
+                df[seller_col].dropna().astype(str).str.strip().str.lower().pipe(
+                    lambda s: s[~s.isin(["", "nan", "seller", "seller name", "sellername"])]
+                )
+            )
+    except Exception as e:
+        logger.warning("load_alcohol_data failed: %s", e)
+    return result
+
+
+@st.cache_data(ttl=3600)
 def load_jerseys_from_local() -> Dict:
-    FILE_NAME = "Jersey_validation.xlsx"
+    FILE_NAME = "Jersey_validation_updated.xlsx" if os.path.exists("Jersey_validation_updated.xlsx") else "Jersey_validation.xlsx"
     result: Dict = {
         "keywords": {tab: set() for tab in COUNTRY_TABS},
         "exempted": {tab: set() for tab in COUNTRY_TABS},
@@ -493,13 +520,25 @@ def load_jerseys_from_local() -> Dict:
             cat_col = next(
                 (c for c in df_cats.columns if "cat" in c), df_cats.columns[0]
             )
-            result["categories"] = set(
+            raw_cats_set = set(
                 df_cats[cat_col]
                 .dropna()
                 .astype(str)
                 .apply(clean_category_code)
                 .pipe(lambda s: s[~s.isin(["", "nan", "categories", "category"])])
             )
+            # Purge non-jersey categories (e.g. Footwear / Shoes) from jersey categories
+            try:
+                from data_utils import PARQUET_CACHE_DIR
+                pq = os.path.join(PARQUET_CACHE_DIR, "category_map.xlsx.parquet")
+                cm_df = pd.read_parquet(pq) if os.path.exists(pq) else (pd.read_excel("category_map.xlsx") if os.path.exists("category_map.xlsx") else None)
+                if cm_df is not None and "category_code" in cm_df.columns and "Category Path" in cm_df.columns:
+                    _c2p = dict(zip(cm_df["category_code"].astype(str).apply(clean_category_code), cm_df["Category Path"].astype(str).str.lower()))
+                    _footwear_terms = ("footwear", "shoe", "formal shoes", "lace up", "slip on", "boots", "sneaker", "sandal", "slipper")
+                    raw_cats_set = {c for c in raw_cats_set if not any(ft in _c2p.get(c, "") for ft in _footwear_terms)}
+            except Exception as _fe:
+                logger.debug(f"load_jerseys footwear filter: {_fe}")
+            result["categories"] = raw_cats_set
     except Exception as e:
         logger.warning(f"load_jerseys categories: {e}")
     return result
@@ -557,7 +596,8 @@ def load_perfume_catalog_from_local(_mtime: float = 0.0) -> Dict:
     # the first sheet that has a "brand"-ish column.
     def _resolve_sheet(preferred: str, must_have: tuple) -> str:
         try:
-            names = pd.ExcelFile(FILE_NAME).sheet_names
+            with pd.ExcelFile(FILE_NAME) as _book:
+                names = _book.sheet_names
         except Exception:
             return preferred
         if preferred in names:
@@ -643,7 +683,8 @@ def load_perfume_catalog_from_local(_mtime: float = 0.0) -> Dict:
     # people to ignore the log.
     _has_brands_sheet = True
     try:
-        _has_brands_sheet = "Brands" in pd.ExcelFile(FILE_NAME).sheet_names
+        with pd.ExcelFile(FILE_NAME) as _book:
+            _has_brands_sheet = "Brands" in _book.sheet_names
     except Exception:
         pass
     if not _has_brands_sheet:
@@ -705,9 +746,17 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
             "1000024 - Product does not have a license to be sold via Jumia (Not Authorized)",
             "Missing license for this item. Raise a claim via Vendor Center.",
         ),
+        "Potential Restricted Brand": (
+            "1000024 - Product does not have a license to be sold via Jumia (Not Authorized)",
+            "Potential restricted brand product line detected in title under unbranded/generic listing.",
+        ),
         "Suspected Fake product": (
             "1000023 - Confirmation of counterfeit product by Jumia technical team (Not Authorized)",
             "Product confirmed counterfeit.",
+        ),
+        "Out of market devices": (
+            "1000001 - Brand NOT Allowed",
+            "Out of market / discontinued hardware model cannot be listed under OEM brand without refurbished classification.",
         ),
         "Seller Not approved to sell Refurb": (
             "1000028 - Kindly Contact Jumia Seller Support To Confirm Possibility Of Sale Of This Product By Raising A Claim",
@@ -720,6 +769,10 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
         "Seller Approve to sell books": (
             "1000028 - Kindly Contact Jumia Seller Support To Confirm Possibility Of Sale Of This Product By Raising A Claim",
             "Contact Seller Support for Book category approval.",
+        ),
+        "Seller Not Approved to Sell Alcohol": (
+            "1000028 - Kindly Contact Jumia Seller Support To Confirm Possibility Of Sale Of This Product By Raising A Claim",
+            "Contact Seller Support for Alcohol category approval.",
         ),
         "Seller Approved to Sell Perfume": (
             "1000028 - Kindly Contact Jumia Seller Support To Confirm Possibility Of Sale Of This Product By Raising A Claim",
@@ -768,6 +821,10 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
         "Missing COLOR": (
             "1000005 - Kindly confirm the actual product colour",
             "Product color must be mentioned in title/color tab.",
+        ),
+        "Color Mismatch: Title vs COLOR Column": (
+            "1000005 - Kindly confirm the actual product colour",
+            "Color mentioned in product title does not match the color declared in the COLOR column.",
         ),
         "Duplicate product": ("1000007 - Other Reason", "This product is a duplicate."),
         "Wrong Variation": (
@@ -874,6 +931,50 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
         "Specs Inconsistency": (
             "1000008 - Kindly Improve Product Name Description",
             "The RAM/Storage spec stated in the product title does not match what's stated in the description. Kindly correct the description to match the exact variant being sold.",
+        ),
+        "Restricted Keywords": (
+            "1000033 - Keywords in your content/ Product name / description has been blacklisted",
+            "Listing contains restricted or blacklisted keywords or prohibited content.",
+        ),
+        "Title Language Check – Refurbished Missing in Title": (
+            "1000008 - Kindly Improve Product Name Description",
+            "Refurbished/Renewed product – the product name must state 'Refurbished' or 'Renewed' (e.g. 'Brand Model (Refurbished) - Color').",
+        ),
+        "Title Language Check – Missing Weight/Volume/Count": (
+            "1000008 - Kindly Improve Product Name Description",
+            "This item is sold by weight/volume/count – please state the quantity/size in the title (e.g., 100ml, 500g, 60 capsules, 30 tablets).",
+        ),
+        "Title Language Check – Not In English": (
+            "1000008 - Kindly Improve Product Name Description",
+            "Product title must be in English.",
+        ),
+        "Title Language Check – Incomplete Phone/Tablet/Laptop Title": (
+            "1000008 - Kindly Improve Product Name Description",
+            "Phone/Tablet/Laptop listing is incomplete — the product name must state the key specs (e.g. RAM and storage: '8GB RAM, 256GB'). Please add the specifications to the title.",
+        ),
+        "Title Language Check – Other": (
+            "1000008 - Kindly Improve Product Name Description",
+            "Kindly improve product name description.",
+        ),
+        "Product Name Brand Name – Generic/Placeholder Brand": (
+            "1000007 - Other Reason",
+            "Use correct brand instead of Generic/Placeholder. For fashion items, use 'Fashion'; for beauty items, use 'Beauty' — or set the actual brand name.",
+        ),
+        "Product Name Brand Name – High-End Brand Counterfeit Suspected": (
+            "1000023 - Confirmation of counterfeit product by Jumia technical team (Not Authorized)",
+            "Product title contains high-end brand but listed brand is Generic. Suspected counterfeit or brand mismatch – must use the actual brand.",
+        ),
+        "Product Name Brand Name – Brand Repeated In Title": (
+            "1000007 - Other Reason",
+            "Brand name should not be repeated in product name.",
+        ),
+        "Product Name Brand Name – Inspired/Alternative Perfume Brand": (
+            "1000030 - Suspected Counterfeit/Fake Product.Please Contact Seller Support By Raising A Claim , For Questions & Inquiries (Not Authorized)",
+            "Inspired or alternative perfume brands must follow brand guidelines.",
+        ),
+        "Product Name Brand Name – Other": (
+            "1000007 - Other Reason",
+            "Kindly verify product name and brand name compatibility.",
         ),
     }
 
@@ -990,6 +1091,23 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
     return default_mapping
 
 
+def _load_ring_sellers(path: str) -> dict:
+    """
+    Returns {seller_name_lower: ring_id} for all known seller rings.
+    Returns {} if the file is missing — the ring duplicate check is then a no-op.
+    """
+    if not os.path.exists(path):
+        return {}
+    try:
+        df = pd.read_excel(path, dtype=str).dropna(subset=["SELLER_NAME"])
+        df["SELLER_NAME"] = df["SELLER_NAME"].str.strip()
+        df["RING_ID"]     = df["RING_ID"].str.strip()
+        return dict(zip(df["SELLER_NAME"].str.lower(), df["RING_ID"]))
+    except Exception:
+        logger.exception("ring_sellers.xlsx failed to load")
+        return {}
+
+
 @st.cache_data(ttl=3600)
 def load_all_support_files() -> Dict:
     """Load all support/config files into a single dictionary."""
@@ -1002,6 +1120,7 @@ def load_all_support_files() -> Dict:
         "blacklisted_words": safe_txt("blacklisted.txt"),
         "book_category_codes": safe_txt("Books_cat.txt"),
         "books_data": load_books_data_from_local(),
+        "alcohol_data": load_alcohol_data_from_local(),
         "perfume_category_codes": safe_txt("Perfume_cat.txt"),
         "perfume_data": load_perfume_data_from_local(),
         "perfume_catalog": load_perfume_catalog_from_local(
@@ -1022,6 +1141,7 @@ def load_all_support_files() -> Dict:
         "warranty_category_codes": safe_txt("warranty.txt"),
         "suspected_fake": load_suspected_fake_from_local(),
         "duplicate_exempt_codes": safe_txt("duplicate_exempt.txt"),
+        "ring_sellers": _load_ring_sellers("ring_sellers.xlsx"),
         "restricted_brands_all": load_restricted_brands_from_local(),
         "prohibited_words_all": load_prohibited_from_local(),
         "known_brands": safe_txt("brands.txt"),
@@ -1096,10 +1216,59 @@ def load_all_support_files() -> Dict:
     return support
 
 
+class LazyCompiledRules(dict):
+    """
+    On-demand compiling dictionary for weighted category rules.
+    Loads raw JSON in ~0.3s and compiles regex patterns only for categories
+    actually requested, cutting startup time by over 8 seconds.
+    """
+    def __init__(self, raw_rules: dict):
+        super().__init__()
+        self._raw = raw_rules
+
+    def _compile(self, cat_path: str):
+        keywords_dict = self._raw.get(cat_path)
+        if not isinstance(keywords_dict, dict) or not keywords_dict:
+            return None
+        import re as _re
+        try:
+            safe_kws = {str(k): float(w) for k, w in keywords_dict.items()}
+            sorted_kws = sorted(safe_kws.keys(), key=len, reverse=True)
+            if not sorted_kws:
+                return None
+            pattern_str = r"\b(" + "|".join(_re.escape(k) for k in sorted_kws) + r")\b"
+            compiled = {
+                "pattern": _re.compile(pattern_str, _re.IGNORECASE),
+                "weights": {k.lower(): w for k, w in safe_kws.items()},
+            }
+            self[cat_path] = compiled
+            return compiled
+        except Exception:
+            return None
+
+    def __getitem__(self, key):
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        res = self._compile(key)
+        if res is not None:
+            return res
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        if super().__contains__(key):
+            return super().get(key, default)
+        if key in self._raw:
+            res = self._compile(key)
+            if res is not None:
+                return res
+        return default
+
+    def __contains__(self, key):
+        return key in self._raw or super().__contains__(key)
+
+
 @st.cache_resource(ttl=3600)
 def load_and_compile_json_rules(json_path="category_qc_weighted.json") -> dict:
-    import re as _re
-
     if not os.path.exists(json_path):
         logger.warning(f"{json_path} not found.")
         return {}
@@ -1131,23 +1300,7 @@ def load_and_compile_json_rules(json_path="category_qc_weighted.json") -> dict:
         logger.warning("JSON rules file has unrecognizable format.")
         return {}
 
-    compiled_rules = {}
-    for cat_path, keywords_dict in raw_rules.items():
-        if not isinstance(keywords_dict, dict) or not keywords_dict:
-            continue
-        try:
-            safe_kws = {str(k): float(w) for k, w in keywords_dict.items()}
-            sorted_kws = sorted(safe_kws.keys(), key=len, reverse=True)
-            if not sorted_kws:
-                continue
-            pattern_str = r"\b(" + "|".join(_re.escape(k) for k in sorted_kws) + r")\b"
-            compiled_rules[str(cat_path)] = {
-                "pattern": _re.compile(pattern_str, _re.IGNORECASE),
-                "weights": {k.lower(): w for k, w in safe_kws.items()},
-            }
-        except Exception as e:
-            logger.warning(f"Skipping bad JSON rule for {cat_path}: {e}")
-    return compiled_rules
+    return LazyCompiledRules(raw_rules)
 
 
 # cache_resource, not cache_data: this dict is read-only reference data shared

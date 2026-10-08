@@ -62,11 +62,13 @@ class CategoryRule:
     # sellers put the same thing in either field, and a product whose brand is
     # the giveaway often has an innocuous name.
     brand_keyword: object = None
+    exclude_keyword: object = None
     belongs: str = ""
     match: str = "word"                 # "word" | "substring"
     countries: Optional[List[str]] = None   # None = every market
     reason: str = WRONG_CATEGORY_REASON
     active: bool = True
+    overturned: bool = False
     columns: List[str] = field(default_factory=lambda: ["NAME", "CATEGORY_CODE"])
 
 
@@ -89,6 +91,7 @@ class GenericCategoryRule:
     countries: Optional[List[str]] = None
     reason: str = WRONG_CATEGORY_REASON
     active: bool = True
+    overturned: bool = False
     columns: List[str] = field(default_factory=lambda: ["CATEGORY_CODE"])
 
 
@@ -110,11 +113,15 @@ class FdaRule:
     flag: str = ""
     label: str = ""
     brand_keyword: object = None
+    # Optional category signal. When present, a product in a matching category
+    # is regulated even if the seller uses a bland name and brand.
+    category_keyword: object = None
     except_in: List[str] = field(default_factory=list)
     match: str = "word"
     countries: Optional[List[str]] = None
     reason: str = "1000007 - Other Reason"
     active: bool = True
+    overturned: bool = False
     columns: List[str] = field(default_factory=lambda: ["NAME", "CATEGORY_CODE", "FDA"])
 
 
@@ -141,6 +148,39 @@ SEXUAL_WELLNESS_TERMS = [
     # just as often.
     "maximal perfomance",
     "maximal performance",
+    # High-confidence patterns observed in the 2026-10-08 Kenya catalogue.
+    "sexual wellness", "sex lubricant", "sex lube", "orgasmic gel",
+    "vagina tightening", "vaginal tightening", "vagina tight", "yoni",
+    "masturbator", "sex toy", "dildo", "vibrator", "penis pump",
+    "penis ring", "nipple clamps", "erectile dysfunction",
+    "premature ejaculation", "delay spray", "desensitizing spray",
+    "male enhancement", "sexual excitement", "performance enhancer",
+    "erectyl", "virginity tightening", "g-spot", "anal lubricant",
+    "orgasm", "arousal gel",
+    # Additional high-confidence patterns found in the 2026-10-08 catalogue
+    # supplements.  These are specific enough to avoid treating ordinary
+    # beauty, massage, or personal-care listings as sexual wellness.
+    "male genital desensitizer", "genital desensitizer",
+    "male gental desensitizer", "gental desensitizer",
+    "desensitizing and delaying", "delaying spray", "delay sex spray",
+    "sex duration delayed spray",
+    "clitoral stimulator", "female orgasm enhancer", "erotic lubricant",
+    "water-based lubricant", "silicone-based lubricant",
+    "sexual enhancer", "sex toys", "adult toys", "sex games",
+    "male sexual health", "vaginial tightening", "vagina super tightening",
+    "pleasure liquid gel", "women orgasms spray", "arousal sexual",
+]
+
+# FDA scope is intentionally narrower than the miscategorisation scope above.
+# Toys, games, and standalone devices can still be identified as sexual
+# wellness for Wrong Category, but they should not be sent to the FDA check.
+SEXUAL_WELLNESS_FDA_TERMS = [
+    term for term in SEXUAL_WELLNESS_TERMS
+    if term not in {
+        "masturbator", "sex toy", "sex toys", "dildo", "vibrator",
+        "penis pump", "penis ring", "nipple clamps", "clitoral stimulator",
+        "adult toys", "sex games",
+    }
 ]
 
 # Matched against BRAND, not NAME. Nigeria's restricted list already carries
@@ -155,6 +195,16 @@ SEXUAL_WELLNESS_TERMS = [
 SEXUAL_WELLNESS_BRANDS = [
     "titan",
     "titan gel",
+    # These brands occur on delay/tightening products in the supplement
+    # catalogues.  This list is only used inside the shaving-category rule,
+    # so it cannot classify an ordinary product elsewhere by brand alone.
+    "stud 100",
+    "maxman",
+    "max men",
+    "medicate sticks",
+    "dynamo delay",
+    "peineili",
+    "lidoria",
 ]
 
 # The same signal, minus the ambiguous half, for rules that are NOT confined to
@@ -167,6 +217,13 @@ SEXUAL_WELLNESS_BRANDS = [
 # "Titan Gel" as a brand has no such second life, so it stays.
 SEXUAL_WELLNESS_BRANDS_UNAMBIGUOUS = [
     "titan gel",
+    "maxman",
+    "max men",
+    "stud 100",
+    "medicate sticks",
+    "jjlbro",
+    "dynamo delay",
+    "peineili",
 ]
 
 
@@ -204,6 +261,7 @@ RULES: List[CategoryRule] = [
             "Health & Beauty / Beauty & Personal Care / Personal Care / Shave & Hair Removal",
             "Health & Beauty / Personal Care / Shave & Hair Removal",
         ],
+        belongs="Health & Beauty / Sexual Wellness",
         comment="Sexual wellness product filed as a shaving product — not a shaving cream, lotion or gel",
     ),
 
@@ -215,13 +273,20 @@ RULES: List[CategoryRule] = [
     FdaRule(
         id="sexual-wellness-needs-fda",
         flag="Sexual wellness product without FDA registration",
-        keyword=SEXUAL_WELLNESS_TERMS,
+        label="Sexual wellness product without FDA registration",
+        keyword=SEXUAL_WELLNESS_FDA_TERMS,
         brand_keyword=SEXUAL_WELLNESS_BRANDS_UNAMBIGUOUS,
+        # Do not use the whole Sexual Wellness tree here: that would send
+        # Adult Toys & Games to the FDA queue. These category branches cover
+        # the regulated liquid/spray/gel products; product-name matching still
+        # catches a spray filed under an unusual leaf such as Sex Toys.
+        category_keyword=["lubricants", "sexual enhancers", "sexual remedies", "safer sex"],
         except_in=[
             "Health & Beauty / Beauty & Personal Care / Personal Care / Shave & Hair Removal",
             "Health & Beauty / Personal Care / Shave & Hair Removal",
         ],
         comment="Sexual wellness product with no FDA registration number",
+        overturned=False,
     ),
 
     # The parent of 87 subcategories. Filing directly on it is a
@@ -234,6 +299,49 @@ RULES: List[CategoryRule] = [
         parent="Home & Office / Home & Kitchen / Kitchen & Dining / Small Appliances",
         comment="Filed on the Small Appliances parent category — a more specific "
                 "subcategory exists and should be used",
+        overturned=False,
+    ),
+
+    CategoryRule(
+        id="jerrycan-in-cooking-appliances",
+        flag="Wrong Category",
+        label="Jerrycan in Cooking Appliances / Kitchen Bundle",
+        keyword=["jerrycan", "jerry can", "jerrican", "fuel can"],
+        wrong_in=[
+            "Home & Office / Appliances / Cooking Appliances",
+            "Home & Office / Appliances / Cooking Appliances / Kitchen Bundle",
+            "Home & Office / Home & Kitchen / Kitchen & Dining / Small Appliances",
+        ],
+        belongs="Grocery / Paper & Plastic or Home & Office / Storage & Organisation or Automobile / Fuel Containers",
+        comment="Jerrycan/fuel container filed under Cooking Appliances — belongs in Storage, Paper & Plastic, or Automotive",
+    ),
+
+    CategoryRule(
+        id="non-phone-in-smartphones",
+        flag="Wrong Category",
+        label="Non-phone product in smartphone category",
+        keyword=[
+            "heat sealer", "sealing machine", "power bank", "battery pack",
+            "solar lighting", "power inverter", "bill counter", "counterfeit detector",
+            "disco light", "stage light", "weighing scale", "subwoofer", "storage box",
+            "plastic tote", "storage bins", "ab roller",
+        ],
+        exclude_keyword=[
+            "redmi", "xiaomi", "samsung", "galaxy", "iphone", "tecno", "infinix",
+            "oppo", "vivo", "realme", "itel", "nokia", "huawei", "honor",
+            "camon", "spark", "smartphone", "mobile phone", "android phone",
+            "feature phone", "cell phone", "quad sim", "triple sim", "single sim",
+            "basic phone", "rugged phone", "button phone", "keypad phone",
+            "dual sim", "ram", "rom",
+        ],
+        wrong_in=[
+            "Phones & Tablets / Mobile Phones / Smartphones",
+            "Phones & Tablets / Mobile Phones / Smartphones / Android Phones",
+            "Phones & Tablets / Mobile Phones / Smartphones / iOS Phones",
+            "Phones & Tablets / Mobile Phones",
+            "Phones & Tablets / Tablets",
+        ],
+        comment="Product is not a smartphone/mobile phone — assigned to Wrong Category",
     ),
 
     # ── From the weekly search-quality reports ─────────────────────────────
@@ -292,6 +400,7 @@ RULES: List[CategoryRule] = [
         wrong_in=["Books, Movies and Music / DVDs"],
         comment="Filed under DVDs — books and other products do not belong in the DVD categories",
         columns=["CATEGORY_CODE"],        # no NAME dependency: the category is the offence
+        overturned=False,
     ),
 
     # Parked. A lavalier microphone is a legitimate Musical Instruments
@@ -381,6 +490,7 @@ def _text_hit(data, pat, brand_pat):
 def _make_category_check(rule, codes: set):
     pat = _keyword_pattern(rule.keyword, rule.match)
     brand_pat = _keyword_pattern(getattr(rule, "brand_keyword", None), rule.match)
+    excl_pat = _keyword_pattern(getattr(rule, "exclude_keyword", None), rule.match)
 
     def _check(data, **_kwargs):
         if data is None or data.empty or not codes:
@@ -397,9 +507,13 @@ def _make_category_check(rule, codes: set):
             if text is None:
                 return pd.DataFrame(columns=data.columns)
             hit = in_scope & text
+        if excl_pat is not None and "NAME" in data.columns:
+            hit &= ~data["NAME"].fillna("").astype(str).str.contains(excl_pat, na=False)
         detail = rule.comment
         if getattr(rule, "belongs", ""):
             detail = f"{detail} (should be: {rule.belongs})"
+        if getattr(rule, "overturned", False):
+            detail = f"Rejection overturned: {detail} -- product approved."
         return _emit(data, hit, detail, rule.reason)
 
     # Read by flag_cache_path: several rules share a flag name, and without
@@ -414,7 +528,10 @@ def _make_generic_check(rule, codes: set):
             return pd.DataFrame(columns=getattr(data, "columns", []))
         if "CATEGORY_CODE" not in data.columns:
             return pd.DataFrame(columns=data.columns)
-        return _emit(data, _cat_series(data).isin(codes), rule.comment, rule.reason)
+        cmt = rule.comment
+        if getattr(rule, "overturned", False):
+            cmt = f"Rejection overturned: {cmt} -- product approved."
+        return _emit(data, _cat_series(data).isin(codes), cmt, rule.reason)
 
     _check._rule_id = rule.id
     return _check
@@ -431,17 +548,29 @@ def _fda_missing(data):
 def _make_fda_check(rule, except_codes: set):
     pat = _keyword_pattern(rule.keyword, rule.match)
     brand_pat = _keyword_pattern(getattr(rule, "brand_keyword", None), rule.match)
+    category_pat = _keyword_pattern(getattr(rule, "category_keyword", None), "substring")
 
     def _check(data, **_kwargs):
-        if data is None or data.empty or (pat is None and brand_pat is None):
+        if data is None or data.empty or (pat is None and brand_pat is None and category_pat is None):
             return pd.DataFrame(columns=getattr(data, "columns", []))
         hit = _text_hit(data, pat, brand_pat)
         if hit is None:
-            return pd.DataFrame(columns=data.columns)
+            hit = pd.Series(False, index=data.index)
+        # The catalogue can carry a bland name such as “Honey” or “Massage
+        # Oil” while the category itself clearly identifies sexual wellness.
+        # Use the category as a high-confidence signal, without changing the
+        # behaviour of unrelated FDA rules that have no category_keyword.
+        if category_pat is not None:
+            for _cat_col in ("CATEGORY", "FULL_CATEGORY_PATH", "CATEGORY_PATH"):
+                if _cat_col in data.columns:
+                    hit |= data[_cat_col].fillna("").astype(str).str.contains(category_pat, na=False)
         if except_codes and "CATEGORY_CODE" in data.columns:
             hit &= ~_cat_series(data).isin(except_codes)
         hit &= _fda_missing(data)
-        return _emit(data, hit, rule.comment, rule.reason)
+        cmt = rule.comment
+        if getattr(rule, "overturned", False):
+            cmt = f"Rejection overturned: {cmt} -- product approved."
+        return _emit(data, hit, cmt, rule.reason)
 
     _check._rule_id = rule.id
     return _check
@@ -534,6 +663,10 @@ def build_scopes(code_to_path: Dict, country_code: str = "") -> Dict:
                         else _keyword_pattern(rule.keyword, rule.match)),
             "brand_pattern": (None if isinstance(rule, GenericCategoryRule)
                               else _keyword_pattern(getattr(rule, "brand_keyword", None), rule.match)),
+            "category_pattern": (None if isinstance(rule, GenericCategoryRule)
+                                 else _keyword_pattern(getattr(rule, "category_keyword", None), "substring")),
+            "exclude_pattern": (None if isinstance(rule, GenericCategoryRule)
+                                else _keyword_pattern(getattr(rule, "exclude_keyword", None), rule.match)),
         }
     return scopes
 
@@ -568,9 +701,19 @@ def audit_record(rec: Dict, scopes: Dict, country_code: str = "") -> List[Dict]:
     for scope in scopes.values():
         rule = scope["rule"]
         pat, brand_pat = scope["pattern"], scope.get("brand_pattern")
-        if pat is not None or brand_pat is not None:
+        category_pat = scope.get("category_pattern")
+        excl_pat = scope.get("exclude_pattern")
+        category_text = " ".join(
+            str(rec.get(_col, "") or "")
+            for _col in ("CATEGORY", "FULL_CATEGORY_PATH", "CATEGORY_PATH")
+        )
+        category_hit = bool(category_pat and category_pat.search(category_text))
+        if pat is not None or brand_pat is not None or category_pat is not None:
             if not ((pat is not None and pat.search(name))
-                    or (brand_pat is not None and brand_pat.search(brand))):
+                    or (brand_pat is not None and brand_pat.search(brand))
+                    or category_hit):
+                continue
+            if excl_pat is not None and excl_pat.search(name):
                 continue
 
         if isinstance(rule, FdaRule):
@@ -579,8 +722,12 @@ def audit_record(rec: Dict, scopes: Dict, country_code: str = "") -> List[Dict]:
             fda = str(rec.get("FDA", "") or "").strip().lower()
             if fda not in _FDA_EMPTY:
                 continue
-            out.append({"rule": _rule_label(rule), "kind": "violation", "against": "fda",
-                        "reason_type": _rule_label(rule), "detail": rule.comment})
+            is_ov = getattr(rule, "overturned", False)
+            kind = "overturned" if is_ov else "violation"
+            rt = f"{_rule_label(rule)} - Overturned" if is_ov else _rule_label(rule)
+            dt = f"Rejection overturned: {rule.comment} -- product approved." if is_ov else rule.comment
+            out.append({"rule": _rule_label(rule), "kind": kind, "against": "fda",
+                        "reason_type": rt, "detail": dt})
             continue
 
         if not code:
@@ -589,8 +736,12 @@ def audit_record(rec: Dict, scopes: Dict, country_code: str = "") -> List[Dict]:
             detail = rule.comment
             if isinstance(rule, CategoryRule) and rule.belongs:
                 detail = f"{detail} (should be: {rule.belongs})"
-            out.append({"rule": _rule_label(rule), "kind": "violation", "against": "category",
-                        "reason_type": _rule_label(rule), "detail": detail})
+            is_ov = getattr(rule, "overturned", False)
+            kind = "overturned" if is_ov else "violation"
+            rt = f"{_rule_label(rule)} - Overturned" if is_ov else _rule_label(rule)
+            dt = f"Rejection overturned: {detail} -- product approved." if is_ov else detail
+            out.append({"rule": _rule_label(rule), "kind": kind, "against": "category",
+                        "reason_type": rt, "detail": dt})
         elif scope["belongs"] and code in scope["belongs"]:
             out.append({"rule": _rule_label(rule), "kind": "correct_placement", "against": "category",
                         "reason_type": f"{_rule_label(rule)} — correctly placed",
@@ -611,6 +762,8 @@ def relevant_columns() -> Dict[str, List[str]]:
         cols = set(r.columns)
         if getattr(r, "brand_keyword", None):
             cols.add("BRAND")
+        if getattr(r, "category_keyword", None):
+            cols.update({"CATEGORY", "FULL_CATEGORY_PATH", "CATEGORY_PATH"})
         # Union: several rules can share a flag, and last-wins would drop
         # the columns every rule but one depends on.
         out[_flag_name(r)] = sorted(set(out.get(_flag_name(r), [])) | cols)

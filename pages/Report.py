@@ -67,7 +67,7 @@ def build_daily_status_sheet(master_df, status_col):
             'Day': day,
             'Status': 'Approved',
             'Count': approved,
-            'Daily Total': daily_total,
+            'Daily Total': str(daily_total),
             'Rate (%)': approved_rate
         })
         rows.append({
@@ -87,7 +87,7 @@ def build_daily_status_sheet(master_df, status_col):
         'Day': 'WEEKLY TOTAL',
         'Status': 'Approved',
         'Count': total_approved,
-        'Daily Total': grand_total,
+        'Daily Total': str(grand_total),
         'Rate (%)': round(total_approved / grand_total * 100, 1) if grand_total > 0 else 0.0
     })
     rows.append({
@@ -98,7 +98,9 @@ def build_daily_status_sheet(master_df, status_col):
         'Rate (%)': round(total_rejected / grand_total * 100, 1) if grand_total > 0 else 0.0
     })
 
-    return pd.DataFrame(rows)
+    df_res = pd.DataFrame(rows)
+    df_res['Daily Total'] = df_res['Daily Total'].astype(str)
+    return df_res
 
 
 def generate_excel_report(daily_summary, seller_stats, top_reasons, top_categories, metadata, daily_status_df):
@@ -270,6 +272,9 @@ if uploaded_files:
 
         if all_data:
             master_df = pd.concat(all_data, ignore_index=True)
+            for _col in ("PARENTSKU", "ParentSKU", "ParentSku", "parentsku", "SKU", "Sku"):
+                if _col in master_df.columns:
+                    master_df[_col] = master_df[_col].fillna("").astype(str)
             st.success(
                 f"Successfully merged **{total_files_merged} file(s)** for **{primary_country}** (Week {primary_week})",
                 icon=":material/library_add_check:"

@@ -12,6 +12,9 @@ navy
 black
 yellow
 red
+wood
+inox
+camel
 Amarante
 Capucine
 Cramoisi

@@ -254,8 +254,6 @@ def load_kebs_banned_products():
                     "brand_lower": brand_l,
                     "reason": reason,
                 })
-                # Also add a brand-only entry so brand alone can still match
-                brand_only.append({"brand_lower": brand_l, "reason": reason})
 
         return full_products, brand_only
     except Exception:
@@ -631,3 +629,539 @@ def check_kebs_fda(data: pd.DataFrame) -> pd.DataFrame:
     return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
+# ── Invalid Brand Name check ─────────────────────────────────────────────────
+#
+# Rejects any product whose BRAND field is an exact match (case-insensitive)
+# to one of the entries in "Flagged brands.txt".  These are not real brand
+# names — they are category descriptors, generic words, specs, or other
+# non-brand values that sellers mistakenly put in the Brand field.
+#
+# FLAG  : 1000001 - Brand NOT Allowed
+# Comment: instructs the seller to use the package brand or Generic, and
+#          provides the new-brand request form link.
+
+_FLAGGED_BRANDS_CACHE: set | None = None  # lazy-loaded singleton
+
+
+def _load_flagged_brands() -> set:
+    """
+    Load the list of disallowed brand strings from 'Flagged brands.txt',
+    located next to this module.  Returns a set of lower-cased strings for
+    O(1) exact matching.  Result is cached after the first load.
+    """
+    global _FLAGGED_BRANDS_CACHE
+    if _FLAGGED_BRANDS_CACHE is not None:
+        return _FLAGGED_BRANDS_CACHE
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    txt_path = os.path.join(here, "Flagged brands.txt")
+
+    if not os.path.exists(txt_path):
+        logger.warning("Flagged brands.txt not found at %s — Invalid Brand check skipped.", txt_path)
+        # Keep the mandatory placeholder rule even if the optional catalogue
+        # file is unavailable.
+        _FLAGGED_BRANDS_CACHE = {"other"}
+        return _FLAGGED_BRANDS_CACHE
+
+    brands: set = set()
+    with open(txt_path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            val = line.strip()
+            if val:
+                brands.add(val.lower())
+
+    # "Other" is always a placeholder, regardless of country or whether an
+    # edited local Flagged brands file accidentally omits it.
+    brands.add("other")
+
+    _FLAGGED_BRANDS_CACHE = brands
+    logger.info("Loaded %d flagged brand entries from %s", len(brands), txt_path)
+    return _FLAGGED_BRANDS_CACHE
+
+
+def check_invalid_brand_name(
+    data: pd.DataFrame,
+    code_to_path: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Flag products whose BRAND is an exact match (case-insensitive) to one of
+    the entries in 'Flagged brands.txt'.
+
+    Matching rule
+    -------------
+    * **Exact only** — 'Power' in the flagged list will match BRAND == 'Power'
+      but NOT 'Power Bank' or 'PowerBar'.
+    * Case-insensitive.
+
+    Comment personalisation
+    -----------------------
+    * Fashion-category products are told to use 'Fashion' as the brand.
+    * All other products are told to use 'Generic'.
+      The category is resolved via code_to_path (full path string starting with
+      'Fashion'); falls back to a plain string search on CATEGORY if the map
+      is absent or the code is not found.
+
+    Output columns added
+    --------------------
+    FLAG           : '1000001 - Brand NOT Allowed'
+    Comment_Detail : prescriptive message directing the seller to the correct
+                     brand name or the brand-creation form.
+    """
+    required = {"PRODUCT_SET_SID", "BRAND"}
+    if data.empty or not required.issubset(data.columns):
+        return pd.DataFrame(columns=data.columns)
+
+    flagged_brands = _load_flagged_brands()
+    if not flagged_brands:
+        return pd.DataFrame(columns=data.columns)
+
+    d = data.copy()
+    brand_lower = d["BRAND"].fillna("").astype(str).str.strip().str.lower()
+    mask = brand_lower.isin(flagged_brands)
+
+    flagged = d[mask].copy()
+    if flagged.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    # ── Determine per-row whether the product is in the Fashion category (Vectorized) ──
+    _c2p = code_to_path or {}
+    is_fashion_mask = pd.Series(False, index=flagged.index)
+    if "CATEGORY_CODE" in flagged.columns and _c2p:
+        _cat_codes = flagged["CATEGORY_CODE"].fillna("").astype(str).str.strip()
+        _paths = _cat_codes.map(_c2p).fillna("").astype(str).str.strip().str.lower()
+        is_fashion_mask = _paths.str.startswith("fashion")
+    if "CATEGORY" in flagged.columns:
+        _cat_str = flagged["CATEGORY"].fillna("").astype(str).str.strip().str.lower()
+        is_fashion_mask = is_fashion_mask | _cat_str.str.startswith("fashion")
+
+    _COMMENT_FASHION = (
+        "Please use the correct brand name indicated on the package. "
+        "If no brand use Fashion as brand or "
+        "To create the actual brand name for this product, please fill out the form at: "
+        "https://bit.ly/2kpjja8"
+    )
+    _COMMENT_OTHER = (
+        "Please use the correct brand name indicated on the package. "
+        "If no brand use Generic as brand or "
+        "To create the actual brand name for this product, please fill out the form at: "
+        "https://bit.ly/2kpjja8"
+    )
+
+    flagged["FLAG"] = "1000001 - Brand NOT Allowed"
+    flagged["Comment_Detail"] = ""
+    flagged.loc[is_fashion_mask,  "Comment_Detail"] = _COMMENT_FASHION
+    flagged.loc[~is_fashion_mask, "Comment_Detail"] = _COMMENT_OTHER
+
+    return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
+
+
+# ── Animal Health Product Compliance Checks (KE + UG) ───────────────────────
+#
+# FOUR validations drawn from the pet/veterinary product catalog sourced from
+# PCPB (Pest Control Products Board), the Kenya Ministry of Agriculture
+# Press Release 378, and the Kenya Government 77 Highly Hazardous Pesticides
+# (HHPs) list.
+#
+# Reference file : pet_catalog_compliance.xlsx  (two sheets)
+#   "Banned"     → PCPB Banned 45 List, Ministry Press Release 378,
+#                  Kenya Government 77 HHPs  (110 products)
+#   "Prohibited" → PCPB Deregistered Products + Unauthorised Imports (51 products)
+#
+# Validation A — check_animal_health_banned_products
+#   Match by product name / active ingredient / brand against the Banned sheet.
+#   FLAG: 1000033
+#
+# Validation B — check_animal_health_prohibited_products
+#   Match by product name / active ingredient / brand against the Prohibited sheet.
+#   FLAG: 1000033
+#
+# Validation C — check_animal_health_banned_category
+#   Block any product filed under a category code that exclusively contains
+#   PCPB-banned substances (CATEGORY_CODE in _BANNED_ANIMAL_HEALTH_CAT_CODES).
+#   FLAG: 1000024
+#
+# Validation D — check_animal_health_prohibited_category
+#   Block any product filed under a category code that exclusively contains
+#   PCPB-deregistered / unauthorised products.
+#   FLAG: 1000024
+#
+# Applies to: Kenya (KE) and Uganda (UG).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PET_CATALOG_FILE = "pet_catalog_compliance.xlsx"
+
+# Category path keywords that indicate an animal-health product
+_ANIMAL_HEALTH_PATH_TOKENS = re.compile(
+    r"\b(?:pet|animal|livestock|poultry|veterinary|vet|farm|ranch|worm|flea"
+    r"|tick|dip|dewormer|ectoparasit|anthelmintic|acaricid|insecticid"
+    r"|pesticide|herbicide|fungicide)\b",
+    re.IGNORECASE,
+)
+
+# ── Category codes that are exclusively used by BANNED products ───────────────
+# Source: pet catalog (1).xlsx → 'catalog' sheet
+#   PCPB Banned 45 List | Ministry Press Release 378 | Kenya Gov 77 HHPs
+# Both codes appear only in banned rows — no authorised products share them.
+_BANNED_ANIMAL_HEALTH_CAT_CODES: frozenset = frozenset({
+    "1001888",   # Garden & Outdoors / Farm & Ranch / Livestock Supplies / Pest & Disease Control
+    "1002509",   # Garden & Outdoors / Farm & Ranch / Pest Control
+})
+
+# Human-readable paths for each banned category code (used in comments)
+_BANNED_CAT_PATHS: dict = {
+    "1001888": "Garden & Outdoors / Farm & Ranch / Livestock Supplies / Pest & Disease Control",
+    "1002509": "Garden & Outdoors / Farm & Ranch / Pest Control",
+}
+
+# ── Category codes that are exclusively used by PROHIBITED products ────────────
+# Source: pet catalog (1).xlsx → 'catalog' sheet
+#   PCPB Deregistered + Unauthorised Imports
+_PROHIBITED_ANIMAL_HEALTH_CAT_CODES: frozenset = frozenset({
+    "1001888",   # Garden & Outdoors / Farm & Ranch / Livestock Supplies / Pest & Disease Control
+    "1002509",   # Garden & Outdoors / Farm & Ranch / Pest Control
+    "1004223",   # Pet Supplies / Dogs / Flea & Tick Control / Dog Flea Sprays
+})
+
+# Human-readable paths for each prohibited category code (used in comments)
+_PROHIBITED_CAT_PATHS: dict = {
+    "1001888": "Garden & Outdoors / Farm & Ranch / Livestock Supplies / Pest & Disease Control",
+    "1002509": "Garden & Outdoors / Farm & Ranch / Pest Control",
+    "1004223": "Pet Supplies / Dogs / Flea & Tick Control / Dog Flea Sprays",
+}
+
+# FLAG codes
+_FLAG_BLACKLISTED  = "1000033 - Keywords in your content/ Product name / description has been blacklisted"
+_FLAG_NOT_LICENSED = "1000024 - Product does not have a license to be sold via Jumia (Not Authorized)"
+
+
+@st.cache_data(ttl=3600)
+def load_animal_health_catalog():
+    """
+    Returns (banned_entries, prohibited_entries) — each a list of dicts:
+        {
+          "trade_name_lower"  : str,   # Full Trade Name in lowercase
+          "brand_lower"       : str,   # Brand in lowercase
+          "ingredients_lower" : list,  # individual active-ingredient tokens
+          "reason"            : str,   # Banned / Status text
+        }
+
+    Loads from pet_catalog_compliance.xlsx (Banned + Prohibited sheets).
+    Returns ([], []) if the file is missing or unreadable.
+    """
+    if not os.path.exists(_PET_CATALOG_FILE):
+        logger.warning(
+            "load_animal_health_catalog: %s not found — animal health checks skipped.",
+            _PET_CATALOG_FILE,
+        )
+        return [], []
+
+    def _parse_sheet(sheet_name):
+        try:
+            df = pd.read_excel(_PET_CATALOG_FILE, sheet_name=sheet_name, dtype=str)
+        except Exception:
+            logger.exception(
+                "load_animal_health_catalog: failed to read sheet %r from %s",
+                sheet_name, _PET_CATALOG_FILE,
+            )
+            return []
+
+        df = df.fillna("")
+        entries = []
+        for _, row in df.iterrows():
+            brand  = str(row.get("Brand", "")).strip()
+            trade  = str(row.get("Full Trade Name", "")).strip()
+            ingrs  = str(row.get("Active Ingredients", "")).strip()
+            reason = str(row.get("Banned / Status", "")).strip()
+
+            if not trade or trade.lower() in ("nan", "none", ""):
+                continue
+
+            # Split "Pyrantel Pamoate 144mg, Praziquantel 50mg" into tokens,
+            # strip dosage numbers, keep tokens ≥5 chars.
+            ingr_tokens = []
+            for raw_tok in re.split(r"[,&/]+", ingrs):
+                clean = re.sub(
+                    r"\d[\d.]*\s*(?:mg|g|ml|%|ppm|kg|l)\b", "", raw_tok,
+                    flags=re.IGNORECASE
+                ).strip().lower()
+                if len(clean) >= 5 and clean not in ("nan", "none", ""):
+                    ingr_tokens.append(clean)
+
+            entries.append({
+                "trade_name_lower":  trade.lower(),
+                "brand_lower":       brand.lower(),
+                "ingredients_lower": ingr_tokens,
+                "reason":            reason,
+            })
+        return entries
+
+    banned_entries     = _parse_sheet("Banned")
+    prohibited_entries = _parse_sheet("Prohibited")
+    logger.info(
+        "load_animal_health_catalog: %d banned, %d prohibited entries loaded.",
+        len(banned_entries), len(prohibited_entries),
+    )
+    return banned_entries, prohibited_entries
+
+
+def _run_animal_health_check(
+    data: pd.DataFrame,
+    entries: list,
+    flag_label: str,
+    comment_prefix: str,
+) -> pd.DataFrame:
+    """
+    Shared matching engine for both banned and prohibited animal health checks.
+    """
+    required = {"PRODUCT_SET_SID", "NAME", "BRAND"}
+    if data.empty or not required.issubset(data.columns) or not entries:
+        return pd.DataFrame(columns=data.columns)
+
+    d = data.copy()
+
+    # ── Category / brand pre-filter ──────────────────────────────────────────
+    # Exclude generic words that happen to appear in chemical catalogs (e.g. 'carbon')
+    _GENERIC_BRAND_EXCLUSIONS = {"carbon", "generic", "standard", "classic", "natural", "pure", "bio"}
+    catalog_brands = {
+        e["brand_lower"] for e in entries
+        if len(e["brand_lower"]) >= 4 and e["brand_lower"] not in _GENERIC_BRAND_EXCLUSIONS
+    }
+
+    mask_animal = pd.Series(False, index=d.index)
+    if "CATEGORY" in d.columns:
+        mask_animal |= d["CATEGORY"].astype(str).str.contains(
+            _ANIMAL_HEALTH_PATH_TOKENS, na=False
+        )
+    mask_animal |= d["NAME"].fillna("").astype(str).str.contains(
+        _ANIMAL_HEALTH_PATH_TOKENS, na=False
+    )
+
+    # Hard guard: Phones, computing, electronics, cases & covers, apparel are NEVER animal health products
+    if "CATEGORY" in d.columns:
+        mask_ineligible = d["CATEGORY"].astype(str).str.contains(
+            r"\b(?:phone|phones|tablet|tablets|laptop|laptops|computing|cases?|covers?|wallet|screen.?protector|accessories)\b",
+            case=False, na=False
+        )
+        mask_animal &= ~mask_ineligible
+
+    target = d[mask_animal].copy()
+    if target.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    # ── Build combined match text ─────────────────────────────────────────────
+    target["_brand_l"]  = target["BRAND"].fillna("").str.strip().str.lower()
+    target["_name_l"]   = target["NAME"].fillna("").str.strip().str.lower()
+    target["_combined"] = (target["_brand_l"] + " " + target["_name_l"]).str.strip()
+
+    # Sort longest trade name first for specificity
+    entries_sorted = sorted(entries, key=lambda e: len(e["trade_name_lower"]), reverse=True)
+
+    # Vectorised pre-filter using a combined regex of all trade names ≥5 chars with word boundaries
+    trade_names = [e["trade_name_lower"] for e in entries_sorted if len(e["trade_name_lower"]) >= 5]
+    if trade_names:
+        _pre_pat = re.compile(
+            r"(?:\b(?:" + "|".join(re.escape(t) for t in trade_names) + r")\b)",
+            re.IGNORECASE,
+        )
+        _cand_mask = (
+            target["_combined"].str.contains(_pre_pat, na=False)
+            | target["_brand_l"].isin(catalog_brands)
+        )
+        target = target[_cand_mask]
+
+    if target.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    results   = []
+    seen_sids = set()
+
+    for _, row in target.iterrows():
+        sid = str(row.get("PRODUCT_SET_SID", "")).strip()
+        if sid in seen_sids:
+            continue
+
+        combined = row["_combined"]
+        brand_l  = row["_brand_l"]
+        matched_reason = None
+
+        for entry in entries_sorted:
+            trade = entry["trade_name_lower"]
+
+            # Match 1: trade name with word boundaries
+            if len(trade) >= 5 and re.search(rf"\b{re.escape(trade)}\b", combined):
+                matched_reason = entry["reason"]
+                break
+
+            # Match 2: active ingredient token with word boundaries
+            for ingr in entry["ingredients_lower"]:
+                if re.search(rf"\b{re.escape(ingr)}\b", combined):
+                    matched_reason = entry["reason"]
+                    break
+            if matched_reason:
+                break
+
+            # Match 3: exact brand match (only for non-generic brands and confirmed animal health category)
+            cat_str = str(row.get("CATEGORY", "")).lower()
+            if (
+                entry["brand_lower"]
+                and len(entry["brand_lower"]) >= 4
+                and entry["brand_lower"] not in _GENERIC_BRAND_EXCLUSIONS
+                and brand_l == entry["brand_lower"]
+                and bool(_ANIMAL_HEALTH_PATH_TOKENS.search(cat_str))
+            ):
+                matched_reason = entry["reason"]
+                break
+
+        if not matched_reason:
+            continue
+
+        seen_sids.add(sid)
+        comment = (
+            f"{comment_prefix} {matched_reason}. "
+            "This product cannot be listed on Jumia. "
+            "Please contact Jumia Seller Support if you believe this is an error. "
+            "See https://www.pcpb.go.ke for the official PCPB register."
+        )
+        result_row = row.copy()
+        result_row["FLAG"]           = flag_label
+        result_row["Comment_Detail"] = comment
+        results.append(result_row)
+
+    if not results:
+        return pd.DataFrame(columns=data.columns)
+    return pd.DataFrame(results)
+
+
+def check_animal_health_banned_products(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flags products matching the PCPB Banned 45 List, Kenya Ministry of
+    Agriculture Press Release 378 ban, or the Kenya Government 77 Highly
+    Hazardous Pesticides (HHPs) list.
+
+    These are hard-banned substances — listing them is not permitted.
+
+    Applies to: Kenya (KE) and Uganda (UG).
+    """
+    banned_entries, _ = load_animal_health_catalog()
+    return _run_animal_health_check(
+        data,
+        entries        = banned_entries,
+        flag_label     = _FLAG_BLACKLISTED,
+        comment_prefix = "Animal health product is BANNED by PCPB / Kenya Government:",
+    )
+
+
+def check_animal_health_prohibited_products(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flags products matching the PCPB Deregistered Products list or identified
+    as Unauthorised (Unregistered) Imports.
+
+    These products have had their registration revoked and are no longer
+    permitted for sale or distribution.
+
+    Applies to: Kenya (KE) and Uganda (UG).
+    """
+    _, prohibited_entries = load_animal_health_catalog()
+    return _run_animal_health_check(
+        data,
+        entries        = prohibited_entries,
+        flag_label     = _FLAG_BLACKLISTED,
+        comment_prefix = "Animal health product is PROHIBITED / DEREGISTERED by PCPB:",
+    )
+
+
+def check_animal_health_banned_category(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Validation C — Category-level block for BANNED animal health categories.
+
+    Flags any product whose CATEGORY_CODE falls into a category that is
+    exclusively composed of PCPB-banned substances (Banned 45 List, Ministry
+    Press Release 378, Kenya Government 77 HHPs).
+
+    Blocked categories (all products in these categories are prohibited):
+      1001888  Garden & Outdoors / Farm & Ranch / Livestock Supplies /
+               Pest & Disease Control
+      1002509  Garden & Outdoors / Farm & Ranch / Pest Control
+
+    FLAG   : 1000024 - Product does not have a license to be sold via Jumia
+             (Not Authorized)
+    Comment: Category is reserved for PCPB-banned agricultural pesticides and
+             cannot be used to list products on Jumia Kenya / Uganda. Instructs
+             the seller to contact Seller Support.
+
+    Applies to: Kenya (KE) and Uganda (UG).
+    """
+    required = {"PRODUCT_SET_SID", "CATEGORY_CODE"}
+    if data.empty or not required.issubset(data.columns):
+        return pd.DataFrame(columns=data.columns)
+
+    d = data.copy()
+    cat_str = d["CATEGORY_CODE"].fillna("").astype(str).str.strip()
+    mask = cat_str.isin(_BANNED_ANIMAL_HEALTH_CAT_CODES)
+    flagged = d[mask].copy()
+    if flagged.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    def _comment(code: str) -> str:
+        path = _BANNED_CAT_PATHS.get(str(code).strip(), f"Category {code}")
+        return (
+            f"The category '{path}' is reserved for PCPB-banned agricultural "
+            "pesticides and cannot be used to list products on Jumia Kenya / Uganda. "
+            "All products in this category are prohibited under the PCPB Banned 45 List, "
+            "Ministry Press Release 378, or the Kenya Government 77 Highly Hazardous "
+            "Pesticides (HHPs) list. "
+            "Please contact Jumia Seller Support if you believe this is an error. "
+            "See https://www.pcpb.go.ke for the official PCPB register."
+        )
+
+    flagged["FLAG"]           = _FLAG_NOT_LICENSED
+    flagged["Comment_Detail"] = cat_str[mask].apply(_comment)
+    return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
+
+
+def check_animal_health_prohibited_category(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Validation D — Category-level block for PROHIBITED / DEREGISTERED animal
+    health categories.
+
+    Flags any product whose CATEGORY_CODE falls into a category that is
+    exclusively composed of PCPB-deregistered products or unauthorised imports.
+
+    Blocked categories:
+      1001888  Garden & Outdoors / Farm & Ranch / Livestock Supplies /
+               Pest & Disease Control
+      1002509  Garden & Outdoors / Farm & Ranch / Pest Control
+      1004223  Pet Supplies / Dogs / Flea & Tick Control / Dog Flea Sprays
+
+    FLAG   : 1000024 - Product does not have a license to be sold via Jumia
+             (Not Authorized)
+    Comment: Category is reserved for PCPB-deregistered products / unauthorised
+             imports and cannot be used to list products on Jumia Kenya / Uganda.
+
+    Applies to: Kenya (KE) and Uganda (UG).
+    """
+    required = {"PRODUCT_SET_SID", "CATEGORY_CODE"}
+    if data.empty or not required.issubset(data.columns):
+        return pd.DataFrame(columns=data.columns)
+
+    d = data.copy()
+    cat_str = d["CATEGORY_CODE"].fillna("").astype(str).str.strip()
+    mask = cat_str.isin(_PROHIBITED_ANIMAL_HEALTH_CAT_CODES)
+    flagged = d[mask].copy()
+    if flagged.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    def _comment(code: str) -> str:
+        path = _PROHIBITED_CAT_PATHS.get(str(code).strip(), f"Category {code}")
+        return (
+            f"The category '{path}' is reserved for PCPB-deregistered products "
+            "and unauthorised imports that are not permitted for sale or distribution "
+            "in Kenya / Uganda. "
+            "Please reclassify your product to the correct category or contact "
+            "Jumia Seller Support if you believe this is an error. "
+            "See https://www.pcpb.go.ke for the official PCPB register."
+        )
+
+    flagged["FLAG"]           = _FLAG_NOT_LICENSED
+    flagged["Comment_Detail"] = cat_str[mask].apply(_comment)
+    return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])

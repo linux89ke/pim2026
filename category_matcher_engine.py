@@ -661,7 +661,7 @@ class CategoryMatcherEngine:
                     .clip(lower=1)
                 )
                 _rank = _shuffled.groupby("category").cumcount()
-                df = _shuffled[_rank < _take]
+                df = _shuffled[_rank < _take].copy()
                 # Re-check class count survived the proportional sample
                 if len(df["category"].unique()) < 2:
                     return
@@ -757,9 +757,10 @@ class CategoryMatcherEngine:
         if not self._pending_corrections and not self._pending_negatives: return
         had_corrections = bool(self._pending_corrections)
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
                 c = conn.cursor()
-                c.execute("BEGIN TRANSACTION")
+                c.execute("BEGIN IMMEDIATE")
                 for name, cat in self._pending_corrections.items():
                     c.execute("INSERT INTO category_corrections (name, category) VALUES (?, ?)", (name, cat))
                 for name, cat, reason in self._pending_negatives:

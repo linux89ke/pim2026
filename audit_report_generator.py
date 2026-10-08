@@ -126,6 +126,7 @@ def _flag_description(flag: str) -> str:
     _MAP = {
         "Wrong Category": "The AI incorrectly classified these products under the wrong category based on flawed category-matching logic.",
         "Missing COLOR": "The AI blocked these items citing a missing color field. However, color information is either present in the product name or not required for this category.",
+        "Color Mismatch: Title vs COLOR Column": "The color specified in the product title contradicts the color declared in the COLOR attribute column.",
         "Color Check": "The AI blocked these items citing a missing color field. However, color information is either present in the product name or not required for this category.",
         "Product Warranty": "These items were rejected due to missing warranty information. However, the category does not mandate a warranty or the data is present.",
         "Warranty Check": "These items were rejected due to missing warranty information. However, the category does not mandate a warranty or the data is present.",

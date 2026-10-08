@@ -389,7 +389,7 @@ def check_nigeria_powerbanks(data: pd.DataFrame, ng_rules: Dict) -> pd.DataFrame
 
 def check_generic_powerbanks(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
     _PSEUDO_BRANDS = {
-        "generic", "fashion", "unbranded", "no brand", "original", "new",
+        "generic", "fashion", "unbranded", "no brand", "original", "originals", "new",
         "unknown", "brand", "oem", "n/a", "na",
     }
     MIN_MAH = 10_000

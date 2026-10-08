@@ -64,6 +64,13 @@ _CHECK_ICONS = {
     "image_extraction": "🔌",
     "ai_caption": "🖋️",
     "brand_image": "🔎",
+    "apple_acc_overturned": "🍏",
+    "general_rule": "📋",
+    "refurbished": "🔄",
+    "suspected_fake": "🚨",
+    "generic_brand_evasion": "🏴",
+    "specs_inconsistency": "📱",
+    "pipeline_overturned": "↩️",
 }
 
 _VERDICT_STYLE = {
@@ -574,7 +581,7 @@ def targeted_audit_modal(support_files):
         st.warning("No data available to audit. Please upload and process files first.")
         if st.button("Close", key="btn_close_audit_empty"):
             st.session_state.show_targeted_audit_modal = False
-            st.rerun()
+            st.rerun(scope="app")
         return
 
     run_col, search_col, clear_col = st.columns([1.6, 2, 1])
@@ -912,30 +919,56 @@ def targeted_audit_modal(support_files):
         # Any wheel or touch aborts it, so a reviewer who starts scrolling
         # during those three seconds is not dragged back.
         if run_clicked:
-            components.html(
-                """
-                <script>
-                (function () {
-                  var doc = window.parent.document, n = 0, stopped = false;
-                  var stop = function () { stopped = true; };
-                  doc.addEventListener('wheel', stop, {once: true, passive: true});
-                  doc.addEventListener('touchstart', stop, {once: true, passive: true});
-                  var timer = setInterval(function () {
-                    n += 1;
-                    if (stopped || n > 20) { clearInterval(timer); return; }
-                    var dlg = doc.querySelector('[data-testid="stDialog"]');
-                    var anchor = doc.getElementById('audit-findings-top');
-                    if (!dlg || !anchor) return;
-                    var y = anchor.getBoundingClientRect().top
-                          - dlg.getBoundingClientRect().top
-                          + dlg.scrollTop;
-                    dlg.scrollTop = Math.max(0, y - 8);
-                  }, 150);
-                })();
-                </script>
-                """,
-                height=0,
-            )
+            if hasattr(st, "iframe"):
+                st.iframe(
+                    """
+                    <script>
+                    (function () {
+                      var doc = window.parent.document, n = 0, stopped = false;
+                      var stop = function () { stopped = true; };
+                      doc.addEventListener('wheel', stop, {once: true, passive: true});
+                      doc.addEventListener('touchstart', stop, {once: true, passive: true});
+                      var timer = setInterval(function () {
+                        n += 1;
+                        if (stopped || n > 20) { clearInterval(timer); return; }
+                        var dlg = doc.querySelector('[data-testid="stDialog"]');
+                        var anchor = doc.getElementById('audit-findings-top');
+                        if (!dlg || !anchor) return;
+                        var y = anchor.getBoundingClientRect().top
+                              - dlg.getBoundingClientRect().top
+                              + dlg.scrollTop;
+                        dlg.scrollTop = Math.max(0, y - 8);
+                      }, 150);
+                    })();
+                    </script>
+                    """,
+                    height=1,
+                )
+            else:
+                components.html(
+                    """
+                    <script>
+                    (function () {
+                      var doc = window.parent.document, n = 0, stopped = false;
+                      var stop = function () { stopped = true; };
+                      doc.addEventListener('wheel', stop, {once: true, passive: true});
+                      doc.addEventListener('touchstart', stop, {once: true, passive: true});
+                      var timer = setInterval(function () {
+                        n += 1;
+                        if (stopped || n > 20) { clearInterval(timer); return; }
+                        var dlg = doc.querySelector('[data-testid="stDialog"]');
+                        var anchor = doc.getElementById('audit-findings-top');
+                        if (!dlg || !anchor) return;
+                        var y = anchor.getBoundingClientRect().top
+                              - dlg.getBoundingClientRect().top
+                              + dlg.scrollTop;
+                        dlg.scrollTop = Math.max(0, y - 8);
+                      }, 150);
+                    })();
+                    </script>
+                    """,
+                    height=0,
+                )
 
         # ── Export ───────────────────────────────────────────────────────────
         # Both downloads serve the snapshot from the first completed run, not
@@ -1037,4 +1070,4 @@ def targeted_audit_modal(support_files):
     st.markdown('<hr class="audit-divider">', unsafe_allow_html=True)
     if st.button("Close", key="btn_close_audit_modal", type="secondary", width='stretch'):
         st.session_state.show_targeted_audit_modal = False
-        st.rerun()
+        st.rerun(scope="app")

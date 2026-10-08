@@ -75,7 +75,7 @@ SEVERITY = {
         "color": "#B3261E",
         "wash":  "#FBEAE9",
         "spine": "#B3261E",
-        "mark":  "🟥",
+        "mark":  ":material/gpp_bad:",
     },
     "judgment": {
         "order": 1,
@@ -84,7 +84,7 @@ SEVERITY = {
         "color": "#8A5200",
         "wash":  "#FBF1E3",
         "spine": "#B26A00",
-        "mark":  "🟧",
+        "mark":  ":material/manage_search:",
     },
     "advisory": {
         "order": 2,
@@ -93,7 +93,7 @@ SEVERITY = {
         "color": "#3D5A75",
         "wash":  "#EDF2F6",
         "spine": "#4A6B8A",
-        "mark":  "🟦",
+        "mark":  ":material/info:",
     },
     "resolved": {
         "order": 3,
@@ -102,7 +102,7 @@ SEVERITY = {
         "color": "#3F6B4F",
         "wash":  "#EAF1EC",
         "spine": "#3F6B4F",
-        "mark":  "🟩",
+        "mark":  ":material/check_circle:",
     },
 }
 
@@ -128,12 +128,14 @@ _FLAG_SEVERITY = {
     "FDA":                                        "blocker",
     "Off-Platform Contact":                       "blocker",
     "Seller Not approved to sell Refurb":         "blocker",
+    "Out of market devices":                      "blocker",
     "Seller Approve to sell books":               "blocker",
     "Seller Approved to Sell Perfume":            "blocker",
     "Perfume Tester":                             "blocker",
 
     # ── Needs judgment: a check fired, a human decides ──
     "Wrong Category":                             "judgment",
+    "Potential Restricted Brand":                 "judgment",
     "Category Check":                             "judgment",
     "Miscellaneous Category":                     "judgment",
     "Category Max Price Exceeded":                "judgment",
@@ -153,13 +155,17 @@ _FLAG_SEVERITY = {
 
     # ── Advisory: data hygiene ──
     "Missing COLOR":                              "advisory",
+    "Color Mismatch: Title vs COLOR Column":      "advisory",
     "Missing Weight/Volume":                      "advisory",
     "Unnecessary words in NAME":                  "advisory",
     "Single-word NAME":                           "advisory",
     "Product Warranty":                           "advisory",
-    "Image Stretched":                            "advisory",
-    "Image Blurry":                               "advisory",
-    "Poor images":                                "advisory",
+    # Image quality — same bad photo across sellers is still bad whoever
+    # lists it, so these cascade automatically rather than prompting.
+    "Image Stretched":                            "blocker",
+    "Image Blurry":                               "blocker",
+    "Poor images":                                "blocker",
+    "Brand Image Check":                          "blocker",
     "Image Too Many things displayed":            "advisory",
     "Poor Images Aspect Ratio":                   "advisory",
     "All Caps NAME":                              "advisory",
@@ -181,6 +187,7 @@ _FLAG_LABELS = {
     "FDA":                                        "FDA restricted",
     "Off-Platform Contact":                       "Contact details in the listing",
     "Seller Not approved to sell Refurb":         "Seller not approved for refurbished",
+    "Out of market devices":                      "Out of market device",
     "Seller Approve to sell books":               "Seller not approved for books",
     "Seller Approved to Sell Perfume":            "Seller not approved for perfume",
     "Perfume Tester":                             "Tester listed for sale",
@@ -191,6 +198,7 @@ _FLAG_LABELS = {
     "Miscellaneous Category":                     "Filed under Miscellaneous",
     "Category Max Price Exceeded":                "Price above category cap",
     "Generic branded products with genuine brands": "Generic listing using a real brand",
+    "Potential Restricted Brand":                 "Potential restricted brand",
     # check_generic_brand_issues matches brand == "generic" within the fashion
     # category codes (valid_category_codes_fas), so the category is half the
     # finding — "Generic brand name" left that out.
@@ -205,6 +213,7 @@ _FLAG_LABELS = {
     "Duplicate product":                          "Duplicate listing",
     "Image Mismatch":                             "Image doesn't match the title",
     "Missing COLOR":                              "Missing colour",
+    "Color Mismatch: Title vs COLOR Column":      "Color mismatch (Title vs COLOR)",
     "Missing Weight/Volume":                      "Missing weight or volume",
     "Unnecessary words in NAME":                  "Filler words in title",
     "Single-word NAME":                           "Single-word title",
@@ -459,7 +468,19 @@ def app_css() -> str:
       background-color: {C['panel']};
       padding: 10px 14px;
       border-radius: 10px;
-      font-size: var(--text-body);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.25;
+      font-weight: 650;
+      letter-spacing: -.005em;
+    }}
+    div[data-testid="stExpander"] details[open] summary {{
+      border-bottom: 1px solid {C['hairline_soft']};
+      border-bottom-left-radius: 0;
+      border-bottom-right-radius: 0;
+    }}
+    div[data-testid="stExpander"] [data-testid="stExpanderDetails"] {{
+      padding: 4px 14px 16px;
     }}
     div[data-testid="stExpander"] summary:hover {{
       background-color: {C['panel_sunken']};
