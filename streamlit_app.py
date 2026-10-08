@@ -4483,18 +4483,19 @@ def check_color_title_mismatch(
 
     target = data
 
-    # Follow color validation rules: ONLY check products in color-required categories.
-    # Products outside color_categories are never checked for color mismatches,
-    # regardless of whether they have a color in the title or COLOR column.
-    if "CATEGORY_CODE" in target.columns and color_categories:
-        if "_cat_clean" not in target.columns:
-            target = target.copy()
-            target["_cat_clean"] = target["CATEGORY_CODE"].apply(clean_category_code)
-        _cats = set(clean_category_code(c) for c in color_categories if c)
-        target = target[target["_cat_clean"].isin(_cats)]
-    elif color_categories:
-        # No CATEGORY_CODE column — cannot determine category; skip the check entirely
+    # Follow color validation rules: ONLY check products in color-required
+    # categories. An empty/missing eligibility list must disable this check;
+    # otherwise a failed support-file load would accidentally make every
+    # product eligible for a title/color comparison.
+    if not color_categories or "CATEGORY_CODE" not in target.columns:
         return pd.DataFrame(columns=data.columns)
+    if "_cat_clean" not in target.columns:
+        target = target.copy()
+        target["_cat_clean"] = target["CATEGORY_CODE"].apply(clean_category_code)
+    _cats = {clean_category_code(c) for c in color_categories if str(c).strip()}
+    if not _cats:
+        return pd.DataFrame(columns=data.columns)
+    target = target[target["_cat_clean"].isin(_cats)]
 
     if target.empty:
         return pd.DataFrame(columns=data.columns)
