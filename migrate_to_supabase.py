@@ -166,9 +166,26 @@ def import_image_rules(
             yield item
 
     imported = 0
+    seen = set()
     for batch in _chunks(rows(), batch_size):
-        _post_batch(session, endpoint, batch, key, on_conflict="image_url,flag")
-        imported += len(batch)
+        unique = []
+        for item in batch:
+            identity = (item.get("phash") or item.get("image_url"), item.get("flag"))
+            if identity not in seen:
+                seen.add(identity)
+                unique.append(item)
+        hashed = [item for item in unique if item.get("phash")]
+        unhashed = [item for item in unique if not item.get("phash")]
+        if hashed:
+            _post_batch(session, endpoint, hashed, key, on_conflict="phash,flag")
+            imported += len(hashed)
+        for item in unhashed:
+            try:
+                _post_batch(session, endpoint, [item], key)
+                imported += 1
+            except RuntimeError as exc:
+                if "409" not in str(exc) and "duplicate" not in str(exc).lower():
+                    raise
         print(f"Image rules: {imported:,} uploaded", flush=True)
     return imported
 
