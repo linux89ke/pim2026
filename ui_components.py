@@ -5650,8 +5650,15 @@ function _applyBatchReject(br) {{
     if (wrap && !wrap.querySelector('.rej-overlay.queued')) {{
       var queuedOverlay = document.createElement('div');
       queuedOverlay.className = 'rej-overlay queued';
-      var reasonText = String(payload[s] || 'Poor image').replace(/_/g, ' ');
-      if (reasonText === 'REJECT POOR IMAGE') reasonText = LABELS.poor_img || 'Poor image';
+      var reasonText = String(payload[s] || 'REJECT_POOR_IMAGE');
+      var customPrefix = 'Other Reason (Custom): ';
+      if (reasonText.indexOf(customPrefix) === 0) {{
+        reasonText = reasonText.slice(customPrefix.length);
+      }} else {{
+        var reasonSelect = document.getElementById('batch-reason-bottom');
+        var reasonOption = reasonSelect && Array.from(reasonSelect.options).find(function(opt) {{ return opt.value === reasonText; }});
+        reasonText = reasonOption ? reasonOption.textContent.trim() : reasonText.replace(/^REJECT_/, '').replace(/_/g, ' ');
+      }}
       queuedOverlay.innerHTML = '<div class="rej-badge">Queued</div><div class="rej-label">' + escapeHtml(reasonText) + '</div>';
       wrap.appendChild(queuedOverlay);
     }}
