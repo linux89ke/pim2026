@@ -5592,7 +5592,7 @@ window.undoReject = function(sid) {{
 // onclick in the markup does not have to change; ignored.
 window.doBatchReject = function(pos) {{
   var sel = document.getElementById('batch-reason-bottom');
-  if (!sel) return;
+  if (!sel) {{ showGhostOverlay('Reject controls are still loading. Try again.'); return; }}
   var br = sel.value;
   if (br === 'OTHER_CUSTOM') {{
     showCustomReasonPanel(function(cmt) {{
@@ -5619,7 +5619,8 @@ function _applyBatchReject(br) {{
     for (var s in selected) delete selected[s];
     for (var s in staged) delete staged[s];
     updateSelCount();
-    return;
+    showGhostOverlay('Select at least one product before batch reject.');
+    return 0;
   }}
   var allSids = Object.assign({{}}, selected, staged);
   for (var s in payload) {{ COMMITTED[s] = payload[s]; }}
@@ -5654,6 +5655,8 @@ function _applyBatchReject(br) {{
     }});
   }}
   updateSelCount();
+  showGhostOverlay(count + ' product' + (count === 1 ? '' : 's') + ' queued for rejection. Close the review to save.', 5000);
+  return count;
 }}
 
 var _customReasonCallback = null;
