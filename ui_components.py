@@ -4333,6 +4333,16 @@ function closeVisualReview() {{
 }}
 
 function _doCloseModal() {{
+  // Hide the review surface immediately. On hosted Streamlit the parent
+  // websocket can take a moment to process the bridge event; leaving the
+  // dialog visible during that round trip makes Close look broken. The next
+  // rerun restores the normal layout from show_review_modal.
+  try {{
+    var immediate = window.parent.document.querySelector('.st-key-grid_iframe_container');
+    if (immediate) immediate.style.visibility = 'hidden';
+    var syncImmediate = window.parent.document.querySelector('.st-key-grid_sync_broadcaster');
+    if (syncImmediate) syncImmediate.style.visibility = 'hidden';
+  }} catch(e) {{}}
   // 1. Click the Streamlit Python Close button in the footer (triggers session state update & clean rerun)
   try {{
     var par = window.parent;
