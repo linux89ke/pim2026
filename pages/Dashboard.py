@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
+import r2_storage
 
 from learned_rules import (
     LEARNABLE_FLAGS,
@@ -776,6 +777,15 @@ if uploads:
     unsupported_flags = set()
     for uploaded in uploads:
         for source_name, source_bytes in _report_frames(uploaded):
+            # Keep the original report in durable object storage when R2 is
+            # configured. The local parser still handles the import exactly
+            # as before, and the upload runs in the background.
+            _report_key = hashlib.sha256(source_name.encode("utf-8") + source_bytes).hexdigest()[:24]
+            r2_storage.upload_bytes_async(
+                source_bytes,
+                f"validation/historical-reports/{_report_key}-{Path(source_name).name}",
+                "application/octet-stream",
+            )
             try:
                 frame = _read_report_cached(source_name, source_bytes, "v3")
             except Exception as exc:

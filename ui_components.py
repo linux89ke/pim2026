@@ -53,6 +53,7 @@ from data_utils import (
     save_manual_decisions,
 )
 from export_utils import generate_smart_export, prepare_full_data_merged
+import r2_storage
 from learned_rules import (
     learn_image_rejections_async,
     load_learned_image_rules,
@@ -7490,6 +7491,11 @@ def _render_export_card(title, df, desc, func, exports_config):
                                 "fname": fname,
                                 "mime": mime,
                             }
+                            r2_storage.upload_bytes_async(
+                                res.getvalue(),
+                                f"validation/exports/{fname}",
+                                mime,
+                            )
                 st.session_state.setdefault("validation_stage_timings", {})["Report export"] = round(time.perf_counter() - _export_t0, 3)
                 st.rerun()
         else:

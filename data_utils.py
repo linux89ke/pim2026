@@ -18,6 +18,7 @@ from typing import Dict, List, Set, Tuple, Optional
 from dataclasses import dataclass
 
 from constants import NEW_FILE_MAPPING, COLOR_VARIANT_TO_BASE, MULTI_COUNTRY_VALUES, PARQUET_CACHE_DIR
+import r2_storage
 
 # ---------------------------------------------------------------------------
 # Load mojibake substitution map once at import time
@@ -41,6 +42,7 @@ def save_df_parquet(df, filename):
         tmp_path = f"{pq_path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         df.to_parquet(tmp_path)
         os.replace(tmp_path, pq_path)
+        r2_storage.upload_file_async(pq_path, f"validation/parquet/{filename}", "application/octet-stream")
     except Exception as e:
         logger.warning(f"Failed to save parquet {filename}: {e}")
 

@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+import r2_storage
 
 ROOT = Path(__file__).resolve().parent
 AUTOMATION_DIR = ROOT / ".validation_automation"
@@ -29,12 +30,14 @@ def save_chunk_results(manifest: dict, batch_id: str, report, results: dict) -> 
     root = chunk_artifact_dir(str(manifest.get("signature", "unknown")))
     report_path = root / f"{_safe_artifact_name(batch_id)}_report.parquet"
     report.to_parquet(report_path, index=False)
+    r2_storage.upload_file_async(report_path, f"validation/chunks/{report_path.name}", "application/octet-stream")
     result_paths = {}
     for flag, frame in (results or {}).items():
         if not isinstance(frame, pd.DataFrame):
             continue
         path = root / f"{_safe_artifact_name(batch_id)}_{_safe_artifact_name(flag)}.parquet"
         frame.to_parquet(path, index=False)
+        r2_storage.upload_file_async(path, f"validation/chunks/{path.name}", "application/octet-stream")
         result_paths[str(flag)] = str(path)
     item = manifest.setdefault("batches", {}).setdefault(str(batch_id), {})
     item["report_path"] = str(report_path)
@@ -97,6 +100,7 @@ def save_manifest(manifest: dict) -> None:
     with _LOCK:
         tmp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
+    r2_storage.upload_file_async(path, f"validation/manifests/{path.name}", "application/json")
 
 def mark_batch(manifest: dict, batch_id: str, **fields) -> dict:
     batches = manifest.setdefault("batches", {})
@@ -122,6 +126,7 @@ def thumbnail_data_uri(raw: bytes, url: str, size: int = 240) -> str:
             image = Image.open(io.BytesIO(raw)).convert("RGB")
             image.thumbnail((size, size), Image.Resampling.LANCZOS)
             image.save(path, format="JPEG", quality=72, optimize=True)
+            r2_storage.upload_file_async(path, f"validation/thumbnails/{path.name}", "image/jpeg")
         encoded = base64.b64encode(path.read_bytes()).decode("ascii")
         return "data:image/jpeg;base64," + encoded
     except Exception:
