@@ -6750,6 +6750,10 @@ def visual_review_modal(support_files):
             review_data["BRAND"].astype(str).isin(search_brands)
         ]
 
+    # Filtering above can return a view.  Make the display frame owned before
+    # adding derived columns so review reruns do not emit SettingWithCopyWarning.
+    review_data = review_data.copy()
+
     # --- Shared warning computation -------------------------------------
     # Single source of truth for per-SID warnings, used both for the
     # flag/sort filter pass (over review_data, potentially many rows) and
