@@ -8859,6 +8859,70 @@ def handle_jtbridge():
                 if isinstance(_ac, dict):
                     if "pending_auto_comments" not in st.session_state: st.session_state.pending_auto_comments = {}
                     st.session_state.pending_auto_comments.update(_ac)
+            elif _msg.get("action") == "flush_review":
+                # The iframe keeps batch decisions local while the reviewer
+                # works.  Close sends one message so the report is written in
+                # one grouped operation and this script reruns only once.
+                _flush = _msg.get("payload", {})
+                _payload = _flush.get("sids", {}) if isinstance(_flush, dict) else {}
+                _auto_comments = _flush.get("comments", {}) if isinstance(_flush, dict) else {}
+                _approvals = _flush.get("approvals", []) if isinstance(_flush, dict) else []
+                if not isinstance(_payload, dict): _payload = {}
+                if not isinstance(_auto_comments, dict): _auto_comments = {}
+                _rgroups = {}
+                for _sid, _rkey in _payload.items(): _rgroups.setdefault(_rkey, []).append(_sid)
+                _groups = []
+                for _rkey, _sids in _rgroups.items():
+                    if str(_rkey).startswith("Other Reason (Custom): "):
+                        _flag = "Other Reason (Custom)"
+                        _code = "1000007 - Other Reason"
+                        _cmt = str(_rkey).split(": ", 1)[1]
+                    else:
+                        _IMAGE_FLAG_FALLBACK = {"REJECT_IMG_STRETCHED": "Image Stretched", "REJECT_IMG_BLURRY": "Image Blurry", "REJECT_IMG_MISMATCH": "Image Mismatch", "REJECT_IMG_INFRINGING": "Image Infringing", "REJECT_IMG_TOO_MANY": "Image Too Many things displayed"}
+                        _flag = REASON_MAP.get(_rkey) or _IMAGE_FLAG_FALLBACK.get(_rkey, "Other Reason (Custom)")
+                        _rinfo = support_files["flags_mapping"].get(_flag, {"reason": "1000007 - Other Reason", "en": "Manual rejection"})
+                        _code = _rinfo["reason"]
+                        _cmt_lang = "fr" if st.session_state.selected_country == "Morocco" else "en"
+                        _cmt = _rinfo.get(_cmt_lang, _rinfo.get("en"))
+                    _by_comment = {}
+                    for _sid in _sids:
+                        _by_comment.setdefault(_auto_comments.get(_sid, _cmt), []).append(_sid)
+                    for _cmt_val, _sid_group in _by_comment.items():
+                        _groups.append((list(_sid_group), _flag, _code, _cmt_val))
+                _changed = 0
+                for _sid_group, _flag, _code, _cmt in _groups:
+                    if not _sid_group: continue
+                    apply_status_change(
+                        _sid_group, status="Rejected", reason=_code, comment=_cmt,
+                        flag=_flag, is_manual=True, is_zip=False, snapshot=False,
+                        checkpoint=False, clear_caches=False, propagate_siblings=True,
+                    )
+                    _changed += len(_sid_group)
+                _restored = 0
+                if isinstance(_approvals, (list, tuple, set)):
+                    for _sid in _approvals:
+                        restore_single_item(_sid)
+                        _restored += 1
+                if _changed or _restored:
+                    checkpoint_final_report(st.session_state.final_report)
+                    _clear_result_caches(clear_streamlit_cache=False)
+                    _fr_flush = st.session_state.get("final_report")
+                    if isinstance(_fr_flush, pd.DataFrame):
+                        _fr_flush.attrs.pop("__pim_hash__", None)
+                        _fr_flush.attrs.pop("__pim_hash_stamp__", None)
+                    _quick_flush = st.session_state.get("quick_rejects", {})
+                    if isinstance(_quick_flush, dict):
+                        for _sid in _approvals if isinstance(_approvals, (list, tuple, set)) else []:
+                            _quick_flush.pop(str(_sid).strip(), None)
+                    st.session_state.setdefault("main_toasts", []).append(
+                        f"Saved {_changed:,} review decision(s)" if _changed else f"Saved {_restored:,} review change(s)"
+                    )
+                st.session_state.show_review_modal = False
+                st.session_state.pop("_grid_pending_report_sync", None)
+                st.session_state["main_bridge_counter"] = st.session_state.get("main_bridge_counter", 0) + 1
+                st.session_state["_grid_closing"] = True
+                st.session_state.do_scroll_top = False
+                st.rerun()
             elif _msg.get("action") == "reject":
                 _raw_payload = _msg.get("payload", {})
                 if isinstance(_raw_payload, dict) and "sids" in _raw_payload:

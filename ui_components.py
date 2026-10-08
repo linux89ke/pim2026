@@ -4323,6 +4323,25 @@ setTimeout(function() {{
 window._pendingUndos = window._pendingUndos || {{}};
 window._undoTimer = null;
 
+// Batch decisions stay in the iframe until the reviewer closes it.  Sending
+// one bridge message for every batch reject makes Streamlit rerun the whole
+// script repeatedly, which is especially expensive for large reports.
+function _restorePendingReview() {{
+  try {{
+    var saved = JSON.parse(sessionStorage.getItem('pim_review_pending') || 'null');
+    return saved && typeof saved === 'object' ? saved : {{}};
+  }} catch(e) {{ return {{}}; }}
+}}
+var _savedPendingReview = _restorePendingReview();
+window._pendingReview = window._pendingReview || {{
+  decisions: _savedPendingReview.decisions || {{}},
+  comments: _savedPendingReview.comments || {{}},
+  approvals: _savedPendingReview.approvals || {{}}
+}};
+function _savePendingReview() {{
+  try {{ sessionStorage.setItem('pim_review_pending', JSON.stringify(window._pendingReview)); }} catch(e) {{}}
+}}
+
 var selected = window._gridSelected;
 var staged = window._stagedRejections;
 
@@ -4359,7 +4378,29 @@ function closeVisualReview() {{
     if (typeof _applyBatchReject === 'function') {{
       _applyBatchReject(br);
     }}
-    setTimeout(_doCloseModal, 350);
+    setTimeout(_flushPendingReviewAndClose, 50);
+    return;
+  }}
+  _flushPendingReviewAndClose();
+}}
+
+function _flushPendingReviewAndClose() {{
+  var p = window._pendingReview || {{decisions: {{}}, comments: {{}}, approvals: {{}}}};
+  var hasDecisions = Object.keys(p.decisions || {{}}).length > 0;
+  var hasApprovals = Object.keys(p.approvals || {{}}).length > 0;
+  if (hasDecisions || hasApprovals) {{
+    // The close message performs the single server-side commit and closes the
+    // modal in that same rerun.  Clear browser state now so reopening the
+    // review cannot replay an already submitted batch.
+    try {{
+      sessionStorage.removeItem('pim_review_pending');
+      sessionStorage.removeItem('pim_grid_selection');
+    }} catch(e) {{}}
+    sendMsg('flush_review', {{
+      sids: p.decisions || {{}},
+      comments: p.comments || {{}},
+      approvals: Object.keys(p.approvals || {{}})
+    }});
     return;
   }}
   _doCloseModal();
@@ -5009,6 +5050,7 @@ function updateSelCount() {{
   var pendingText = pendingCount + ' ' + LABELS.items_pending;
   document.querySelectorAll('.sel-count-text').forEach(el => el.textContent = pendingText);
   _saveGridSelection(selected, staged);
+  _savePendingReview();
   updateParentPagination();
 }}
 
@@ -5478,7 +5520,10 @@ window.clearStaged = function(sid) {{
 
 window.undoReject = function(sid) {{
   delete COMMITTED[sid];
-  window._pendingUndos[sid] = true;
+  var pending = window._pendingReview || (window._pendingReview = {{decisions: {{}}, comments: {{}}, approvals: {{}}}});
+  delete pending.decisions[sid];
+  delete pending.comments[sid];
+  pending.approvals[sid] = true;
   if (sid in selected) delete selected[sid];
 
   var safeSid = sid.replace(/'/g, "\\\\'");
@@ -5511,30 +5556,19 @@ window.undoReject = function(sid) {{
     }}
   }} catch(e) {{}}
 
+  _savePendingReview();
   if (window._undoTimer) clearTimeout(window._undoTimer);
   window._undoTimer = setTimeout(function() {{
-    var payload = Object.assign({{}}, window._pendingUndos);
-    window._pendingUndos = {{}};
-    if (!Object.keys(payload).length) return;
-
-    requestAnimationFrame(function() {{
-      requestAnimationFrame(function() {{
-        sendMsg('undo', payload);
-
-        setTimeout(function() {{
-          try {{
-            var fe = window.frameElement;
-            if (fe) {{
-              fe.style.removeProperty('min-height');
-              delete fe.dataset.pinnedHeight;
-              if (fe.parentElement) fe.parentElement.style.removeProperty('min-height');
-            }}
-          }} catch(e) {{}}
-          document.querySelectorAll('.card.undo-processing').forEach(function(c) {{
-            c.classList.remove('undo-processing');
-          }});
-        }}, 1000);
-      }});
+    try {{
+      var fe = window.frameElement;
+      if (fe) {{
+        fe.style.removeProperty('min-height');
+        delete fe.dataset.pinnedHeight;
+        if (fe.parentElement) fe.parentElement.style.removeProperty('min-height');
+      }}
+    }} catch(e) {{}}
+    document.querySelectorAll('.card.undo-processing').forEach(function(c) {{
+      c.classList.remove('undo-processing');
     }});
   }}, 400);
 }};
@@ -5576,10 +5610,17 @@ function _applyBatchReject(br) {{
   var allSids = Object.assign({{}}, selected, staged);
   for (var s in payload) {{ COMMITTED[s] = payload[s]; }}
   for (var s in allSids) {{ delete selected[s]; delete staged[s]; }}
-  // Show a non-blocking status toast while the queued commit drains.
-  showGhostOverlay('Applying rejections…', 90000);
+  // Keep the decision local until Close.  This avoids a Streamlit bridge
+  // event (and full script rerun) for every batch action.
+  var pending = window._pendingReview || (window._pendingReview = {{decisions: {{}}, comments: {{}}, approvals: {{}}}});
+  for (var ps in payload) {{
+    pending.decisions[ps] = payload[ps];
+    if (commentPayload[ps]) pending.comments[ps] = commentPayload[ps];
+    delete pending.approvals[ps];
+  }}
+  _savePendingReview();
   // Update card classes directly instead of full renderAll() to avoid blocking the
-  // main thread for 500 cards. The queue is persisted by a background fragment.
+  // main thread for 500 cards. The pending decision is persisted in sessionStorage.
   var grid = document.getElementById('card-grid');
   for (var s in payload) {{
     var el = grid ? grid.querySelector('#card-' + escapeHtml(s)) : null;
@@ -5599,7 +5640,6 @@ function _applyBatchReject(br) {{
     }});
   }}
   updateSelCount();
-  sendMsg('reject', {{ sids: payload, comments: commentPayload }});
 }}
 
 var _customReasonCallback = null;
@@ -5628,23 +5668,21 @@ document.getElementById('custom-reason-input').addEventListener('keydown', funct
 
 window.doBatchUndo = function() {{
   if (window._undoTimer) {{ clearTimeout(window._undoTimer); window._undoTimer = null; }}
-  var payload = Object.assign({{}}, window._pendingUndos);
-  window._pendingUndos = {{}};
+  var pending = window._pendingReview || (window._pendingReview = {{decisions: {{}}, comments: {{}}, approvals: {{}}}});
   var count = 0;
   for (var s in selected) {{
-    if (s in COMMITTED) {{ payload[s] = true; count++; }}
+    if (s in COMMITTED || s in pending.decisions) {{ pending.approvals[s] = true; count++; }}
   }}
-  if (Object.keys(payload).length === 0) {{
+  if (count === 0) {{
     for (var s in selected) delete selected[s];
     updateSelCount();
     return;
   }}
-  for (var s in payload) {{ delete COMMITTED[s]; }}
+  for (var s in pending.approvals) {{ delete pending.decisions[s]; delete pending.comments[s]; delete COMMITTED[s]; }}
   for (var s in selected) {{ delete selected[s]; }}
 
   renderAll();
   updateSelCount();
-  sendMsg('undo', payload);
 }};
 
 window.doDeselAll = function() {{
