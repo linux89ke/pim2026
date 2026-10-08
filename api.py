@@ -25,24 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import json
-from PIL import Image
 
 logger = logging.getLogger(__name__)
-
-# SentenceTransformers / CLIP removed — Visual Brand Guard disabled
-
-# ── Visual Brand Guard (disabled — CLIP/SentenceTransformers removed) ─────
-class VisualBrandGuard:
-    """No-op stub. CLIP model dependency has been removed."""
-    def __init__(self, *args, **kwargs):
-        self.is_ready = False
-
-    def build_index(self): pass
-
-    def check_image(self, *args, **kwargs):
-        return None
-
-brand_guard = VisualBrandGuard()
 
 app = FastAPI(title="Product Validation API", version="1.0.0")
 
@@ -95,12 +79,6 @@ def _read_result_artifact(path_value: bytes | str | None) -> bytes | None:
         return None
     with open(path, "rb") as handle:
         return handle.read()
-
-@app.on_event("startup")
-async def startup_event():
-    # Build the brand index on background thread to not block FastAPI startup
-    loop = asyncio.get_running_loop()
-    loop.run_in_executor(None, brand_guard.build_index)
 
 # ── Models ───────────────────────────────────────────────────────────────────
 class SubmitResponse(BaseModel):
@@ -262,52 +240,6 @@ def _run_full_pipeline(
         "rejection_rate": round(len(rej) / max(len(final_report), 1) * 100, 1),
         "flags": rej["FLAG"].value_counts().to_dict(),
     }
-
-    # 6. Visual Brand Guard (Optional - Kenya Only for now)
-    if brand_guard.is_ready and country.lower() == 'kenya':
-        from data_utils import _get_image_from_zip
-        import requests
-        logger.info("Running Visual Brand Guard check...")
-        
-        # Determine if we are processing a ZIP
-        zf = None
-        if filename.lower().endswith('.zip'):
-            zf = zipfile.ZipFile(BytesIO(file_bytes))
-            
-        for idx, row in final_report.iterrows():
-            if row['Status'] == 'Rejected': continue
-            sid = str(row['ProductSetSid']).strip()
-            product_rows = data_unique[data_unique['PRODUCT_SET_SID'] == sid]
-            if product_rows.empty: continue
-            p_row = product_rows.iloc[0]
-            
-            img_url = str(p_row.get('MAIN_IMAGE_URL', '')).strip()
-            if not img_url: continue
-            
-            seller_name = str(row.get('SELLER_NAME', 'Unknown')).strip()
-            
-            img_bytes = None
-            try:
-                if zf and img_url.startswith('images/'):
-                    img_bytes = zf.read(img_url)
-                elif img_url.startswith(('http://', 'https://')):
-                    resp = requests.get(img_url, timeout=5)
-                    if resp.status_code == 200:
-                        img_bytes = resp.content
-            except:
-                continue
-
-            if img_bytes:
-                detected_brand = brand_guard.check_image(img_bytes, seller_name)
-                if detected_brand:
-                    seller_brand = str(row.get('BRAND', 'Generic')).strip()
-                    if seller_brand.lower() != detected_brand.lower():
-                        final_report.at[idx, 'Status'] = 'Rejected'
-                        final_report.at[idx, 'FLAG'] = f"Restricted Brand ({detected_brand})"
-                        final_report.at[idx, 'Reason'] = "1000002 - Restricted Brand"
-                        final_report.at[idx, 'Comment'] = f"Visual match for restricted brand: {detected_brand.upper()}. Seller declared: {seller_brand}."
-        
-        if zf: zf.close()
 
     _stage("Finalizing report…", 98)
     artifact_key = result_key or f"adhoc-{uuid.uuid4().hex}"
