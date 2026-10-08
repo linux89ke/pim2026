@@ -7089,6 +7089,20 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+ # Support files are needed by the page chrome, before the country selector
+ # bridge is rendered. Initialise the country validator first; the selector
+ # below can replace it and trigger a rerun when the user switches markets.
+if "selected_country" not in st.session_state:
+    _initial_country = "Kenya"
+    try:
+        _saved_country = Path(".country_pref").read_text(encoding="utf-8").strip()
+        if _saved_country in {"Kenya", "Uganda", "Nigeria", "Ghana", "Morocco", "Egypt", "Senegal", "Ivory Coast"}:
+            _initial_country = _saved_country
+    except OSError:
+        pass
+    st.session_state.selected_country = _initial_country
+country_validator = CountryValidator(st.session_state.selected_country)
+
 try:
     from loaders import load_support_files_lazy
     support_files = load_support_files_lazy(country_validator.code)
