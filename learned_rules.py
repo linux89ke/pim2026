@@ -9,14 +9,17 @@ queried it and its snapshot audit table grew without bound.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
+import supabase_store
 
 RULES_PATH = Path(__file__).resolve().parent / "learned_image_rules.json"
 LEARNABLE_FLAGS = frozenset({
@@ -55,6 +58,10 @@ _LOCK = threading.RLock()
 _RULES_MTIME = -1.0
 _RULES = []
 _WRITER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="learned-rules")
+_REMOTE_RULES = None
+_REMOTE_RULES_FETCHED_AT = 0.0
+_REMOTE_RULES_TTL = 60.0
+_LOG = logging.getLogger(__name__)
 
 def _sync_sqlite_locked(rules: list) -> None:
     """Compatibility no-op for callers from the pre-JSON-only implementation."""
@@ -90,8 +97,72 @@ def _load_locked() -> list:
 
 
 def load_learned_image_rules() -> list:
+    global _REMOTE_RULES, _REMOTE_RULES_FETCHED_AT
+    if supabase_store.enabled():
+        now = time.monotonic()
+        if _REMOTE_RULES is None or now - _REMOTE_RULES_FETCHED_AT >= _REMOTE_RULES_TTL:
+            try:
+                _REMOTE_RULES = supabase_store.fetch_all("learned_image_rules")
+                _REMOTE_RULES_FETCHED_AT = now
+            except Exception as exc:
+                _LOG.warning("Could not read Supabase learned rules; using local fallback: %s", exc)
+                _REMOTE_RULES = None
+        if _REMOTE_RULES is not None:
+            return list(_REMOTE_RULES)
     with _LOCK:
         return list(_load_locked())
+
+
+_REMOTE_RULE_COLUMNS = {
+    "image_url", "phash", "flag", "reason", "comment", "brand_infringed",
+    "category_code", "product_set_sid", "seller_name", "status", "review_state",
+    "source", "created_at", "updated_at", "last_matched_at", "last_confirmed_at",
+    "review_due_at",
+}
+
+
+def _remote_upsert_rules(records: list[dict]) -> None:
+    if not records or not supabase_store.enabled():
+        return
+    now = supabase_store.now_iso()
+    payload = []
+    for record in records:
+        row = {key: record.get(key) for key in _REMOTE_RULE_COLUMNS}
+        row["updated_at"] = row.get("updated_at") or now
+        row["created_at"] = row.get("created_at") or now
+        for field in ("last_matched_at", "last_confirmed_at", "review_due_at"):
+            if row.get(field) == "":
+                row[field] = None
+        payload.append(row)
+    try:
+        supabase_store.upsert("learned_image_rules", payload, on_conflict="image_url,flag")
+        global _REMOTE_RULES, _REMOTE_RULES_FETCHED_AT
+        _REMOTE_RULES = None
+        _REMOTE_RULES_FETCHED_AT = 0.0
+    except Exception as exc:
+        _LOG.warning("Could not write learned rules to Supabase: %s", exc)
+
+
+def _remote_delete_rules(records: list[dict]) -> None:
+    if not records or not supabase_store.enabled():
+        return
+    try:
+        for record in records:
+            filters = {}
+            if record.get("id") is not None:
+                filters["id"] = record.get("id")
+            else:
+                for field in ("image_url", "phash", "flag", "created_at"):
+                    value = str(record.get(field, "") or "").strip()
+                    if value:
+                        filters[field] = value
+            if filters:
+                supabase_store.delete_where("learned_image_rules", filters)
+        global _REMOTE_RULES, _REMOTE_RULES_FETCHED_AT
+        _REMOTE_RULES = None
+        _REMOTE_RULES_FETCHED_AT = 0.0
+    except Exception as exc:
+        _LOG.warning("Could not delete learned rules from Supabase: %s", exc)
 
 
 def delete_learned_image_rules(rules) -> int:
@@ -109,8 +180,9 @@ def delete_learned_image_rules(rules) -> int:
     if not targets:
         return 0
     with _LOCK:
-        current = list(_load_locked())
+        current = list(load_learned_image_rules())
         kept = []
+        removed_records = []
         removed = 0
         for rule in current:
             key = (
@@ -121,6 +193,7 @@ def delete_learned_image_rules(rules) -> int:
             )
             if key in targets:
                 removed += 1
+                removed_records.append(rule)
             else:
                 kept.append(rule)
         if not removed:
@@ -133,6 +206,7 @@ def delete_learned_image_rules(rules) -> int:
         _RULES = kept
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
         _sync_sqlite_locked(_RULES)
+        _remote_delete_rules(removed_records)
         return removed
 
 
@@ -140,8 +214,9 @@ def remove_learned_rules_by_flag(flag: str) -> int:
     """Remove all learned image rules for a flag that is now validator-owned."""
     canonical = normalize_learned_flag(flag)
     with _LOCK:
-        current = list(_load_locked())
+        current = list(load_learned_image_rules())
         kept = [rule for rule in current if normalize_learned_flag(rule.get("flag", "")) != canonical]
+        removed_records = [rule for rule in current if normalize_learned_flag(rule.get("flag", "")) == canonical]
         removed = len(current) - len(kept)
         if not removed:
             return 0
@@ -153,6 +228,7 @@ def remove_learned_rules_by_flag(flag: str) -> int:
         _RULES = kept
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
         _sync_sqlite_locked(_RULES)
+        _remote_delete_rules(removed_records)
         return removed
 
 
@@ -162,7 +238,7 @@ def restore_learned_image_rules(rules) -> int:
     if not additions:
         return 0
     with _LOCK:
-        current = list(_load_locked())
+        current = list(load_learned_image_rules())
         keys = {(str(r.get("image_url", "")).strip(), str(r.get("phash", "")).strip(), str(r.get("created_at", "")).strip()) for r in current}
         new_items = [r for r in additions if (str(r.get("image_url", "")).strip(), str(r.get("phash", "")).strip(), str(r.get("created_at", "")).strip()) not in keys]
         if not new_items:
@@ -176,6 +252,7 @@ def restore_learned_image_rules(rules) -> int:
         _RULES = current
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
         _sync_sqlite_locked(_RULES)
+        _remote_upsert_rules(new_items)
         return len(new_items)
 
 
@@ -192,7 +269,7 @@ def update_learned_image_rule_flag(rule: dict, new_flag: str) -> bool:
         str(rule.get("created_at", "")).strip(),
     )
     with _LOCK:
-        current = list(_load_locked())
+        current = list(load_learned_image_rules())
         changed = False
         for item in current:
             key = (
@@ -214,6 +291,11 @@ def update_learned_image_rule_flag(rule: dict, new_flag: str) -> bool:
         _RULES = current
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
         _sync_sqlite_locked(_RULES)
+        _remote_upsert_rules([item for item in current if (
+            str(item.get("image_url", "")).strip(),
+            str(item.get("phash", "")).strip(),
+            str(item.get("created_at", "")).strip(),
+        ) == target])
         return True
 
 
@@ -228,7 +310,7 @@ def set_learned_image_rule_review(rule: dict, review_state: str) -> bool:
         str(rule.get("created_at", "")).strip(),
     )
     with _LOCK:
-        current = list(_load_locked())
+        current = list(load_learned_image_rules())
         changed = False
         for item in current:
             key = (str(item.get("image_url", "")).strip(), str(item.get("phash", "")).strip(), str(item.get("created_at", "")).strip())
@@ -248,6 +330,11 @@ def set_learned_image_rule_review(rule: dict, review_state: str) -> bool:
         _RULES = current
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
         _sync_sqlite_locked(_RULES)
+        _remote_upsert_rules([item for item in current if (
+            str(item.get("image_url", "")).strip(),
+            str(item.get("phash", "")).strip(),
+            str(item.get("created_at", "")).strip(),
+        ) == target])
         return True
 
 
@@ -325,7 +412,7 @@ def learn_image_rejections(
     if not records:
         return 0
     with _LOCK:
-        current = list(_load_locked())
+        current = list(load_learned_image_rules())
         keys = {(str(r.get("image_url", "")).strip(), str(r.get("phash", "")).strip(), r.get("flag", "")) for r in current}
         url_keys = {(url, flag) for url, _phash, flag in keys if url}
         phash_keys = {(_phash, flag) for _url, _phash, flag in keys if _phash}
@@ -352,6 +439,7 @@ def learn_image_rejections(
         _RULES = payload
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
         _sync_sqlite_locked(_RULES)
+        _remote_upsert_rules(additions)
         return len(additions)
 
 
@@ -378,7 +466,7 @@ def record_learned_image_matches(matches) -> int:
     now = now_dt.isoformat()
     cutoff = now_dt - timedelta(days=1)
     with _LOCK:
-        current = list(_load_locked())
+        current = list(load_learned_image_rules())
         changed = 0
         for rule in current:
             if str(rule.get("image_url", "")).strip() in urls or str(rule.get("phash", "")).strip() in phashes:
@@ -404,6 +492,8 @@ def record_learned_image_matches(matches) -> int:
         _RULES = current
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
         _sync_sqlite_locked(_RULES)
+        changed_rules = [rule for rule in current if str(rule.get("last_matched_at", "")) == now]
+        _remote_upsert_rules(changed_rules)
         return changed
 
 
@@ -479,7 +569,7 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
     if not all_records:
         return 0
     with _LOCK:
-        current = list(_load_locked())
+        current = list(load_learned_image_rules())
         keys = {(str(r.get("image_url", "")).strip(), str(r.get("phash", "")).strip(), normalize_learned_flag(r.get("flag", ""))) for r in current}
         url_keys = {(url, flag) for url, _phash, flag in keys if url}
         phash_keys = {(_phash, flag) for _url, _phash, flag in keys if _phash}
@@ -504,6 +594,7 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
         _RULES = payload
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
         _sync_sqlite_locked(_RULES)
+        _remote_upsert_rules(additions)
         return len(additions)
 
 
@@ -531,7 +622,7 @@ def remove_image_rules_for_sids(
     if not urls and not phashes:
         return 0
     with _LOCK:
-        current = list(_load_locked())
+        current = list(load_learned_image_rules())
         kept = []
         removed = 0
         for rule in current:
@@ -551,6 +642,10 @@ def remove_image_rules_for_sids(
         _RULES = kept
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
         _sync_sqlite_locked(_RULES)
+        _remote_delete_rules([
+            rule for rule in current
+            if rule not in kept and normalize_learned_flag(rule.get("flag", "")) == flag
+        ])
         return removed
 
 

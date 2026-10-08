@@ -8,6 +8,7 @@ import pandas as pd
 import logging
 import traceback
 import sqlite3
+import supabase_store
 # SentenceTransformers removed — TF-IDF used exclusively
 #
 # sklearn is imported lazily. Measured with -X importtime, importing this
@@ -353,6 +354,8 @@ class CategoryMatcherEngine:
         self.negative_db: dict = {}        # clean_name -> {lowercased rejected categories}
         self.negative_reasons: dict = {}   # (clean_name, category_lower) -> human reason text
         self._pending_negatives: list = [] # (clean_name, category, reason) awaiting flush
+        self._remote_corrections_df = None
+        self._remote_negatives_df = None
         self.compiled_rules = {}  # Store JSON rules directly in the engine
         # (vectorizer, classifier) kept as ONE tuple so a background retrain can
         # swap both halves atomically. A reader that caught a half-swap would
@@ -432,6 +435,29 @@ class CategoryMatcherEngine:
             logger.warning(f"Failed to init category learning DB: {e}")
 
     def load_learning_db(self):
+        if supabase_store.enabled():
+            try:
+                remote = supabase_store.fetch_all("category_corrections")
+                df = pd.DataFrame(remote, columns=["name", "category"])
+                if not df.empty:
+                    self._remote_corrections_df = df[["name", "category"]].copy()
+                    self.learning_db = df.groupby("name")["category"].last().to_dict()
+                    self._ensure_correction_model(self._remote_corrections_df)
+                nremote = supabase_store.fetch_all("category_negatives")
+                ndf = pd.DataFrame(nremote, columns=["name", "category", "reason"])
+                if not ndf.empty:
+                    self._remote_negatives_df = ndf[["name", "category", "reason"]].copy()
+                    ndf["category_l"] = ndf["category"].astype(str).str.strip().str.lower()
+                    self.negative_db = {n: set(g) for n, g in ndf.groupby("name")["category_l"]}
+                    self.negative_reasons = {
+                        (n, cl): str(r).strip()
+                        for n, cl, r in zip(ndf["name"], ndf["category_l"], ndf["reason"].fillna(""))
+                        if str(r).strip()
+                    }
+                logger.info("[CatLearn] Loaded category learning from Supabase (%s corrections, %s negatives)", len(df), len(ndf))
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load category learning from Supabase; using local DB: {e}")
         try:
             with sqlite3.connect(self.db_path) as conn:
                 df = pd.read_sql_query("SELECT name, category FROM category_corrections", conn)
@@ -614,8 +640,11 @@ class CategoryMatcherEngine:
             fingerprint = self._corrections_fingerprint()
         if df is None:
             try:
-                with sqlite3.connect(self.db_path) as conn:
-                    df = pd.read_sql_query("SELECT name, category FROM category_corrections", conn)
+                if self._remote_corrections_df is not None:
+                    df = self._remote_corrections_df.copy()
+                else:
+                    with sqlite3.connect(self.db_path) as conn:
+                        df = pd.read_sql_query("SELECT name, category FROM category_corrections", conn)
             except Exception:
                 return
         if df is None or df.empty or len(df['category'].unique()) < 2:
@@ -706,6 +735,7 @@ class CategoryMatcherEngine:
         if not clean_n or not category: return
         self.learning_db[clean_n] = category
         if auto_save:
+            remote_row = {"name": clean_n, "category": str(category).strip(), "learned_at": supabase_store.now_iso()}
             try:
                 with sqlite3.connect(self.db_path) as conn:
                     c = conn.cursor()
@@ -724,6 +754,10 @@ class CategoryMatcherEngine:
                 self._schedule_retrain()
             except Exception as e:
                 logger.warning(f"Failed to save correction to DB: {e}")
+            try:
+                supabase_store.insert("category_corrections", [remote_row])
+            except Exception as e:
+                logger.warning(f"Failed to save correction to Supabase: {e}")
         else:
             self._pending_corrections[clean_n] = category
 
@@ -757,6 +791,14 @@ class CategoryMatcherEngine:
         if not self._pending_corrections and not self._pending_negatives: return
         had_corrections = bool(self._pending_corrections)
         try:
+            remote_corrections = [
+                {"name": name, "category": cat, "learned_at": supabase_store.now_iso()}
+                for name, cat in self._pending_corrections.items()
+            ]
+            remote_negatives = [
+                {"name": name, "category": cat, "reason": reason, "learned_at": supabase_store.now_iso()}
+                for name, cat, reason in self._pending_negatives
+            ]
             with sqlite3.connect(self.db_path, timeout=30.0) as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 c = conn.cursor()
@@ -778,6 +820,11 @@ class CategoryMatcherEngine:
                 conn.commit()
             self._pending_corrections = {}
             self._pending_negatives = []
+            try:
+                supabase_store.insert("category_corrections", remote_corrections)
+                supabase_store.insert("category_negatives", remote_negatives)
+            except Exception as e:
+                logger.warning(f"Failed to batch save category learning to Supabase: {e}")
             self._invalidate_counts()
             if had_corrections:
                 self._schedule_retrain()
