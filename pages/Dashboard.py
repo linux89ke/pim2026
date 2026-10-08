@@ -127,18 +127,24 @@ def _render_category_admin_module():
     st.caption("Review category corrections and negative category decisions used by the category matcher.")
     try:
         from category_matcher_engine import CategoryMatcherEngine
-        _category_engine = CategoryMatcherEngine()
-        _db_path = Path(_category_engine.db_path)
+        _db_path = Path(__file__).resolve().parents[1] / "cat_learning.db"
         try:
             _db_mtime = _db_path.stat().st_mtime_ns
         except OSError:
             _db_mtime = 0
 
+        @st.cache_resource(show_spinner=False, max_entries=2)
+        def _cached_category_engine(_mtime_ns: int):
+            del _mtime_ns
+            return CategoryMatcherEngine(str(_db_path))
+
+        _category_engine = _cached_category_engine(_db_mtime)
+
         @st.cache_data(show_spinner=False, max_entries=4)
         def _cached_category_learning(_mtime_ns: int):
             # The mtime is deliberately the cache key: category edits from a
             # validation run or another tab invalidate the dashboard view.
-            _engine = CategoryMatcherEngine()
+            _engine = _cached_category_engine(_mtime_ns)
             return _engine.list_corrections(limit=2000), _engine.list_negatives(limit=2000)
 
         _corrections, _negatives = _cached_category_learning(_db_mtime)

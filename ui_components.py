@@ -60,12 +60,6 @@ from learned_rules import (
     load_learned_image_rules_for_urls,
     delete_learned_image_rules,
 )
-import importlib
-import targeted_audit as _ta_mod
-try:
-    importlib.reload(_ta_mod)
-except Exception:
-    pass
 from targeted_audit import targeted_audit_modal
 
 logger = logging.getLogger(__name__)

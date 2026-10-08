@@ -23,9 +23,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
-import polars as pl
-import plotly.express as px
-import plotly.graph_objects as go
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
@@ -154,17 +151,6 @@ from pricing_rules import (
 )
 from refurbished_rules import check_refurbished_products, check_out_of_market_devices
 from translations import LANGUAGES, get_translation
-import importlib
-import targeted_audit as _ta_mod
-try:
-    importlib.reload(_ta_mod)
-except Exception:
-    pass
-import ui_components as _ui_mod
-try:
-    importlib.reload(_ui_mod)
-except Exception:
-    pass
 
 from ui_components import (
     apply_status_change,
@@ -7105,7 +7091,7 @@ st.markdown(
 
 try:
     from loaders import load_support_files_lazy
-    support_files = load_support_files_lazy()
+    support_files = load_support_files_lazy(country_validator.code)
     st.session_state.support_files = support_files
     st.session_state["compiled_json_rules"] = support_files.get("compiled_json_rules", {})
 except Exception as e:
@@ -8761,26 +8747,22 @@ if _offer:
             st.rerun()
 
 
-@st.fragment(run_every="0.5s")
 def _drain_review_batch_queue():
-    """Commit a visual-review batch in short slices.
+    """Commit a legacy queued visual-review batch in one grouped operation.
 
-    The iframe can keep handling page navigation between slices.  The worker
-    deliberately runs on Streamlit's script thread (rather than mutating
-    session state from a Python thread), but each slice is bounded so a large
-    batch never monopolises the bridge request.
+    Current iframes keep decisions local and send ``flush_review`` on close,
+    so this compatibility path is no longer a periodic fragment. Removing
+    the timer prevents fragment-lifecycle warnings during normal reruns.
     """
     _queue = st.session_state.get("_review_batch_queue")
     if not isinstance(_queue, list) or not _queue:
         return
 
-    st.caption("Saving the previous batch in the background. Page navigation remains available.")
-
     _job = _queue[0]
     _groups = _job.get("groups", []) if isinstance(_job, dict) else []
     _cursor = int(_job.get("cursor", 0) or 0) if isinstance(_job, dict) else 0
     _offset = int(_job.get("offset", 0) or 0) if isinstance(_job, dict) else 0
-    _slice_size = 180
+    _slice_size = max(1, sum(len(g.get("sids", [])) for g in _groups if isinstance(g, dict)))
     _processed = 0
 
     while _cursor < len(_groups) and _processed < _slice_size:
@@ -9089,6 +9071,12 @@ def _build_dashboard_figures(fr_meta: pd.DataFrame, manual_hours: float):
     df_hash signature, not a full-object hash) so repeated fragment reruns — e.g. a
     keystroke in Quick SID Lookup — don't rebuild a groupby + 5 charts every time
     the underlying data hasn't actually changed."""
+    # Charts are only needed when the dashboard/results view is rendered.
+    # Keeping Plotly out of the cold-start import path saves startup memory and
+    # avoids importing it for upload-only or review-only interactions.
+    import plotly.express as px
+    import plotly.graph_objects as go
+
     app_df = fr_meta[fr_meta["Status"] == "Approved"]
     rej_df = fr_meta[fr_meta["Status"] == "Rejected"]
 
@@ -9506,9 +9494,8 @@ with _rail_slot:
 
 handle_jtbridge()
 
-# Keep batch persistence in its own short-lived fragment. Register the
-# periodic fragment only while a queue exists; calling it unconditionally with
-# run_every="0.5s" made every idle session wake twice per second forever.
+# Compatibility path for messages from an older iframe build. Current review
+# actions are flushed once on close and never populate this queue.
 if st.session_state.get("_review_batch_queue"):
     _drain_review_batch_queue()
 

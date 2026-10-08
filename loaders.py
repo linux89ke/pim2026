@@ -130,10 +130,11 @@ def safe_excel_read(filename: str, sheet_name, usecols=None) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600)
-def load_prohibited_from_local() -> Dict[str, List[Dict]]:
+def load_prohibited_from_local(country_tab: Optional[str] = None) -> Dict[str, List[Dict]]:
     FILE_NAME = "Prohibbited.xlsx"
     prohibited_by_country = {}
-    for tab in COUNTRY_TABS:
+    _tabs = [country_tab] if country_tab in COUNTRY_TABS else COUNTRY_TABS
+    for tab in _tabs:
         try:
             df = safe_excel_read(FILE_NAME, sheet_name=tab)
             if df.empty:
@@ -173,10 +174,14 @@ def load_prohibited_from_local() -> Dict[str, List[Dict]]:
 
 
 @st.cache_data(ttl=3600)
-def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
+def load_restricted_brands_from_local(country_name: Optional[str] = None) -> Dict[str, List[Dict]]:
     FILE_NAME = "Restricted_Brands.xlsx"
     config_by_country = {}
-    for country_name, tab_name in COUNTRY_NAME_TO_TAB.items():
+    _countries = (
+        {country_name: COUNTRY_NAME_TO_TAB[country_name]}
+        if country_name in COUNTRY_NAME_TO_TAB else COUNTRY_NAME_TO_TAB
+    )
+    for country_name, tab_name in _countries.items():
         try:
             df = safe_excel_read(FILE_NAME, sheet_name=tab_name)
             if df.empty:
@@ -266,14 +271,15 @@ def load_restricted_brands_from_local() -> Dict[str, List[Dict]]:
 
 
 @st.cache_data(ttl=3600)
-def load_refurb_data_from_local() -> dict:
+def load_refurb_data_from_local(country_tab: Optional[str] = None) -> dict:
     FILE_NAME = "Refurb.xlsx"
     result = {
         "sellers": {},
         "categories": {"Phones": set(), "Laptops": set()},
         "keywords": set(),
     }
-    for tab in COUNTRY_TABS:
+    _tabs = [country_tab] if country_tab in COUNTRY_TABS else COUNTRY_TABS
+    for tab in _tabs:
         try:
             df = safe_excel_read(FILE_NAME, sheet_name=tab, usecols=[0, 1])
             if not df.empty:
@@ -326,10 +332,11 @@ def load_refurb_data_from_local() -> dict:
 
 
 @st.cache_data(ttl=3600)
-def load_perfume_data_from_local() -> Dict:
+def load_perfume_data_from_local(country_tab: Optional[str] = None) -> Dict:
     FILE_NAME = "Perfume.xlsx"
     result = {"sellers": {}, "keywords": set(), "category_codes": set()}
-    for tab in COUNTRY_TABS:
+    _tabs = [country_tab] if country_tab in COUNTRY_TABS else COUNTRY_TABS
+    for tab in _tabs:
         try:
             df = safe_excel_read(FILE_NAME, sheet_name=tab)
             if not df.empty:
@@ -394,10 +401,11 @@ def load_perfume_data_from_local() -> Dict:
 
 
 @st.cache_data(ttl=3600)
-def load_books_data_from_local() -> Dict:
+def load_books_data_from_local(country_tab: Optional[str] = None) -> Dict:
     FILE_NAME = "Books_sellers.xlsx"
     result = {"sellers": {}, "category_codes": set()}
-    for tab in COUNTRY_TABS:
+    _tabs = [country_tab] if country_tab in COUNTRY_TABS else COUNTRY_TABS
+    for tab in _tabs:
         try:
             df = safe_excel_read(FILE_NAME, sheet_name=tab)
             if not df.empty:
@@ -467,14 +475,15 @@ def load_alcohol_data_from_local() -> Dict:
 
 
 @st.cache_data(ttl=3600)
-def load_jerseys_from_local() -> Dict:
+def load_jerseys_from_local(country_tab: Optional[str] = None) -> Dict:
     FILE_NAME = "Jersey_validation_updated.xlsx" if os.path.exists("Jersey_validation_updated.xlsx") else "Jersey_validation.xlsx"
     result: Dict = {
         "keywords": {tab: set() for tab in COUNTRY_TABS},
         "exempted": {tab: set() for tab in COUNTRY_TABS},
         "categories": set(),
     }
-    for tab in COUNTRY_TABS:
+    _tabs = [country_tab] if country_tab in COUNTRY_TABS else COUNTRY_TABS
+    for tab in _tabs:
         try:
             df = safe_excel_read(FILE_NAME, sheet_name=tab)
             if not df.empty:
@@ -723,12 +732,13 @@ def load_perfume_catalog_from_local(_mtime: float = 0.0) -> Dict:
 
 
 @st.cache_data(ttl=3600)
-def load_suspected_fake_from_local() -> Dict:
+def load_suspected_fake_from_local(country_tab: Optional[str] = None) -> Dict:
     if not os.path.exists("suspected_fake.xlsx"):
         logger.warning("suspected_fake.xlsx not found")
         return {code: pd.DataFrame() for code in COUNTRY_TABS}
     result = {}
-    for code in COUNTRY_TABS:
+    _tabs = [country_tab] if country_tab in COUNTRY_TABS else COUNTRY_TABS
+    for code in _tabs:
         try:
             result[code] = pd.read_excel(
                 "suspected_fake.xlsx", sheet_name=code, engine="openpyxl", dtype=str
@@ -1108,10 +1118,18 @@ def _load_ring_sellers(path: str) -> dict:
         return {}
 
 
-@st.cache_data(ttl=3600)
-def load_all_support_files() -> Dict:
-    """Load all support/config files into a single dictionary."""
+def load_all_support_files(country_code: str = "KE") -> Dict:
+    """Load all support/config files into a single read-only dictionary.
+
+    The public wrapper below owns the resource cache. Keeping a second
+    cache_data layer here serialized and copied the entire support dictionary
+    before cache_resource stored it again.
+    """
     from nigeria_rules import load_nigeria_qc_rules
+    _country_tab = str(country_code or "KE").upper()
+    if _country_tab not in COUNTRY_TABS:
+        _country_tab = "KE"
+    _country_name = next((name for name, tab in COUNTRY_NAME_TO_TAB.items() if tab == _country_tab), "Kenya")
 
     def safe_txt(f):
         return load_txt_file(f) if os.path.exists(f) else []
@@ -1119,10 +1137,10 @@ def load_all_support_files() -> Dict:
     support = {
         "blacklisted_words": safe_txt("blacklisted.txt"),
         "book_category_codes": safe_txt("Books_cat.txt"),
-        "books_data": load_books_data_from_local(),
+        "books_data": load_books_data_from_local(_country_tab),
         "alcohol_data": load_alcohol_data_from_local(),
         "perfume_category_codes": safe_txt("Perfume_cat.txt"),
-        "perfume_data": load_perfume_data_from_local(),
+        "perfume_data": load_perfume_data_from_local(_country_tab),
         "perfume_catalog": load_perfume_catalog_from_local(
             _mtime=_file_mtime("perfume_catalog.xlsx")
         ),
@@ -1137,19 +1155,19 @@ def load_all_support_files() -> Dict:
         "category_fas": safe_txt("Fashion_cat.txt"),
         "reasons": load_excel_file("reasons.xlsx"),
         "flags_mapping": load_flags_mapping(),
-        "jerseys_data": load_jerseys_from_local(),
+        "jerseys_data": load_jerseys_from_local(_country_tab),
         "warranty_category_codes": safe_txt("warranty.txt"),
-        "suspected_fake": load_suspected_fake_from_local(),
+        "suspected_fake": load_suspected_fake_from_local(_country_tab),
         "duplicate_exempt_codes": safe_txt("duplicate_exempt.txt"),
         "ring_sellers": _load_ring_sellers("ring_sellers.xlsx"),
-        "restricted_brands_all": load_restricted_brands_from_local(),
-        "prohibited_words_all": load_prohibited_from_local(),
+        "restricted_brands_all": load_restricted_brands_from_local(_country_name),
+        "prohibited_words_all": load_prohibited_from_local(_country_tab),
         "known_brands": safe_txt("brands.txt"),
         "variation_allowed_codes": safe_txt("variation.txt"),
         "weight_category_codes": safe_txt("weight.txt"),
         "smartphone_category_codes": safe_txt("smartphones.txt"),
-        "refurb_data": load_refurb_data_from_local(),
-        "ng_qc_rules": load_nigeria_qc_rules(),
+        "refurb_data": load_refurb_data_from_local(_country_tab),
+        "ng_qc_rules": load_nigeria_qc_rules() if _country_tab == "NG" else {},
     }
 
     # Category map
@@ -1308,9 +1326,9 @@ def load_and_compile_json_rules(json_path="category_qc_weighted.json") -> dict:
 # hands back a fresh deep copy on each access — ~97ms per rerun for this ~6.5MB
 # payload, paid on every click. cache_resource returns the same object for free.
 # Callers only ever read from it (verified: no writes to support_files anywhere).
-@st.cache_resource(ttl=3600)
-def load_support_files_lazy():
-    return load_all_support_files()
+@st.cache_resource(ttl=3600, max_entries=2)
+def load_support_files_lazy(country_code: str = "KE"):
+    return load_all_support_files(country_code)
 
 
 def compile_regex_patterns(words: List[str], flags=re.IGNORECASE) -> re.Pattern:
