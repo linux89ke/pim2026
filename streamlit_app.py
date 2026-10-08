@@ -8859,12 +8859,18 @@ def _drain_review_batch_queue():
     if _cursor >= len(_groups):
         # Checkpoint once for the complete batch, rather than once for every
         # selected group.  This is the expensive disk/report operation.
-        checkpoint_final_report(st.session_state.final_report)
+        # The journal is enough to recover these decisions and is much smaller
+        # than the complete report.  Avoid a full Parquet rewrite on iframe
+        # close; the report remains in session memory for the rerun.
+        checkpoint_final_report(st.session_state.final_report, write_report=False)
         _clear_result_caches(clear_streamlit_cache=False)
         _fr = st.session_state.get("final_report")
         if isinstance(_fr, pd.DataFrame):
-            _fr.attrs.pop("__pim_hash__", None)
-            _fr.attrs.pop("__pim_hash_stamp__", None)
+            # Status/flag edits already increment data_version. Give the
+            # display cache a cheap explicit version key instead of forcing
+            # df_hash() to scan every cell in a large report on close.
+            _fr.attrs["__pim_hash__"] = f"manual:{st.session_state.get('data_version', 0)}"
+            _fr.attrs["__pim_hash_stamp__"] = (_fr.shape, tuple(_fr.columns))
         _queue.pop(0)
         st.session_state["_grid_pending_report_sync"] = True
         st.session_state.setdefault("main_toasts", []).append(
@@ -8937,12 +8943,16 @@ def handle_jtbridge():
                         restore_single_item(_sid)
                         _restored += 1
                 if _changed or _restored:
-                    checkpoint_final_report(st.session_state.final_report)
+                    # Persist the compact decision journal only.  Rewriting a
+                    # large report Parquet made closing the iframe appear to
+                    # hang even though the in-memory report was already up to
+                    # date.
+                    checkpoint_final_report(st.session_state.final_report, write_report=False)
                     _clear_result_caches(clear_streamlit_cache=False)
                     _fr_flush = st.session_state.get("final_report")
                     if isinstance(_fr_flush, pd.DataFrame):
-                        _fr_flush.attrs.pop("__pim_hash__", None)
-                        _fr_flush.attrs.pop("__pim_hash_stamp__", None)
+                        _fr_flush.attrs["__pim_hash__"] = f"manual:{st.session_state.get('data_version', 0)}"
+                        _fr_flush.attrs["__pim_hash_stamp__"] = (_fr_flush.shape, tuple(_fr_flush.columns))
                     _quick_flush = st.session_state.get("quick_rejects", {})
                     if isinstance(_quick_flush, dict):
                         for _sid in _approvals if isinstance(_approvals, (list, tuple, set)) else []:
@@ -9107,13 +9117,20 @@ def get_enriched_results(fr_df, data_df):
         return pd.DataFrame()
     # Explicitly pull ONLY required columns to prevent cloning wide datasets
     needed_cols = [c for c in ["PRODUCT_SET_SID", "SELLER_NAME", "BRAND"] if c in data_df.columns]
-    return pd.merge(
+    enriched = pd.merge(
         fr_df, 
         data_df[needed_cols], 
         left_on="ProductSetSid", 
         right_on="PRODUCT_SET_SID", 
         how="left"
     )
+    # Preserve the cheap manual-edit key on the derived frame so the chart
+    # cache does not hash the entire enriched report again on this rerun.
+    _stamp = fr_df.attrs.get("__pim_hash__")
+    if _stamp:
+        enriched.attrs["__pim_hash__"] = f"enriched:{_stamp}"
+        enriched.attrs["__pim_hash_stamp__"] = (enriched.shape, tuple(enriched.columns))
+    return enriched
 
 
 @st.cache_data(show_spinner=False, hash_funcs={pd.DataFrame: df_hash})

@@ -1252,7 +1252,7 @@ def render_sibling_prompt():
             st.rerun()
 
 
-def checkpoint_final_report(fr: pd.DataFrame = None) -> bool:
+def checkpoint_final_report(fr: pd.DataFrame = None, *, write_report: bool = True) -> bool:
     """Persist the current report — including manual decisions — to disk.
 
     Manual approvals/rejections otherwise live only in st.session_state, and
@@ -1283,6 +1283,13 @@ def checkpoint_final_report(fr: pd.DataFrame = None) -> bool:
         country=st.session_state.get("_process_country", ""),
     )
 
+    # The manual journal is the durable, content-addressed recovery source.
+    # Visual-review close actions already have the updated report in memory;
+    # rewriting a large report Parquet here duplicates the work and blocks the
+    # close rerun.  Full report checkpoints remain available to callers that
+    # need an on-disk snapshot (startup/export/undo paths).
+    if not write_report:
+        return True
     sig = st.session_state.get("current_sig_hash")
     if not sig:
         return False
@@ -7449,9 +7456,8 @@ def render_grid_closing_overlay():
           <div class="gco-card">
             <div class="gco-ring"><span></span><span></span><span></span></div>
             <div class="gco-title">Saving your review…</div>
-            <div class="gco-sub">Applying your decisions and rebuilding the
-              report. This takes a moment on a large batch — please don't
-              refresh.</div>
+            <div class="gco-sub">Saving your decisions and refreshing the
+              results. Your changes are kept while this finishes.</div>
             <div class="gco-bar"><i></i></div>
           </div>
         </div>
