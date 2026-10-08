@@ -7050,14 +7050,10 @@ def visual_review_modal(support_files):
     """, unsafe_allow_html=True)
 
     with st.container(key="grid_iframe_container"):
-        _num_cards = len(page_data) if ('page_data' in locals() and isinstance(page_data, pd.DataFrame) and not page_data.empty) else 50
-        _cols_n = max(1, st.session_state.get("grid_cols_per_row", 4))
-        _num_rows = max(1, (_num_cards + _cols_n - 1) // _cols_n)
-        _card_h = 360 if st.session_state.get("show_images", True) else 180
-
-        _GRID_VIEWPORT_H = 620
-        _content_h = _num_rows * _card_h + 150
-        _dynamic_iframe_h = min(_GRID_VIEWPORT_H, max(420, _content_h))
+        # Keep the component height constant. A changing height becomes part
+        # of Streamlit's iframe element identity and can cause Cloud reruns to
+        # tear down and recreate the grid, which looks like a refresh.
+        _dynamic_iframe_h = 620
         _iframe_t0 = time.perf_counter()
         st.iframe(_grid_html_str, height=_dynamic_iframe_h)
         st.session_state["validation_stage_timings"] = {
