@@ -438,15 +438,15 @@ class CategoryMatcherEngine:
         if supabase_store.enabled():
             try:
                 remote = supabase_store.fetch_all("category_corrections")
-                df = pd.DataFrame(remote, columns=["name", "category"])
+                df = pd.DataFrame(remote)
                 if not df.empty:
-                    self._remote_corrections_df = df[["name", "category"]].copy()
+                    self._remote_corrections_df = df.copy()
                     self.learning_db = df.groupby("name")["category"].last().to_dict()
                     self._ensure_correction_model(self._remote_corrections_df)
                 nremote = supabase_store.fetch_all("category_negatives")
-                ndf = pd.DataFrame(nremote, columns=["name", "category", "reason"])
+                ndf = pd.DataFrame(nremote)
                 if not ndf.empty:
-                    self._remote_negatives_df = ndf[["name", "category", "reason"]].copy()
+                    self._remote_negatives_df = ndf.copy()
                     ndf["category_l"] = ndf["category"].astype(str).str.strip().str.lower()
                     self.negative_db = {n: set(g) for n, g in ndf.groupby("name")["category_l"]}
                     self.negative_reasons = {
@@ -839,6 +839,17 @@ class CategoryMatcherEngine:
     # into the SQLite file by hand.
 
     def list_corrections(self, limit: int = 500) -> pd.DataFrame:
+        if supabase_store.enabled():
+            try:
+                df = self._remote_corrections_df
+                if df is None:
+                    df = pd.DataFrame(supabase_store.fetch_all("category_corrections"))
+                if df.empty:
+                    return pd.DataFrame(columns=["id", "name", "category", "timestamp"])
+                out = df.rename(columns={"learned_at": "timestamp"})
+                return out.reindex(columns=["id", "name", "category", "timestamp"]).tail(limit).iloc[::-1].reset_index(drop=True)
+            except Exception as e:
+                logger.warning(f"list_corrections remote read failed: {e}")
         try:
             with sqlite3.connect(self.db_path) as conn:
                 return pd.read_sql_query(
@@ -850,6 +861,17 @@ class CategoryMatcherEngine:
             return pd.DataFrame(columns=["id", "name", "category", "timestamp"])
 
     def list_negatives(self, limit: int = 500) -> pd.DataFrame:
+        if supabase_store.enabled():
+            try:
+                df = self._remote_negatives_df
+                if df is None:
+                    df = pd.DataFrame(supabase_store.fetch_all("category_negatives"))
+                if df.empty:
+                    return pd.DataFrame(columns=["id", "name", "category", "reason", "timestamp"])
+                out = df.rename(columns={"learned_at": "timestamp"})
+                return out.reindex(columns=["id", "name", "category", "reason", "timestamp"]).tail(limit).iloc[::-1].reset_index(drop=True)
+            except Exception as e:
+                logger.warning(f"list_negatives remote read failed: {e}")
         try:
             with sqlite3.connect(self.db_path) as conn:
                 return pd.read_sql_query(
@@ -875,6 +897,14 @@ class CategoryMatcherEngine:
         cached = getattr(self, "_counts_cache", None)
         if cached is not None:
             return cached
+        if supabase_store.enabled():
+            try:
+                corr = self._remote_corrections_df
+                neg = self._remote_negatives_df
+                self._counts_cache = (0 if corr is None else len(corr), 0 if neg is None else len(neg))
+                return self._counts_cache
+            except Exception as e:
+                logger.warning(f"remote counts() failed: {e}")
         try:
             with sqlite3.connect(self.db_path) as conn:
                 c = conn.cursor()
@@ -891,6 +921,14 @@ class CategoryMatcherEngine:
     def delete_corrections(self, ids: list) -> int:
         """Delete rows by id from category_corrections and refresh in-memory state."""
         if not ids: return 0
+        if supabase_store.enabled():
+            try:
+                supabase_store.delete_by_ids("category_corrections", ids)
+                self.load_learning_db()
+                self._invalidate_counts()
+                return len(ids)
+            except Exception as e:
+                logger.warning(f"delete_corrections remote delete failed: {e}")
         try:
             with sqlite3.connect(self.db_path) as conn:
                 c = conn.cursor()
@@ -922,6 +960,14 @@ class CategoryMatcherEngine:
     def delete_negatives(self, ids: list) -> int:
         """Delete rows by id from category_negatives and refresh in-memory state."""
         if not ids: return 0
+        if supabase_store.enabled():
+            try:
+                supabase_store.delete_by_ids("category_negatives", ids)
+                self.load_learning_db()
+                self._invalidate_counts()
+                return len(ids)
+            except Exception as e:
+                logger.warning(f"delete_negatives remote delete failed: {e}")
         try:
             with sqlite3.connect(self.db_path) as conn:
                 c = conn.cursor()
