@@ -9442,10 +9442,11 @@ with _rail_slot:
 
 handle_jtbridge()
 
-# Keep batch persistence in its own short-lived fragment.  This fragment is
-# independent from the review iframe, so Next/Previous can be used while the
-# prior page is still being committed.
-_drain_review_batch_queue()
+# Keep batch persistence in its own short-lived fragment. Register the
+# periodic fragment only while a queue exists; calling it unconditionally with
+# run_every="0.5s" made every idle session wake twice per second forever.
+if st.session_state.get("_review_batch_queue"):
+    _drain_review_batch_queue()
 
 render_main_results()
 

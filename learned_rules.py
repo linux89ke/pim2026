@@ -363,6 +363,44 @@ def merge_learned_image_rules(blocked_map: dict) -> dict:
     return merged
 
 
+def load_learned_image_rules_for_urls(urls) -> list[dict]:
+    """Return learned rules for the supplied image URLs only.
+
+    The review iframe needs rule provenance for the current page, not the
+    complete catalog. On Supabase, query those URLs in batches; locally reuse
+    the already cached JSON list and filter it in memory.
+    """
+    wanted = {
+        str(url).strip()
+        for url in (urls or [])
+        if str(url).strip() and str(url).strip().lower() not in {"nan", "none"}
+    }
+    if not wanted:
+        return []
+    if supabase_store.enabled():
+        try:
+            fields = ",".join(sorted(_REMOTE_RULE_COLUMNS))
+            out = []
+            values = list(wanted)
+            for start in range(0, len(values), 100):
+                chunk = values[start:start + 100]
+                # URLs in the catalog do not contain commas. PostgREST handles
+                # the URL encoding of the complete in.(...) expression.
+                out.extend(supabase_store.fetch_where(
+                    "learned_image_rules",
+                    {"image_url": "in.(" + ",".join(chunk) + ")"},
+                    select=fields,
+                ))
+            return out
+        except Exception as exc:
+            _LOG.warning("Could not query learned rules for current images: %s", exc)
+    with _LOCK:
+        return [
+            rule for rule in load_learned_image_rules()
+            if str(rule.get("image_url", "")).strip() in wanted
+        ]
+
+
 def learn_image_rejections(
     data: pd.DataFrame,
     sids,

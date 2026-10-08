@@ -57,6 +57,7 @@ import r2_storage
 from learned_rules import (
     learn_image_rejections_async,
     load_learned_image_rules,
+    load_learned_image_rules_for_urls,
     delete_learned_image_rules,
 )
 import importlib
@@ -2505,7 +2506,9 @@ def render_flag_expander(
         # Keep the table for selection, and add a readable gallery for normal
         # review. It is limited to the current page to avoid extra network work.
         st.markdown("**Image gallery**")
-        _gallery_learned_rules = load_learned_image_rules()
+        _gallery_learned_rules = load_learned_image_rules_for_urls(
+            _preview_urls[: min(len(_preview_urls), 40)]
+        )
         _gallery_rules_by_url = {
             str(_r.get("image_url", "")).strip(): _r
             for _r in _gallery_learned_rules
@@ -4186,6 +4189,20 @@ window.addEventListener('message', function(e) {{
     if (e.data.committed) COMMITTED = e.data.committed;
     if (e.data.poor_img_sids) POOR_IMG_SIDS = new Set(e.data.poor_img_sids);
     if (e.data.prefetch) PREFETCH_URLS = e.data.prefetch;
+    if (Object.prototype.hasOwnProperty.call(e.data, 'grid_sort')) {{
+      window._currentSort = e.data.grid_sort || '';
+      ['sort-sel-top','sort-sel-bottom'].forEach(function(id) {{
+        var _sortEl = document.getElementById(id);
+        if (_sortEl) _sortEl.value = window._currentSort;
+      }});
+    }}
+    if (Object.prototype.hasOwnProperty.call(e.data, 'grid_filter')) {{
+      window._currentFilter = e.data.grid_filter || '';
+      ['filter-sel-top','filter-sel-bottom'].forEach(function(id) {{
+        var _filterEl = document.getElementById(id);
+        if (_filterEl) _filterEl.value = window._currentFilter;
+      }});
+    }}
     closeGhostOverlay();
 
     // Scroll state lives on #card-grid now, not the window.
@@ -4262,8 +4279,24 @@ function saveGridViewState() {{
   }} catch(e) {{}}
 }}
 
-window._gridSelected = window._gridSelected || {{}};
-window._stagedRejections = window._stagedRejections || {{}};
+// Keep reviewer selections outside the iframe document. Streamlit can
+// recreate an iframe during a rerun; sessionStorage survives that replacement
+// and prevents selected cards from disappearing when paging or filtering.
+function _restoreGridSelection() {{
+  try {{
+    var saved = JSON.parse(sessionStorage.getItem('pim_grid_selection') || 'null');
+    return saved && typeof saved === 'object' ? saved : {{}};
+  }} catch(e) {{ return {{}}; }}
+}}
+function _saveGridSelection(selectedState, stagedState) {{
+  try {{
+    var payload = {{selected: selectedState || {{}}, staged: stagedState || {{}}}};
+    sessionStorage.setItem('pim_grid_selection', JSON.stringify(payload));
+  }} catch(e) {{}}
+}}
+var _savedGridSelection = _restoreGridSelection();
+window._gridSelected = window._gridSelected || _savedGridSelection.selected || {{}};
+window._stagedRejections = window._stagedRejections || _savedGridSelection.staged || {{}};
 window.currentZoomSid = null;
 window._imageIssues = window._imageIssues || {{}};
 // URLs whose images have already loaded once in this iframe session. Cards with
@@ -4975,6 +5008,7 @@ function updateSelCount() {{
   var pendingCount = (Object.keys(selected).length + Object.keys(staged).length);
   var pendingText = pendingCount + ' ' + LABELS.items_pending;
   document.querySelectorAll('.sel-count-text').forEach(el => el.textContent = pendingText);
+  _saveGridSelection(selected, staged);
   updateParentPagination();
 }}
 
@@ -6428,7 +6462,13 @@ def visual_review_modal(support_files):
         if _default is not None:
             review_data[_review_col] = review_data[_review_col].fillna(_default)
     review_data["Learned Review Match"] = review_data["Learned Review Match"].fillna(False).astype(bool)
-    _learned_rules = load_learned_image_rules()
+    # The iframe only needs provenance for the images on the current page.
+    # Fetching the complete learned catalog here made every review rerun pay
+    # for a 60 MB JSON parse or a 73k-row Supabase download.
+    _learned_rules = load_learned_image_rules_for_urls(
+        review_data.get("MAIN_IMAGE", pd.Series(dtype=str)).astype(str).tolist()
+        if "MAIN_IMAGE" in review_data.columns else []
+    )
     _learned_by_url = {
         str(r.get("image_url", "")).strip(): r for r in _learned_rules
         if str(r.get("image_url", "")).strip()
@@ -6966,7 +7006,7 @@ def visual_review_modal(support_files):
     # in-place, so reuse the document for page-only changes.  Invalidate it when
     # controls that are actually embedded in the document change.
     _grid_template_key = (
-        int(cols_per_row), int(ipp), str(curr_sort or ""), str(curr_flag or ""),
+        int(cols_per_row),
         str(st.session_state.get("ui_lang", "en")),
         bool(st.session_state.get("show_images", True)),
         str(st.session_state.get("process_signature", "")),
@@ -7089,6 +7129,9 @@ def visual_review_modal(support_files):
         committed: {_committed_json},
         poor_img_sids: {_poor_img_sids_json},
         prefetch: {_prefetch_json},
+        grid_sort: {json.dumps(curr_sort or '')},
+        grid_filter: {json.dumps(curr_flag or '')},
+        grid_page_size: {int(ipp)},
         {_cards_field}
         {_images_field}
         cards_sig: {json.dumps(_cards_sig)},

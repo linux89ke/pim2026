@@ -78,6 +78,35 @@ def fetch_all(table: str, *, page_size: int = 1000, order: str = "id") -> list[d
     return rows
 
 
+def fetch_where(table: str, params: dict[str, str], *, select: str = "*", page_size: int = 1000) -> list[dict]:
+    """Fetch only rows matching PostgREST filters.
+
+    This is intentionally separate from ``fetch_all``. Large reference tables
+    such as learned image rules should be queried by the current upload's URLs
+    or hashes instead of downloading the entire table on every review rerun.
+    """
+    if not enabled():
+        return []
+    rows: list[dict] = []
+    offset = 0
+    base_params = dict(params or {})
+    base_params["select"] = select
+    while True:
+        query = {**base_params, "limit": page_size, "offset": offset}
+        response = _session.get(
+            _endpoint(table), params=query, headers=_headers(), timeout=120
+        )
+        response.raise_for_status()
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError(f"Unexpected Supabase response for {table}")
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return rows
+
+
 def upsert(table: str, rows: list[dict], *, on_conflict: str | None = None) -> None:
     if not rows or not enabled():
         return
