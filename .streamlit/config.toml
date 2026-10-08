@@ -5,7 +5,6 @@
 # on, etc.). Settings that belong to the app itself live here instead.
 
 [server]
-port = 8505
 # 200MB, not 500. The uploaded ZIP is held in session state in full — it is the
 # single largest thing this app keeps in memory — and Streamlit Cloud's
 # container is small enough that a big batch can push it into an OOM restart,
