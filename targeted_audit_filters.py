@@ -389,12 +389,12 @@ _MULTICOLOR_VARIANTS_AUDIT = {
 def _is_placeholder_color(color_val: str) -> bool:
     """True for a COLOR value that is punctuation standing in for nothing —
     '-', '--', '..', '***' — same guard streamlit_app.py's check_missing_color
-    already applies (re.match(r"^[.\-_*]{1,5}$")). Without it here, a seller
+    already applies (re.match(r"^[._*-]{1,5}$")). Without it here, a seller
     writing a bare dash could get AI-rescued by Color_AI_Normalized guessing a
     color from the title text, and the audit would call that a False
     Rejection — a dash is not a color declaration, whatever the AI infers.
     """
-    return bool(re.match(r"^[.\-_*]{1,5}$", color_val.strip()))
+    return bool(re.match(r"^[._*-]{1,5}$", color_val.strip()))
 
 
 def _color_recognised(color_val: str, valid_set: set) -> bool:
