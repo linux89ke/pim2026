@@ -3832,6 +3832,10 @@ def build_fast_grid_html(
 
   .card.committed-rej .rej-badge{{background:{R};color:#fff;padding:6px 12px;border-radius:6px;font-size:15px;font-weight:800;letter-spacing:0.5px;}}
   .card.committed-rej .rej-label{{font-size:12px;color:{R};font-weight:700;max-width:130px;}}
+  .card.queued-rej{{border-color:#d97706;opacity:.88;}}
+  .card.queued-rej .rej-overlay{{display:flex;background:rgba(255,247,237,.92);}}
+  .card.queued-rej .rej-badge{{background:#d97706;color:#fff;padding:6px 10px;border-radius:6px;font-size:13px;font-weight:800;}}
+  .card.queued-rej .rej-label{{font-size:12px;color:#92400e;font-weight:700;max-width:145px;text-align:center;}}
 
   .undo-btn{{margin-top:8px;padding:6px 14px;background:#313133;color:#fff;border:none;border-radius:4px;font-size:11px;font-weight:bold;cursor:pointer;}}
   .undo-btn:hover{{background:#000;}}
@@ -5544,7 +5548,7 @@ window.undoReject = function(sid) {{
   var cardEl = document.getElementById('card-' + escapeHtml(sid));
 
   if (cardEl) {{
-      cardEl.classList.remove('committed-rej', 'poor-img-rej', 'brand-image-rej', 'pot-restricted-rej');
+      cardEl.classList.remove('committed-rej', 'queued-rej', 'poor-img-rej', 'brand-image-rej', 'pot-restricted-rej');
 
       var overlay = cardEl.querySelector('.rej-overlay');
       if (overlay) overlay.remove();
@@ -5641,7 +5645,16 @@ function _applyBatchReject(br) {{
     var el = grid ? grid.querySelector('#card-' + escapeHtml(s)) : null;
     if (!el) continue;
     el.classList.remove('selected', 'staged-rej');
-    el.classList.add('committed-rej');
+    el.classList.add('committed-rej', 'queued-rej');
+    var wrap = el.querySelector('.card-img-wrap');
+    if (wrap && !wrap.querySelector('.rej-overlay.queued')) {{
+      var queuedOverlay = document.createElement('div');
+      queuedOverlay.className = 'rej-overlay queued';
+      var reasonText = String(payload[s] || 'Poor image').replace(/_/g, ' ');
+      if (reasonText === 'REJECT POOR IMAGE') reasonText = LABELS.poor_img || 'Poor image';
+      queuedOverlay.innerHTML = '<div class="rej-badge">Queued</div><div class="rej-label">' + escapeHtml(reasonText) + '</div>';
+      wrap.appendChild(queuedOverlay);
+    }}
     // Dim the card visually so the user gets instant feedback
     el.style.opacity = '0.55';
     // One-shot ring so a bulk reject reads as an event, not a silent
