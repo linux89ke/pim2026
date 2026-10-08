@@ -3591,6 +3591,42 @@ _WEBSITE_RE = re.compile(
 # after extraction as well as bare-domain false positives.
 _WEBSITE_FALSE_POSITIVE_DOMAINS = frozenset({"fl.oz"})
 
+# Official manufacturer/platform domains are legitimate when the listing is
+# clearly for that product.  These aliases cover common cases where the title
+# uses a model shorthand (for example PS4) instead of the domain's brand name.
+_PRODUCT_DOMAIN_ALIASES = {
+    "playstation": ("playstation", "ps4", "ps5", "sony"),
+    "xbox": ("xbox", "series x", "series s", "microsoft"),
+    "nintendo": ("nintendo", "switch", "wii"),
+}
+
+
+def _website_belongs_to_product(term: str, row: pd.Series) -> bool:
+    """Return whether an external website is the product's own brand site."""
+    value = str(term or "").strip().lower()
+    value = re.split(r"[\s\]\)\}>,'\";]+", value, maxsplit=1)[0]
+    value = re.sub(r"^(?:https?://|www\.)", "", value)
+    host = value.split("/", 1)[0].rstrip(".")
+    labels = [part for part in host.split(".") if part]
+    if len(labels) < 2:
+        return False
+    domain = labels[-2].replace("-", " ")
+    if domain in {"co", "com", "net", "org"} and len(labels) >= 3:
+        domain = labels[-3].replace("-", " ")
+
+    product_text = " ".join(
+        str(row.get(column, ""))
+        for column in ("NAME", "BRAND")
+        if column in row.index
+    ).lower()
+    product_compact = re.sub(r"[^a-z0-9]+", " ", product_text)
+    aliases = _PRODUCT_DOMAIN_ALIASES.get(domain, (domain,))
+    return any(
+        re.search(r"(?<![a-z0-9])" + re.escape(alias.lower()) + r"(?![a-z0-9])", product_compact)
+        for alias in aliases
+        if alias
+    )
+
 
 def _is_website_false_positive(term: str) -> bool:
     """Return True for an explicitly allowed example/placeholder domain."""
@@ -3887,6 +3923,7 @@ def check_offplatform_contact(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
                     terms = sorted({
                         m.strip() for m in kind_re.findall(text)
                         if m and m.strip() and not _is_platform_url(m)
+                        and not (kind_label == "website" and _website_belongs_to_product(m, data.loc[idx]))
                         and not (kind_label == "website" and _is_bare_domain_false_positive(m))
                     })
                 if terms:
