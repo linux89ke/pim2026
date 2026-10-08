@@ -183,6 +183,22 @@ SEXUAL_WELLNESS_FDA_TERMS = [
     }
 ]
 
+# Adult toys and games are handled by the product/category policy. They are
+# not FDA-document products. Keep this exclusion separate from the FDA keyword
+# list because terms such as "orgasm", "g-spot", and "vibrator" can appear in
+# a toy title and would otherwise make the FDA rule fire before the category
+# policy gets a chance to classify it.
+SEXUAL_WELLNESS_FDA_TOY_TERMS = [
+    "sex toy", "sex toys", "adult toy", "adult toys", "sex game", "sex games",
+    "dildo", "vibrator", "vibrating", "masturbator", "clitoral stimulator",
+    "suction toy", "bullet toy", "rabbit vibrator", "g-spot vibrator",
+    "penis pump", "penis ring", "nipple clamps", "butt plug",
+]
+
+SEXUAL_WELLNESS_FDA_TOY_CATEGORY_TERMS = [
+    "adult toys", "adult toy", "sex toys", "sex games", "sexual wellness toys",
+]
+
 # Matched against BRAND, not NAME. Nigeria's restricted list already carries
 # "Titan" as a brand in its own right, separate from "Titan Gel", so the brand
 # field is a real signal and not a guess.
@@ -566,6 +582,23 @@ def _make_fda_check(rule, except_codes: set):
                     hit |= data[_cat_col].fillna("").astype(str).str.contains(category_pat, na=False)
         if except_codes and "CATEGORY_CODE" in data.columns:
             hit &= ~_cat_series(data).isin(except_codes)
+        # Do not send toys or games to the FDA queue. This is deliberately
+        # applied after the normal keyword/category match so a toy that also
+        # contains words such as "orgasm" or "g-spot" is still classified by
+        # the product/category rule, but never rejected for a missing FDA
+        # registration number.
+        if getattr(rule, "id", "") == "sexual-wellness-needs-fda":
+            toy_pat = _keyword_pattern(SEXUAL_WELLNESS_FDA_TOY_TERMS, "substring")
+            toy_hit = _text_hit(data, toy_pat, None)
+            if toy_hit is None:
+                toy_hit = pd.Series(False, index=data.index)
+            for _cat_col in ("CATEGORY", "FULL_CATEGORY_PATH", "CATEGORY_PATH"):
+                if _cat_col in data.columns:
+                    toy_hit |= data[_cat_col].fillna("").astype(str).str.contains(
+                        _keyword_pattern(SEXUAL_WELLNESS_FDA_TOY_CATEGORY_TERMS, "substring"),
+                        na=False,
+                    )
+            hit &= ~toy_hit
         hit &= _fda_missing(data)
         cmt = rule.comment
         if getattr(rule, "overturned", False):
