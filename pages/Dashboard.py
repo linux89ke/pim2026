@@ -15,6 +15,7 @@ import r2_storage
 from learned_rules import (
     LEARNABLE_FLAGS,
     delete_learned_image_rules,
+    deduplicate_learned_image_rules,
     load_learned_image_rules,
     learn_image_rejections_bulk,
     normalize_learned_flag,
@@ -83,6 +84,69 @@ def _load_dashboard_catalog(mtime_ns: int, day_key: str) -> pd.DataFrame:
 
 
 _stored_df = _load_dashboard_catalog(_rules_mtime_ns, datetime.now(timezone.utc).date().isoformat())
+
+# Exact pHash audit: CDN URLs can differ while the downloaded image is the
+# same. Keep the flag in the grouping key so one image can still have separate
+# review reasons. Near-pHash matches remain review candidates and are never
+# deleted automatically here. Build the preview with vectorized pandas work;
+# do not convert the entire catalog to Python dictionaries on every rerun.
+_duplicate_rule_groups = []
+if not _stored_df.empty:
+    _dup_view = _stored_df.copy()
+    _dup_phash = _dup_view["phash"] if "phash" in _dup_view.columns else pd.Series("", index=_dup_view.index)
+    _dup_url = _dup_view["image_url"] if "image_url" in _dup_view.columns else pd.Series("", index=_dup_view.index)
+    if "image_url" not in _dup_view.columns:
+        _dup_view["image_url"] = ""
+    _dup_view["_dedupe_key"] = _dup_phash.fillna("").astype(str).str.strip()
+    _dup_view["_dedupe_key"] = _dup_view["_dedupe_key"].mask(
+        _dup_view["_dedupe_key"].eq(""), _dup_url.fillna("").astype(str).str.strip()
+    )
+    _dup_view["_key_type"] = _dup_phash.fillna("").astype(str).str.strip().ne("").map({True: "Exact pHash", False: "Exact URL"})
+    _dup_flag = _dup_view["flag"] if "flag" in _dup_view.columns else pd.Series("", index=_dup_view.index)
+    _dup_view["_flag_key"] = _dup_flag.fillna("").astype(str)
+    _dup_view["_dedupe_key"] = _dup_view["_dedupe_key"].replace({"": pd.NA, "nan": pd.NA})
+    _dup_view = _dup_view.dropna(subset=["_dedupe_key"])
+    if not _dup_view.empty:
+        _dup_counts = (
+            _dup_view.groupby(["_dedupe_key", "_flag_key", "_key_type"], dropna=False)
+            .agg(Rules=("_dedupe_key", "size"), URLs=("image_url", "nunique"))
+            .reset_index()
+        )
+        _dup_counts = _dup_counts[_dup_counts["Rules"] > 1]
+        _duplicate_rule_groups = [
+            {"match_type": str(row["_key_type"]), "flag": str(row["_flag_key"]), "count": int(row["Rules"]), "urls": [""] * int(row["URLs"]), "phash": str(row["_dedupe_key"]) if str(row["_key_type"]) == "Exact pHash" else "" }
+            for _, row in _dup_counts.iterrows()
+        ]
+if _duplicate_rule_groups:
+    with st.expander(
+        f"Image duplicate audit · {sum(max(0, g['count'] - 1) for g in _duplicate_rule_groups):,} redundant rule(s)",
+        expanded=False,
+    ):
+        _dup_preview = pd.DataFrame([
+            {
+                "Match": group["match_type"],
+                "Flag": group["flag"],
+                "Rules": group["count"],
+                "URLs": len(group["urls"]),
+                "pHash": group["phash"] or "—",
+            }
+            for group in _duplicate_rule_groups[:200]
+        ])
+        st.caption("These are exact URL or exact pHash duplicates. Different URLs with the same pHash are included.")
+        st.dataframe(_dup_preview, hide_index=True, width="stretch")
+        _duplicate_total = sum(max(0, group["count"] - 1) for group in _duplicate_rule_groups)
+        if st.button(
+            f"Remove {_duplicate_total:,} redundant exact duplicates",
+            icon=":material/cleaning_services:",
+            type="secondary",
+            key="dedupe_learned_exact_images",
+        ):
+            _removed_duplicates = deduplicate_learned_image_rules()
+            st.session_state["_learned_import_notice"] = (
+                f"Removed {_removed_duplicates:,} redundant exact image rule(s)."
+            )
+            st.rerun()
+
 _undo_history = st.session_state.get("_learned_rule_undo_history", [])
 _undo_rules = _undo_history[-1] if _undo_history else st.session_state.get("_learned_rule_undo", [])
 if _undo_rules and st.button(

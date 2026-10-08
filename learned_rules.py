@@ -220,6 +220,59 @@ def delete_learned_image_rules(rules) -> int:
         return removed
 
 
+def audit_duplicate_learned_image_rules(rules=None) -> list[dict]:
+    """Return exact-pHash duplicate groups without changing the catalog.
+
+    A URL is not part of the grouping key: the same downloaded image can have
+    different CDN URLs. Flags remain part of the key because one image may
+    legitimately carry separate review reasons. Rules without a pHash are
+    reported only when their URL is repeated exactly.
+    """
+    current = list(rules if rules is not None else load_learned_image_rules())
+    groups = {}
+    for index, rule in enumerate(current):
+        if not isinstance(rule, dict):
+            continue
+        phash = str(rule.get("phash", "") or "").strip().casefold()
+        url = str(rule.get("image_url", "") or "").strip()
+        flag = normalize_learned_flag(rule.get("flag", ""))
+        key = ("phash", phash, flag) if phash else ("url", url, flag) if url else None
+        if key is not None:
+            groups.setdefault(key, []).append((index, rule))
+    duplicates = []
+    for key, entries in groups.items():
+        if len(entries) < 2:
+            continue
+        duplicates.append({
+            "match_type": "Exact pHash" if key[0] == "phash" else "Exact URL",
+            "phash": key[1] if key[0] == "phash" else "",
+            "flag": key[2],
+            "count": len(entries),
+            "urls": sorted({str(row.get("image_url", "")).strip() for _, row in entries if row.get("image_url")}),
+            "rules": [row for _, row in entries],
+        })
+    duplicates.sort(key=lambda item: item["count"], reverse=True)
+    return duplicates
+
+
+def deduplicate_learned_image_rules(rules=None) -> int:
+    """Remove redundant exact URL/pHash rules, retaining one per group."""
+    groups = audit_duplicate_learned_image_rules(rules)
+    remove = []
+    for group in groups:
+        entries = list(group.get("rules", []))
+        # Prefer a confirmed rule, then the most recently confirmed/matched,
+        # then the most recently created record so useful audit metadata wins.
+        entries.sort(key=lambda row: (
+            str(row.get("review_state", "")).casefold() == "confirmed",
+            str(row.get("last_confirmed_at", "") or ""),
+            str(row.get("last_matched_at", "") or ""),
+            str(row.get("created_at", "") or ""),
+        ), reverse=True)
+        remove.extend(entries[1:])
+    return delete_learned_image_rules(remove)
+
+
 def remove_learned_rules_by_flag(flag: str) -> int:
     """Remove all learned image rules for a flag that is now validator-owned."""
     canonical = normalize_learned_flag(flag)
