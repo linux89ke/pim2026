@@ -372,8 +372,17 @@ async def submit_validation(background_tasks: BackgroundTasks, file: UploadFile 
     fhash = _file_hash(file_bytes)
     rkey = _result_key(fhash, country)
     r = await get_redis()
-    if await r.exists(rkey + ":summary") and await r.exists(rkey + ":report") and await r.exists(rkey + ":data"):
+    _cached_report = await r.get(rkey + ":report")
+    _cached_data = await r.get(rkey + ":data")
+    if (
+        await r.exists(rkey + ":summary")
+        and _read_result_artifact(_cached_report) is not None
+        and _read_result_artifact(_cached_data) is not None
+    ):
         return SubmitResponse(job_id=f"cached-{fhash[:8]}", cache_hit=True, message="Cached")
+    # Discard stale Redis entries created before artifacts moved out of Redis.
+    if await r.exists(rkey + ":summary"):
+        await r.delete(rkey + ":report", rkey + ":data", rkey + ":summary")
 
     job_id = str(uuid.uuid4())
     # Atomically claim the in-flight slot for this file+country. If another
@@ -401,7 +410,11 @@ async def get_summary(country: str, file_hash: str):
     r = await get_redis()
     raw = await r.get(_result_key(file_hash, country) + ":summary")
     if not raw: raise HTTPException(404)
-    return ValidationSummary(**json.loads(raw))
+    try:
+        return ValidationSummary(**json.loads(raw))
+    except (TypeError, json.JSONDecodeError):
+        # Backward compatibility for summaries written before the JSON format.
+        return ValidationSummary(**pickle.loads(raw))
 
 @app.get("/result/report/{country}/{file_hash}")
 async def get_report(country: str, file_hash: str):
