@@ -1,0 +1,16 @@
+# FastAPI service dependencies — api.py / run_api.py only.
+#
+# None of these load during a Streamlit run (verified against a real batch:
+# fastapi, uvicorn and redis were all absent from sys.modules afterwards).
+# Keeping them out of requirements.txt shrinks the Streamlit Cloud image and
+# shortens the component scan at startup.
+#
+# Install alongside the app's own requirements when running the API:
+#     pip install -r requirements.txt -r requirements-api.txt
+
+fastapi
+uvicorn[standard]
+redis>=5.0.0
+
+# Not imported directly; FastAPI needs it to parse multipart form uploads.
+python-multipart

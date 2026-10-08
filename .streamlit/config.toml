@@ -1,0 +1,42 @@
+# Applies to BOTH local runs and Streamlit Cloud.
+#
+# Previously all tuning lived in CLI flags in .claude/launch.json, which Cloud
+# never sees — so Cloud silently ran on defaults (200MB uploads, file watching
+# on, etc.). Settings that belong to the app itself live here instead.
+
+[server]
+# 200MB, not 500. The uploaded ZIP is held in session state in full — it is the
+# single largest thing this app keeps in memory — and Streamlit Cloud's
+# container is small enough that a big batch can push it into an OOM restart,
+# which drops the session and takes the grid's images with it. Raising this to
+# match the local launch flag was a mistake on a host that cannot afford it.
+# Raise it only alongside somewhere durable to put the bytes.
+maxUploadSize = 200
+
+# The app directory holds the on-disk caches (app_cache_flags/,
+# app_cache_parquet/), a 23MB sqlite DB and a 27MB model pickle. Watching all of
+# that costs CPU for nothing: none of it is source code, and rules files are
+# picked up via mtime checks rather than by the watcher. "poll" would be worse
+# still — it hashes watched files on a timer.
+fileWatcherType = "none"
+
+# Only relevant locally; Cloud terminates TLS and sets these itself.
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+# Streamlit's "magic" re-parses the script AST to auto-display bare expressions.
+# This app renders everything explicitly through st.* calls, so the parse is
+# pure overhead on a 4,700-line script.
+magicEnabled = false
+# Keep partial widget state coherent across the app's many st.rerun() calls.
+fastReruns = true
+
+[client]
+showErrorDetails = true
+
+[theme]
+base = "light"
+primaryColor = "#FF8800"
