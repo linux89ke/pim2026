@@ -62,6 +62,7 @@ _WRITER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="learned-rules")
 _REMOTE_RULES = None
 _REMOTE_RULES_FETCHED_AT = 0.0
 _REMOTE_RULES_TTL = 60.0
+_REMOTE_RULES_SUSPICIOUS = False
 _PAGE_RULE_CACHE = OrderedDict()
 _PAGE_RULE_CACHE_MAX = 64
 _LOG = logging.getLogger(__name__)
@@ -104,14 +105,45 @@ def _load_locked() -> list:
     return _RULES
 
 
+def _local_rule_count() -> int:
+    """Read only the local catalog size without changing the in-memory cache."""
+    try:
+        with RULES_PATH.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        return len(value) if isinstance(value, list) else 0
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
 def load_learned_image_rules() -> list:
-    global _REMOTE_RULES, _REMOTE_RULES_FETCHED_AT
+    global _REMOTE_RULES, _REMOTE_RULES_FETCHED_AT, _REMOTE_RULES_SUSPICIOUS
     if supabase_store.enabled():
         now = time.monotonic()
+        if _REMOTE_RULES_SUSPICIOUS and now - _REMOTE_RULES_FETCHED_AT < _REMOTE_RULES_TTL:
+            # A previous fetch looked like a truncated remote catalog. Keep
+            # using the known-good local snapshot until it is repaired.
+            with _LOCK:
+                return list(_load_locked())
         if _REMOTE_RULES is None or now - _REMOTE_RULES_FETCHED_AT >= _REMOTE_RULES_TTL:
             try:
-                _REMOTE_RULES = supabase_store.fetch_all("learned_image_rules")
+                _fetched = supabase_store.fetch_all("learned_image_rules")
                 _REMOTE_RULES_FETCHED_AT = now
+                _local_count = _local_rule_count()
+                # Never let a partial cloud migration replace a substantially
+                # larger local catalog during an edit/import. A real remote
+                # catalog may be larger or the local file may be absent; only
+                # reject an implausibly small remote result.
+                if _local_count >= 100 and len(_fetched) < max(25, int(_local_count * 0.5)):
+                    _REMOTE_RULES = None
+                    _REMOTE_RULES_SUSPICIOUS = True
+                    _LOG.error(
+                        "Refusing partial Supabase learned catalog (%s rules vs %s local); "
+                        "repair the cloud catalog before saving learned data.",
+                        len(_fetched), _local_count,
+                    )
+                else:
+                    _REMOTE_RULES = _fetched
+                    _REMOTE_RULES_SUSPICIOUS = False
             except Exception as exc:
                 _LOG.warning("Could not read Supabase learned rules; using local fallback: %s", exc)
                 _REMOTE_RULES = None
@@ -168,9 +200,10 @@ def _remote_upsert_rules(records: list[dict]) -> None:
                     # A pre-existing URL/flag row is already synchronized.
                     if "409" not in str(_insert_exc) and "duplicate" not in str(_insert_exc).lower():
                         raise
-        global _REMOTE_RULES, _REMOTE_RULES_FETCHED_AT
+        global _REMOTE_RULES, _REMOTE_RULES_FETCHED_AT, _REMOTE_RULES_SUSPICIOUS
         _REMOTE_RULES = None
         _REMOTE_RULES_FETCHED_AT = 0.0
+        _REMOTE_RULES_SUSPICIOUS = False
         _clear_page_rule_cache()
     except Exception as exc:
         _LOG.warning("Could not write learned rules to Supabase: %s", exc)
