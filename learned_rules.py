@@ -14,6 +14,7 @@ import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -61,7 +62,13 @@ _WRITER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="learned-rules")
 _REMOTE_RULES = None
 _REMOTE_RULES_FETCHED_AT = 0.0
 _REMOTE_RULES_TTL = 60.0
+_PAGE_RULE_CACHE = OrderedDict()
+_PAGE_RULE_CACHE_MAX = 64
 _LOG = logging.getLogger(__name__)
+
+
+def _clear_page_rule_cache() -> None:
+    _PAGE_RULE_CACHE.clear()
 
 def _sync_sqlite_locked(rules: list) -> None:
     """Compatibility no-op for callers from the pre-JSON-only implementation."""
@@ -86,6 +93,7 @@ def _load_locked() -> list:
         mtime = 0.0
     if mtime == _RULES_MTIME:
         return _RULES
+    _clear_page_rule_cache()
     try:
         with RULES_PATH.open("r", encoding="utf-8") as handle:
             loaded = json.load(handle)
@@ -139,6 +147,7 @@ def _remote_upsert_rules(records: list[dict]) -> None:
         global _REMOTE_RULES, _REMOTE_RULES_FETCHED_AT
         _REMOTE_RULES = None
         _REMOTE_RULES_FETCHED_AT = 0.0
+        _clear_page_rule_cache()
     except Exception as exc:
         _LOG.warning("Could not write learned rules to Supabase: %s", exc)
 
@@ -161,6 +170,7 @@ def _remote_delete_rules(records: list[dict]) -> None:
         global _REMOTE_RULES, _REMOTE_RULES_FETCHED_AT
         _REMOTE_RULES = None
         _REMOTE_RULES_FETCHED_AT = 0.0
+        _clear_page_rule_cache()
     except Exception as exc:
         _LOG.warning("Could not delete learned rules from Supabase: %s", exc)
 
@@ -377,6 +387,11 @@ def load_learned_image_rules_for_urls(urls) -> list[dict]:
     }
     if not wanted:
         return []
+    cache_key = tuple(sorted(wanted))
+    cached = _PAGE_RULE_CACHE.get(cache_key)
+    if cached is not None:
+        _PAGE_RULE_CACHE.move_to_end(cache_key)
+        return list(cached)
     if supabase_store.enabled():
         try:
             fields = ",".join(sorted(_REMOTE_RULE_COLUMNS))
@@ -391,14 +406,23 @@ def load_learned_image_rules_for_urls(urls) -> list[dict]:
                     {"image_url": "in.(" + ",".join(chunk) + ")"},
                     select=fields,
                 ))
-            return out
+            _PAGE_RULE_CACHE[cache_key] = list(out)
+            _PAGE_RULE_CACHE.move_to_end(cache_key)
+            while len(_PAGE_RULE_CACHE) > _PAGE_RULE_CACHE_MAX:
+                _PAGE_RULE_CACHE.popitem(last=False)
+            return list(out)
         except Exception as exc:
             _LOG.warning("Could not query learned rules for current images: %s", exc)
     with _LOCK:
-        return [
+        out = [
             rule for rule in load_learned_image_rules()
             if str(rule.get("image_url", "")).strip() in wanted
         ]
+        _PAGE_RULE_CACHE[cache_key] = list(out)
+        _PAGE_RULE_CACHE.move_to_end(cache_key)
+        while len(_PAGE_RULE_CACHE) > _PAGE_RULE_CACHE_MAX:
+            _PAGE_RULE_CACHE.popitem(last=False)
+        return out
 
 
 def learn_image_rejections(

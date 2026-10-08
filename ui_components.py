@@ -6932,9 +6932,9 @@ def visual_review_modal(support_files):
                     if url.startswith("https") and url not in seen_urls:
                         seen_urls.add(url)
                         prefetch_urls.append(url)
-                        if len(prefetch_urls) >= 100:
+                        if len(prefetch_urls) >= 24:
                             break
-                    if len(prefetch_urls) >= 100:
+                    if len(prefetch_urls) >= 24:
                         break
             _prefetch_cache[_prefetch_cache_key] = prefetch_urls
             _prefetch_cache.move_to_end(_prefetch_cache_key)

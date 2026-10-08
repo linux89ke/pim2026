@@ -8632,7 +8632,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                             st.session_state["_grid_review_data_cache"] = _review_data
                             _warm_urls: set = set()
                             if "MAIN_IMAGE" in _review_data.columns:
-                                for _url in _review_data.iloc[: 50 * 2]["MAIN_IMAGE"].astype(str):
+                                for _url in _review_data.iloc[: 24]["MAIN_IMAGE"].astype(str):
                                     _url = _url.strip().replace("http://", "https://", 1)
                                     if _url.startswith("https"): _warm_urls.add(_url)
                             st.session_state["_grid_warm_urls"] = list(_warm_urls)
