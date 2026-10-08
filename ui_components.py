@@ -851,12 +851,24 @@ def _add_sids_to_post_qc_results(sid_set: set, flag: str, comment: str = "") -> 
         results[base_flag] = base_rows
 
 
+def _preferred_image_series(all_data):
+    """Return the first non-empty image value from IMAGE1/MAIN_IMAGE fields."""
+    if all_data is None:
+        return None
+    cols = [c for c in ("IMAGE1", "MAIN_IMAGE", "image1", "IMAGE_URL") if c in all_data.columns]
+    if not cols:
+        return None
+    values = all_data[cols].replace(r"^\s*$", pd.NA, regex=True)
+    return values.bfill(axis=1).iloc[:, 0]
+
+
 def _get_image_maps(all_data):
     if "_image_maps" not in st.session_state or st.session_state.get("_image_maps_df_id") != id(all_data):
-        if all_data is None or "PRODUCT_SET_SID" not in all_data.columns or "IMAGE1" not in all_data.columns:
+        _images = _preferred_image_series(all_data)
+        if all_data is None or "PRODUCT_SET_SID" not in all_data.columns or _images is None:
             st.session_state["_image_maps"] = ({}, {})
         else:
-            sid_to_img = dict(zip(all_data["PRODUCT_SET_SID"].astype(str).str.strip(), all_data["IMAGE1"]))
+            sid_to_img = dict(zip(all_data["PRODUCT_SET_SID"].astype(str).str.strip(), _images))
             img_to_sids = {}
             for sid, img in sid_to_img.items():
                 if pd.isna(img) or not str(img).strip():
@@ -974,6 +986,7 @@ def _get_phash_maps(all_data):
     keys lets the cascade find near hashes within the shared conservative
     distance threshold without comparing every product pair.
     """
+    _images = _preferred_image_series(all_data)
     if (
         "_phash_maps" in st.session_state
         and st.session_state.get("_phash_maps_df_id") == id(all_data)
@@ -985,12 +998,12 @@ def _get_phash_maps(all_data):
         all_data is None
         or not hash_by_url
         or "PRODUCT_SET_SID" not in getattr(all_data, "columns", [])
-        or "MAIN_IMAGE" not in getattr(all_data, "columns", [])
+        or _images is None
     ):
         maps = ({}, {})
     else:
         sids = all_data["PRODUCT_SET_SID"].astype(str).str.strip()
-        imgs = all_data["MAIN_IMAGE"].astype(str)
+        imgs = _images.astype(str)
         sid_to_phash = {}
         phash_to_sids = {}
         for sid, img in zip(sids, imgs):
@@ -1332,12 +1345,11 @@ def apply_status_change(
     _sibling_sids = sorted({s for v in _sibling_map.values() for s in v})
     _severity = flag_severity(flag) if _sibling_sids else None
     _same_category_rule = flag in {"Wrong Category", "Category Check"}
-    _cascadeable = (
-        _severity == "blocker"
-        or flag == "Image Too Many things displayed"
-        or _is_image_rej
-        or _same_category_rule
-    )
+    # Image decisions are powerful but can be seller-specific. Always show a
+    # confirmation with the affected sellers instead of silently rejecting the
+    # whole same-image cluster. Product blockers and same-category decisions
+    # retain their existing automatic propagation behavior.
+    _cascadeable = _severity == "blocker" or _same_category_rule
 
     if _sibling_sids and _cascadeable:
         # Product-level rules travel to matching listings. Wrong Category has
@@ -1378,7 +1390,8 @@ def apply_status_change(
     # no phash was computed yet).  Applies the same name-match guard.
     if _is_image_rej:
         all_data = st.session_state.get("all_data_map")
-        if all_data is not None and "PRODUCT_SET_SID" in all_data.columns and "IMAGE1" in all_data.columns:
+        _images = _preferred_image_series(all_data)
+        if all_data is not None and "PRODUCT_SET_SID" in all_data.columns and _images is not None:
             sid_to_img, img_to_sids = _get_image_maps(all_data)
             _name_map_url = _get_sid_name_map(all_data)
             # snapshot the set BEFORE expanding so we compare against originals
