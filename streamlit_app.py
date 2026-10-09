@@ -8796,6 +8796,23 @@ if _offer:
             f"({_ago}). This upload adds {len(_offer.get('added', []))} file(s).",
             icon=":material/history:",
         )
+        _offer_decisions = _offer.get("decisions")
+        if isinstance(_offer_decisions, pd.DataFrame) and not _offer_decisions.empty:
+            _decision_col = next(
+                (c for c in ("FLAG", "Flag", "Reason", "Comment", "Status") if c in _offer_decisions.columns),
+                None,
+            )
+            if _decision_col:
+                _summary_rows = [
+                    {"Decision": str(reason), "SKUs": int(count)}
+                    for reason, count in _offer_decisions[_decision_col].fillna("(no reason)").astype(str).str.strip().value_counts().items()
+                ]
+                st.dataframe(pd.DataFrame(_summary_rows), hide_index=True, width="stretch")
+            with st.expander(f"View {_pv['matched']:,} matching SKU decisions", expanded=False):
+                _detail_cols = [c for c in ("ProductSetSid", "Status", "FLAG", "Reason", "Comment") if c in _offer_decisions.columns]
+                st.dataframe(_offer_decisions[_detail_cols].head(500), hide_index=True, width="stretch")
+                if len(_offer_decisions) > 500:
+                    st.caption(f"Showing the first 500 of {len(_offer_decisions):,} matching decisions.")
         _m1, _m2, _m3 = st.columns(3)
         _m1.metric("Will be re-applied", f"{_pv['matched']:,}")
         _m2.metric("No longer in report", f"{_pv['missing']:,}",
