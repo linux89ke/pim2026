@@ -2582,6 +2582,7 @@ def render_flag_expander(
                     _gallery_learned = _gallery_row.get("Learned Match", False)
                     _gallery_tag = "Learned rule" if _gallery_learned is True or str(_gallery_learned).casefold() in {"true", "1", "yes"} else ""
                     _gallery_overturned = str(_gallery_row.get("Overturned", "")).strip().casefold() in {"overturned", "🔓 overturned"}
+                    _gallery_url = _gallery_preview_urls[_gallery_idx]
                     _gallery_rule = None
                     if _gallery_tag:
                         _gallery_rule_url = str(_gallery_row.get("Learned Rule URL", "") or "").strip()
@@ -2593,7 +2594,27 @@ def render_flag_expander(
                         if _gallery_rule is None:
                             _gallery_image_url = str(_gallery_row.get("MAIN_IMAGE", "") or "").strip()
                             _gallery_rule = _gallery_rules_by_url.get(_gallery_image_url)
-                    _gallery_url = _gallery_preview_urls[_gallery_idx]
+                    # A cached report can retain learned provenance after the
+                    # page-level rule lookup has expired, especially for a
+                    # pHash match whose stored URL differs from the current
+                    # CDN URL. Keep the action visible by using the recorded
+                    # URL/pHash as the deletion identity; the deletion helper
+                    # will remove every associated catalog record.
+                    if _gallery_tag and _gallery_rule is None:
+                        _fallback_rule_url = str(
+                            _gallery_row.get("Learned Rule URL", "")
+                            or _gallery_row.get("MAIN_IMAGE", "")
+                            or _gallery_url
+                        ).strip()
+                        _fallback_rule_phash = str(
+                            _gallery_row.get("Learned Rule pHash", "") or ""
+                        ).strip()
+                        if _fallback_rule_url or _fallback_rule_phash:
+                            _gallery_rule = {
+                                "image_url": _fallback_rule_url,
+                                "phash": _fallback_rule_phash,
+                                "flag": str(_gallery_row.get("FLAG", title) or title),
+                            }
                     if _gallery_url:
                         st.image(_gallery_url, width=220)
                     else:
