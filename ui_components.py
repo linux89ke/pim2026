@@ -2664,6 +2664,17 @@ def render_flag_expander(
                         if _gallery_brand and _gallery_brand.casefold() not in {"nan", "none"} else ""
                     )
                     if _gallery_tag and _gallery_rule:
+                        _identity_urls = {str(_gallery_rule.get("image_url", "") or "").strip(), str(_gallery_url or "").strip()}
+                        _identity_phash = str(_gallery_rule.get("phash", "") or "").strip()
+                        _other_learned_reasons = sorted({
+                            str(_r.get("flag", "")).strip() for _r in _gallery_learned_rules
+                            if isinstance(_r, dict)
+                            and str(_r.get("flag", "")).strip()
+                            and ((str(_r.get("image_url", "")).strip() in _identity_urls and str(_r.get("image_url", "")).strip())
+                                 or (_identity_phash and str(_r.get("phash", "")).strip() == _identity_phash))
+                        })
+                        if len(_other_learned_reasons) > 1:
+                            st.caption("Other learned reasons remain: " + ", ".join(_other_learned_reasons))
                         _select_key = "select_learned_preview_" + hashlib.md5(
                             f"{title}|{_gallery_sid}".encode("utf-8", "ignore")
                         ).hexdigest()[:12]
@@ -2687,7 +2698,7 @@ def render_flag_expander(
                                 st.session_state.display_df_cache = {}
                                 st.session_state.pop("_learned_image_rule_map_cache", None)
                                 st.toast(
-                                    "Learned image rule removed. Run validation again to refresh this product's verdict.",
+                                    "Learned reason removed. Other learned reasons and normal validators can still reject this product; rerun validation to refresh its verdict.",
                                     icon=":material/check_circle:",
                                 )
                                 st.rerun()

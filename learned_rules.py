@@ -54,6 +54,22 @@ FLAG_ALIASES = {
     "suspected counterfeit jersey": "Suspected counterfeit Jerseys",
     "suspected counterfeit jerseys": "Suspected counterfeit Jerseys",
 }
+# When one image has several learned reasons, generic poor-image quality is
+# the least specific explanation. Keep it as a fallback so a more specific
+# learned reason remains visible and actionable after one reason is removed.
+_LEARNED_FLAG_PRIORITY = {
+    "Poor images": 10,
+    "Image Stretched": 30,
+    "Image Blurry": 30,
+    "Image Mismatch": 40,
+    "Image Too Many things displayed": 40,
+    "Image Infringing": 50,
+    "Restricted brands": 60,
+    "Brand Image Mismatch": 60,
+    "Suspected Fake product": 70,
+    "Counterfeit Sneakers": 70,
+    "Suspected counterfeit Jerseys": 70,
+}
 
 _LOCK = threading.RLock()
 _RULES_MTIME = -1.0
@@ -530,7 +546,9 @@ def load_learned_image_rule_index() -> dict:
         entry = {"flag": flag, "brand": rule.get("brand_infringed", "") or rule.get("brand", ""), "url": rule.get("image_url", ""), "phash": rule.get("phash", ""), "source": "json"}
         for key in (str(rule.get("image_url", "")).strip(), str(rule.get("phash", "")).strip()):
             if key:
-                by_key[key] = entry
+                _old = by_key.get(key)
+                if _old is None or _LEARNED_FLAG_PRIORITY.get(flag, 50) >= _LEARNED_FLAG_PRIORITY.get(str(_old.get("flag", "")), 50):
+                    by_key[key] = entry
         flag_counts[flag] = flag_counts.get(flag, 0) + 1
         seller = str(rule.get("seller_name", "")).strip()
         if seller:
