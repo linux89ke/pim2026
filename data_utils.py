@@ -536,6 +536,21 @@ def _detect_and_read_csv(buf) -> pd.DataFrame:
         detected_enc = 'latin1'
         sample_text = sample_bytes.decode('latin1', errors='replace')
 
+    # Product exports are overwhelmingly UTF-8/CSV with a comma header. Take
+    # the direct parser path when the header clearly contains product fields;
+    # the broader encoding/separator sniff remains available for arbitrary
+    # historical reports and unusual delimiters.
+    _header = sample_text.splitlines()[0] if sample_text.splitlines() else ""
+    _header_upper = _header.upper()
+    if "," in _header and any(token in _header_upper for token in ("PRODUCT_SET_SID", "PRODUCT SET SID", "PARENTSKU")):
+        try:
+            return pd.read_csv(
+                BytesIO(raw_bytes), sep=",", encoding=detected_enc or "utf-8",
+                dtype=str, on_bad_lines="skip",
+            )
+        except Exception:
+            pass
+
     candidate_seps = [',', ';', '\t']
     if sample_text:
         try:

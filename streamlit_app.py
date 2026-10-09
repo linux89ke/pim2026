@@ -58,7 +58,9 @@ def get_image_session() -> requests.Session:
     global _IMAGE_SESSION
     if _IMAGE_SESSION is None:
         s = requests.Session()
-        retry = Retry(total=2, backoff_factor=0.3, status_forcelist=[500, 502, 503])
+        # One bounded retry prevents a handful of dead CDN URLs from holding a
+        # large validation open for multiple backoff rounds.
+        retry = Retry(total=1, backoff_factor=0.15, status_forcelist=[500, 502, 503], raise_on_status=False)
         adapter = HTTPAdapter(
             max_retries=retry,
             pool_connections=50,  # keep 50 TCP connections alive
@@ -1050,7 +1052,7 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
         session = get_image_session()
         try:
             # Bumping timeout to 15s to handle internal CDNs like vendorcenter.jumia.com
-            r = session.get(url.replace("http://", "https://"), timeout=15)
+            r = session.get(url.replace("http://", "https://"), timeout=(3.05, 8))
             if r.status_code == 200:
                 raw = r.content
                 size, ph = _size_and_phash(raw)
@@ -5520,6 +5522,7 @@ def validate_products(
     skip_validators: Optional[List[str]] = None,
     on_progress: Optional[callable] = None,
     full_batch: Optional[pd.DataFrame] = None,
+    duplicate_batch_sig: str = "",
 ):
     _pipeline_started = time.perf_counter()
     data = data.copy()
@@ -6212,29 +6215,24 @@ def validate_products(
     def _prepare_duplicate_precomputed():
         """Build the batch-wide duplicate result after image hashes are ready."""
         nonlocal _duplicate_precomputed
+        # Duplicate groups are upload-wide. Compute them once from the full
+        # upload and reuse the cached result for every validation chunk; the
+        # final report still intersects the result with the current chunk.
+        # Filtering by rejected_sids here changed the cache key on every chunk
+        # and caused duplicate preparation to repeat unnecessarily.
         _duplicate_source = full_batch if full_batch is not None else data
         _duplicate_rows = data
-        # A product already rejected by a cheap validator cannot improve the
-        # final status of a surviving product. Excluding those SIDs keeps the
-        # expensive duplicate grouping focused on candidates while retaining
-        # cross-file duplicate detection among the remaining products.
-        if rejected_sids and isinstance(_duplicate_source, pd.DataFrame) and "PRODUCT_SET_SID" in _duplicate_source.columns:
-            _duplicate_source = _duplicate_source[
-                ~_duplicate_source["PRODUCT_SET_SID"].astype(str).isin(rejected_sids)
-            ]
-            _duplicate_rows = data[
-                ~data["PRODUCT_SET_SID"].astype(str).isin(rejected_sids)
-            ]
         if _duplicate_source.empty or _duplicate_rows.empty:
             return
-        try:
-            _duplicate_batch_sig = df_hash(_duplicate_source)
-        except Exception:
-            _duplicate_batch_sig = f"rows-{len(_duplicate_source)}"
+        if not duplicate_batch_sig:
+            try:
+                duplicate_batch_sig = df_hash(_duplicate_source)
+            except Exception:
+                duplicate_batch_sig = f"rows-{len(_duplicate_source)}"
         # Bump this when the duplicate stage's prerequisites change. The v2
         # key prevents an older cache entry (created before image preparation)
         # from hiding image-based duplicates.
-        _duplicate_cache_key = f"dup-v3:{_duplicate_batch_sig}:{len(_duplicate_source)}"
+        _duplicate_cache_key = f"dup-v4:{duplicate_batch_sig}:{len(_duplicate_source)}"
         _duplicate_cache = st.session_state.setdefault("_duplicate_validation_cache", {})
         _duplicate_spec = next((item for item in validations if item[0] == "Duplicate product"), None)
         if not _duplicate_spec or _skipped(_duplicate_spec[0], _duplicate_spec[1]):
@@ -6855,6 +6853,7 @@ def cached_validate_products(
     skip_validators: Optional[List[str]] = None,
     _on_progress: Optional[callable] = None,
     _full_batch: Optional[pd.DataFrame] = None,
+    _duplicate_batch_sig: str = "",
 ):
     country_name = next(
         (
@@ -6873,6 +6872,7 @@ def cached_validate_products(
         skip_validators=skip_validators,
         on_progress=_on_progress,
         full_batch=_full_batch,
+        duplicate_batch_sig=_duplicate_batch_sig,
     )
 
 
@@ -6886,6 +6886,12 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
     sids = data["PRODUCT_SET_SID"].astype(str).str.strip().drop_duplicates().tolist()
     frames, result_parts = [], []
     pending_flags = {}
+    try:
+        _duplicate_batch_sig = df_hash(
+            full_batch if isinstance(full_batch, pd.DataFrame) and not full_batch.empty else data
+        )
+    except Exception:
+        _duplicate_batch_sig = f"rows-{len(full_batch) if isinstance(full_batch, pd.DataFrame) else len(data)}"
     aggregate_timings = {}
     aggregate_stages = {}
     if manifest is not None:
@@ -6950,6 +6956,7 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
                 skip_validators=skip_validators,
                 _on_progress=on_progress,
                 _full_batch=full_batch,
+                _duplicate_batch_sig=_duplicate_batch_sig,
             )
             for _v_name, _v_info in st.session_state.get("validation_timings", {}).items():
                 aggregate_timings.setdefault(_v_name, {"seconds": 0.0, "runs": 0})
@@ -7362,11 +7369,10 @@ with st.sidebar:
     if _CAT_MATCHER_AVAILABLE:
         st.markdown("---")
         st.header("AI Learning", anchor=False)
-        _learn_engine = _get_cat_matcher_engine()
-        _n_corr, _n_neg = _learn_engine.counts()
-        _lc1, _lc2 = st.columns(2)
-        _lc1.metric("Corrections", _n_corr, help="Approved (name → category) pairs the matcher learned from")
-        _lc2.metric("Negatives", _n_neg, help="Categories a human explicitly rejected for a product name — excluded from future suggestions")
+        # Do not open the 30MB learning database on every normal rerun just to
+        # display two counters. The engine is initialized only when the admin
+        # explicitly loads the management tables below.
+        st.caption("Category-learning data is loaded on demand.")
         with st.expander("Manage learned data", expanded=False, type="compact"):
             # Streamlit builds the body of an expander even while it is
             # collapsed, so these two 500-row tables were being queried,
@@ -7375,14 +7381,15 @@ with st.sidebar:
             # panel almost nobody opens. Load them only when asked.
             if not st.session_state.get("_show_learned_data", False):
                 st.caption(
-                    f"{_n_corr:,} corrections · {_n_neg:,} negatives learned. "
-                    "The tables are loaded on demand to keep every other "
-                    "interaction fast."
+                    "Open the entries only when you need to audit or edit them. "
+                    "Loading the tables initializes the category-learning engine."
                 )
                 if st.button("Load entries", key="load_learned_data", width="stretch"):
                     st.session_state._show_learned_data = True
                     st.rerun()
             else:
+                _learn_engine = _get_cat_matcher_engine()
+                _n_corr, _n_neg = _learn_engine.counts()
                 if st.button("Hide entries", key="hide_learned_data", width="stretch"):
                     st.session_state._show_learned_data = False
                     st.rerun()
@@ -7719,8 +7726,17 @@ if st.session_state.get("last_processed_files") != process_signature:
     if process_signature == "empty":
         st.session_state.last_processed_files = "empty"
     else:
-        _engine_for_cache = _get_cat_matcher_engine() if _CAT_MATCHER_AVAILABLE else None
-        _learning_stamp = str(len(_engine_for_cache.learning_db)) if _engine_for_cache else "0"
+        # Do not initialise the large category-learning DB just to decide
+        # whether a cached upload exists. File metadata is a stable, cheap
+        # cache revision and the engine is loaded only on a cache miss.
+        _learning_parts = []
+        for _learning_file in ("cat_learning.db", "cat_learning.db.clf.v1.pkl"):
+            try:
+                _st = os.stat(_learning_file)
+                _learning_parts.append(f"{_learning_file}:{_st.st_size}:{_st.st_mtime_ns}")
+            except OSError:
+                _learning_parts.append(f"{_learning_file}:missing")
+        _learning_stamp = "|".join(_learning_parts)
         sig_hash = hashlib.md5((process_signature + _learning_stamp + PROCESSING_CACHE_VERSION).encode()).hexdigest()
         cached_data = load_df_parquet(f"{sig_hash}_data.parquet")
         cached_data_rows = load_df_parquet(f"{sig_hash}_data_rows.parquet")
