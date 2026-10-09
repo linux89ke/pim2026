@@ -2621,7 +2621,16 @@ def render_flag_expander(
                             }
                     if _gallery_tag and _gallery_rule:
                         _gallery_bulk_rules[_gallery_sid] = _gallery_rule
-                    if _gallery_url:
+                    if _gallery_url and _gallery_tag:
+                        _ring_url = html_lib.escape(str(_gallery_url), quote=True)
+                        st.markdown(
+                            f"<div style='width:220px;height:220px;padding:4px;border:4px solid #dc2626;"
+                            f"border-radius:14px;box-shadow:0 0 0 3px rgba(220,38,38,.18),0 4px 12px rgba(220,38,38,.18);"
+                            f"box-sizing:border-box;background:#fff;'><img src='{_ring_url}' alt='Learned image match' "
+                            f"style='width:100%;height:100%;object-fit:contain;border-radius:8px;'></div>",
+                            unsafe_allow_html=True,
+                        )
+                    elif _gallery_url:
                         st.image(_gallery_url, width=220)
                     else:
                         st.markdown(
@@ -3853,6 +3862,7 @@ def build_fast_grid_html(
      visible even when the card is also dimmed as a committed rejection. */
   .card.learned-rej{{background:#e6f4ff;border-color:#93c5fd;}}
   .card.committed-rej.learned-rej{{background:#e6f4ff;border-color:#60a5fa;opacity:.82;}}
+  .card.learned-rej .card-img-wrap{{border:3px solid #dc2626;box-shadow:0 0 0 3px rgba(220,38,38,.18),0 4px 12px rgba(220,38,38,.16);}}
   .card.committed-rej.learned-rej .rej-overlay{{background:rgba(219,234,254,.88) !important;}}
   .card.manual-review{{border-color:#dc2626;box-shadow:0 0 0 3px rgba(220,38,38,0.25);}}
   .card.zip-card{{border-left:4px solid #3b82f6;box-shadow:-4px 0 8px rgba(59,130,246,0.20);}}
