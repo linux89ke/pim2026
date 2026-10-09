@@ -72,3 +72,4 @@ USB
 Other
 USB HUB
 WRISTWATCH
+Scientific
