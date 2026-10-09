@@ -277,6 +277,49 @@ def delete_learned_image_rules(rules) -> int:
         return removed
 
 
+def delete_associated_learned_image_rules(rules) -> int:
+    """Remove every rule associated with the supplied image identity.
+
+    A single image can be learned more than once under different CDN URLs or
+    flags.  Removing only the displayed URL leaves those aliases active and
+    causes the same product to be rejected again.  Treat a non-empty URL or
+    pHash from any selected rule as the identity and remove all matching
+    records from JSON, the SQLite mirror, and the remote store.
+    """
+    records = [rule for rule in (rules or []) if isinstance(rule, dict)]
+    if not records:
+        return 0
+    urls = {str(rule.get("image_url", "") or "").strip() for rule in records}
+    phashes = {str(rule.get("phash", "") or "").strip().casefold() for rule in records}
+    urls.discard("")
+    phashes.discard("")
+    if not urls and not phashes:
+        return 0
+    with _LOCK:
+        current = list(load_learned_image_rules())
+        removed_records = []
+        kept = []
+        for rule in current:
+            url = str(rule.get("image_url", "") or "").strip()
+            phash = str(rule.get("phash", "") or "").strip().casefold()
+            if (url and url in urls) or (phash and phash in phashes):
+                removed_records.append(rule)
+            else:
+                kept.append(rule)
+        if not removed_records:
+            return 0
+        temp = RULES_PATH.with_suffix(".json.tmp")
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(kept, handle, indent=2, ensure_ascii=False)
+        os.replace(temp, RULES_PATH)
+        global _RULES, _RULES_MTIME
+        _RULES = kept
+        _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
+        _sync_sqlite_locked(_RULES)
+        _remote_delete_rules(removed_records)
+        return len(removed_records)
+
+
 def audit_duplicate_learned_image_rules(rules=None) -> list[dict]:
     """Return exact-pHash duplicate groups without changing the catalog.
 

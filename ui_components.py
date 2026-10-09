@@ -59,6 +59,7 @@ from learned_rules import (
     load_learned_image_rules,
     load_learned_image_rules_for_urls,
     delete_learned_image_rules,
+    delete_associated_learned_image_rules,
 )
 from targeted_audit import targeted_audit_modal
 
@@ -2365,6 +2366,20 @@ def render_flag_expander(
         df_view = df_view.sort_values("CATEGORY", na_position="last")
     df_view = df_view.reset_index(drop=True)
 
+    # In image mode, put learned rejections first so the reviewer can audit
+    # the highest-impact rows immediately.  Stable sorting preserves the
+    # existing category/order within each group.
+    if show_table_images and "Learned Match" in df_view.columns:
+        _learned_sort = df_view["Learned Match"].map(
+            lambda value: 1 if value is True or str(value).strip().casefold() in {"true", "1", "yes", "y"} else 0
+        )
+        df_view = (
+            df_view.assign(_learned_first=_learned_sort)
+            .sort_values("_learned_first", ascending=False, kind="stable")
+            .drop(columns=["_learned_first"])
+            .reset_index(drop=True)
+        )
+
     # The "Source" column is gone. ZIP provenance is already stated twice
     # around this table — in the expander label ("⚡ ZIP") and in the flag
     # header badge — so a whole column repeating it per row was spending the
@@ -2520,9 +2535,22 @@ def render_flag_expander(
         # Keep the table for selection, and add a readable gallery for normal
         # review. It is limited to the current page to avoid extra network work.
         st.markdown("**Image gallery**")
-        _gallery_learned_rules = load_learned_image_rules_for_urls(
-            _preview_urls[: min(len(_preview_urls), 40)]
-        )
+        _GALLERY_PAGE_SIZE = 24
+        _gallery_total = len(df_view)
+        _gallery_pages = max(1, (_gallery_total + _GALLERY_PAGE_SIZE - 1) // _GALLERY_PAGE_SIZE)
+        _gallery_page = st.pagination(_gallery_pages, key=f"flag_gallery_pg_{title}_{_flag_pg}") - 1
+        _gallery_lo = _gallery_page * _GALLERY_PAGE_SIZE
+        _gallery_hi = min(_gallery_lo + _GALLERY_PAGE_SIZE, _gallery_total)
+        st.caption(f"Image review {_gallery_lo + 1:,}–{_gallery_hi:,} of {_gallery_total:,}")
+        _gallery_df = df_view.iloc[_gallery_lo:_gallery_hi].reset_index(drop=True)
+        _gallery_preview_urls = _resolve_preview_urls(_gallery_df)
+        # A pHash match can point at a different CDN URL than the product's
+        # current image. Fetch the stored rule URL as well so the remove
+        # action is available for exact and near-pHash matches alike.
+        _gallery_rule_urls = list(_gallery_preview_urls)
+        if "Learned Rule URL" in _gallery_df.columns:
+            _gallery_rule_urls.extend(_gallery_df["Learned Rule URL"].fillna("").astype(str).tolist())
+        _gallery_learned_rules = load_learned_image_rules_for_urls(_gallery_rule_urls)
         _gallery_rules_by_url = {
             str(_r.get("image_url", "")).strip(): _r
             for _r in _gallery_learned_rules
@@ -2537,14 +2565,14 @@ def render_flag_expander(
             and str(_r.get("status", "active")).casefold() == "active"
             and str(_r.get("phash", "")).strip()
         }
-        _gallery_limit = min(len(df_view), 40)
+        _gallery_limit = len(_gallery_df)
         for _gallery_start in range(0, _gallery_limit, 4):
             _gallery_cols = st.columns(4, gap="small")
             for _gallery_col, _gallery_idx in zip(
                 _gallery_cols, range(_gallery_start, min(_gallery_start + 4, _gallery_limit))
             ):
                 with _gallery_col:
-                    _gallery_row = df_view.iloc[_gallery_idx]
+                    _gallery_row = _gallery_df.iloc[_gallery_idx]
                     _gallery_sid = str(_gallery_row.get("PRODUCT_SET_SID", "")).strip()
                     _gallery_name = str(_gallery_row.get("NAME", "")).strip()
                     _gallery_issue = str(_gallery_row.get("Detected Issue", "")).strip()
@@ -2565,7 +2593,7 @@ def render_flag_expander(
                         if _gallery_rule is None:
                             _gallery_image_url = str(_gallery_row.get("MAIN_IMAGE", "") or "").strip()
                             _gallery_rule = _gallery_rules_by_url.get(_gallery_image_url)
-                    _gallery_url = _preview_urls[_gallery_idx]
+                    _gallery_url = _gallery_preview_urls[_gallery_idx]
                     if _gallery_url:
                         st.image(_gallery_url, width=220)
                     else:
@@ -2610,7 +2638,7 @@ def render_flag_expander(
                             icon=":material/delete:",
                             help="Remove the exact learned image rule matched by this product.",
                         ):
-                            _removed = delete_learned_image_rules([_gallery_rule])
+                            _removed = delete_associated_learned_image_rules([_gallery_rule])
                             if _removed:
                                 st.session_state.display_df_cache = {}
                                 st.session_state.pop("_learned_image_rule_map_cache", None)
@@ -2632,8 +2660,6 @@ def render_flag_expander(
                         f"</div>",
                         unsafe_allow_html=True,
                     )
-        if len(df_view) > _gallery_limit:
-            st.caption(f"Showing {_gallery_limit:,} gallery images from this page; use pagination to view more.")
 
     # Apply the provenance tint in both table modes. Learned rows must remain
     # identifiable while image previews are enabled; previously the image

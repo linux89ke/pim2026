@@ -1183,6 +1183,7 @@ from learned_rules import (
     load_learned_image_rules,
     record_learned_image_matches_async,
     delete_learned_image_rules,
+    delete_associated_learned_image_rules,
     restore_learned_image_rules,
     learn_image_rejections,
     learn_image_rejections_bulk,
@@ -7411,13 +7412,19 @@ with st.sidebar:
                     if _corr_df.empty:
                         st.caption("No learned corrections yet.")
                     else:
+                        _corr_page_size = 50
+                        _corr_pages = max(1, (len(_corr_df) + _corr_page_size - 1) // _corr_page_size)
+                        _corr_page = st.pagination(_corr_pages, key="cat_corr_admin_page") - 1
+                        _corr_lo = _corr_page * _corr_page_size
+                        _corr_page_df = _corr_df.iloc[_corr_lo:_corr_lo + _corr_page_size].reset_index(drop=True)
+                        st.caption(f"Showing corrections {_corr_lo + 1:,}–{min(_corr_lo + len(_corr_page_df), len(_corr_df)):,} of {len(_corr_df):,}")
                         _corr_sel = st.dataframe(
-                            _corr_df, hide_index=True, width='stretch', height=220,
+                            _corr_page_df, hide_index=True, width='stretch', height=220,
                             selection_mode="multi-row", on_select="rerun", key="corr_admin_df",
                         )
                         _corr_rows = _corr_sel.selection.rows if _corr_sel and _corr_sel.selection else []
                         if st.button(f"Delete selected ({len(_corr_rows)})", key="del_corr_btn", disabled=not _corr_rows):
-                            _ids = _corr_df.iloc[_corr_rows]["id"].tolist()
+                            _ids = _corr_page_df.iloc[_corr_rows]["id"].tolist()
                             _n = _learn_engine.delete_corrections(_ids)
                             st.toast(f"Deleted {_n} correction(s)", icon="🗑")
                             st.rerun()
@@ -7426,13 +7433,19 @@ with st.sidebar:
                     if _neg_df.empty:
                         st.caption("No learned negatives yet.")
                     else:
+                        _neg_page_size = 50
+                        _neg_pages = max(1, (len(_neg_df) + _neg_page_size - 1) // _neg_page_size)
+                        _neg_page = st.pagination(_neg_pages, key="cat_neg_admin_page") - 1
+                        _neg_lo = _neg_page * _neg_page_size
+                        _neg_page_df = _neg_df.iloc[_neg_lo:_neg_lo + _neg_page_size].reset_index(drop=True)
+                        st.caption(f"Showing negatives {_neg_lo + 1:,}–{min(_neg_lo + len(_neg_page_df), len(_neg_df)):,} of {len(_neg_df):,}")
                         _neg_sel = st.dataframe(
-                            _neg_df, hide_index=True, width='stretch', height=220,
+                            _neg_page_df, hide_index=True, width='stretch', height=220,
                             selection_mode="multi-row", on_select="rerun", key="neg_admin_df",
                         )
                         _neg_rows = _neg_sel.selection.rows if _neg_sel and _neg_sel.selection else []
                         if st.button(f"Delete selected ({len(_neg_rows)})", key="del_neg_btn", disabled=not _neg_rows):
-                            _ids = _neg_df.iloc[_neg_rows]["id"].tolist()
+                            _ids = _neg_page_df.iloc[_neg_rows]["id"].tolist()
                             _n = _learn_engine.delete_negatives(_ids)
                             st.toast(f"Deleted {_n} negative(s)", icon="🗑")
                             st.rerun()
@@ -9098,10 +9111,30 @@ def handle_jtbridge():
                 if isinstance(_dm, pd.DataFrame) and not _dm.empty and "PRODUCT_SET_SID" in _dm.columns:
                     _row = _dm[_dm["PRODUCT_SET_SID"].astype(str).str.strip().eq(_sid)]
                     if not _row.empty:
-                        _img = str(_row.iloc[0].get("MAIN_IMAGE", "")).strip()
-                        _removed_rules = [r for r in load_learned_image_rules() if str(r.get("image_url", "")).strip() == _img]
+                        _img = ""
+                        for _img_col in ("MAIN_IMAGE", "IMAGE1", "image1", "IMAGE_URL"):
+                            if _img_col in _row.columns:
+                                _candidate_img = str(_row.iloc[0].get(_img_col, "") or "").strip()
+                                if _candidate_img and _candidate_img.casefold() not in {"nan", "none"}:
+                                    _img = _candidate_img
+                                    break
+                        _removed_rules = [
+                            r for r in load_learned_image_rules()
+                            if str(r.get("image_url", "")).strip() == _img
+                        ]
+                        if _removed_rules:
+                            _urls = {str(r.get("image_url", "") or "").strip() for r in _removed_rules}
+                            _hashes = {str(r.get("phash", "") or "").strip().casefold() for r in _removed_rules}
+                            _removed_rules = [
+                                r for r in load_learned_image_rules()
+                                if str(r.get("image_url", "") or "").strip() in _urls
+                                or (
+                                    str(r.get("phash", "") or "").strip().casefold()
+                                    and str(r.get("phash", "") or "").strip().casefold() in _hashes
+                                )
+                            ]
                 if _removed_rules:
-                    _deleted = delete_learned_image_rules(_removed_rules)
+                    _deleted = delete_associated_learned_image_rules(_removed_rules)
                     _undo_history = st.session_state.setdefault("_learned_rule_undo_history", [])
                     _undo_history.append(_removed_rules)
                     del _undo_history[:-10]
