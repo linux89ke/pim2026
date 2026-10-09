@@ -4355,13 +4355,20 @@ function _restoreGridSelection() {{
 }}
 function _saveGridSelection(selectedState, stagedState) {{
   try {{
-    var payload = {{selected: selectedState || {{}}, staged: stagedState || {{}}}};
+    var reasonEl = document.getElementById('batch-reason-bottom');
+    var reason = reasonEl ? String(reasonEl.value || '') : String(window._reviewReason || '');
+    window._reviewReason = reason;
+    var payload = {{selected: selectedState || {{}}, staged: stagedState || {{}}, reason: reason}};
     sessionStorage.setItem('pim_grid_selection', JSON.stringify(payload));
   }} catch(e) {{}}
 }}
 var _savedGridSelection = _restoreGridSelection();
-window._gridSelected = window._gridSelected || _savedGridSelection.selected || {{}};
-window._stagedRejections = window._stagedRejections || _savedGridSelection.staged || {{}};
+// Merge browser state from the previous iframe document rather than choosing
+// one object with `||`. A Streamlit page turn can recreate the document while
+// the previous selection is still the freshest copy in sessionStorage.
+window._gridSelected = Object.assign({{}}, _savedGridSelection.selected || {{}}, window._gridSelected || {{}});
+window._stagedRejections = Object.assign({{}}, _savedGridSelection.staged || {{}}, window._stagedRejections || {{}});
+window._reviewReason = String(_savedGridSelection.reason || 'REJECT_POOR_IMAGE');
 window.currentZoomSid = null;
 window._imageIssues = window._imageIssues || {{}};
 // URLs whose images have already loaded once in this iframe session. Cards with
@@ -4383,6 +4390,14 @@ setTimeout(function() {{
   if (s && PAGE_STATE.search) s.value = PAGE_STATE.search;
   _setMultiSelectValues('seller-filter', PAGE_STATE.sellers);
   _setMultiSelectValues('category-filter', PAGE_STATE.categories);
+  var _reasonEl = document.getElementById('batch-reason-bottom');
+  if (_reasonEl) {{
+    _reasonEl.value = window._reviewReason || _reasonEl.value || 'REJECT_POOR_IMAGE';
+    _reasonEl.addEventListener('change', function() {{
+      window._reviewReason = String(this.value || '');
+      _saveGridSelection(selected, staged);
+    }});
+  }}
 }}, 0);
 
 window._pendingUndos = window._pendingUndos || {{}};
