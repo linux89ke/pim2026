@@ -1,6 +1,18 @@
 @echo off
 cd /d "%~dp0"
 
+:: Configure the RAR extractor for this app process.  WinRAR can be
+:: installed without adding UnRAR.exe to PATH, so set rarfile's explicit
+:: tool path before starting Streamlit (and the optional API server).
+set "UNRAR_TOOL="
+if exist "%ProgramFiles%\WinRAR\UnRAR.exe" set "UNRAR_TOOL=%ProgramFiles%\WinRAR\UnRAR.exe"
+if not defined UNRAR_TOOL if exist "%ProgramFiles(x86)%\WinRAR\UnRAR.exe" set "UNRAR_TOOL=%ProgramFiles(x86)%\WinRAR\UnRAR.exe"
+if defined UNRAR_TOOL (
+    echo RAR extractor: %UNRAR_TOOL%
+) else (
+    echo RAR extractor not found - RAR uploads will show setup instructions.
+)
+
 echo ============================================
 echo  Welcome to PIM QC Tool - Startup 
 echo  In Case of Issue Contact Charles Kireki
