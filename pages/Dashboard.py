@@ -993,13 +993,36 @@ if uploads:
         c1.metric("Eligible rows", len(preview))
         c2.metric("Unique image URLs", preview["MAIN_IMAGE"].nunique())
         c3.metric("Current learned rules", len(load_learned_image_rules()))
+        _existing_rules = load_learned_image_rules()
+        _existing_keys = {
+            (str(_rule.get("image_url", "") or "").strip(), normalize_learned_flag(_rule.get("flag", "")))
+            for _rule in _existing_rules if isinstance(_rule, dict)
+        }
+        _preview_keys = list(zip(
+            preview["MAIN_IMAGE"].astype(str).str.strip(),
+            preview["FLAG"].map(normalize_learned_flag),
+        ))
+        _duplicate_preview_count = sum(1 for _key in _preview_keys if _key in _existing_keys)
+        _new_preview_count = max(0, len(preview) - _duplicate_preview_count)
+        if _duplicate_preview_count:
+            if _new_preview_count:
+                st.warning(
+                    f"This upload contains {_duplicate_preview_count:,} rule(s) already learned and {_new_preview_count:,} potentially new rule(s). "
+                    "Duplicates will be skipped; only new rules will be written.",
+                    icon=":material/content_copy:",
+                )
+            else:
+                st.warning(
+                    f"All {len(preview):,} eligible rows are already in the learned catalog. No new rules will be added.",
+                    icon=":material/content_copy:",
+                )
         st.dataframe(
             preview[["PRODUCT_SET_SID", "MAIN_IMAGE", "FLAG", "_SOURCE_FILE"]].head(100),
             hide_index=True,
             width="stretch",
         )
 
-        if st.button("Import eligible rules", icon=":material/upload_file:", type="primary", width="stretch"):
+        if st.button("Import eligible rules", icon=":material/upload_file:", type="primary", width="stretch", help="Duplicate URL/reason rules are skipped automatically."):
             _progress = st.progress(0, text="Starting import…")
             _status = st.empty()
             _files = list(preview.groupby("_SOURCE_FILE"))
