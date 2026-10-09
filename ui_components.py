@@ -2566,6 +2566,7 @@ def render_flag_expander(
             and str(_r.get("phash", "")).strip()
         }
         _gallery_limit = len(_gallery_df)
+        _gallery_bulk_rules = {}
         for _gallery_start in range(0, _gallery_limit, 4):
             _gallery_cols = st.columns(4, gap="small")
             for _gallery_col, _gallery_idx in zip(
@@ -2618,6 +2619,8 @@ def render_flag_expander(
                                 "phash": _fallback_rule_phash,
                                 "flag": str(_gallery_row.get("FLAG", title) or title),
                             }
+                    if _gallery_tag and _gallery_rule:
+                        _gallery_bulk_rules[_gallery_sid] = _gallery_rule
                     if _gallery_url:
                         st.image(_gallery_url, width=220)
                     else:
@@ -2652,6 +2655,14 @@ def render_flag_expander(
                         if _gallery_brand and _gallery_brand.casefold() not in {"nan", "none"} else ""
                     )
                     if _gallery_tag and _gallery_rule:
+                        _select_key = "select_learned_preview_" + hashlib.md5(
+                            f"{title}|{_gallery_sid}".encode("utf-8", "ignore")
+                        ).hexdigest()[:12]
+                        st.checkbox(
+                            "Select for removal",
+                            key=_select_key,
+                            help="Include this learned image reason in a bulk removal.",
+                        )
                         _remove_key = "remove_learned_preview_" + hashlib.md5(
                             f"{title}|{_gallery_sid}".encode("utf-8", "ignore")
                         ).hexdigest()[:12]
@@ -2700,6 +2711,36 @@ def render_flag_expander(
                         f"</div>",
                         unsafe_allow_html=True,
                     )
+        _selected_gallery_sids = [
+            _sid for _sid in _gallery_bulk_rules
+            if st.session_state.get(
+                "select_learned_preview_" + hashlib.md5(f"{title}|{_sid}".encode("utf-8", "ignore")).hexdigest()[:12],
+                False,
+            )
+        ]
+        if _selected_gallery_sids:
+            st.info(f"{len(_selected_gallery_sids):,} learned image reason(s) selected.", icon=":material/checklist:")
+            _bulk_reason_col, _bulk_image_col = st.columns(2)
+            with _bulk_reason_col:
+                if st.button("Remove selected reasons", key=f"bulk_remove_reasons_{title}_{_gallery_page}", icon=":material/delete:"):
+                    _removed = delete_learned_image_rules([_gallery_bulk_rules[_sid] for _sid in _selected_gallery_sids])
+                    if _removed:
+                        for _sid in _selected_gallery_sids:
+                            st.session_state.pop("select_learned_preview_" + hashlib.md5(f"{title}|{_sid}".encode("utf-8", "ignore")).hexdigest()[:12], None)
+                        st.session_state.display_df_cache = {}
+                        st.session_state.pop("_learned_image_rule_map_cache", None)
+                        st.toast(f"Removed {_removed:,} learned reason(s).", icon=":material/check_circle:")
+                        st.rerun()
+            with _bulk_image_col:
+                if st.button("Remove all reasons for selected images", key=f"bulk_remove_images_{title}_{_gallery_page}", icon=":material/delete_sweep:"):
+                    _removed = delete_associated_learned_image_rules([_gallery_bulk_rules[_sid] for _sid in _selected_gallery_sids])
+                    if _removed:
+                        for _sid in _selected_gallery_sids:
+                            st.session_state.pop("select_learned_preview_" + hashlib.md5(f"{title}|{_sid}".encode("utf-8", "ignore")).hexdigest()[:12], None)
+                        st.session_state.display_df_cache = {}
+                        st.session_state.pop("_learned_image_rule_map_cache", None)
+                        st.toast(f"Removed {_removed:,} learned rule(s) for selected images.", icon=":material/check_circle:")
+                        st.rerun()
 
     # Apply the provenance tint in both table modes. Learned rows must remain
     # identifiable while image previews are enabled; previously the image
