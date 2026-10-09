@@ -6896,6 +6896,25 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
     """Run validation in bounded SID chunks and checkpoint each completed chunk."""
     if data is None or data.empty:
         return pd.DataFrame(), {}
+    # A completed chunk is only reusable under the same validator code and
+    # learned-rule revision. Older manifests predate this guard, so they are
+    # deliberately treated as stale once and recomputed instead of silently
+    # restoring a report produced before a rule was added or changed.
+    if manifest is not None:
+        try:
+            _general_rules_path = Path("general_rules.py")
+            _general_rules_revision = _general_rules_path.stat().st_mtime_ns if _general_rules_path.exists() else 0
+        except OSError:
+            _general_rules_revision = 0
+        _validation_revision = f"{rules_revision}:{_general_rules_revision}"
+        if manifest.get("validation_revision") != _validation_revision:
+            manifest["validation_revision"] = _validation_revision
+            manifest["batches"] = {}
+            try:
+                from processing_automation import save_manifest as _save_revision_manifest
+                _save_revision_manifest(manifest)
+            except Exception:
+                logger.debug("Could not reset stale validation manifest", exc_info=True)
     sids = data["PRODUCT_SET_SID"].astype(str).str.strip().drop_duplicates().tolist()
     frames, result_parts = [], []
     pending_flags = {}
