@@ -282,6 +282,37 @@ def preview_decision_merge(final_report, decisions) -> dict:
     return out
 
 
+def find_overlapping_decisions(product_sids, country: str, current_signature: str = ""):
+    """Find reviewed decisions for SIDs reused by a different upload.
+
+    This is intentionally a lookup only. The caller must show the overlap and
+    let the reviewer choose reuse or a fresh validation.
+    """
+    wanted = {str(s).strip() for s in (product_sids or []) if str(s).strip()}
+    if not wanted:
+        return None
+    current_name = manual_decisions_filename(current_signature)
+    matches = []
+    for fname, meta in _read_manual_index().items():
+        if fname == current_name or not isinstance(meta, dict) or str(meta.get("country") or "") != str(country or ""):
+            continue
+        path = os.path.join(PARQUET_CACHE_DIR, fname)
+        if not os.path.exists(path):
+            continue
+        frame = load_df_parquet(fname)
+        if not isinstance(frame, pd.DataFrame) or frame.empty or "ProductSetSid" not in frame.columns:
+            continue
+        frame = frame[frame["ProductSetSid"].astype(str).str.strip().isin(wanted)].copy()
+        if not frame.empty:
+            frame["ProductSetSid"] = frame["ProductSetSid"].astype(str).str.strip()
+            matches.append((float(meta.get("saved_at") or 0), frame))
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[0], reverse=True)
+    merged = pd.concat([frame for _, frame in matches], ignore_index=True).drop_duplicates("ProductSetSid", keep="first")
+    return {"decisions": merged, "matched": int(len(merged)), "saved_at": matches[0][0]}
+
+
 def load_manual_decisions(process_signature: str):
     """Return the journalled decisions for an uploaded file set, or None."""
     if not process_signature or process_signature == "empty":

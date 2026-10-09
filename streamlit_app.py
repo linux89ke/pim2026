@@ -115,6 +115,7 @@ from data_utils import (
     df_hash,
     filter_by_country,
     find_predecessor_decisions,
+    find_overlapping_decisions,
     load_df_parquet,
     load_manual_decisions,
     manual_decisions_mtime,
@@ -8935,6 +8936,45 @@ if _offer:
                       help="Keep validation's results. The earlier decisions stay on disk."):
             st.session_state._predecessor_handled = process_signature
             st.session_state.pop("_predecessor_offer", None)
+            st.rerun()
+
+if (
+    st.session_state.get("last_processed_files") == process_signature
+    and process_signature != "empty"
+    and st.session_state.get("_overlap_handled") != process_signature
+    and "_overlap_offer" not in st.session_state
+):
+    try:
+        _current_report = st.session_state.get("final_report")
+        _current_sids = _current_report["ProductSetSid"].astype(str).str.strip().tolist() if isinstance(_current_report, pd.DataFrame) and "ProductSetSid" in _current_report.columns else []
+        _overlap = find_overlapping_decisions(_current_sids, st.session_state.get("_process_country", ""), process_signature)
+        if _overlap:
+            st.session_state["_overlap_offer"] = _overlap
+        else:
+            st.session_state["_overlap_handled"] = process_signature
+    except Exception:
+        logger.exception("Overlapping decision lookup failed")
+        st.session_state["_overlap_handled"] = process_signature
+
+_overlap_offer = st.session_state.get("_overlap_offer")
+if _overlap_offer:
+    with st.container(border=True):
+        st.warning(
+            f"This upload contains {_overlap_offer['matched']:,} SKU(s) reviewed in another tab or earlier file."
+            " Reusing those decisions avoids repeating image work.",
+            icon=":material/history:",
+        )
+        _oc1, _oc2 = st.columns(2)
+        if _oc1.button(f"Reuse {_overlap_offer['matched']:,} reviewed decisions", type="primary", width="stretch", key="overlap_apply"):
+            _n = apply_manual_decisions(st.session_state.final_report, _overlap_offer["decisions"])
+            checkpoint_final_report(st.session_state.final_report)
+            st.session_state["_overlap_handled"] = process_signature
+            st.session_state.pop("_overlap_offer", None)
+            st.toast(f"Reused {_n:,} reviewed SKU decision(s).", icon=":material/history:")
+            st.rerun()
+        if _oc2.button("Recheck all SKUs fresh", width="stretch", key="overlap_skip", help="Keep this upload's validation results and ignore earlier decisions."):
+            st.session_state["_overlap_handled"] = process_signature
+            st.session_state.pop("_overlap_offer", None)
             st.rerun()
 
 
