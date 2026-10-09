@@ -1674,7 +1674,11 @@ def check_restricted_brands(
         regex=True, na=False,
     )
     _is_ps &= _cat_path_l.str.contains(r"game|dlc|digital games", regex=True, na=False)
-    _is_books = _cat_path_l.str.startswith("books, movies and music")
+    # Books are exempt regardless of whether the feed uses the full
+    # ``Books, Movies and Music`` taxonomy or a shorter ``Books / ...`` path.
+    _is_books = _cat_path_l.str.startswith("books, movies and music") | _cat_path_l.str.contains(
+        r"(?:^|[/,>])\s*books?\b", regex=True, na=False
+    )
     _cat_excl_mask = _is_ps | _is_books
     d = d[~_cat_excl_mask].copy()
 
@@ -5540,6 +5544,7 @@ def validate_products(
     duplicate_batch_sig: str = "",
 ):
     _pipeline_started = time.perf_counter()
+    st.session_state["_validation_code_to_path"] = support_files.get("code_to_path", {})
     data = data.copy()
     # ROW_LEVEL_VALIDATORS map a check's result back onto `data` by index label,
     # which is only meaningful when labels are unique (a concat of per-file
@@ -5969,6 +5974,7 @@ def validate_products(
         {
             "blocked_map": _learned_image_rule_map,
             "country_code": country_validator.code,
+            "code_to_path": support_files.get("code_to_path", {}),
         },
     ))
 
@@ -6538,17 +6544,28 @@ def commit_pending_validation_learning():
     _new_rule_batches = []
     for flag, item in pending.get("flags", {}).items():
         try:
+            _learn_sids = list(item.get("sids", []))
+            # Books are exempt from restricted-brand learning as well as the
+            # live validator. This prevents an accidental manual rejection of
+            # an UNCOVER book from teaching a future restricted-image rule.
+            if str(flag).strip() == "Restricted brands" and isinstance(data, pd.DataFrame):
+                _cat = data.get("CATEGORY", pd.Series("", index=data.index)).fillna("").astype(str).str.strip()
+                _code = data.get("CATEGORY_CODE", pd.Series("", index=data.index)).fillna("").astype(str).str.strip()
+                _paths = _code.map(st.session_state.get("_validation_code_to_path", {})).fillna("").astype(str).str.strip()
+                _book_mask = _cat.where(_cat.str.len().gt(0), _paths).str.casefold().str.startswith("books, movies and music") | _cat.where(_cat.str.len().gt(0), _paths).str.casefold().str.contains(r"(?:^|[/,>])\s*books?\b", regex=True, na=False)
+                _book_sids = set(data.loc[_book_mask, "PRODUCT_SET_SID"].astype(str).str.strip()) if "PRODUCT_SET_SID" in data.columns else set()
+                _learn_sids = [s for s in _learn_sids if str(s).strip() not in _book_sids]
             reconcile_image_rules(
                 data,
-                item.get("sids", []),
+                _learn_sids,
                 flag,
                 hash_by_url=hash_by_url,
                 evaluated_sids=item.get("evaluated_sids", []),
             )
-            if item.get("sids"):
+            if _learn_sids:
                 _new_rule_batches.append({
                     "data": data,
-                    "sids": item.get("sids", []),
+                    "sids": _learn_sids,
                     "flag": flag,
                     "reason": item.get("reason", ""),
                     "source": "validation",

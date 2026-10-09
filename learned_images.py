@@ -351,6 +351,16 @@ def check_blocked_image_fingerprints(
         return pd.DataFrame(columns=data.columns)
 
     country_code = str(kwargs.get("country_code", "")).strip().upper()
+    code_to_path = kwargs.get("code_to_path", {}) or {}
+    category_text = data.get("CATEGORY", pd.Series("", index=data.index)).fillna("").astype(str).str.strip()
+    category_code = data.get("CATEGORY_CODE", pd.Series("", index=data.index)).fillna("").astype(str).str.strip()
+    mapped_category = category_code.map(code_to_path).fillna("").astype(str).str.strip()
+    category_path = category_text.where(category_text.str.len().gt(0), mapped_category).str.casefold()
+    books_sids = set(data.loc[
+        category_path.str.startswith("books, movies and music")
+        | category_path.str.contains(r"(?:^|[/,>])\s*books?\b", regex=True, na=False),
+        sid_col,
+    ].astype(str).str.strip())
     declared_brand_by_sid = {}
     if "BRAND" in data.columns:
         declared_brand_by_sid = dict(zip(
@@ -365,6 +375,8 @@ def check_blocked_image_fingerprints(
             m = matches[sid]
             frow = row.copy()
             learned_flag = str(m.get("flag", "Poor images")).strip()
+            if learned_flag == "Restricted brands" and sid in books_sids:
+                continue
             # Uganda has no restricted-brand rejection catalogue. Its learned
             # restricted-image records are used only as evidence that the
             # declared brand should agree with the brand attached to the image.
