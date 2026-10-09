@@ -955,6 +955,7 @@ def _open_uploaded_archive(payload: bytes, filename: str):
                 "Install 7-Zip or WinRAR, put its executable on PATH, then restart Streamlit; "
                 "or convert the archive to ZIP."
             ) from exc
+        _configure_rarfile_backend(rarfile)
         try:
             return rarfile.RarFile(BytesIO(payload))
         except rarfile.RarCannotExec as exc:
@@ -970,15 +971,37 @@ def _open_uploaded_archive(payload: bytes, filename: str):
     return zipfile.ZipFile(BytesIO(payload))
 
 
+def _configure_rarfile_backend(rarfile_module) -> Optional[str]:
+    """Point rarfile at an installed extractor, including WinRAR's UnRAR.exe."""
+    configured = os.environ.get("UNRAR_TOOL", "").strip()
+    candidates = [configured] if configured else []
+    candidates.extend(
+        [
+            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "WinRAR", "UnRAR.exe"),
+            os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "WinRAR", "UnRAR.exe"),
+        ]
+    )
+    for candidate in candidates:
+        if candidate and (os.path.isfile(candidate) or shutil.which(candidate)):
+            # rarfile does not read UNRAR_TOOL from the environment itself;
+            # its module-level setting must be assigned before RarFile opens.
+            rarfile_module.UNRAR_TOOL = candidate
+            return candidate
+    return None
+
+
 def _rar_backend_available() -> bool:
     """Return whether rarfile can delegate RAR extraction to a local tool."""
     try:
         import rarfile
     except ImportError:
         return False
-    configured = os.environ.get("UNRAR_TOOL", "").strip()
-    if configured and (os.path.isfile(configured) or shutil.which(configured)):
-        return True
+    if _configure_rarfile_backend(rarfile):
+        try:
+            rarfile.tool_setup()
+            return True
+        except Exception:
+            pass
     # rarfile supports these names depending on platform/version.  Include
     # executable spellings because Windows PATH lookup does not always add the
     # suffix when an explicit name is configured by the user.
