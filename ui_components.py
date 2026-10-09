@@ -2021,6 +2021,30 @@ def _resolve_preview_urls(df: pd.DataFrame) -> list:
         usable = empty & ~_candidate_text.str.casefold().isin({"", "nan", "none", "null"})
         img_s.loc[usable] = candidate[usable]
 
+    # Compact validation result rows may carry the SID and issue text but no
+    # image column. Recover the original upload image from the per-upload SID
+    # map so the gallery does not incorrectly show "Image unavailable".
+    _source = st.session_state.get("all_data_map")
+    if isinstance(_source, pd.DataFrame) and not _source.empty:
+        try:
+            _sid_col = next(
+                (c for c in ("PRODUCT_SET_SID", "ProductSetSid", "SID") if c in df.columns),
+                None,
+            )
+            if _sid_col and "PRODUCT_SET_SID" in _source.columns:
+                _sid_to_img, _ = _get_image_maps(_source)
+                _fallback = [
+                    _sid_to_img.get(sid, "")
+                    for sid in df[_sid_col].fillna("").astype(str).str.strip()
+                ]
+                _fallback_s = pd.Series(_fallback, index=df.index, dtype=object)
+                _empty = img_s.fillna("").astype(str).str.strip().str.casefold().isin({"", "nan", "none", "null"})
+                _fallback_ok = ~_fallback_s.fillna("").astype(str).str.strip().str.casefold().isin({"", "nan", "none", "null"})
+                img_s = img_s.mask(_empty & _fallback_ok, _fallback_s)
+        except Exception:
+            # Preview recovery must never prevent the validation table from rendering.
+            pass
+
     names = df.get("NAME", pd.Series([""] * len(df), index=df.index)).fillna("").astype(str).values
     brands = df.get("BRAND", pd.Series([""] * len(df), index=df.index)).fillna("").astype(str).values
 
