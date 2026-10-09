@@ -5310,6 +5310,7 @@ function renderAll() {{
         if (window._moreObserver) window._moreObserver.disconnect();
         window._moreObserver = new IntersectionObserver(function(entries) {{
           if (!entries.some(function(e) {{ return e.isIntersecting; }})) return;
+          if (window._suppressServerPagingUntil && Date.now() < window._suppressServerPagingUntil) return;
           var maxPages = Math.max(1, Math.ceil(totalBase / _pageSizeValue()));
           if ((PAGE_STATE.autoPages || 1) < maxPages) {{
             PAGE_STATE.autoPages += 1;
@@ -5559,6 +5560,8 @@ window.doBatchReject = function(pos) {{
 }};
 
 function _applyBatchReject(br) {{
+  // Keep the reviewer on the current server page after a batch update.
+  window._suppressServerPagingUntil = Date.now() + 2500;
   var payload = {{}}, count = 0;
   var autoC = window._autoComments || {{}};
   for (var s in staged) {{ payload[s] = staged[s]; count++; }}
