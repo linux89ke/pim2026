@@ -2579,8 +2579,11 @@ def render_flag_expander(
                     if _gallery_issue.casefold() in {"nan", "none", "rejected", "manual rejection"}:
                         _gallery_issue = ""
                     _gallery_brand = str(_gallery_row.get("BRAND", "")).strip()
+                    _gallery_comment = str(_gallery_row.get("Comment", "") or _gallery_row.get("COMMENT", "") or "").strip()
                     _gallery_learned = _gallery_row.get("Learned Match", False)
-                    _gallery_tag = "Learned rule" if _gallery_learned is True or str(_gallery_learned).casefold() in {"true", "1", "yes"} else ""
+                    _learned_bool = _gallery_learned is True or str(_gallery_learned).casefold() in {"true", "1", "yes"}
+                    _learned_text = "image fingerprint match" in (_gallery_issue + " " + _gallery_comment).casefold() or "known blocked image" in (_gallery_issue + " " + _gallery_comment).casefold()
+                    _gallery_tag = "Learned rule" if _learned_bool or _learned_text else ""
                     _gallery_overturned = str(_gallery_row.get("Overturned", "")).strip().casefold() in {"overturned", "🔓 overturned"}
                     _gallery_url = _gallery_preview_urls[_gallery_idx]
                     _gallery_rule = None
@@ -2653,13 +2656,13 @@ def render_flag_expander(
                             f"{title}|{_gallery_sid}".encode("utf-8", "ignore")
                         ).hexdigest()[:12]
                         if st.button(
-                            "Remove learned rule",
+                            "Remove this learned reason",
                             key=_remove_key,
                             type="secondary",
                             icon=":material/delete:",
-                            help="Remove the exact learned image rule matched by this product.",
+                            help="Remove this reason for the matched image. Other reasons for the same image remain.",
                         ):
-                            _removed = delete_associated_learned_image_rules([_gallery_rule])
+                            _removed = delete_learned_image_rules([_gallery_rule])
                             if _removed:
                                 st.session_state.display_df_cache = {}
                                 st.session_state.pop("_learned_image_rule_map_cache", None)
@@ -2667,6 +2670,22 @@ def render_flag_expander(
                                     "Learned image rule removed. Run validation again to refresh this product's verdict.",
                                     icon=":material/check_circle:",
                                 )
+                                st.rerun()
+                        _remove_all_key = "remove_all_learned_preview_" + hashlib.md5(
+                            f"{title}|{_gallery_sid}|all".encode("utf-8", "ignore")
+                        ).hexdigest()[:12]
+                        if st.button(
+                            "Remove all reasons for this image",
+                            key=_remove_all_key,
+                            type="secondary",
+                            icon=":material/delete_sweep:",
+                            help="Remove every learned reason associated with this image URL or pHash.",
+                        ):
+                            _removed = delete_associated_learned_image_rules([_gallery_rule])
+                            if _removed:
+                                st.session_state.display_df_cache = {}
+                                st.session_state.pop("_learned_image_rule_map_cache", None)
+                                st.toast(f"Removed {_removed:,} learned rule(s) for this image.", icon=":material/check_circle:")
                                 st.rerun()
                     st.markdown(
                         f"<div style='margin-top:7px;padding:8px 9px;border:1px solid #e5e7eb;"
