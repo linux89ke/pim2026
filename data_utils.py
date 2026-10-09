@@ -918,7 +918,11 @@ def _load_zip_image_by_key(key: str) -> Optional[str]:
                 continue
             try:
                 if _ZIP_FILE_CACHE is None or _ZIP_FILE_BYTES_ID != id(sb):
-                    _ZIP_FILE_CACHE = zipfile.ZipFile(BytesIO(sb))
+                    if bytes(sb[:7]) == b"Rar!\x1a\x07":
+                        import rarfile
+                        _ZIP_FILE_CACHE = rarfile.RarFile(BytesIO(sb))
+                    else:
+                        _ZIP_FILE_CACHE = zipfile.ZipFile(BytesIO(sb))
                     _ZIP_FILE_BYTES_ID = id(sb)
                 if member in _ZIP_FILE_CACHE.namelist():
                     img_bytes = _ZIP_FILE_CACHE.read(member)

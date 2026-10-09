@@ -61,6 +61,7 @@ lxml>=4.9.0
 
 Pillow
 imagehash
+rarfile
 requests>=2.31.0
 boto3>=1.35,<2
 

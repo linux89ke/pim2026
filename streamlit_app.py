@@ -943,7 +943,20 @@ def _basename_lower(value) -> str:
     return name if name and name != "nan" else ""
 
 
-def _index_zip_images(zf: zipfile.ZipFile) -> Dict[str, str]:
+def _open_uploaded_archive(payload: bytes, filename: str):
+    """Open ZIP or RAR uploads through one archive interface."""
+    if str(filename).lower().endswith(".rar"):
+        try:
+            import rarfile
+        except ImportError as exc:
+            raise RuntimeError(
+                "RAR uploads require the rarfile package and an installed unrar/bsdtar backend."
+            ) from exc
+        return rarfile.RarFile(BytesIO(payload))
+    return zipfile.ZipFile(BytesIO(payload))
+
+
+def _index_zip_images(zf) -> Dict[str, str]:
     """Index every image sitting in an images/ folder, at any depth.
 
     This required the folder to be at the top level. Real archives from the QC
@@ -969,10 +982,10 @@ def _prepare_lazy_zip_images(uploaded_file_records: List[Dict]) -> None:
     combined_index = {}
     source_bytes_list = []
     for uf in uploaded_file_records:
-        if not uf["name"].lower().endswith(".zip"):
+        if not uf["name"].lower().endswith((".zip", ".rar")):
             continue
         try:
-            with zipfile.ZipFile(BytesIO(uf["bytes"])) as zf:
+            with _open_uploaded_archive(uf["bytes"], uf["name"]) as zf:
                 idx = _index_zip_images(zf)
             if idx:
                 combined_index.update(idx)
@@ -7669,7 +7682,7 @@ if _has_files:
                 st.session_state.confirm_clear_files = False
                 st.rerun()
 
-uploaded_files = st.file_uploader("Dpload files", type=["csv", "xlsx", "zip"], accept_multiple_files=True, key=f"daily_files_{st.session_state.uploader_key}", label_visibility="collapsed")
+uploaded_files = st.file_uploader("Dpload files", type=["csv", "xlsx", "zip", "rar"], accept_multiple_files=True, key=f"daily_files_{st.session_state.uploader_key}", label_visibility="collapsed")
 
 if uploaded_files:
     _new_cache = []
@@ -7738,8 +7751,8 @@ if st.session_state.get("_row_estimate_sig") != process_signature:
         try:
             _peek = BytesIO(_fc["bytes"])
             _name_lower = _fc["name"].lower()
-            if _name_lower.endswith(".zip"):
-                with zipfile.ZipFile(_peek) as _zf:
+            if _name_lower.endswith((".zip", ".rar")):
+                with _open_uploaded_archive(_fc["bytes"], _fc["name"]) as _zf:
                     _qc_info = next((info for info in _zf.infolist() if "qc_results" in info.filename.lower() and info.filename.lower().endswith((".xlsx", ".xls", ".csv"))), None)
                     if _qc_info:
                         if _qc_info.filename.lower().endswith(".csv"): _total_estimated_rows += _zf.read(_qc_info).count(b"\n")
@@ -7836,7 +7849,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                     # files do not exhaust memory or disk handles.
                     _plain_uploads = [
                         (_idx, _uf) for _idx, _uf in enumerate(_files_for_processing)
-                        if not _uf["name"].lower().endswith(".zip")
+                        if not _uf["name"].lower().endswith((".zip", ".rar"))
                         and not any(k in _uf["name"].lower() for k in ("qc_results", "qc_result"))
                     ]
 
@@ -7862,9 +7875,9 @@ if st.session_state.get("last_processed_files") != process_signature:
                     for _uf_index, uf in enumerate(_files_for_processing):
                         _buf = BytesIO(uf["bytes"])
                         raw_data = pd.DataFrame()
-                        if uf["name"].lower().endswith(".zip"):
+                        if uf["name"].lower().endswith((".zip", ".rar")):
                             has_zip_source = True
-                            with zipfile.ZipFile(_buf) as zf:
+                            with _open_uploaded_archive(uf["bytes"], uf["name"]) as zf:
                                 members = zf.infolist()
                                 qc_files = [info for info in members if "qc_results" in info.filename.lower() and info.filename.lower().endswith((".xlsx", ".xls", ".csv"))]
                                 if qc_files:
