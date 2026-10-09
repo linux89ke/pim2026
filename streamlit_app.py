@@ -7099,6 +7099,7 @@ st.markdown(
         div.st-key-country_flag_bar_container iframe {{
             min-height: 85px !important;
             height: 85px !important;
+            max-height: 85px !important;
         }}
         [data-stale="true"]:has(iframe),
         [data-stale="true"] iframe {{
@@ -7456,8 +7457,10 @@ _flag_buttons_html = "".join([f"""<button onclick="selectCountry('{c}')" id="btn
 
 _flag_selector_html = f"""
 <style>
-  body {{ margin: 0; padding: 0; background: transparent; }}
-  .flag-bar {{ display: flex; gap: 8px; align-items: center; padding: 6px 0; flex-wrap: wrap; }}
+  html, body {{ width: 100%; height: 85px; margin: 0; padding: 0; overflow: hidden; background: transparent; }}
+  .flag-bar {{ display: flex; gap: 8px; align-items: center; width: 100%; height: 85px; padding: 6px 0; flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }}
+  .flag-bar::-webkit-scrollbar {{ height: 5px; }}
+  .flag-bar::-webkit-scrollbar-thumb {{ background: #cbd5e1; border-radius: 99px; }}
   .flag-btn {{ display: flex; align-items: center; gap: 8px; padding: 7px 14px 7px 10px; border: 2px solid #e0e0e0; border-radius: 8px; background: #fff; cursor: pointer; font-family: sans-serif; font-size: 13px; font-weight: 600; color: #444; transition: border-color .15s, box-shadow .15s, background .15s; outline: none; }}
   .flag-btn:hover {{ border-color: {_O}; background: #fff8f2; }}
   .flag-btn.active {{ border-color: {_O}; background: #fff3e6; color: {_O}; box-shadow: 0 0 0 3px rgba(255,136,0,.15); }}
