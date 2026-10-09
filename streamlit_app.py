@@ -6215,7 +6215,7 @@ def validate_products(
 
     def _prepare_duplicate_precomputed():
         """Build the batch-wide duplicate result after image hashes are ready."""
-        nonlocal _duplicate_precomputed
+        nonlocal _duplicate_precomputed, duplicate_batch_sig
         # Duplicate groups are upload-wide. Compute them once from the full
         # upload and reuse the cached result for every validation chunk; the
         # final report still intersects the result with the current chunk.
