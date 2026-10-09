@@ -343,6 +343,12 @@ if _admin_module == "Backups and recovery":
 st.markdown(
     """
     <style>
+    [data-testid="stAppViewContainer"] { background:#f6f8fb; }
+    [data-testid="stSidebar"] { background:#101827; border-right:1px solid #243247; }
+    [data-testid="stSidebar"] * { color:#dbe5f0; }
+    [data-testid="stSidebar"] label { color:#94a9c2 !important; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+    [data-testid="stSidebar"] [role="radio"] { padding:9px 10px; border-radius:9px; }
+    [data-testid="stSidebar"] [role="radio"]:hover { background:#1e2b40; }
     .lr-shell { max-width: 1480px; margin: 0 auto; }
     .lr-hero { display:flex; justify-content:space-between; align-items:flex-end; gap:24px;
         padding:24px 26px; margin:0 0 18px; border-radius:18px;
@@ -355,11 +361,17 @@ st.markdown(
     .lr-hero-stat strong { display:block; font-size:30px; line-height:1; color:#fff; }
     .lr-hero-stat span { display:block; margin-top:6px; color:#bfdbfe; font-size:11px; font-weight:700; }
     .lr-card { min-height:112px; padding:17px 18px; border:1px solid #e2e8f0; border-radius:14px;
-        background:#fff; box-shadow:0 5px 18px rgba(15,23,42,.06); }
+        background:#fff; box-shadow:0 5px 18px rgba(15,23,42,.06); transition:transform .18s,box-shadow .18s; }
+    .lr-card:hover { transform:translateY(-2px); box-shadow:0 12px 28px rgba(15,23,42,.11); }
+    .lr-card-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .lr-card-icon { width:32px; height:32px; display:grid; place-items:center; border-radius:10px; background:#eff6ff; color:#2563eb; font-size:18px; }
     .lr-card-label { color:#64748b; font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.06em; }
     .lr-card-value { color:#0f172a; font-size:26px; font-weight:800; margin-top:7px; letter-spacing:-.03em; }
     .lr-card-note { color:#64748b; font-size:11px; margin-top:5px; }
-    .lr-section { margin:22px 0 8px; color:#0f172a; font-size:16px; font-weight:800; letter-spacing:-.01em; }
+    .lr-section { margin:24px 0 10px; color:#0f172a; font-size:16px; font-weight:800; letter-spacing:-.01em; display:flex; align-items:center; gap:8px; }
+    .lr-section:before { content:''; width:4px; height:18px; border-radius:4px; background:#f28c28; }
+    div[data-testid="stExpander"] { border-color:#e2e8f0; border-radius:12px; background:rgba(255,255,255,.72); }
+    div[data-testid="stMetric"] { background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:12px 14px; }
     @media (max-width: 760px) { .lr-hero { display:block; } .lr-hero-stat { text-align:left; margin-top:18px; } }
     </style>
     """,
@@ -414,15 +426,15 @@ _dashboard_review_pct = _dashboard_reviewed / len(_stored_df) if len(_stored_df)
 _dashboard_active_pct = _dashboard_active / len(_stored_df) if len(_stored_df) else 0
 st.markdown('<div class="lr-section">Rule health</div>', unsafe_allow_html=True)
 _dashboard_cols = st.columns(4, gap="medium")
-for _col, (_label, _value, _note) in zip(
+for _col, (_label, _value, _note, _icon) in zip(
     _dashboard_cols,
-    (("Active rules", _dashboard_active, "Applied during validation"),
-     ("Awaiting review", _dashboard_unreviewed, "Need a reviewer decision"),
-     ("Confirmed", _dashboard_confirmed, "Validated as reliable"),
-     ("Corrected", _dashboard_corrected, "Candidates for removal")),
+    (("Active rules", _dashboard_active, "Applied during validation", "verified"),
+     ("Awaiting review", _dashboard_unreviewed, "Need a reviewer decision", "rate_review"),
+     ("Confirmed", _dashboard_confirmed, "Validated as reliable", "task_alt"),
+     ("Corrected", _dashboard_corrected, "Candidates for removal", "edit_note")),
 ):
     with _col:
-        st.markdown(f'<div class="lr-card"><div class="lr-card-label">{_label}</div><div class="lr-card-value">{_value:,}</div><div class="lr-card-note">{_note}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="lr-card"><div class="lr-card-head"><div class="lr-card-label">{_label}</div><div class="lr-card-icon"><span class="material-symbols-outlined">{_icon}</span></div></div><div class="lr-card-value">{_value:,}</div><div class="lr-card-note">{_note}</div></div>', unsafe_allow_html=True)
 _progress_cols = st.columns(2, gap="large")
 with _progress_cols[0]:
     st.caption(f":material/task_alt: Review coverage · {_dashboard_reviewed:,} of {len(_stored_df):,}")
