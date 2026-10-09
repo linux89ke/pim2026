@@ -628,7 +628,17 @@ def learn_image_rejections(
         return 0
     with _LOCK:
         current = list(load_learned_image_rules())
-        keys = {(str(r.get("image_url", "")).strip(), str(r.get("phash", "")).strip(), r.get("flag", "")) for r in current}
+        # The dedupe scope is image identity + canonical reason.  Never use
+        # image identity alone: one image may legitimately be learned for
+        # different reasons (for example Poor images and Restricted brands).
+        keys = {
+            (
+                str(r.get("image_url", "")).strip(),
+                str(r.get("phash", "")).strip(),
+                normalize_learned_flag(r.get("flag", "")),
+            )
+            for r in current
+        }
         url_keys = {(url, flag) for url, _phash, flag in keys if url}
         phash_keys = {(_phash, flag) for _url, _phash, flag in keys if _phash}
         additions = []
@@ -775,10 +785,22 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
                 "last_confirmed_at": "",
                 "review_due_at": (_created_at + timedelta(days=30)).isoformat(),
             }
+            # Collapse repeated rows within the same import using the same
+            # URL/pHash + reason key used against the existing catalog. A
+            # different flag for the same image remains a valid addition.
             identity = (record["image_url"], record["phash"], record["flag"])
-            if identity not in seen:
-                seen.add(identity)
-                all_records.append(record)
+            if identity in seen:
+                continue
+            if (record["image_url"], record["flag"]) in {
+                (url_key, flag_key) for url_key, _phash_key, flag_key in seen
+            }:
+                continue
+            if record["phash"] and (record["phash"], record["flag"]) in {
+                (phash_key, flag_key) for _url_key, phash_key, flag_key in seen
+            }:
+                continue
+            seen.add(identity)
+            all_records.append(record)
         if progress_callback:
             progress_callback(batch_index, len(batches), batch)
     if not all_records:
