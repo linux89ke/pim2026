@@ -9369,7 +9369,7 @@ def render_main_results():
             "Seconds": float(_info.get("seconds", 0)),
             "Runs": int(_info.get("runs", 0)),
         })
-    if _timing_rows:
+    if _timing_rows or st.session_state.get("validator_status_rows"):
         with st.expander("Validation diagnostics", expanded=False):
             _diag_timing_tab, _diag_status_tab = st.tabs(["Timings", "Validator status"])
             with _diag_timing_tab:
