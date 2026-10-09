@@ -9,6 +9,7 @@ import hashlib
 import logging
 import os
 import pickle
+import sys
 import time
 import uuid
 import zipfile
@@ -25,6 +26,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import json
+
+# Uvicorn can be started directly as `uvicorn api:app`, which bypasses the
+# run_api.py wrapper.  On Windows that otherwise selects ProactorEventLoop;
+# abrupt browser disconnects then produce noisy WinError 10054 tracebacks
+# while closing the socket.  Set the selector policy during module import so
+# the server creates the correct loop regardless of its launch command.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 logger = logging.getLogger(__name__)
 

@@ -2187,12 +2187,12 @@ def render_flag_expander(
         if df_display["Overturned"].eq("").all():
             _extra_cols = [c for c in _extra_cols if c != "Overturned"]
         else:
-            # Streamlit/pandas may preserve a categorical dtype here. Cast to
-            # object before replacing so current pandas versions do not emit a
-            # FutureWarning on every validation expander rerun.
-            df_display["Overturned"] = df_display["Overturned"].astype(object).replace(
-                {"Overturned": "🔓 Overturned"}
-            )
+            # Streamlit/pandas may preserve a categorical dtype here. Convert
+            # through map/object so current pandas versions do not emit a
+            # downcasting warning on every validation expander rerun.
+            df_display["Overturned"] = df_display["Overturned"].map(
+                lambda value: "🔓 Overturned" if value == "Overturned" else value
+            ).astype(object)
 
         _di = df_display["Detected Issue"].astype(str).str.strip()
         df_display["Detected Issue"] = _di.where(
