@@ -951,10 +951,49 @@ def _open_uploaded_archive(payload: bytes, filename: str):
             import rarfile
         except ImportError as exc:
             raise RuntimeError(
-                "RAR uploads require the rarfile package and an installed unrar/bsdtar backend."
+                "RAR uploads require the rarfile package and an installed extraction backend. "
+                "Install 7-Zip or WinRAR, put its executable on PATH, then restart Streamlit; "
+                "or convert the archive to ZIP."
             ) from exc
-        return rarfile.RarFile(BytesIO(payload))
+        try:
+            return rarfile.RarFile(BytesIO(payload))
+        except rarfile.RarCannotExec as exc:
+            # rarfile is only a Python wrapper.  It delegates decompression to
+            # an external unrar/bsdtar/7z/WinRAR executable, which is commonly
+            # missing on clean Windows and Streamlit Cloud installations.
+            raise RuntimeError(
+                "RAR extraction backend not found. Install 7-Zip or WinRAR and "
+                "ensure 7z.exe/WinRAR.exe is on PATH, then restart Streamlit. "
+                "ZIP uploads do not need this dependency; converting the RAR to ZIP "
+                "is also supported."
+            ) from exc
     return zipfile.ZipFile(BytesIO(payload))
+
+
+def _rar_backend_available() -> bool:
+    """Return whether rarfile can delegate RAR extraction to a local tool."""
+    try:
+        import rarfile
+    except ImportError:
+        return False
+    configured = os.environ.get("UNRAR_TOOL", "").strip()
+    if configured and (os.path.isfile(configured) or shutil.which(configured)):
+        return True
+    # rarfile supports these names depending on platform/version.  Include
+    # executable spellings because Windows PATH lookup does not always add the
+    # suffix when an explicit name is configured by the user.
+    return any(
+        shutil.which(name)
+        for name in ("unrar", "unar", "bsdtar", "7z", "7zz", "WinRAR", "WinRAR.exe")
+    )
+
+
+def _rar_backend_help() -> str:
+    return (
+        "RAR upload support needs an extraction program. Install 7-Zip or WinRAR, "
+        "ensure 7z.exe/WinRAR.exe is on PATH, and restart Streamlit. "
+        "Alternatively convert the archive to ZIP; ZIP uploads work without this dependency."
+    )
 
 
 def _index_zip_images(zf) -> Dict[str, str]:
@@ -7780,6 +7819,28 @@ if st.session_state.get("_grid_closing"):
     render_grid_closing_overlay()
 
 _files_for_processing = st.session_state.get("cached_uploaded_files", [])
+
+# Fail fast for RAR uploads when the Python wrapper has no decompression tool
+# behind it.  Previously the app opened the archive during row estimation and
+# failed much later inside validation with a long ``RarCannotExec`` traceback.
+# ZIP uploads and ordinary CSV/XLSX uploads are unaffected.
+_rar_uploads_without_backend = [
+    str(_upload.get("name", "uploaded RAR"))
+    for _upload in _files_for_processing
+    if isinstance(_upload, dict)
+    and str(_upload.get("name", "")).lower().endswith(".rar")
+]
+if _rar_uploads_without_backend and not _rar_backend_available():
+    st.error("RAR files cannot be opened on this computer yet.")
+    st.info(_rar_backend_help(), icon=":material/archive:")
+    st.caption(
+        "No validation was started, so your uploaded files and any completed cache remain safe. "
+        "Install the backend and reload, or upload a ZIP version of the same files."
+    )
+    with st.expander("Affected uploads", expanded=False):
+        for _rar_name in _rar_uploads_without_backend:
+            st.write(_rar_name)
+    st.stop()
 
 
 def _upload_digest(rec: dict) -> str:
