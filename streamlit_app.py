@@ -736,7 +736,7 @@ except Exception:  # a broken rules file must not stop the app importing
 # holds whichever sibling finished first, and the built-in Wrong Category key
 # is unchanged by the check_id fix — so without this bump it would keep serving
 # a rule's result, or an empty one, as the whole flag's verdict.
-FLAG_CACHE_KEY_VERSION = "fk5"
+FLAG_CACHE_KEY_VERSION = "fk6"
 
 # Columns every check implicitly depends on: results are keyed by SID, and the
 # row set itself is part of a check's input.
