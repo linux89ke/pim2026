@@ -182,6 +182,7 @@ with st.sidebar:
             "Category learned rules",
             "Settings",
             "Diagnostics",
+            "Backups and recovery",
         ],
         key="dashboard_admin_module",
         label_visibility="collapsed",
@@ -299,6 +300,28 @@ def _render_admin_diagnostics_module():
     st.dataframe(_health, hide_index=True, width="stretch")
 
 
+def _render_admin_recovery_module():
+    st.markdown("## :material/backup: Backups and recovery")
+    st.caption("Export a point-in-time copy before bulk edits. Restoring is explicit and does not happen during ordinary validation.")
+    _rules_path = Path(__file__).resolve().parents[1] / "learned_image_rules.json"
+    _rules_payload = _rules_path.read_bytes() if _rules_path.exists() else b"[]"
+    _backup_cols = st.columns(3, gap="medium")
+    _backup_cols[0].metric("Learned rules", f"{len(_stored_df):,}")
+    _backup_cols[1].metric("File size", f"{len(_rules_payload) / 1024 / 1024:.1f} MB")
+    _backup_cols[2].metric("Last modified", datetime.fromtimestamp(_rules_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M") if _rules_path.exists() else "Unavailable")
+    st.download_button(
+        "Download learned-rules backup",
+        data=_rules_payload,
+        file_name=f"learned_image_rules_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        mime="application/json",
+        icon=":material/download:",
+        type="primary",
+        key="dashboard_download_rules_backup",
+        disabled=not _rules_path.exists(),
+    )
+    st.info("For a restore, use the existing import workflow after reviewing the file. The import remains duplicate-safe and preserves one image with multiple distinct reasons.", icon=":material/info:")
+
+
 if _admin_module == "Category learned rules":
     _render_category_admin_module()
     st.stop()
@@ -307,6 +330,9 @@ if _admin_module == "Settings":
     st.stop()
 if _admin_module == "Diagnostics":
     _render_admin_diagnostics_module()
+    st.stop()
+if _admin_module == "Backups and recovery":
+    _render_admin_recovery_module()
     st.stop()
 
 # ── Modern dashboard shell ─────────────────────────────────────────────────

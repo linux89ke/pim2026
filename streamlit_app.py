@@ -6858,6 +6858,32 @@ def derive_status_report(data, results, support_files, country_validator):
         if _bool_col not in final_df.columns:
             final_df[_bool_col] = False
 
+    # Keep an explicit per-validator run ledger for the diagnostics panel.
+    # This distinguishes a deliberate skip (for example, a prefetched QC
+    # result) from a failed check or a check that simply found no products.
+    try:
+        _failed_names = {str(name) for name, _message in validation_errors}
+        _status_rows = []
+        for _v_name, _v_func, _v_kwargs in validations:
+            if _v_name in _failed_names:
+                _v_status = "Failed"
+            elif _skipped(_v_name, _v_func):
+                _v_status = "Skipped"
+            elif _v_name in st.session_state.get("_cached_validator_names", set()):
+                _v_status = "Cached"
+            else:
+                _v_status = "Active"
+            _v_timing = validation_timings.get(_v_name, [])
+            _status_rows.append({
+                "Validator": _v_name,
+                "Status": _v_status,
+                "Seconds": round(float(sum(_v_timing)), 3) if _v_timing else 0.0,
+                "Products flagged": int(len(results.get(_v_name, pd.DataFrame()))) if isinstance(results.get(_v_name), pd.DataFrame) else 0,
+            })
+        st.session_state["validator_status_rows"] = _status_rows
+    except Exception:
+        logger.debug("Could not publish validator status ledger", exc_info=True)
+
     # Publish overturned cases so the targeted audit can surface them as
     # False Rejections. This is written on every derive_status_report call
     # so stale data from a previous batch never survives a re-run.
@@ -6930,6 +6956,9 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
                 logger.debug("Could not reset stale validation manifest", exc_info=True)
     sids = data["PRODUCT_SET_SID"].astype(str).str.strip().drop_duplicates().tolist()
     frames, result_parts = [], []
+    # A resumed manifest should be visible in diagnostics as cached work,
+    # while a fresh run remains clearly marked Active.
+    st.session_state["_cached_validator_names"] = set()
     pending_flags = {}
     try:
         _duplicate_batch_sig = df_hash(
@@ -6979,6 +7008,9 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
                 saved_report, saved_results = saved
                 frames.append(saved_report)
                 result_parts.append(saved_results)
+                _cached_names = st.session_state.get("_cached_validator_names")
+                if isinstance(_cached_names, set):
+                    _cached_names.update(str(_name) for _name in saved_results.keys())
                 # Rebuild staged learning candidates from the restored
                 # result frames as well; a process restart has no in-memory
                 # _pending_validation_learning state to reuse.
@@ -7291,8 +7323,13 @@ with st.sidebar:
         st.rerun()
     st.markdown("---")
     st.header(_t("system_status"))
-    if st.button(_t("clear_cache"), width='stretch', type="secondary"):
+    st.caption("Derived-cache controls only. Learned image rules and category learning are never deleted.")
+    if st.button(_t("clear_cache"), width='stretch', type="secondary", help="Clears derived validation, display, and image-cache artifacts. Learned rules and category learning remain intact."):
         st.cache_data.clear()
+        try:
+            st.cache_resource.clear()
+        except Exception:
+            pass
         st.session_state.display_df_cache = {}
 
         def robust_cleanup(directory):
@@ -7307,7 +7344,7 @@ with st.sidebar:
 
         robust_cleanup(PARQUET_CACHE_DIR)
         robust_cleanup(FLAG_CACHE_DIR)
-        st.toast("Cache cleared! (Locked files skipped)", icon="🧹")
+        st.toast("Derived caches cleared. Learned data was kept.", icon=":material/cleaning_services:")
         st.rerun()
     st.markdown("---")
     # ── General rules ─────────────────────────────────────────────────────
@@ -8758,8 +8795,23 @@ if st.session_state.get("last_processed_files") != process_signature:
 
             except Exception as e:
                 logger.exception("Processing error while validating uploaded file(s)")
-                st.error(f"Something went wrong while processing your file(s): {e}\n\nTry re-uploading the file, or contact support if this keeps happening.")
+                _failed_files = [str(_item.get("name", "uploaded file")) for _item in _files_for_processing if isinstance(_item, dict)]
+                _failed_label = ", ".join(_failed_files[:3]) or "the uploaded files"
+                if len(_failed_files) > 3:
+                    _failed_label += f" and {len(_failed_files) - 3} more"
+                st.error(f"Validation could not finish for {_failed_label}.")
+                st.caption("Your files are still available. Retrying is safe; completed cached chunks will be reused when possible.")
+                _retry_col, _clear_col = st.columns(2)
+                with _retry_col:
+                    if st.button("Retry validation", icon=":material/refresh:", key="retry_failed_validation", type="primary"):
+                        st.session_state.last_processed_files = None
+                        st.rerun()
+                with _clear_col:
+                    if st.button("Remove uploaded files", icon=":material/delete:", key="clear_failed_uploads"):
+                        _reset_report_state(clear_uploaded_files=True, clear_zip_cache=True)
+                        st.rerun()
                 with st.expander("Technical details (for support)", expanded=False, type="compact"):
+                    st.caption(f"Failure type: {type(e).__name__}. Retry is safe unless the source file is incomplete or locked.")
                     st.code(traceback.format_exc())
                 st.session_state.last_processed_files = "error"
 
@@ -9319,8 +9371,26 @@ def render_main_results():
         })
     if _timing_rows:
         with st.expander("Validation diagnostics", expanded=False):
-            st.caption("Measured validator time for the current validation run.")
-            st.dataframe(pd.DataFrame(_timing_rows), hide_index=True, width="stretch")
+            _diag_timing_tab, _diag_status_tab = st.tabs(["Timings", "Validator status"])
+            with _diag_timing_tab:
+                st.caption("Measured validator time for the current validation run.")
+                st.dataframe(pd.DataFrame(_timing_rows), hide_index=True, width="stretch")
+            with _diag_status_tab:
+                _status_frame = pd.DataFrame(st.session_state.get("validator_status_rows", []))
+                if _status_frame.empty:
+                    st.info("Validator status is not available for this run yet.")
+                else:
+                    _status_filter = st.multiselect(
+                        "Show statuses",
+                        ["Active", "Cached", "Skipped", "Failed"],
+                        default=["Active", "Cached", "Skipped", "Failed"],
+                        key="validator_status_filter",
+                    )
+                    st.dataframe(
+                        _status_frame[_status_frame["Status"].isin(_status_filter)],
+                        hide_index=True,
+                        width="stretch",
+                    )
     # Only renders when something has actually been waived, so it costs a dict
     # lookup on a normal run.
     render_override_history()
