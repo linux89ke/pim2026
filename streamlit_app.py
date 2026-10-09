@@ -2578,21 +2578,36 @@ def check_suspected_fake_products(
 
         _no_blob = pd.Series(False, index=d.index)
         _claims = {}   # brand -> boolean Series
+        _claim_sources = {}  # brand -> per-row source labels
         for b, rx in _brand_res.items():
-            _blob_hit = _no_blob if b in _NO_DESCRIPTION_SCAN_BRANDS else _blob.str.contains(rx, na=False)
-            _claims[b] = (
-                (d["_brand_lower"] == b)
-                | _name.str.contains(rx, na=False)
-                | _blob_hit
+            _brand_hit = d["_brand_lower"] == b
+            _name_hit = _name.str.contains(rx, na=False)
+            _desc_hit = (
+                _no_blob if b in _NO_DESCRIPTION_SCAN_BRANDS
+                else d.get("DESCRIPTION", pd.Series("", index=d.index)).astype(str).str.replace(_tag_re, " ", regex=True).str.contains(rx, na=False)
             )
+            _short_hit = (
+                _no_blob if b in _NO_DESCRIPTION_SCAN_BRANDS
+                else d.get("SHORT_DESCRIPTION", pd.Series("", index=d.index)).astype(str).str.replace(_tag_re, " ", regex=True).str.contains(rx, na=False)
+            )
+            _claims[b] = _brand_hit | _name_hit | _desc_hit | _short_hit
+            _claim_sources[b] = (_brand_hit, _name_hit, _desc_hit, _short_hit)
         for a, parent in _alias_terms.items():
             rx = _alias_res[a]
-            _blob_hit = _no_blob if parent in _NO_DESCRIPTION_SCAN_BRANDS else _blob.str.contains(rx, na=False)
-            _claims[parent] = _claims.get(parent, pd.Series(False, index=d.index)) | (
-                (d["_brand_lower"] == a)
-                | _name.str.contains(rx, na=False)
-                | _blob_hit
+            _brand_hit = d["_brand_lower"] == a
+            _name_hit = _name.str.contains(rx, na=False)
+            _desc_hit = (
+                _no_blob if parent in _NO_DESCRIPTION_SCAN_BRANDS
+                else d.get("DESCRIPTION", pd.Series("", index=d.index)).astype(str).str.replace(_tag_re, " ", regex=True).str.contains(rx, na=False)
             )
+            _short_hit = (
+                _no_blob if parent in _NO_DESCRIPTION_SCAN_BRANDS
+                else d.get("SHORT_DESCRIPTION", pd.Series("", index=d.index)).astype(str).str.replace(_tag_re, " ", regex=True).str.contains(rx, na=False)
+            )
+            _claims[parent] = _claims.get(parent, pd.Series(False, index=d.index)) | (_brand_hit | _name_hit | _desc_hit | _short_hit)
+            _claim_sources.setdefault(parent, (_no_blob, _no_blob, _no_blob, _no_blob))
+            _old_brand, _old_name, _old_desc, _old_short = _claim_sources[parent]
+            _claim_sources[parent] = (_old_brand | _brand_hit, _old_name | _name_hit, _old_desc | _desc_hit, _old_short | _short_hit)
 
         prices = d["price_to_use"].values
         cats = d["_cat_clean"].values
@@ -2614,12 +2629,14 @@ def check_suspected_fake_products(
                 continue
             # Where the claim came from, so a reviewer can see whether the
             # seller declared the brand or buried it in the copy.
-            _where = pd.Series("BRAND", index=d.index)
-            _where = _where.mask(d["_brand_lower"] != b, "NAME")
-            _where = _where.mask(
-                (d["_brand_lower"] != b) & ~_name.str.contains(_brand_res[b], na=False),
-                "DESCRIPTION",
+            _brand_hit, _name_hit, _desc_hit, _short_hit = _claim_sources.get(
+                b,
+                (d["_brand_lower"] == b, _name.str.contains(_brand_res[b], na=False), _no_blob, _no_blob),
             )
+            _where = pd.Series("BRAND", index=d.index)
+            _where = _where.mask(~_brand_hit, "NAME")
+            _where = _where.mask(~_brand_hit & ~_name_hit & ~_short_hit, "DESCRIPTION")
+            _where = _where.mask(~_brand_hit & ~_name_hit & _short_hit, "SHORT_DESCRIPTION")
             _new = _under & ~_flag
             _detail.loc[_new] = (
                 f"{b.title()} claimed in " + _where.loc[_new]
