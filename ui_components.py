@@ -4116,6 +4116,7 @@ def build_fast_grid_html(
     </select>
   </span>
   <span class="sel-count-text" style="font-weight:700; color:var(--accent-text); font-size:13px; font-family:var(--font-mono); font-variant-numeric:tabular-nums slashed-zero;">0 {labels_dict["items_pending"]}</span>
+  <span id="review-save-state" style="font-size:11px;font-weight:700;color:#64748b;padding:4px 8px;border:1px solid #e2e8f0;border-radius:999px;">Saved</span>
   <select class="reason-sel" id="batch-reason-bottom">
     <option value="REJECT_POOR_IMAGE">{labels_dict["poor_img"]}</option>
     <option value="REJECT_IMG_STRETCHED">Image Stretched</option>
@@ -4469,6 +4470,8 @@ function _flushPendingReviewAndClose() {{
   var hasDecisions = Object.keys(p.decisions || {{}}).length > 0;
   var hasApprovals = Object.keys(p.approvals || {{}}).length > 0;
   if (hasDecisions || hasApprovals) {{
+    var saveState = document.getElementById('review-save-state');
+    if (saveState) {{ saveState.textContent = 'Saving'; saveState.style.color = '#2563eb'; saveState.style.borderColor = '#93c5fd'; }}
     // The close message performs the single server-side commit and closes the
     // modal in that same rerun.  Clear browser state now so reopening the
     // review cannot replay an already submitted batch.
@@ -5131,6 +5134,12 @@ function updateSelCount() {{
   document.querySelectorAll('.sel-count-text').forEach(el => el.textContent = pendingText);
   _saveGridSelection(selected, staged);
   _savePendingReview();
+  var saveState = document.getElementById('review-save-state');
+  if (saveState) {{
+    saveState.textContent = pendingCount ? 'Unsaved decisions' : 'Saved';
+    saveState.style.color = pendingCount ? '#b45309' : '#64748b';
+    saveState.style.borderColor = pendingCount ? '#fcd34d' : '#e2e8f0';
+  }}
   updateParentPagination();
 }}
 

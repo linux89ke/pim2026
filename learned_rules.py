@@ -65,6 +65,8 @@ _REMOTE_RULES_TTL = 60.0
 _REMOTE_RULES_SUSPICIOUS = False
 _PAGE_RULE_CACHE = OrderedDict()
 _PAGE_RULE_CACHE_MAX = 64
+_RUNTIME_INDEX = None
+_RUNTIME_INDEX_MTIME = -1
 _LOG = logging.getLogger(__name__)
 
 
@@ -505,25 +507,37 @@ def merge_learned_image_rules(blocked_map: dict) -> dict:
     """Merge active JSON rules into the URL/pHash matcher map."""
     merged = dict(blocked_map or {})
     with _LOCK:
-        for rule in load_learned_image_rules():
-            if str(rule.get("status", "active")).lower() != "active":
-                continue
-            if normalize_learned_flag(rule.get("flag", "")) not in LEARNABLE_FLAGS:
-                continue
-            entry = {
-                "flag": rule.get("flag", "Poor images"),
-                "brand": rule.get("brand_infringed", "") or rule.get("brand", ""),
-                "url": rule.get("image_url", ""),
-                "phash": rule.get("phash", ""),
-                "source": "json",
-            }
-            url = str(rule.get("image_url", "")).strip()
-            phash = str(rule.get("phash", "")).strip()
-            if url:
-                merged[url] = entry
-            if phash:
-                merged[phash] = entry
+        merged.update(load_learned_image_rule_index().get("by_key", {}))
     return merged
+
+
+def load_learned_image_rule_index() -> dict:
+    """Return compact URL/pHash lookups for validation runtime use."""
+    global _RUNTIME_INDEX, _RUNTIME_INDEX_MTIME
+    try:
+        mtime = RULES_PATH.stat().st_mtime_ns
+    except OSError:
+        mtime = 0
+    if _RUNTIME_INDEX is not None and _RUNTIME_INDEX_MTIME == mtime:
+        return _RUNTIME_INDEX
+    by_key, flag_counts, seller_counts = {}, {}, {}
+    for rule in load_learned_image_rules():
+        if str(rule.get("status", "active")).lower() != "active":
+            continue
+        flag = normalize_learned_flag(rule.get("flag", ""))
+        if flag not in LEARNABLE_FLAGS:
+            continue
+        entry = {"flag": flag, "brand": rule.get("brand_infringed", "") or rule.get("brand", ""), "url": rule.get("image_url", ""), "phash": rule.get("phash", ""), "source": "json"}
+        for key in (str(rule.get("image_url", "")).strip(), str(rule.get("phash", "")).strip()):
+            if key:
+                by_key[key] = entry
+        flag_counts[flag] = flag_counts.get(flag, 0) + 1
+        seller = str(rule.get("seller_name", "")).strip()
+        if seller:
+            seller_counts[seller] = seller_counts.get(seller, 0) + 1
+    _RUNTIME_INDEX = {"by_key": by_key, "flag_counts": flag_counts, "seller_counts": seller_counts}
+    _RUNTIME_INDEX_MTIME = mtime
+    return _RUNTIME_INDEX
 
 
 def load_learned_image_rules_for_urls(urls) -> list[dict]:

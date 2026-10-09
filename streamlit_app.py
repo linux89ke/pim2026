@@ -6024,6 +6024,7 @@ def validate_products(
     # matched are kept.
     ROW_LEVEL_VALIDATORS = {"Suspected Fake Perfume"}
     _skip_set = {s.lower() for s in (skip_validators or [])}
+    _skip_reasons = {s.lower(): "Uploaded QC/prefetch supplied the decision" for s in (skip_validators or [])}
     if not data_has_warranty_cols:
         _skip_set.add("product warranty")
     # Image preparation is deliberately deferred until after the cheap text and
@@ -6871,6 +6872,8 @@ def derive_status_report(data, results, support_files, country_validator):
                 _v_status = "Skipped"
             elif _v_name in st.session_state.get("_cached_validator_names", set()):
                 _v_status = "Cached"
+            elif validation_timings.get(_v_name):
+                _v_status = "Runtime"
             else:
                 _v_status = "Active"
             _v_timing = validation_timings.get(_v_name, [])
@@ -6879,6 +6882,7 @@ def derive_status_report(data, results, support_files, country_validator):
                 "Status": _v_status,
                 "Seconds": round(float(sum(_v_timing)), 3) if _v_timing else 0.0,
                 "Products flagged": int(len(results.get(_v_name, pd.DataFrame()))) if isinstance(results.get(_v_name), pd.DataFrame) else 0,
+                "Skip reason": _skip_reasons.get(_v_name.lower(), "") if _v_status == "Skipped" else "",
             })
         st.session_state["validator_status_rows"] = _status_rows
     except Exception:
@@ -8810,6 +8814,14 @@ if st.session_state.get("last_processed_files") != process_signature:
                     if st.button("Remove uploaded files", icon=":material/delete:", key="clear_failed_uploads"):
                         _reset_report_state(clear_uploaded_files=True, clear_zip_cache=True)
                         st.rerun()
+                st.download_button(
+                    "Download diagnostics",
+                    data=traceback.format_exc(),
+                    file_name="pim_validation_diagnostics.txt",
+                    mime="text/plain",
+                    icon=":material/download:",
+                    key="download_validation_diagnostics",
+                )
                 with st.expander("Technical details (for support)", expanded=False, type="compact"):
                     st.caption(f"Failure type: {type(e).__name__}. Retry is safe unless the source file is incomplete or locked.")
                     st.code(traceback.format_exc())
@@ -9382,8 +9394,8 @@ def render_main_results():
                 else:
                     _status_filter = st.multiselect(
                         "Show statuses",
-                        ["Active", "Cached", "Skipped", "Failed"],
-                        default=["Active", "Cached", "Skipped", "Failed"],
+                        ["Active", "Runtime", "Cached", "Skipped", "Failed"],
+                        default=["Active", "Runtime", "Cached", "Skipped", "Failed"],
                         key="validator_status_filter",
                     )
                     st.dataframe(
@@ -9391,6 +9403,9 @@ def render_main_results():
                         hide_index=True,
                         width="stretch",
                     )
+                    _applied = _status_frame[_status_frame["Status"].isin(["Runtime", "Cached", "Active"])]
+                    _skipped_count = int((_status_frame["Status"] == "Skipped").sum())
+                    st.caption(f"Rules actually applied: {_applied['Validator'].nunique():,} · Skipped with explanation: {_skipped_count:,} · Failed: {int((_status_frame['Status'] == 'Failed').sum()):,}")
     # Only renders when something has actually been waived, so it costs a dict
     # lookup on a normal run.
     render_override_history()

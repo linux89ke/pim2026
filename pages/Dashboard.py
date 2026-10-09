@@ -182,6 +182,7 @@ with st.sidebar:
             "Category learned rules",
             "Settings",
             "Diagnostics",
+            "Performance",
             "Backups and recovery",
         ],
         key="dashboard_admin_module",
@@ -329,6 +330,9 @@ if _admin_module == "Settings":
     _render_admin_settings_module()
     st.stop()
 if _admin_module == "Diagnostics":
+    _render_admin_diagnostics_module()
+    st.stop()
+if _admin_module == "Performance":
     _render_admin_diagnostics_module()
     st.stop()
 if _admin_module == "Backups and recovery":
