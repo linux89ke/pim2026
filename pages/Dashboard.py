@@ -645,6 +645,7 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                 st.info("No image rules match the current filters.")
             else:
                 st.caption(f"Reviewing {_audit_rows.shape[0]:,} image rules. Actions update the JSON catalog immediately.")
+                _audit_selected_records = []
                 for _audit_start in range(0, len(_audit_rows), 4):
                     _audit_cols = st.columns(4, gap="small")
                     for _audit_offset, (_audit_col, (_audit_idx, _audit_row)) in enumerate(
@@ -689,6 +690,8 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                             # imports several rules at once. Include the row identity so
                             # every Streamlit widget receives a stable unique key.
                             _audit_key = f"{_audit_start + _audit_offset}_{_audit_idx}_{str(_audit_row.get('created_at', '')).replace('-', '')[-16:]}"
+                            if st.checkbox("Select for removal", key=f"audit_select_{_audit_key}", label_visibility="collapsed"):
+                                _audit_selected_records.append(_audit_row.to_dict())
                             _audit_new_flag = st.selectbox(
                                 "Reason",
                                 sorted(LEARNABLE_FLAGS),
@@ -715,6 +718,15 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                                         st.success("Removed")
                                         st.rerun()
                             st.divider()
+                if _audit_selected_records:
+                    _audit_bulk_a, _audit_bulk_b = st.columns([2, 3], gap="small")
+                    with _audit_bulk_a:
+                        if st.button("Remove selected audit rules", icon=":material/delete_sweep:", type="secondary", key="remove_selected_audit_rules", width="stretch"):
+                            _audit_removed = delete_learned_image_rules(_audit_selected_records)
+                            st.success(f"Removed {_audit_removed:,} learned rule(s).")
+                            st.rerun()
+                    with _audit_bulk_b:
+                        st.caption(f":material/checklist: {len(_audit_selected_records):,} audit card(s) selected")
         # A small gallery makes it possible to verify the image before
         # deleting its rule. Keep it bounded so a large catalog stays fast.
         _preview_rows = _view_df[
