@@ -6221,7 +6221,10 @@ def validate_products(
         # Filtering by rejected_sids here changed the cache key on every chunk
         # and caused duplicate preparation to repeat unnecessarily.
         _duplicate_source = full_batch if full_batch is not None else data
-        _duplicate_rows = data
+        # The cache stores the complete upload-wide duplicate result. The
+        # current chunk is applied later by run_batch when it intersects the
+        # result with its own dataframe.
+        _duplicate_rows = _duplicate_source
         if _duplicate_source.empty or _duplicate_rows.empty:
             return
         if not duplicate_batch_sig:
@@ -6237,8 +6240,13 @@ def validate_products(
         _duplicate_spec = next((item for item in validations if item[0] == "Duplicate product"), None)
         if not _duplicate_spec or _skipped(_duplicate_spec[0], _duplicate_spec[1]):
             return
-        _duplicate_precomputed = _duplicate_cache.get(_duplicate_cache_key)
-        if _duplicate_precomputed is not None:
+        _duplicate_full_result = _duplicate_cache.get(_duplicate_cache_key)
+        if _duplicate_full_result is not None:
+            _duplicate_precomputed = _duplicate_full_result
+            if rejected_sids and isinstance(_duplicate_precomputed, pd.DataFrame) and "PRODUCT_SET_SID" in _duplicate_precomputed.columns:
+                _duplicate_precomputed = _duplicate_precomputed[
+                    ~_duplicate_precomputed["PRODUCT_SET_SID"].astype(str).str.strip().isin(rejected_sids)
+                ]
             return
         _duplicate_started = time.perf_counter()
         _duplicate_name, _duplicate_func, _duplicate_kwargs = _duplicate_spec
@@ -6256,6 +6264,10 @@ def validate_products(
             _progress_callback=_duplicate_detail_progress,
         )
         _duplicate_cache[_duplicate_cache_key] = _duplicate_precomputed
+        if rejected_sids and isinstance(_duplicate_precomputed, pd.DataFrame) and "PRODUCT_SET_SID" in _duplicate_precomputed.columns:
+            _duplicate_precomputed = _duplicate_precomputed[
+                ~_duplicate_precomputed["PRODUCT_SET_SID"].astype(str).str.strip().isin(rejected_sids)
+            ]
         while len(_duplicate_cache) > 4:
             _duplicate_cache.pop(next(iter(_duplicate_cache)))
         validation_timings.setdefault("Duplicate product", []).append(time.perf_counter() - _duplicate_started)
