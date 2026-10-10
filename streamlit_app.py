@@ -967,13 +967,22 @@ def _configure_rarfile_backend(rarfile_module) -> Optional[str]:
         if candidate and (os.path.isfile(candidate) or shutil.which(candidate)):
             rarfile_module.UNRAR_TOOL = candidate
             return candidate
-    for tool_name in ("7z", "7zz"):
+    for tool_name in ("7z", "7zz", "unrar", "unar", "bsdtar"):
         tool_path = shutil.which(tool_name)
+        if not tool_path:
+            for fixed_path in (f"/usr/bin/{tool_name}", f"/usr/local/bin/{tool_name}"):
+                if os.path.isfile(fixed_path) and os.access(fixed_path, os.X_OK):
+                    tool_path = fixed_path
+                    break
         if tool_path:
             if tool_name == "7z":
                 rarfile_module.SEVENZIP_TOOL = tool_path
-            else:
+            elif tool_name == "7zz":
                 rarfile_module.SEVENZIP2_TOOL = tool_path
+            elif tool_name == "unrar":
+                rarfile_module.UNRAR_TOOL = tool_path
+            elif tool_name == "unar":
+                rarfile_module.UNAR_TOOL = tool_path
             return tool_path
     return None
 
@@ -985,7 +994,7 @@ def _rar_backend_available() -> bool:
         return False
     if _configure_rarfile_backend(rarfile):
         try:
-            rarfile.tool_setup()
+            rarfile.tool_setup(force=True)
             return True
         except Exception:
             pass
