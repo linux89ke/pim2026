@@ -1130,6 +1130,26 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
         _cache_hits = sum(1 for u in urls if u and u in _IMAGE_DIM_CACHE)
         new_urls = list(dict.fromkeys(u for u in urls if u and u not in _IMAGE_DIM_CACHE))
 
+    # An exact learned URL match already has a deterministic image decision;
+    # downloading it again cannot change that decision. Keep these URLs out of
+    # the cold-image queue so learned poor-image/restricted/fake matches are
+    # effectively free on later uploads. Other image validators can still run
+    # for the remaining URLs, and the viewer can load the original URL lazily.
+    _learned_url_skips = 0
+    try:
+        _learned_map = st.session_state.get("_learned_image_rule_map_cache", {}).get("map", {})
+        if isinstance(_learned_map, dict):
+            _learned_urls = {
+                str(key).strip() for key in _learned_map
+                if str(key).strip().lower().startswith(("http://", "https://"))
+            }
+            if _learned_urls:
+                _before_learned = len(new_urls)
+                new_urls = [url for url in new_urls if url not in _learned_urls]
+                _learned_url_skips = _before_learned - len(new_urls)
+    except Exception:
+        _learned_url_skips = 0
+
     # Descriptors only — three short strings per image, not the image itself.
     #
     # This used to collect the decoded payload for every ZIP image up front and
@@ -1203,6 +1223,7 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
             "thumbnail_seconds": 0.0,
             "failed": 0,
             "archive_matches": int(_archive_matches),
+            "learned_url_skips": int(_learned_url_skips),
         }
         st.session_state["validation_stage_timings"] = {
             **st.session_state.get("validation_stage_timings", {}),
@@ -1359,6 +1380,7 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
             "thumbnail_seconds": round(_thumbnail_seconds, 3),
             "failed": int(_failed_count),
             "archive_matches": int(_archive_matches),
+            "learned_url_skips": int(_learned_url_skips),
         }
         st.session_state["validation_stage_timings"] = {
             **st.session_state.get("validation_stage_timings", {}),
