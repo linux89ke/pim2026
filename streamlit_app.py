@@ -941,6 +941,8 @@ if "zip_image_index" not in st.session_state:
     st.session_state.zip_image_index = {}
 if "zip_image_source_bytes" not in st.session_state:
     st.session_state.zip_image_source_bytes = None
+if "zip_image_name_index" not in st.session_state:
+    st.session_state.zip_image_name_index = {}
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 SID_COLUMN_CANDIDATES = ["PRODUCT_SET_SID", "ProductSetSid", "Product Set SID", "cod_productset_sid", "SID"]
@@ -953,6 +955,16 @@ def _find_sid_col(df: pd.DataFrame) -> Optional[str]:
 def _basename_lower(value) -> str:
     name = str(value).strip().replace("\\", "/").split("/")[-1].lower()
     return name if name and name != "nan" else ""
+
+
+def _archive_name_key(value) -> str:
+    """Stable title prefix used by report image filenames."""
+    try:
+        import unicodedata
+        value = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode()
+    except Exception:
+        value = str(value)
+    return re.sub(r"[^a-z0-9]+", "", value.lower())[:48]
 
 
 def _configure_rarfile_backend(rarfile_module) -> Optional[str]:
@@ -1053,6 +1065,12 @@ def _prepare_lazy_zip_images(uploaded_file_records: List[Dict]) -> None:
         except Exception as e:
             logger.warning("Failed indexing ZIP images from %s: %s", uf["name"], e)
     st.session_state.zip_image_index = combined_index
+    name_index = {}
+    for basename, member in combined_index.items():
+        key = _archive_name_key(Path(basename).stem)
+        if key:
+            name_index.setdefault(key, []).append(member)
+    st.session_state.zip_image_name_index = name_index
     st.session_state.zip_image_source_bytes = source_bytes_list if source_bytes_list else None
 
 
@@ -1090,27 +1108,42 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
     # Each image is needed for as long as it takes to read its size and hash.
     # Holding it after that was the whole cost.
     zip_descriptors = []
-    store = st.session_state.get("zip_image_store", {})
-    if store and "MAIN_IMAGE" in data.columns:
-        _zip_mask = (
-            data["MAIN_IMAGE"].astype(str).str.strip().ne("")
-            & ~data["MAIN_IMAGE"].astype(str).str.startswith("http")
-        )
+    _archive_matches = 0
+    _archive_keys = set()
+    _zip_index_snapshot = dict(st.session_state.get("zip_image_index") or {})
+    _zip_name_index_snapshot = dict(st.session_state.get("zip_image_name_index") or {})
+    _zip_sources_snapshot = list(st.session_state.get("zip_image_source_bytes") or [])
+    if _zip_index_snapshot and _zip_sources_snapshot and "MAIN_IMAGE" in data.columns:
+        _zip_mask = data["MAIN_IMAGE"].astype(str).str.strip().ne("")
         if _zip_mask.any():
-            _zip_subset = data.loc[_zip_mask, ["MAIN_IMAGE"]].copy()
+            _cols = ["MAIN_IMAGE"]
             for c in ["NAME", "BRAND"]:
                 if c in data.columns:
-                    _zip_subset[c] = data.loc[_zip_mask, c]
+                    _cols.append(c)
+            _zip_subset = data.loc[_zip_mask, _cols].copy()
             _zip_subset = _zip_subset.drop_duplicates(subset=["MAIN_IMAGE"])
             for _zrow in _zip_subset.itertuples():
                 img_val = str(_zrow.MAIN_IMAGE)
                 if img_val in _IMAGE_DIM_CACHE:
                     continue
-                zip_descriptors.append((
-                    img_val,
-                    str(getattr(_zrow, "NAME", "")),
-                    str(getattr(_zrow, "BRAND", "")),
-                ))
+                name = str(getattr(_zrow, "NAME", ""))
+                brand = str(getattr(_zrow, "BRAND", ""))
+                member = _zip_index_snapshot.get(_basename_lower(img_val))
+                if not member:
+                    candidates = list(_zip_name_index_snapshot.get(_archive_name_key(name), []))
+                    if len(candidates) > 1 and brand.strip() and brand.lower() != "nan":
+                        brand_key = _archive_name_key(brand)
+                        filtered = [m for m in candidates if brand_key and brand_key in _archive_name_key(Path(m).stem)]
+                        if len(filtered) == 1:
+                            candidates = filtered
+                    if len(candidates) == 1:
+                        member = candidates[0]
+                if member:
+                    zip_descriptors.append((img_val, name, brand, member))
+                    _archive_matches += 1
+                    _archive_keys.add(img_val)
+    if _archive_keys:
+        new_urls = [u for u in new_urls if u not in _archive_keys]
 
     if not new_urls and not zip_descriptors:
         st.session_state["image_fetch_metrics"] = {
@@ -1121,6 +1154,7 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
             "decode_phash_seconds": 0.0,
             "thumbnail_seconds": 0.0,
             "failed": 0,
+            "archive_matches": int(_archive_matches),
         }
         st.session_state["validation_stage_timings"] = {
             **st.session_state.get("validation_stage_timings", {}),
@@ -1154,7 +1188,7 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
         return url, None, "", "", 0.0, 0.0, 0.0, False
 
     def process_zip_img(tup):
-        key, payload = tup
+        key, payload, _member = tup
         try:
             if isinstance(payload, str) and payload.startswith("data:"):
                 _, encoded = payload.split(",", 1)
@@ -1194,18 +1228,13 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
                 # because the backend was invoked once per image. Use bounded
                 # workers and thread-local archive handles instead. No
                 # Streamlit state is touched from these workers.
-                _zip_sources = list(st.session_state.get("zip_image_source_bytes") or [])
-                _zip_index = dict(st.session_state.get("zip_image_index") or {})
+                _zip_sources = _zip_sources_snapshot
                 _reader_local = threading.local()
 
                 def _read_zip_descriptor(_desc):
-                    _img_val, _name, _brand = _desc
-                    _key = _basename_lower(_img_val)
-                    _member = _zip_index.get(_key)
+                    _img_val, _name, _brand, _member = _desc
                     if not _member:
-                        _member = _zip_index.get(_basename_lower(f"{_name}-{_brand}"))
-                    if not _member:
-                        return _img_val, b""
+                        return _img_val, b"", ""
                     for _source in _zip_sources:
                         try:
                             _source_id = id(_source)
@@ -1221,12 +1250,12 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
                                 _archives[_source_id] = _archive
                                 _reader_local.archives = _archives
                             try:
-                                return _img_val, _archive.read(_member)
+                                return _img_val, _archive.read(_member), _member
                             except KeyError:
                                 continue
                         except Exception:
                             continue
-                    return _img_val, b""
+                    return _img_val, b"", ""
 
                 _payloads = list(executor.map(_read_zip_descriptor, _slice))
                 if _payloads:
@@ -1274,6 +1303,7 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
             "decode_phash_seconds": round(_decode_seconds, 3),
             "thumbnail_seconds": round(_thumbnail_seconds, 3),
             "failed": int(_failed_count),
+            "archive_matches": int(_archive_matches),
         }
         st.session_state["validation_stage_timings"] = {
             **st.session_state.get("validation_stage_timings", {}),
