@@ -8018,7 +8018,20 @@ if st.session_state.get("last_processed_files") != process_signature:
                                 qc_files = [info for info in members if "qc_results" in info.filename.lower() and info.filename.lower().endswith((".xlsx", ".xls", ".csv"))]
                                 if qc_files:
                                     for qcf in qc_files:
-                                        qc_data = zf.read(qcf)
+                                        try:
+                                            qc_data = zf.read(qcf)
+                                        except Exception as _qc_read_error:
+                                            # A damaged/truncated RAR member should
+                                            # not abort every other file in the
+                                            # upload. Keep the member name and the
+                                            # extractor's short-read detail so the
+                                            # reviewer can replace the archive.
+                                            st.warning(
+                                                f"Could not read {qcf.filename} from {uf['name']}: "
+                                                f"the archive member appears incomplete ({_qc_read_error}). "
+                                                "Other valid members will continue processing."
+                                            )
+                                            continue
                                         qdf = (_detect_and_read_csv(BytesIO(qc_data)) if qcf.filename.lower().endswith(".csv") else pd.read_excel(BytesIO(qc_data), dtype=str))
                                         
                                         if "QC_Skip_Reason" in qdf.columns:
