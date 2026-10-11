@@ -1189,15 +1189,44 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
         with concurrent.futures.ThreadPoolExecutor(max_workers=_zip_workers) as executor:
             for _start in range(0, len(zip_descriptors), _ZIP_DECODE_CHUNK):
                 _slice = zip_descriptors[_start:_start + _ZIP_DECODE_CHUNK]
-                # Read on this thread, not in the workers. _get_image_from_zip
-                # goes through st.session_state, and calling that from a worker
-                # is what the "missing ScriptRunContext" warnings are about — it
-                # happens to work today and is not worth leaning on harder.
-                _payloads = []
-                for _img_val, _name, _brand in _slice:
-                    _payload = _get_image_from_zip(_name, _brand, _img_val)
-                    if _payload:
-                        _payloads.append((_img_val, _payload))
+                # RAR reads are delegated to 7z/unar. Reading every embedded
+                # image on the Streamlit thread made a large RAR appear frozen
+                # because the backend was invoked once per image. Use bounded
+                # workers and thread-local archive handles instead. No
+                # Streamlit state is touched from these workers.
+                _zip_sources = list(st.session_state.get("zip_image_source_bytes") or [])
+                _zip_index = dict(st.session_state.get("zip_image_index") or {})
+                _reader_local = threading.local()
+
+                def _read_zip_descriptor(_desc):
+                    _img_val, _name, _brand = _desc
+                    _key = _basename_lower(_img_val)
+                    _member = _zip_index.get(_key)
+                    if not _member:
+                        _member = _zip_index.get(_basename_lower(f"{_name}-{_brand}"))
+                    if not _member:
+                        return _img_val, b""
+                    for _source in _zip_sources:
+                        try:
+                            _source_id = id(_source)
+                            _archives = getattr(_reader_local, "archives", {})
+                            _archive = _archives.get(_source_id)
+                            if _archive is None:
+                                if bytes(_source[:7]) == b"Rar!\x1a\x07":
+                                    import rarfile
+                                    _configure_rarfile_backend(rarfile)
+                                    _archive = rarfile.RarFile(BytesIO(_source))
+                                else:
+                                    _archive = zipfile.ZipFile(BytesIO(_source))
+                                _archives[_source_id] = _archive
+                                _reader_local.archives = _archives
+                            if _member in _archive.namelist():
+                                return _img_val, _archive.read(_member)
+                        except Exception:
+                            continue
+                    return _img_val, b""
+
+                _payloads = list(executor.map(_read_zip_descriptor, _slice))
                 if _payloads:
                     results.extend(list(executor.map(process_zip_img, _payloads)))
                 if progress_callback:
@@ -7826,8 +7855,11 @@ if st.session_state.get("_row_estimate_sig") != process_signature:
                 with _open_uploaded_archive(_fc["bytes"], _fc["name"]) as _zf:
                     _qc_info = next((info for info in _zf.infolist() if "qc_results" in info.filename.lower() and info.filename.lower().endswith((".xlsx", ".xls", ".csv"))), None)
                     if _qc_info:
-                        if _qc_info.filename.lower().endswith(".csv"): _total_estimated_rows += _zf.read(_qc_info).count(b"\n")
-                        else: _total_estimated_rows += max(1, _qc_info.file_size // 500)
+                        # Do not decompress the complete QC CSV merely to estimate
+                        # progress. RAR backends may spawn an external process for
+                        # each read; file size is sufficient for an estimate and
+                        # avoids a second full archive pass before validation.
+                        _total_estimated_rows += max(1, int(getattr(_qc_info, "file_size", 0) or len(_fc["bytes"]) // 500) // (500 if _qc_info.filename.lower().endswith(".csv") else 1))
                     else: _total_estimated_rows += max(1, len(_fc["bytes"]) // 500)
             elif _name_lower.endswith(".xlsx"):
                 _total_estimated_rows += pd.read_excel(_peek, engine="openpyxl", nrows=1, dtype=str).shape[0]
