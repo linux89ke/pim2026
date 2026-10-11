@@ -1851,6 +1851,12 @@ def check_restricted_brands(
     _cat_code = d.get("CATEGORY_CODE", pd.Series("", index=d.index)).fillna("").astype(str).str.strip()
     _mapped_path = _cat_code.map(code_to_path or {}).fillna("").astype(str).str.strip()
     _cat_path = _cat_text.where(_cat_text.str.len().gt(0), _mapped_path)
+    # Country rule category lists are keyed by the normalized category code.
+    # Some direct CSV/ZIP uploads do not pass through the normalizer first;
+    # derive the helper here so those files are checked instead of failing with
+    # KeyError('_cat_clean') and silently producing no restricted-brand rows.
+    if "_cat_clean" not in d.columns:
+        d["_cat_clean"] = _cat_code.map(clean_category_code)
     _cat_path_l = _cat_path.str.lower()
     _is_ps = _cat_code.isin(_PS_GAME_CODES) | _cat_path_l.str.contains(
         r"(?:ps\s*4|ps\s*5|playstation\s*4|playstation\s*5)", regex=True, na=False
