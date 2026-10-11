@@ -22,6 +22,11 @@ from constants import PHASH_MATCH_MAX_DISTANCE
 
 logger = logging.getLogger(__name__)
 
+# Runtime-only pHash indexes. The learned JSON remains the source of truth;
+# this bounded cache avoids rebuilding the same four-part index once per
+# validation chunk.
+_PHASH_INDEX_CACHE = {}
+
 _MODULE_DIR = Path(__file__).resolve().parent
 _BLOCKED_IMG_EXCEL = str(_MODULE_DIR / "Image_learn.xlsx")
 _BLOCKED_IMG_CACHE = str(_MODULE_DIR / "Image_learn_cache.json")
@@ -197,19 +202,24 @@ def get_blocked_image_matches(
     # chunks differs in at most two bits. Looking up those small neighborhoods
     # reduces the candidate set by orders of magnitude while preserving the
     # exact same distance rule.
-    hash_catalog = []
-    chunk_index = [{}, {}, {}, {}]
-    for key, entry in blocked_map.items():
-        if not isinstance(entry, dict) or len(key) != 16:
-            continue
-        try:
-            value = int(key, 16)
-            hash_catalog.append((value, entry))
-            for chunk_no in range(4):
-                chunk = (value >> (chunk_no * 16)) & 0xFFFF
-                chunk_index[chunk_no].setdefault(chunk, []).append((value, entry))
-        except (TypeError, ValueError):
-            continue
+    _index_key = (id(blocked_map), len(blocked_map))
+    _cached_index = _PHASH_INDEX_CACHE.get(_index_key)
+    if _cached_index is None:
+        chunk_index = [{}, {}, {}, {}]
+        for key, entry in blocked_map.items():
+            if not isinstance(entry, dict) or len(key) != 16:
+                continue
+            try:
+                value = int(key, 16)
+                for chunk_no in range(4):
+                    chunk = (value >> (chunk_no * 16)) & 0xFFFF
+                    chunk_index[chunk_no].setdefault(chunk, []).append((value, entry))
+            except (TypeError, ValueError):
+                continue
+        _PHASH_INDEX_CACHE.clear()
+        _PHASH_INDEX_CACHE[_index_key] = chunk_index
+    else:
+        chunk_index = _cached_index
 
     def _chunk_variants(value: int):
         yield value
