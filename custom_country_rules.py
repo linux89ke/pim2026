@@ -8,6 +8,18 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _category_map_frame() -> pd.DataFrame:
+    """Use the shared loader so category_map.xlsx is read from Parquet."""
+    try:
+        from loaders import load_excel_file
+        frame = load_excel_file("category_map.xlsx")
+        return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        logger.exception("Could not load the cached category map")
+        return pd.DataFrame()
+
+
 def _clean_text(val) -> str:
     if val is None:
         return ""
@@ -91,19 +103,21 @@ def drop_kenya_books_false_positives(
 @st.cache_data(ttl=3600)
 def load_health_beauty_codes() -> set:
     try:
-        from openpyxl import load_workbook
-        cat_wb = load_workbook('category_map.xlsx', read_only=True)
-        cat_ws = cat_wb.active
-        cat_rows = list(cat_ws.iter_rows(values_only=True))
-        cat_wb.close()
+        cat_df = _category_map_frame()
+        if cat_df.empty:
+            return set()
+        cat_df.columns = [str(c).strip() for c in cat_df.columns]
+        code_col = next((c for c in cat_df.columns if "code" in c.lower()), None)
+        path_col = next((c for c in cat_df.columns if "path" in c.lower()), None)
+        if not code_col or not path_col:
+            return set()
         
         # Column 1 = code, Column 2 = path
         hb_codes = set()
-        for r in cat_rows[1:]:
-            if r[1] and r[2]:
-                path = str(r[2]).strip()
-                if path.startswith("Health") and "Beauty" in path:
-                    hb_codes.add(str(int(r[1])))
+        for _, row in cat_df[[code_col, path_col]].dropna().iterrows():
+            path = str(row[path_col]).strip()
+            if path.startswith("Health") and "Beauty" in path:
+                hb_codes.add(str(int(row[code_col])))
         return hb_codes
     except Exception:
         logger.exception("load_health_beauty_codes: failed to load category_map.xlsx — Health & Beauty checks will see an empty code set")
@@ -176,19 +190,22 @@ def load_kebs_hb_codes() -> set:
     vision, sexual wellness, tools, etc.) are naturally excluded.
     """
     try:
-        from openpyxl import load_workbook
-        cat_wb = load_workbook('category_map.xlsx', read_only=True)
-        cat_ws = cat_wb.active
-        cat_rows = list(cat_ws.iter_rows(values_only=True))
-        cat_wb.close()
+        cat_df = _category_map_frame()
+        if cat_df.empty:
+            return set()
+        cat_df.columns = [str(c).strip() for c in cat_df.columns]
+        code_col = next((c for c in cat_df.columns if "code" in c.lower()), None)
+        path_col = next((c for c in cat_df.columns if "path" in c.lower()), None)
+        if not code_col or not path_col:
+            return set()
 
         kebs_codes = set()
         allowed_lower = tuple(s.lower() for s in _KEBS_ALLOWED_PATH_SECTIONS)
 
-        for r in cat_rows[1:]:
-            if not r[1] or not r[2]:
+        for _, row in cat_df[[code_col, path_col]].dropna().iterrows():
+            if not row[code_col] or not row[path_col]:
                 continue
-            path = str(r[2]).strip().lower()
+            path = str(row[path_col]).strip().lower()
 
             # Must be in Health & Beauty OR Baby Products (for baby skin care)
             is_hb = path.startswith("health & beauty") or path.startswith("health and beauty")
@@ -200,7 +217,7 @@ def load_kebs_hb_codes() -> set:
             # Check if any allowed section appears in the path
             if any(section in path for section in allowed_lower):
                 try:
-                    kebs_codes.add(str(int(r[1])))
+                    kebs_codes.add(str(int(row[code_col])))
                 except (ValueError, TypeError):
                     pass
 

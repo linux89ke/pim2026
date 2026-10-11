@@ -369,6 +369,13 @@ class CategoryMatcherEngine:
         self._init_db()
         self.load_learning_db()
 
+    def _connect(self):
+        """Open a concurrency-safe learning connection."""
+        conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
     # Read-only views over _corr_model so existing call sites keep working and
     # can never observe a partially-swapped model.
     @property
@@ -411,7 +418,7 @@ class CategoryMatcherEngine:
 
     def _init_db(self):
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 c = conn.cursor()
                 c.execute('''
                     CREATE TABLE IF NOT EXISTS category_corrections (
@@ -459,7 +466,7 @@ class CategoryMatcherEngine:
             except Exception as e:
                 logger.warning(f"Failed to load category learning from Supabase; using local DB: {e}")
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 df = pd.read_sql_query("SELECT name, category FROM category_corrections", conn)
                 if not df.empty:
                     self.learning_db = df.groupby('name')['category'].last().to_dict()
@@ -472,7 +479,7 @@ class CategoryMatcherEngine:
         except Exception as e:
             logger.warning(f"Failed to load category learning DB: {e}")
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 ndf = pd.read_sql_query("SELECT name, category, reason FROM category_negatives", conn)
             if not ndf.empty:
                 ndf['category_l'] = ndf['category'].astype(str).str.strip().str.lower()
@@ -512,7 +519,7 @@ class CategoryMatcherEngine:
         so (count, min_id, max_id) changes on every insert and every prune.
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 row = conn.execute(
                     "SELECT COUNT(*), MIN(id), MAX(id) FROM category_corrections"
                 ).fetchone()
@@ -643,7 +650,7 @@ class CategoryMatcherEngine:
                 if self._remote_corrections_df is not None:
                     df = self._remote_corrections_df.copy()
                 else:
-                    with sqlite3.connect(self.db_path) as conn:
+                    with self._connect() as conn:
                         df = pd.read_sql_query("SELECT name, category FROM category_corrections", conn)
             except Exception:
                 return
@@ -737,7 +744,7 @@ class CategoryMatcherEngine:
         if auto_save:
             remote_row = {"name": clean_n, "category": str(category).strip(), "learned_at": supabase_store.now_iso()}
             try:
-                with sqlite3.connect(self.db_path) as conn:
+                with self._connect() as conn:
                     c = conn.cursor()
                     c.execute("INSERT INTO category_corrections (name, category) VALUES (?, ?)", (clean_n, category))
                     c.execute("SELECT COUNT(*) FROM category_corrections")
@@ -799,7 +806,7 @@ class CategoryMatcherEngine:
                 {"name": name, "category": cat, "reason": reason, "learned_at": supabase_store.now_iso()}
                 for name, cat, reason in self._pending_negatives
             ]
-            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            with self._connect() as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 c = conn.cursor()
                 c.execute("BEGIN IMMEDIATE")
@@ -851,7 +858,7 @@ class CategoryMatcherEngine:
             except Exception as e:
                 logger.warning(f"list_corrections remote read failed: {e}")
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 return pd.read_sql_query(
                     "SELECT id, name, category, timestamp FROM category_corrections "
                     "ORDER BY id DESC LIMIT ?", conn, params=(limit,),
@@ -873,7 +880,7 @@ class CategoryMatcherEngine:
             except Exception as e:
                 logger.warning(f"list_negatives remote read failed: {e}")
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 return pd.read_sql_query(
                     "SELECT id, name, category, reason, timestamp FROM category_negatives "
                     "ORDER BY id DESC LIMIT ?", conn, params=(limit,),
@@ -906,7 +913,7 @@ class CategoryMatcherEngine:
             except Exception as e:
                 logger.warning(f"remote counts() failed: {e}")
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 c = conn.cursor()
                 c.execute("SELECT COUNT(*) FROM category_corrections")
                 n_corr = c.fetchone()[0]
@@ -930,7 +937,7 @@ class CategoryMatcherEngine:
             except Exception as e:
                 logger.warning(f"delete_corrections remote delete failed: {e}")
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 c = conn.cursor()
                 c.executemany("DELETE FROM category_corrections WHERE id = ?", [(i,) for i in ids])
                 conn.commit()
@@ -943,7 +950,7 @@ class CategoryMatcherEngine:
         # last remaining correction would leave the stale in-memory dict
         # non-empty even though the table is now empty.
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 df = pd.read_sql_query("SELECT name, category FROM category_corrections", conn)
             self.learning_db = df.groupby('name')['category'].last().to_dict() if not df.empty else {}
             self._corr_model = None
@@ -969,7 +976,7 @@ class CategoryMatcherEngine:
             except Exception as e:
                 logger.warning(f"delete_negatives remote delete failed: {e}")
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 c = conn.cursor()
                 c.executemany("DELETE FROM category_negatives WHERE id = ?", [(i,) for i in ids])
                 conn.commit()
@@ -980,7 +987,7 @@ class CategoryMatcherEngine:
         self.negative_db = {}
         self.negative_reasons = {}
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 ndf = pd.read_sql_query("SELECT name, category, reason FROM category_negatives", conn)
             if not ndf.empty:
                 ndf['category_l'] = ndf['category'].astype(str).str.strip().str.lower()
@@ -1527,3 +1534,4 @@ def check_wrong_category(data: pd.DataFrame, categories_list: list, compiled_rul
     results_df['Suggested_Category'] = [_idx_to_prediction[i] for i in results_df.index]
     
     return results_df[data.columns.tolist() + ['Comment_Detail', 'Suggested_Category']].drop_duplicates(subset=['PRODUCT_SET_SID'])
+
