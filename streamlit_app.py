@@ -6316,6 +6316,7 @@ def validate_products(
 
     _validator_stage_started = time.perf_counter()
     results.update(run_batch(cheap_v, data))
+    st.session_state.setdefault("validation_stage_timings", {})["Text/category validation"] = round(time.perf_counter() - _validator_stage_started, 3)
 
     def _prepare_duplicate_precomputed():
         """Build the batch-wide duplicate result after image hashes are ready."""
@@ -6410,8 +6411,9 @@ def validate_products(
     _prepare_duplicate_precomputed()
 
     expensive_v = [v for v in validations if v[0] in EXPENSIVE_VALIDATORS]
+    _expensive_stage_started = time.perf_counter()
     results.update(run_batch(expensive_v, data))
-    st.session_state.setdefault("validation_stage_timings", {})["Text/category validation"] = round(time.perf_counter() - _validator_stage_started, 3)
+    st.session_state.setdefault("validation_stage_timings", {})["Expensive validator execution"] = round(time.perf_counter() - _expensive_stage_started, 3)
     try:
         st.session_state["validation_timings"] = {
             name: {"seconds": round(sum(values), 3), "runs": len(values)}
@@ -6996,6 +6998,7 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
     pending_flags = {}
     aggregate_timings = {}
     aggregate_stages = {}
+    aggregate_image_metrics = {}
     if manifest is not None:
         try:
             if on_progress:
@@ -7065,6 +7068,9 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
                 aggregate_timings[_v_name]["runs"] += int(_v_info.get("runs", 0))
             for _stage_name, _stage_seconds in st.session_state.get("validation_stage_timings", {}).items():
                 aggregate_stages[_stage_name] = aggregate_stages.get(_stage_name, 0.0) + float(_stage_seconds)
+            for _metric_name, _metric_value in (st.session_state.get("image_fetch_metrics", {}) or {}).items():
+                if isinstance(_metric_value, (int, float)):
+                    aggregate_image_metrics[_metric_name] = aggregate_image_metrics.get(_metric_name, 0) + _metric_value
             frames.append(fr_chunk)
             result_parts.append(result_chunk)
             _pending = st.session_state.get("_pending_validation_learning", {})
@@ -7091,6 +7097,11 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
     st.session_state["validation_stage_timings"] = {
         _name: round(_seconds, 3) for _name, _seconds in aggregate_stages.items()
     }
+    if aggregate_image_metrics:
+        st.session_state["image_fetch_metrics"] = {
+            _name: round(_value, 3) if isinstance(_value, float) else int(_value)
+            for _name, _value in aggregate_image_metrics.items()
+        }
     return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), combined
 
 
@@ -9264,6 +9275,10 @@ def render_main_results():
         with st.expander("Validation diagnostics", expanded=False):
             st.caption("Measured validator time for the current validation run.")
             st.dataframe(pd.DataFrame(_timing_rows), hide_index=True, width="stretch")
+            _image_metrics = st.session_state.get("image_fetch_metrics", {}) or {}
+            if _image_metrics:
+                st.caption("Image preparation detail")
+                st.dataframe(pd.DataFrame([_image_metrics]), hide_index=True, width="stretch")
     # Only renders when something has actually been waived, so it costs a dict
     # lookup on a normal run.
     render_override_history()
