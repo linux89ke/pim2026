@@ -1177,9 +1177,10 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
     def fetch(url):
         session = get_image_session()
         try:
-            # Bumping timeout to 15s to handle internal CDNs like vendorcenter.jumia.com
+            # Keep a failed external image from holding a large validation for
+            # minutes. Archive matches are handled locally before this path.
             _network_t0 = time.perf_counter()
-            r = session.get(url.replace("http://", "https://"), timeout=15)
+            r = session.get(url.replace("http://", "https://"), timeout=(2.5, 5))
             _network_elapsed = time.perf_counter() - _network_t0
             if r.status_code == 200:
                 raw = r.content
