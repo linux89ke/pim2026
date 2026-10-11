@@ -868,8 +868,8 @@ class _BoundedDict(OrderedDict):
             self.popitem(last=False)
 
 
-_IMAGE_DIM_CACHE = _BoundedDict(maxsize=5000)
-_IMAGE_HASH_CACHE = _BoundedDict(maxsize=5000)
+_IMAGE_DIM_CACHE = _BoundedDict(maxsize=50000)
+_IMAGE_HASH_CACHE = _BoundedDict(maxsize=50000)
 _IMAGE_THUMB_CACHE = _BoundedDict(maxsize=2500)
 _IMAGE_DIM_LOCK = threading.Lock()
 # Staging area for the low-resolution advisory produced by check_image_blurry.
@@ -2711,13 +2711,11 @@ def check_suspected_fake_products(
         _in_scope_cats = _sneaker_cats | {c for (_b, c) in brand_cat_price}
         _in_scope = d["_cat_clean"].isin(_in_scope_cats) if _in_scope_cats else pd.Series(False, index=d.index)
         if _in_scope.any():
-            _blob = (
-                d.get("DESCRIPTION", pd.Series("", index=d.index)).astype(str)
-                + " "
-                + d.get("SHORT_DESCRIPTION", pd.Series("", index=d.index)).astype(str)
-            ).where(_in_scope, "").str.replace(_tag_re, " ", regex=True).str.lower()
+            _scope_idx = d.index[_in_scope]
+            _desc_clean = d.loc[_scope_idx, "DESCRIPTION"].astype(str).str.replace(_tag_re, " ", regex=True)
+            _short_clean = d.loc[_scope_idx, "SHORT_DESCRIPTION"].astype(str).str.replace(_tag_re, " ", regex=True)
         else:
-            _blob = pd.Series("", index=d.index)
+            _scope_idx = pd.Index([])
 
         _no_blob = pd.Series(False, index=d.index)
         _claims = {}   # brand -> boolean Series
@@ -2725,28 +2723,28 @@ def check_suspected_fake_products(
         for b, rx in _brand_res.items():
             _brand_hit = d["_brand_lower"] == b
             _name_hit = _name.str.contains(rx, na=False)
-            _desc_hit = (
-                _no_blob if b in _NO_DESCRIPTION_SCAN_BRANDS
-                else d.get("DESCRIPTION", pd.Series("", index=d.index)).astype(str).str.replace(_tag_re, " ", regex=True).str.contains(rx, na=False)
-            )
-            _short_hit = (
-                _no_blob if b in _NO_DESCRIPTION_SCAN_BRANDS
-                else d.get("SHORT_DESCRIPTION", pd.Series("", index=d.index)).astype(str).str.replace(_tag_re, " ", regex=True).str.contains(rx, na=False)
-            )
+            if b in _NO_DESCRIPTION_SCAN_BRANDS or len(_scope_idx) == 0:
+                _desc_hit = _no_blob
+                _short_hit = _no_blob
+            else:
+                _desc_hit = pd.Series(False, index=d.index)
+                _desc_hit.loc[_scope_idx] = _desc_clean.str.contains(rx, na=False)
+                _short_hit = pd.Series(False, index=d.index)
+                _short_hit.loc[_scope_idx] = _short_clean.str.contains(rx, na=False)
             _claims[b] = _brand_hit | _name_hit | _desc_hit | _short_hit
             _claim_sources[b] = (_brand_hit, _name_hit, _desc_hit, _short_hit)
         for a, parent in _alias_terms.items():
             rx = _alias_res[a]
             _brand_hit = d["_brand_lower"] == a
             _name_hit = _name.str.contains(rx, na=False)
-            _desc_hit = (
-                _no_blob if parent in _NO_DESCRIPTION_SCAN_BRANDS
-                else d.get("DESCRIPTION", pd.Series("", index=d.index)).astype(str).str.replace(_tag_re, " ", regex=True).str.contains(rx, na=False)
-            )
-            _short_hit = (
-                _no_blob if parent in _NO_DESCRIPTION_SCAN_BRANDS
-                else d.get("SHORT_DESCRIPTION", pd.Series("", index=d.index)).astype(str).str.replace(_tag_re, " ", regex=True).str.contains(rx, na=False)
-            )
+            if parent in _NO_DESCRIPTION_SCAN_BRANDS or len(_scope_idx) == 0:
+                _desc_hit = _no_blob
+                _short_hit = _no_blob
+            else:
+                _desc_hit = pd.Series(False, index=d.index)
+                _desc_hit.loc[_scope_idx] = _desc_clean.str.contains(rx, na=False)
+                _short_hit = pd.Series(False, index=d.index)
+                _short_hit.loc[_scope_idx] = _short_clean.str.contains(rx, na=False)
             _claims[parent] = _claims.get(parent, pd.Series(False, index=d.index)) | (_brand_hit | _name_hit | _desc_hit | _short_hit)
             _claim_sources.setdefault(parent, (_no_blob, _no_blob, _no_blob, _no_blob))
             _old_brand, _old_name, _old_desc, _old_short = _claim_sources[parent]

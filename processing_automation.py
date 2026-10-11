@@ -1,6 +1,6 @@
 """Large-file validation helpers: manifests, thumbnails, similarity and review queues."""
 from __future__ import annotations
-import base64, hashlib, io, json, os, re, threading
+import base64, time, hashlib, io, json, os, re, threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,7 +17,7 @@ THUMB_DIR.mkdir(exist_ok=True, parents=True)
 DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="image-download")
 _LOCK = threading.RLock()
 
-def load_image_metadata_cache(max_entries: int = 10000) -> dict:
+def load_image_metadata_cache(max_entries: int = 50000) -> dict:
     """Load the durable URL -> dimensions/pHash cache.
 
     This is a small derived cache, deliberately separate from learned rules.
@@ -35,30 +35,37 @@ def load_image_metadata_cache(max_entries: int = 10000) -> dict:
     except (OSError, ValueError, TypeError):
         return {}
 
-def save_image_metadata_cache(entries: dict, max_entries: int = 10000) -> None:
+def save_image_metadata_cache(entries: dict, max_entries: int = 50000) -> None:
     """Atomically persist successful image metadata without touching rules."""
     if not isinstance(entries, dict):
         return
-    clean = {}
-    for url, value in list(entries.items())[-max_entries:]:
-        if not str(url).strip() or not isinstance(value, dict):
-            continue
-        size = value.get("size")
-        phash = str(value.get("phash") or "").strip()
-        if not phash and not size:
-            continue
-        clean[str(url)] = {
-            "size": list(size) if isinstance(size, (tuple, list)) and len(size) == 2 else None,
-            "phash": phash,
-            "updated_at": value.get("updated_at") or datetime.now(timezone.utc).isoformat(),
-        }
-    try:
-        with _LOCK:
+    with _LOCK:
+        existing = load_image_metadata_cache(max_entries=max_entries)
+        existing.update(entries)
+        clean = {}
+        for url, value in list(existing.items())[-max_entries:]:
+            if not str(url).strip() or not isinstance(value, dict):
+                continue
+            size = value.get("size")
+            phash = str(value.get("phash") or "").strip()
+            if not phash and not size:
+                continue
+            clean[str(url)] = {
+                "size": list(size) if isinstance(size, (tuple, list)) and len(size) == 2 else None,
+                "phash": phash,
+                "updated_at": value.get("updated_at") or datetime.now(timezone.utc).isoformat(),
+            }
+        try:
             tmp = IMAGE_CACHE_PATH.with_suffix(".tmp")
             tmp.write_text(json.dumps({"version": 1, "entries": clean}, separators=(",", ":")), encoding="utf-8")
-            os.replace(tmp, IMAGE_CACHE_PATH)
-    except OSError:
-        pass
+            for _attempt in range(5):
+                try:
+                    os.replace(tmp, IMAGE_CACHE_PATH)
+                    break
+                except (PermissionError, OSError):
+                    time.sleep(0.05 * (2 ** _attempt))
+        except OSError:
+            pass
 
 def chunk_artifact_dir(signature: str) -> Path:
     path = AUTOMATION_DIR / "chunks" / str(signature)
