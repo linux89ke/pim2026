@@ -3,8 +3,41 @@ import pandas as pd
 import datetime
 import re
 import zipfile
+import os
+import shutil
 from io import BytesIO
 import plotly.express as px
+
+
+def _configure_rar_backend(rarfile_module):
+    """Configure rarfile with the local or Streamlit Cloud extractor."""
+    configured = os.environ.get("UNRAR_TOOL", "").strip()
+    candidates = [configured] if configured else []
+    candidates.extend([
+        shutil.which("7z"), shutil.which("7zz"), shutil.which("unrar"),
+        shutil.which("unar"), shutil.which("bsdtar"),
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "WinRAR", "UnRAR.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "WinRAR", "UnRAR.exe"),
+    ])
+    for candidate in candidates:
+        if candidate and (os.path.isfile(candidate) or shutil.which(candidate)):
+            if os.path.basename(candidate).lower() in {"7z", "7z.exe", "7zz", "7zz.exe"}:
+                rarfile_module.SEVENZIP_TOOL = candidate
+                rarfile_module.SEVENZIP2_TOOL = candidate
+            elif os.path.basename(candidate).lower() in {"unar", "unar.exe"}:
+                rarfile_module.UNAR_TOOL = candidate
+            else:
+                rarfile_module.UNRAR_TOOL = candidate
+            return candidate
+    return None
+
+
+def _read_archive_member(archive, member_name):
+    """Read a CSV/Excel member from either ZipFile or RarFile."""
+    with archive.open(member_name, "r") as member:
+        if member_name.lower().endswith(".csv"):
+            return pd.read_csv(member, low_memory=False)
+        return pd.read_excel(member)
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="PIM Weekly Analysis Dashboard", page_icon=":material/analytics:", layout="wide")
@@ -229,11 +262,11 @@ def highlight_weekends(row):
 
 # --- MAIN UI ---
 st.title(":material/monitoring: PIM Weekly Export Analyzer")
-st.markdown("Upload your `ProductSets` files (**CSV, Excel, or ZIP archives**) to generate a professional performance report.")
+st.markdown("Upload your `ProductSets` files (**CSV, Excel, ZIP, or RAR archives**) to generate a professional performance report.")
 
 uploaded_files = st.file_uploader(
-    "Select files or ZIP archives to process",
-    type=["csv", "xlsx", "xls", "zip"],
+    "Select files or ZIP/RAR archives to process",
+    type=["csv", "xlsx", "xls", "zip", "rar"],
     accept_multiple_files=True
 )
 
@@ -247,21 +280,39 @@ if uploaded_files:
 
     with st.spinner(":material/hourglass_empty: Extracting and merging files..."):
         for file in uploaded_files:
-            if file.name.endswith('.zip'):
-                with zipfile.ZipFile(file, 'r') as z:
-                    for zip_filename in z.namelist():
-                        if zip_filename.endswith(('.csv', '.xlsx', '.xls')) and not zip_filename.startswith('__MACOSX'):
-                            with z.open(zip_filename) as f:
-                                if zip_filename.endswith('.csv'):
-                                    df = pd.read_csv(f, low_memory=False)
-                                else:
-                                    df = pd.read_excel(f)
-                                c, w = process_dataframe(df, zip_filename.split('/')[-1], all_data)
+            file_name = str(file.name)
+            file_name_lower = file_name.lower()
+            if file_name_lower.endswith(('.zip', '.rar')):
+                try:
+                    if file_name_lower.endswith('.rar'):
+                        try:
+                            import rarfile
+                        except ImportError as exc:
+                            raise RuntimeError("RAR support requires the rarfile package.") from exc
+                        if not _configure_rar_backend(rarfile):
+                            raise RuntimeError(
+                                "RAR extraction backend not found. Install 7-Zip/WinRAR locally "
+                                "or add p7zip-full to the deployment packages."
+                            )
+                        archive = rarfile.RarFile(BytesIO(file.getvalue()), 'r')
+                    else:
+                        archive = zipfile.ZipFile(file, 'r')
+
+                    with archive as z:
+                        member_names = z.namelist()
+                        for archive_filename in member_names:
+                            member_lower = str(archive_filename).lower()
+                            if (member_lower.endswith(('.csv', '.xlsx', '.xls'))
+                                    and not str(archive_filename).replace('\\', '/').startswith('__macosx/')):
+                                df = _read_archive_member(z, archive_filename)
+                                c, w = process_dataframe(df, str(archive_filename).replace('\\', '/').split('/')[-1], all_data)
                                 if primary_country == "Unknown":
                                     primary_country, primary_week = c, w
                                 total_files_merged += 1
+                except Exception as exc:
+                    st.error(f"Could not open {file_name}: {exc}", icon=":material/error:")
             else:
-                if file.name.endswith('.csv'):
+                if file_name_lower.endswith('.csv'):
                     df = pd.read_csv(file, low_memory=False)
                 else:
                     df = pd.read_excel(file)
