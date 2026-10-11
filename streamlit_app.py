@@ -1063,11 +1063,17 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
     in a single network pass using session pooling. Thread-safe.
     """
     _image_t0 = time.perf_counter()
+    _cache_hits = 0
+    _network_seconds = 0.0
+    _decode_seconds = 0.0
+    _thumbnail_seconds = 0.0
+    _failed_count = 0
     if "MAIN_IMAGE" not in data.columns:
         return {}
     _all_urls = data["MAIN_IMAGE"].astype(str)
     urls = _all_urls[_all_urls.str.strip().str.startswith("http")].unique()
     with _IMAGE_DIM_LOCK:
+        _cache_hits = sum(1 for u in urls if u and u in _IMAGE_DIM_CACHE)
         new_urls = list(dict.fromkeys(u for u in urls if u and u not in _IMAGE_DIM_CACHE))
 
     # Descriptors only — three short strings per image, not the image itself.
@@ -1107,37 +1113,45 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
                 ))
 
     if not new_urls and not zip_descriptors:
+        st.session_state["image_fetch_metrics"] = {
+            "unique_urls": int(len(urls)),
+            "cache_hits": int(_cache_hits),
+            "downloads": 0,
+            "network_seconds": 0.0,
+            "decode_phash_seconds": 0.0,
+            "thumbnail_seconds": 0.0,
+            "failed": 0,
+        }
         st.session_state["validation_stage_timings"] = {
             **st.session_state.get("validation_stage_timings", {}),
             "Image download and pHash": 0.0,
+            "Image network download": 0.0,
+            "Image decode and pHash": 0.0,
+            "Image thumbnail generation": 0.0,
         }
         return _IMAGE_DIM_CACHE
-
-    # Thumbnail files are only needed for the first visible review window.
-    # Generating and writing one for every image during validation added a
-    # second full image-processing pass to large uploads. Cards can safely use
-    # the original URL while a thumbnail is not cached.
-    _thumb_url_limit = 200
-    _thumbnail_urls = set(new_urls[:_thumb_url_limit])
-    _thumbnail_zip_keys = {d[0] for d in zip_descriptors[:_thumb_url_limit]}
 
     def fetch(url):
         session = get_image_session()
         try:
             # Bumping timeout to 15s to handle internal CDNs like vendorcenter.jumia.com
+            _network_t0 = time.perf_counter()
             r = session.get(url.replace("http://", "https://"), timeout=15)
+            _network_elapsed = time.perf_counter() - _network_t0
             if r.status_code == 200:
                 raw = r.content
+                _decode_t0 = time.perf_counter()
                 size, ph = _size_and_phash(raw)
-                thumb = thumbnail_data_uri(raw, url, 240) if url in _thumbnail_urls else ""
-                return url, size, ph, thumb
+                _decode_elapsed = time.perf_counter() - _decode_t0
+                return url, size, ph, "", _network_elapsed, _decode_elapsed, 0.0, True
+            return url, None, "", "", _network_elapsed, 0.0, 0.0, False
         except Exception:
             pass
         # Keep the result shape identical to successful downloads. The image
         # prefetch collector stores (url, dimensions, phash, thumbnail); a
         # three-item failure tuple made one bad image abort the whole prefetch
         # pass with "expected 4, got 3".
-        return url, None, "", ""
+        return url, None, "", "", 0.0, 0.0, 0.0, False
 
     def process_zip_img(tup):
         key, payload = tup
@@ -1147,12 +1161,13 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
                 raw = base64.b64decode(encoded)
             else:
                 raw = payload if isinstance(payload, (bytes, bytearray)) else b""
+            _decode_t0 = time.perf_counter()
             size, ph = _size_and_phash(raw)
-            thumb = thumbnail_data_uri(raw, key, 240) if key in _thumbnail_zip_keys else ""
-            return key, size, ph, thumb
+            _decode_elapsed = time.perf_counter() - _decode_t0
+            return key, size, ph, "", 0.0, _decode_elapsed, 0.0, True
         except Exception:
             pass
-        return key, None, "", ""
+        return key, None, "", "", 0.0, 0.0, 0.0, False
 
     results = []
     # Lowered thread concurrency limit to prevent socket exhaustion
@@ -1192,7 +1207,13 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
                 _payloads = None
 
     with _IMAGE_DIM_LOCK:
-        for key, size, ph, thumb in results:
+        _persisted = {}
+        for key, size, ph, thumb, _net, _decode, _thumb, _ok in results:
+            _network_seconds += float(_net or 0.0)
+            _decode_seconds += float(_decode or 0.0)
+            _thumbnail_seconds += float(_thumb or 0.0)
+            if not _ok:
+                _failed_count += 1
             # Record failures too. Without this, a URL that 404s or times out is
             # absent from the cache, so it lands in `new_urls` again on the next
             # run and is re-fetched with the full 6s timeout + 2 retries — every
@@ -1202,6 +1223,10 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
                 _IMAGE_HASH_CACHE[key] = ph
             if thumb:
                 _IMAGE_THUMB_CACHE[key] = thumb
+            if size or ph:
+                _persisted[key] = {"size": size, "phash": ph}
+        if _persisted:
+            save_image_metadata_cache(_persisted)
 
     # Publish a snapshot for ui_components, which needs the hashes to find the
     # same photo listed by another seller but cannot import this module (it is
@@ -1210,9 +1235,21 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
     try:
         st.session_state["_image_phash_by_url"] = dict(_IMAGE_HASH_CACHE)
         st.session_state["_image_thumbnail_by_url"] = dict(_IMAGE_THUMB_CACHE)
+        st.session_state["image_fetch_metrics"] = {
+            "unique_urls": int(len(urls)),
+            "cache_hits": int(_cache_hits),
+            "downloads": int(len(new_urls)),
+            "network_seconds": round(_network_seconds, 3),
+            "decode_phash_seconds": round(_decode_seconds, 3),
+            "thumbnail_seconds": round(_thumbnail_seconds, 3),
+            "failed": int(_failed_count),
+        }
         st.session_state["validation_stage_timings"] = {
             **st.session_state.get("validation_stage_timings", {}),
             "Image download and pHash": round(time.perf_counter() - _image_t0, 3),
+            "Image network download": round(_network_seconds, 3),
+            "Image decode and pHash": round(_decode_seconds, 3),
+            "Image thumbnail generation": round(_thumbnail_seconds, 3),
         }
     except Exception:
         pass
@@ -1264,7 +1301,23 @@ from learned_rules import (
 from processing_automation import (
     load_manifest, mark_batch, completed_batches, file_signature,
     save_chunk_results, load_chunk_results, save_stage_frame, load_stage_frame, thumbnail_data_uri,
+    load_image_metadata_cache, save_image_metadata_cache,
 )
+
+# Restore successful image metadata between Streamlit reruns/restarts. This
+# cache contains only derived dimensions and pHashes; it never contains
+# learned decisions and can be deleted safely.
+try:
+    for _cached_url, _cached_meta in load_image_metadata_cache().items():
+        if not isinstance(_cached_meta, dict):
+            continue
+        _cached_size = _cached_meta.get("size")
+        _cached_phash = str(_cached_meta.get("phash") or "").strip()
+        _IMAGE_DIM_CACHE[str(_cached_url)] = tuple(_cached_size) if isinstance(_cached_size, list) and len(_cached_size) == 2 else None
+        if _cached_phash:
+            _IMAGE_HASH_CACHE[str(_cached_url)] = _cached_phash
+except Exception:
+    logger.debug("Could not restore persistent image metadata cache", exc_info=True)
 
 
 

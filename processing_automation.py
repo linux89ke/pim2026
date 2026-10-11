@@ -11,10 +11,54 @@ ROOT = Path(__file__).resolve().parent
 AUTOMATION_DIR = ROOT / ".validation_automation"
 MANIFEST_DIR = AUTOMATION_DIR / "manifests"
 THUMB_DIR = AUTOMATION_DIR / "thumbnails"
+IMAGE_CACHE_PATH = AUTOMATION_DIR / "image_metadata.json"
 MANIFEST_DIR.mkdir(exist_ok=True, parents=True)
 THUMB_DIR.mkdir(exist_ok=True, parents=True)
 DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="image-download")
 _LOCK = threading.RLock()
+
+def load_image_metadata_cache(max_entries: int = 10000) -> dict:
+    """Load the durable URL -> dimensions/pHash cache.
+
+    This is a small derived cache, deliberately separate from learned rules.
+    It can be deleted safely and is ignored by Git.  Invalid or oversized
+    entries are ignored so a damaged cache never prevents validation startup.
+    """
+    try:
+        payload = json.loads(IMAGE_CACHE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return {}
+        entries = payload.get("entries", payload)
+        if not isinstance(entries, dict):
+            return {}
+        return dict(list(entries.items())[-max_entries:])
+    except (OSError, ValueError, TypeError):
+        return {}
+
+def save_image_metadata_cache(entries: dict, max_entries: int = 10000) -> None:
+    """Atomically persist successful image metadata without touching rules."""
+    if not isinstance(entries, dict):
+        return
+    clean = {}
+    for url, value in list(entries.items())[-max_entries:]:
+        if not str(url).strip() or not isinstance(value, dict):
+            continue
+        size = value.get("size")
+        phash = str(value.get("phash") or "").strip()
+        if not phash and not size:
+            continue
+        clean[str(url)] = {
+            "size": list(size) if isinstance(size, (tuple, list)) and len(size) == 2 else None,
+            "phash": phash,
+            "updated_at": value.get("updated_at") or datetime.now(timezone.utc).isoformat(),
+        }
+    try:
+        with _LOCK:
+            tmp = IMAGE_CACHE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"version": 1, "entries": clean}, separators=(",", ":")), encoding="utf-8")
+            os.replace(tmp, IMAGE_CACHE_PATH)
+    except OSError:
+        pass
 
 def chunk_artifact_dir(signature: str) -> Path:
     path = AUTOMATION_DIR / "chunks" / str(signature)
