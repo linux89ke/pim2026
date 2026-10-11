@@ -1215,7 +1215,11 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
 
     results = []
     # Lowered thread concurrency limit to prevent socket exhaustion
-    _img_workers = min(16, max(4, (os.cpu_count() or 4) * 2))
+    # Image fetching is network-bound. Streamlit Cloud commonly reports only
+    # two CPUs, which previously reduced this pool to four workers and made a
+    # batch with hundreds of external images wait behind unreachable URLs.
+    # Keep a bounded cap, but maintain enough concurrency for I/O workloads.
+    _img_workers = min(16, max(12, (os.cpu_count() or 4) * 4))
     if new_urls:
         with concurrent.futures.ThreadPoolExecutor(max_workers=_img_workers) as executor:
             for _image_index, _image_result in enumerate(executor.map(fetch, new_urls), start=1):
