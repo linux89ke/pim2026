@@ -7859,7 +7859,7 @@ if st.session_state.get("_row_estimate_sig") != process_signature:
                         # progress. RAR backends may spawn an external process for
                         # each read; file size is sufficient for an estimate and
                         # avoids a second full archive pass before validation.
-                        _total_estimated_rows += max(1, int(getattr(_qc_info, "file_size", 0) or len(_fc["bytes"]) // 500) // (500 if _qc_info.filename.lower().endswith(".csv") else 1))
+                        _total_estimated_rows += max(1, int(getattr(_qc_info, "file_size", 0) or len(_fc["bytes"])) // 500)
                     else: _total_estimated_rows += max(1, len(_fc["bytes"]) // 500)
             elif _name_lower.endswith(".xlsx"):
                 _total_estimated_rows += pd.read_excel(_peek, engine="openpyxl", nrows=1, dtype=str).shape[0]
