@@ -6141,6 +6141,13 @@ def validate_products(
     # checks so a clearly rejected upload does not spend time building duplicate
     # groups before its primary validation results are available.
     _duplicate_precomputed = None
+    _upload_wide_cache = st.session_state.setdefault("_upload_wide_validator_cache", {})
+    _upload_wide_signature = None
+    if isinstance(full_batch, pd.DataFrame) and not full_batch.empty:
+        try:
+            _upload_wide_signature = df_hash(full_batch)
+        except Exception:
+            _upload_wide_signature = f"rows-{len(full_batch)}"
 
     def _emit_progress(name: str, i: int, total: int):
         nonlocal _last_progress_t
@@ -6177,13 +6184,18 @@ def validate_products(
         with concurrent.futures.ThreadPoolExecutor(max_workers=_val_workers) as executor:
             future_to_name = {}
             future_started = {}
+            future_is_upload_wide = {}
             for name, func, kwargs in v_list:
                 if _skipped(name, func):
                     continue
 
                 working_data = current_data
                 digests = _full_digests
-                if name in EXPENSIVE_VALIDATORS and rejected_sids:
+                _is_upload_wide = bool(name == "Wrong Category" and isinstance(full_batch, pd.DataFrame) and not full_batch.empty)
+                if _is_upload_wide:
+                    working_data = full_batch
+                    digests = _ColumnDigests(full_batch)
+                elif name in EXPENSIVE_VALIDATORS and rejected_sids:
                     working_data = _filtered_data
                     digests = _filtered_digests
                     if working_data.empty:
@@ -6217,11 +6229,16 @@ def validate_products(
                     name, digests, country_validator.code, _rules_sig, _key_extra,
                 )
                 _curr_ctx = get_script_run_ctx() if get_script_run_ctx else None
-                if name == "Duplicate product" and _duplicate_precomputed is not None:
+                _wide_key = f"{name}:{country_validator.code}:{_rules_sig}:{_upload_wide_signature}"
+                _wide_cached = _upload_wide_cache.get(_wide_key) if _is_upload_wide else None
+                if _wide_cached is not None:
+                    _future = executor.submit(lambda _result=_wide_cached: _result)
+                elif name == "Duplicate product" and _duplicate_precomputed is not None:
                     _future = executor.submit(lambda _result=_duplicate_precomputed: _result)
                 else:
                     _future = executor.submit(_run_with_ctx, _curr_ctx, run_cached_check, func, cache_path, ckwargs)
                 future_to_name[_future] = name
+                future_is_upload_wide[_future] = (_is_upload_wide, _wide_key)
                 future_started[_future] = time.perf_counter()
 
             for future in concurrent.futures.as_completed(future_to_name):
@@ -6231,6 +6248,11 @@ def validate_products(
                 _emit_progress(name, processed_count, total_tasks)
                 try:
                     res = future.result()
+                    _wide_info = future_is_upload_wide.get(future)
+                    if _wide_info and _wide_info[0] and _wide_info[1] not in _upload_wide_cache:
+                        _upload_wide_cache[_wide_info[1]] = res
+                        while len(_upload_wide_cache) > 12:
+                            _upload_wide_cache.pop(next(iter(_upload_wide_cache)))
                     if not res.empty and "PRODUCT_SET_SID" in res.columns:
                         res = res.loc[:, ~res.columns.duplicated()].copy()
                         res["PRODUCT_SET_SID"] = res["PRODUCT_SET_SID"].astype(str).str.strip()
