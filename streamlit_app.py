@@ -8051,6 +8051,39 @@ if st.session_state.get("last_processed_files") != process_signature:
                                         
                                         _accumulated_zip_qc_dfs.append(qdf)
 
+                                # Some QC archives contain both QC_Results files
+                                # and the original productSets export. If the
+                                # QC members are truncated, keep processing from
+                                # that product table instead of ending with a
+                                # misleading "No data" error.
+                                if raw_data.empty:
+                                    _product_members = [
+                                        info for info in members
+                                        if info.filename.lower().endswith((".csv", ".xlsx", ".xls"))
+                                        and "qc_results" not in info.filename.lower()
+                                        and "qc_result" not in info.filename.lower()
+                                        and any(token in info.filename.lower() for token in ("productsets", "product_set", "product-set"))
+                                    ]
+                                    for _product_info in _product_members:
+                                        try:
+                                            _product_bytes = zf.read(_product_info)
+                                            if _product_info.filename.lower().endswith(".csv"):
+                                                _product_frame = _detect_and_read_csv(BytesIO(_product_bytes))
+                                            else:
+                                                _product_frame = pd.read_excel(BytesIO(_product_bytes), dtype=str)
+                                            if not _product_frame.empty:
+                                                raw_data = _product_frame
+                                                st.info(
+                                                    f"Using {_product_info.filename} because the QC result members were unreadable.",
+                                                    icon=":material/info:"
+                                                )
+                                                break
+                                        except Exception as _product_read_error:
+                                            st.warning(
+                                                f"Could not read {_product_info.filename} from {uf['name']}: "
+                                                f"{_product_read_error}"
+                                            )
+
                                 # ── PIM_QC_Result.xlsx ────────────────────
                                 _pim = next(
                                     (
