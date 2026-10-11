@@ -1004,12 +1004,17 @@ def _rar_backend_available() -> bool:
         import rarfile
     except ImportError:
         return False
-    if _configure_rarfile_backend(rarfile):
+    _configured_tool = _configure_rarfile_backend(rarfile)
+    if _configured_tool:
         try:
             rarfile.tool_setup(force=True)
             return True
         except Exception:
-            pass
+            # Some Cloud Linux images expose 7z/unar at a fixed path while
+            # rarfile's probe cannot execute its feature test during startup.
+            # Let the archive open below be the authoritative test.
+            if os.path.isfile(_configured_tool) and os.access(_configured_tool, os.X_OK):
+                return True
     return any(shutil.which(name) for name in ("unrar", "unar", "bsdtar", "7z", "7zz"))
 
 
