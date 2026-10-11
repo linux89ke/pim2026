@@ -7082,7 +7082,7 @@ def cached_validate_products(
 def validate_in_chunks(data, support_files, country_validator, data_has_warranty,
                       *, cache_prefix, skip_validators=None, on_progress=None,
                       full_batch=None, rules_revision=0.0, manifest=None,
-                      batch_prefix="batch", chunk_size=1000):
+                      batch_prefix="batch", chunk_size=5000):
     """Run validation in bounded SID chunks and checkpoint each completed chunk."""
     if data is None or data.empty:
         return pd.DataFrame(), {}
@@ -7111,12 +7111,11 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
             logger.debug("Could not persist normalized stage artifact", exc_info=True)
     pending_data = data
     pending_hashes = st.session_state.get("_image_phash_by_url", {})
-    # Larger chunks reduce repeated validator setup and dataframe hashing for
-    # large uploads while retaining checkpoint recovery for smaller batches.
-    if len(sids) > 20_000 and chunk_size < 10_000:
+    # Larger chunks reduce repeated validator setup and dataframe hashing. Keep
+    # a bounded ceiling so very large uploads still checkpoint and resume
+    # without building one enormous in-memory validation frame.
+    if len(sids) > 5_000 and chunk_size < 10_000:
         chunk_size = 10_000
-    elif len(sids) > 5_000 and chunk_size < 5_000:
-        chunk_size = 5_000
     total = max(1, (len(sids) + chunk_size - 1) // chunk_size)
     done = completed_batches(manifest or {})
     for index in range(total):
