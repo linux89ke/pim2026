@@ -465,13 +465,11 @@ def flag_pill_header(flag_name: str, count: int, is_zip: bool = False) -> str:
         f'<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{_icon_path}</svg></span>'
     )
 
-    # The ZIP badge stays as it was: this is how a reviewer tells a result the
-    # QC system already produced from one this tool computed itself, and the
-    # blue reads as "different source" rather than as a severity. Only the
-    # gradient's light end was darkened (#3b82f6 -> #2563eb) because white on
-    # it was 3.7:1 at 10px; the darker blue keeps the same look at 5.2:1.
+    # Keep ZIP provenance visibly orange, as in the original validation view.
+    # It is a source indicator rather than a rejection severity, so the flag
+    # icon and count still use the flag's severity colour.
     zip_badge = (
-        ' <span style="background:linear-gradient(135deg, #2563eb, #1d4ed8);'
+        ' <span style="background:linear-gradient(135deg, #f59e0b, #ea580c);'
         'color:white;border-radius:6px;padding:2px 8px;font-size:11px;'
         'font-weight:900;box-shadow:0 2px 4px rgba(0,0,0,0.1);'
         'margin-left:8px;">ZIP</span>'
@@ -4825,7 +4823,7 @@ function renderCard(card) {{
   var aiBrandHtml = (card.brand_detected && card.brand_detected.toLowerCase() !== card.brand.toLowerCase()) ? `<div class="ai-brand-pill" title="AI detected brand: ${{escapeHtml(card.brand_detected)}}">🏷 AI Brand: ${{escapeHtml(card.brand_detected)}}</div>` : '';
   var brandDetectedHtml = (isBrandImgRej && card.brand_detected) ? '<div class="co" style="background:#E8F5E9;color:#2E7D32;border:1px solid #C8E6C9;" title="Brand Detected: ' + escapeHtml(card.brand_detected) + '">Detected Brand: ' + escapeHtml(card.brand_detected) + '</div>' : '';
   var isOverturned = Boolean((card.flag_comment && card.flag_comment.toLowerCase().includes('overturned')) || card.zip_override);
-  var zipBadgeHtml = card.is_zip ? '<span style="background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:#fff;font-size:10px;font-weight:900;padding:2px 8px;border-radius:6px;box-shadow:0 2px 4px rgba(0,0,0,0.15);margin-left:8px;display:inline-block;">ZIP</span>' : '';
+  var zipBadgeHtml = card.is_zip ? '<span style="background:linear-gradient(135deg,#f59e0b,#ea580c);color:#fff;font-size:10px;font-weight:900;padding:2px 8px;border-radius:6px;box-shadow:0 2px 4px rgba(0,0,0,0.15);margin-left:8px;display:inline-block;">ZIP</span>' : '';
   if (card.zip_override) {{
     var ot = card.zip_override.toLowerCase();
     var isAppleOv = ot.includes('apple');

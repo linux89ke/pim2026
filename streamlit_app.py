@@ -9514,6 +9514,19 @@ def render_main_results():
         st.markdown(
             """
             <style>
+            /* ZIP/prefetched validations use the original orange source
+               treatment. The keyed container makes this stable across
+               reruns and avoids the old document-wide MutationObserver. */
+            div[class*="st-key-validation_zip_"] [data-testid="stExpander"] > details > summary {
+                background: linear-gradient(90deg, rgba(244, 210, 159, .96), rgba(244, 210, 159, .68)) !important;
+                color: rgb(49, 51, 63) !important;
+                border-radius: 8px !important;
+                margin-bottom: 4px !important;
+            }
+            div[class*="st-key-validation_zip_"] [data-testid="stExpander"] > details > summary p,
+            div[class*="st-key-validation_zip_"] [data-testid="stExpander"] > details > summary svg {
+                color: rgb(49, 51, 63) !important;
+            }
             /* Learned-rule validations are high-confidence inherited
                rejections. Keep the normal severity colors, but add a clear
                red treatment to the validation expander itself. */
