@@ -26,6 +26,12 @@ logger = logging.getLogger(__name__)
 # this bounded cache avoids rebuilding the same four-part index once per
 # validation chunk.
 _PHASH_INDEX_CACHE = {}
+# Matching the same upload twice (validator pass, then report construction)
+# used to repeat the full near-pHash search. Keep a small process-local cache;
+# the key includes the upload's SID/image fingerprint and the learned-map
+# identity, so a changed catalog cannot return stale decisions.
+_MATCH_RESULT_CACHE = {}
+_MATCH_RESULT_CACHE_MAX = 8
 
 _MODULE_DIR = Path(__file__).resolve().parent
 _BLOCKED_IMG_EXCEL = str(_MODULE_DIR / "Image_learn.xlsx")
@@ -234,10 +240,27 @@ def get_blocked_image_matches(
     # Repeated image URLs/hashes are common in a product batch. Memoize their
     # nearest catalog result so each distinct upload hash is compared once.
     nearest_cache = {}
+    # Build a cheap stable key for this upload. It is intentionally based only
+    # on the SID, image URL and supplied pHash map; product descriptions and
+    # other columns cannot affect image matching.
+    try:
+        _match_key = (
+            id(blocked_map), len(blocked_map), id(hash_by_url),
+            hash(tuple(zip(
+                data[sid_col].fillna("").astype(str).str.strip(),
+                data[img_col].fillna("").astype(str).str.strip(),
+            )))
+        )
+        _cached_matches = _MATCH_RESULT_CACHE.get(_match_key)
+        if _cached_matches is not None:
+            return dict(_cached_matches)
+    except Exception:
+        _match_key = None
+
     matches = {}
-    for _, row in data.iterrows():
-        sid = str(row[sid_col]).strip()
-        url = str(row[img_col]).strip()
+    _sid_values = data[sid_col].fillna("").astype(str).str.strip().to_numpy()
+    _url_values = data[img_col].fillna("").astype(str).str.strip().to_numpy()
+    for sid, url in zip(_sid_values, _url_values):
         if not url or url.lower() == "nan" or not sid:
             continue
 
@@ -334,6 +357,10 @@ def get_blocked_image_matches(
                 ),
             }
 
+    if _match_key is not None:
+        _MATCH_RESULT_CACHE[_match_key] = dict(matches)
+        while len(_MATCH_RESULT_CACHE) > _MATCH_RESULT_CACHE_MAX:
+            _MATCH_RESULT_CACHE.pop(next(iter(_MATCH_RESULT_CACHE)))
     return matches
 
 
@@ -395,11 +422,13 @@ def check_blocked_image_fingerprints(
         ))
 
     flagged_rows = []
-    for _, row in data.iterrows():
-        sid = str(row[sid_col]).strip()
+    _sid_values = data[sid_col].fillna("").astype(str).str.strip().to_numpy()
+    for _row_pos, sid in enumerate(_sid_values):
         if sid in matches and matches[sid].get("decision", "reject") == "reject":
             m = matches[sid]
-            frow = row.copy()
+            # Only materialise a pandas Series for rows that actually match;
+            # the old iterrows path created one for every product.
+            frow = data.iloc[_row_pos].copy()
             learned_flag = str(m.get("flag", "Poor images")).strip()
             # Uganda has no restricted-brand rejection catalogue. Its learned
             # restricted-image records are used only as evidence that the
@@ -409,7 +438,7 @@ def check_blocked_image_fingerprints(
             # explains the wrong brand.
             if country_code == "UG" and learned_flag == "Restricted brands":
                 learned_brand = str(m.get("brand", "")).strip()
-                declared_brand = declared_brand_by_sid.get(sid, str(row.get("BRAND", "")).strip())
+                declared_brand = declared_brand_by_sid.get(sid, "")
                 if _learned_brands_agree(declared_brand, learned_brand):
                     continue
                 frow["Comment_Detail"] = (

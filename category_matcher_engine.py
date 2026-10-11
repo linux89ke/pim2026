@@ -1132,13 +1132,40 @@ class CategoryMatcherEngine:
         n = len(names)
         results = [''] * n
 
+        # Resolve exact corrections first, then run the learned classifier on
+        # all remaining names in one transform/predict_proba call.  Calling
+        # ``predict_proba`` once per product is dramatically slower for the
+        # multi-class model because each call pays the sklearn dispatch and
+        # sparse-matrix setup cost again.
+        clean_names = [clean_text(name) for name in names]
         pending_indices = []
-        for i, name in enumerate(names):
-            learned = self.predict_category_from_learning(name)
-            if learned:
-                results[i] = learned
+        for i, clean_n in enumerate(clean_names):
+            neg = self.negative_db.get(clean_n, set())
+            cand = self.learning_db.get(clean_n)
+            if cand and str(cand).strip().lower() not in neg:
+                results[i] = cand
             else:
                 pending_indices.append(i)
+
+        if pending_indices and self.correction_classifier and self.correction_vectorizer:
+            try:
+                pending_clean = [clean_names[i] for i in pending_indices]
+                pending_vec = self.correction_vectorizer.transform(pending_clean)
+                pending_probs = self.correction_classifier.predict_proba(pending_vec)
+                classes = self.correction_classifier.classes_
+                for row_no, orig_idx in enumerate(pending_indices):
+                    probs = pending_probs[row_no]
+                    max_prob_idx = int(np.argmax(probs))
+                    if float(probs[max_prob_idx]) <= 0.6:
+                        continue
+                    cand = classes[max_prob_idx]
+                    neg = self.negative_db.get(clean_names[orig_idx], set())
+                    if str(cand).strip().lower() not in neg:
+                        results[orig_idx] = cand
+            except Exception as e:
+                logger.warning(f"Batch learned category prediction failed: {e}")
+
+        pending_indices = [i for i, result in enumerate(results) if not result]
 
         if not pending_indices or not self._tfidf_built:
             return results

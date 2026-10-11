@@ -6236,7 +6236,16 @@ def validate_products(
     def run_batch(v_list, current_data):
         nonlocal processed_count
         batch_results = {}
-        _val_workers = min(8, max(2, (os.cpu_count() or 4) * 2))
+        # Most validators are pandas/string/regex work and therefore contend
+        # for Python's GIL. Eight workers made large uploads slower by
+        # context-switching between CPU-bound checks. Keep a small bounded pool
+        # for the few checks that release the GIL, while avoiding the previous
+        # thread storm. An environment override is useful for profiling.
+        try:
+            _requested_workers = int(os.environ.get("PIM_VALIDATOR_WORKERS", "4"))
+        except (TypeError, ValueError):
+            _requested_workers = 4
+        _val_workers = min(4, max(2, _requested_workers))
 
         # At most two distinct frames are handed to checks in a batch: the full
         # one, and (for EXPENSIVE_VALIDATORS) the same minus already-rejected
