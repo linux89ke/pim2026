@@ -6170,7 +6170,7 @@ def validate_products(
     EXPENSIVE_VALIDATORS = {
         "Image Stretched", "Image Blurry", "Image Mismatch", "Image Infringing",
         "Image Too Many things displayed", "Duplicate product", "Wrong Category",
-        "Variation Name Mismatch",
+        "Variation Name Mismatch", "Poor images - Blocked Fingerprint",
     }
     # Validators whose verdict is per-ROW, not per-PRODUCT_SET_SID. The normal
     # path below re-selects every row sharing a flagged SID (so a check can

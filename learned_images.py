@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import urllib.request
+from itertools import combinations
 from io import BytesIO
 from pathlib import Path
 from PIL import Image
@@ -190,16 +191,35 @@ def get_blocked_image_matches(
         except Exception:
             hash_by_url = {}
 
-    # Build the hash-only catalog once per call. `blocked_map` also contains
-    # exact URL keys, which must not be treated as hash signatures.
+    # Build a four-part Hamming index. A full scan of 70k learned hashes for
+    # every uploaded image made large batches quadratic. If a 64-bit query is
+    # within distance 6 of a catalog hash, at least one of its four 16-bit
+    # chunks differs in at most two bits. Looking up those small neighborhoods
+    # reduces the candidate set by orders of magnitude while preserving the
+    # exact same distance rule.
     hash_catalog = []
+    chunk_index = [{}, {}, {}, {}]
     for key, entry in blocked_map.items():
         if not isinstance(entry, dict) or len(key) != 16:
             continue
         try:
-            hash_catalog.append((int(key, 16), entry))
+            value = int(key, 16)
+            hash_catalog.append((value, entry))
+            for chunk_no in range(4):
+                chunk = (value >> (chunk_no * 16)) & 0xFFFF
+                chunk_index[chunk_no].setdefault(chunk, []).append((value, entry))
         except (TypeError, ValueError):
             continue
+
+    def _chunk_variants(value: int):
+        yield value
+        bits = range(16)
+        for width in (1, 2):
+            for positions in combinations(bits, width):
+                mask = 0
+                for bit in positions:
+                    mask |= 1 << bit
+                yield value ^ mask
 
     # Repeated image URLs/hashes are common in a product batch. Memoize their
     # nearest catalog result so each distinct upload hash is compared once.
@@ -235,7 +255,13 @@ def get_blocked_image_matches(
                         if ph not in nearest_cache:
                             best_distance = PHASH_MATCH_MAX_DISTANCE + 1
                             best_entry = None
-                            for catalog_hash, catalog_entry in hash_catalog:
+                            candidates = {}
+                            for chunk_no in range(4):
+                                chunk = (query_hash >> (chunk_no * 16)) & 0xFFFF
+                                for variant in _chunk_variants(chunk):
+                                    for catalog_hash, catalog_entry in chunk_index[chunk_no].get(variant, ()):
+                                        candidates[catalog_hash] = catalog_entry
+                            for catalog_hash, catalog_entry in candidates.items():
                                 candidate_distance = (query_hash ^ catalog_hash).bit_count()
                                 if candidate_distance < best_distance:
                                     best_distance = candidate_distance
