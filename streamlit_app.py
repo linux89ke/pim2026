@@ -1220,8 +1220,10 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
                                     _archive = zipfile.ZipFile(BytesIO(_source))
                                 _archives[_source_id] = _archive
                                 _reader_local.archives = _archives
-                            if _member in _archive.namelist():
+                            try:
                                 return _img_val, _archive.read(_member)
+                            except KeyError:
+                                continue
                         except Exception:
                             continue
                     return _img_val, b""
