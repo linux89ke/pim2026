@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 from collections import OrderedDict
@@ -23,6 +24,27 @@ import pandas as pd
 import supabase_store
 
 RULES_PATH = Path(__file__).resolve().parent / "learned_image_rules.json"
+def _replace_rules_file(temp_path: Path, target_path: Path, retries: int = 40) -> None:
+    """Replace the catalog while tolerating transient Windows sharing locks."""
+    last_error = None
+    for attempt in range(retries):
+        try:
+            os.replace(temp_path, target_path)
+            return
+        except (PermissionError, OSError) as exc:
+            last_error = exc
+            if attempt < retries - 1:
+                time.sleep(min(0.10 * (1.35 ** attempt), 1.0))
+    try:
+        shutil.copyfile(temp_path, target_path)
+        temp_path.unlink(missing_ok=True)
+        return
+    except Exception as copy_error:
+        raise PermissionError(
+            f"Could not update {target_path.name} because Windows has the file locked. "
+            "Close other Dashboard/Streamlit tabs or antivirus preview and retry; "
+            "the staged import remains in the temporary file."
+        ) from (last_error or copy_error)
 LEARNABLE_FLAGS = frozenset({
     "Poor images", "Image Stretched", "Image Blurry", "Image Mismatch",
     "Image Infringing", "Image Too Many things displayed",
@@ -211,7 +233,7 @@ def delete_learned_image_rules(rules) -> int:
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(kept, handle, indent=2, ensure_ascii=False)
-        os.replace(temp, RULES_PATH)
+        _replace_rules_file(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = kept
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -233,7 +255,7 @@ def remove_learned_rules_by_flag(flag: str) -> int:
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(kept, handle, indent=2, ensure_ascii=False)
-        os.replace(temp, RULES_PATH)
+        _replace_rules_file(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = kept
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -257,7 +279,7 @@ def restore_learned_image_rules(rules) -> int:
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(current, handle, indent=2, ensure_ascii=False)
-        os.replace(temp, RULES_PATH)
+        _replace_rules_file(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = current
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -296,7 +318,7 @@ def update_learned_image_rule_flag(rule: dict, new_flag: str) -> bool:
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(current, handle, indent=2, ensure_ascii=False)
-        os.replace(temp, RULES_PATH)
+        _replace_rules_file(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = current
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -335,7 +357,7 @@ def set_learned_image_rule_review(rule: dict, review_state: str) -> bool:
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(current, handle, indent=2, ensure_ascii=False)
-        os.replace(temp, RULES_PATH)
+        _replace_rules_file(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = current
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -496,7 +518,7 @@ def learn_image_rejections(
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
-        os.replace(temp, RULES_PATH)
+        _replace_rules_file(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = payload
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -549,7 +571,7 @@ def record_learned_image_matches(matches) -> int:
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(current, handle, indent=2, ensure_ascii=False)
-        os.replace(temp, RULES_PATH)
+        _replace_rules_file(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = current
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -651,7 +673,7 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
-        os.replace(temp, RULES_PATH)
+        _replace_rules_file(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = payload
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -699,7 +721,7 @@ def remove_image_rules_for_sids(
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(kept, handle, indent=2, ensure_ascii=False)
-        os.replace(temp, RULES_PATH)
+        _replace_rules_file(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = kept
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -727,3 +749,5 @@ def reconcile_image_rules(
     flagged_values = [] if flagged_sids is None else flagged_sids
     flagged = {str(s).strip() for s in flagged_values}
     return remove_image_rules_for_sids(data, all_sids - flagged, flag, hash_by_url=hash_by_url)
+
+
