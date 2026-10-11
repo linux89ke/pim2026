@@ -1073,8 +1073,9 @@ def _prepare_lazy_zip_images(uploaded_file_records: List[Dict]) -> None:
     name_index = {}
     for basename, member in combined_index.items():
         key = _archive_name_key(Path(basename).stem)
-        if key:
-            name_index.setdefault(key, []).append(member)
+        for _prefix_len in (24, 32, 40, 48):
+            if key[:_prefix_len]:
+                name_index.setdefault(key[:_prefix_len], []).append(member)
     st.session_state.zip_image_name_index = name_index
     st.session_state.zip_image_source_bytes = source_bytes_list if source_bytes_list else None
 
@@ -1135,14 +1136,17 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
                 brand = str(getattr(_zrow, "BRAND", ""))
                 member = _zip_index_snapshot.get(_basename_lower(img_val))
                 if not member:
-                    candidates = list(_zip_name_index_snapshot.get(_archive_name_key(name), []))
-                    if len(candidates) > 1 and brand.strip() and brand.lower() != "nan":
-                        brand_key = _archive_name_key(brand)
-                        filtered = [m for m in candidates if brand_key and brand_key in _archive_name_key(Path(m).stem)]
-                        if len(filtered) == 1:
-                            candidates = filtered
-                    if len(candidates) == 1:
-                        member = candidates[0]
+                    _name_key = _archive_name_key(name)
+                    for _prefix_len in (48, 40, 32, 24):
+                        candidates = list(_zip_name_index_snapshot.get(_name_key[:_prefix_len], []))
+                        if len(candidates) > 1 and brand.strip() and brand.lower() != "nan":
+                            brand_key = _archive_name_key(brand)
+                            filtered = [m for m in candidates if brand_key and brand_key in _archive_name_key(Path(m).stem)]
+                            if len(filtered) == 1:
+                                candidates = filtered
+                        if len(candidates) == 1:
+                            member = candidates[0]
+                            break
                 if member:
                     zip_descriptors.append((img_val, name, brand, member))
                     _archive_matches += 1
