@@ -1,0 +1,19 @@
+name: Local validation checks
+
+on:
+  push:
+    branches: [main, perf/startup-and-flag-cache]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements.txt pytest
+      - run: python -m py_compile api.py api_client.py category_matcher_engine.py custom_country_rules.py learned_rules.py processing_automation.py streamlit_app.py ui_components.py
+      - run: pytest -q tests
