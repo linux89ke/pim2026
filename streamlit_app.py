@@ -2712,8 +2712,10 @@ def check_suspected_fake_products(
         _in_scope = d["_cat_clean"].isin(_in_scope_cats) if _in_scope_cats else pd.Series(False, index=d.index)
         if _in_scope.any():
             _scope_idx = d.index[_in_scope]
-            _desc_clean = d.loc[_scope_idx, "DESCRIPTION"].astype(str).str.replace(_tag_re, " ", regex=True)
-            _short_clean = d.loc[_scope_idx, "SHORT_DESCRIPTION"].astype(str).str.replace(_tag_re, " ", regex=True)
+            _desc_source = d.get("DESCRIPTION", pd.Series("", index=d.index))
+            _short_source = d.get("SHORT_DESCRIPTION", pd.Series("", index=d.index))
+            _desc_clean = _desc_source.loc[_scope_idx].astype(str).str.replace(_tag_re, " ", regex=True)
+            _short_clean = _short_source.loc[_scope_idx].astype(str).str.replace(_tag_re, " ", regex=True)
         else:
             _scope_idx = pd.Index([])
 
