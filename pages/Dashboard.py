@@ -16,6 +16,7 @@ import r2_storage
 from learned_rules import (
     LEARNABLE_FLAGS,
     delete_learned_image_rules,
+    deduplicate_learned_image_rules,
     load_learned_image_rules,
     learn_image_rejections_bulk,
     normalize_learned_flag,
@@ -90,8 +91,11 @@ def _load_dashboard_catalog(mtime_ns: int, day_key: str) -> pd.DataFrame:
     _seller_nonempty = _seller.replace("", pd.NA)
     frame["sellers_affected"] = _seller_nonempty.groupby(frame["_cluster_key"]).transform("nunique").fillna(0).astype(int)
     frame["confirmed_decisions"] = frame["review_state"].eq("Confirmed").groupby(frame["_cluster_key"]).transform("sum").astype(int)
-    _created = pd.to_datetime(frame.get("created_at", ""), errors="coerce", utc=True)
-    frame["review_due_at"] = pd.to_datetime(frame.get("review_due_at", _created + pd.Timedelta(days=30)), errors="coerce", utc=True)
+    _created_source = frame["created_at"] if "created_at" in frame.columns else pd.Series(pd.NaT, index=frame.index)
+    _created = pd.to_datetime(_created_source, errors="coerce", utc=True)
+    _default_due = _created + pd.to_timedelta(30, unit="D")
+    _due_source = frame["review_due_at"] if "review_due_at" in frame.columns else _default_due
+    frame["review_due_at"] = pd.to_datetime(_due_source, errors="coerce", utc=True)
     frame["lifecycle"] = "Active"
     frame.loc[frame["review_state"].eq("Corrected"), "lifecycle"] = "Correction queued"
     frame.loc[frame["review_due_at"].lt(pd.Timestamp.now(tz="UTC")) & frame["review_state"].eq("Unreviewed"), "lifecycle"] = "Review overdue"
@@ -108,6 +112,69 @@ def _load_dashboard_catalog(mtime_ns: int, day_key: str) -> pd.DataFrame:
 
 
 _stored_df = _load_dashboard_catalog(_rules_mtime_ns, datetime.now(timezone.utc).date().isoformat())
+
+# Exact pHash audit: CDN URLs can differ while the downloaded image is the
+# same. Keep the flag in the grouping key so one image can still have separate
+# review reasons. Near-pHash matches remain review candidates and are never
+# deleted automatically here. Build the preview with vectorized pandas work;
+# do not convert the entire catalog to Python dictionaries on every rerun.
+_duplicate_rule_groups = []
+if not _stored_df.empty:
+    _dup_view = _stored_df.copy()
+    _dup_phash = _dup_view["phash"] if "phash" in _dup_view.columns else pd.Series("", index=_dup_view.index)
+    _dup_url = _dup_view["image_url"] if "image_url" in _dup_view.columns else pd.Series("", index=_dup_view.index)
+    if "image_url" not in _dup_view.columns:
+        _dup_view["image_url"] = ""
+    _dup_view["_dedupe_key"] = _dup_phash.fillna("").astype(str).str.strip()
+    _dup_view["_dedupe_key"] = _dup_view["_dedupe_key"].mask(
+        _dup_view["_dedupe_key"].eq(""), _dup_url.fillna("").astype(str).str.strip()
+    )
+    _dup_view["_key_type"] = _dup_phash.fillna("").astype(str).str.strip().ne("").map({True: "Exact pHash", False: "Exact URL"})
+    _dup_flag = _dup_view["flag"] if "flag" in _dup_view.columns else pd.Series("", index=_dup_view.index)
+    _dup_view["_flag_key"] = _dup_flag.fillna("").astype(str)
+    _dup_view["_dedupe_key"] = _dup_view["_dedupe_key"].replace({"": pd.NA, "nan": pd.NA})
+    _dup_view = _dup_view.dropna(subset=["_dedupe_key"])
+    if not _dup_view.empty:
+        _dup_counts = (
+            _dup_view.groupby(["_dedupe_key", "_flag_key", "_key_type"], dropna=False)
+            .agg(Rules=("_dedupe_key", "size"), URLs=("image_url", "nunique"))
+            .reset_index()
+        )
+        _dup_counts = _dup_counts[_dup_counts["Rules"] > 1]
+        _duplicate_rule_groups = [
+            {"match_type": str(row["_key_type"]), "flag": str(row["_flag_key"]), "count": int(row["Rules"]), "urls": [""] * int(row["URLs"]), "phash": str(row["_dedupe_key"]) if str(row["_key_type"]) == "Exact pHash" else "" }
+            for _, row in _dup_counts.iterrows()
+        ]
+if _duplicate_rule_groups:
+    with st.expander(
+        f"Image duplicate audit · {sum(max(0, g['count'] - 1) for g in _duplicate_rule_groups):,} redundant rule(s)",
+        expanded=False,
+    ):
+        _dup_preview = pd.DataFrame([
+            {
+                "Match": group["match_type"],
+                "Flag": group["flag"],
+                "Rules": group["count"],
+                "URLs": len(group["urls"]),
+                "pHash": group["phash"] or "—",
+            }
+            for group in _duplicate_rule_groups[:200]
+        ])
+        st.caption("These are exact URL or exact pHash duplicates. Different URLs with the same pHash are included.")
+        st.dataframe(_dup_preview, hide_index=True, width="stretch")
+        _duplicate_total = sum(max(0, group["count"] - 1) for group in _duplicate_rule_groups)
+        if st.button(
+            f"Remove {_duplicate_total:,} redundant exact duplicates",
+            icon=":material/cleaning_services:",
+            type="secondary",
+            key="dedupe_learned_exact_images",
+        ):
+            _removed_duplicates = deduplicate_learned_image_rules()
+            st.session_state["_learned_import_notice"] = (
+                f"Removed {_removed_duplicates:,} redundant exact image rule(s)."
+            )
+            st.rerun()
+
 _undo_history = st.session_state.get("_learned_rule_undo_history", [])
 _undo_rules = _undo_history[-1] if _undo_history else st.session_state.get("_learned_rule_undo", [])
 if _undo_rules and st.button(
@@ -140,6 +207,8 @@ with st.sidebar:
             "Category learned rules",
             "Settings",
             "Diagnostics",
+            "Performance",
+            "Backups and recovery",
         ],
         key="dashboard_admin_module",
         label_visibility="collapsed",
@@ -152,18 +221,24 @@ def _render_category_admin_module():
     st.caption("Review category corrections and negative category decisions used by the category matcher.")
     try:
         from category_matcher_engine import CategoryMatcherEngine
-        _category_engine = CategoryMatcherEngine()
-        _db_path = Path(_category_engine.db_path)
+        _db_path = Path(__file__).resolve().parents[1] / "cat_learning.db"
         try:
             _db_mtime = _db_path.stat().st_mtime_ns
         except OSError:
             _db_mtime = 0
 
+        @st.cache_resource(show_spinner=False, max_entries=2)
+        def _cached_category_engine(_mtime_ns: int):
+            del _mtime_ns
+            return CategoryMatcherEngine(str(_db_path))
+
+        _category_engine = _cached_category_engine(_db_mtime)
+
         @st.cache_data(show_spinner=False, max_entries=4)
         def _cached_category_learning(_mtime_ns: int):
             # The mtime is deliberately the cache key: category edits from a
             # validation run or another tab invalidate the dashboard view.
-            _engine = CategoryMatcherEngine()
+            _engine = _cached_category_engine(_mtime_ns)
             return _engine.list_corrections(limit=2000), _engine.list_negatives(limit=2000)
 
         _corrections, _negatives = _cached_category_learning(_db_mtime)
@@ -251,6 +326,28 @@ def _render_admin_diagnostics_module():
     st.dataframe(_health, hide_index=True, width="stretch")
 
 
+def _render_admin_recovery_module():
+    st.markdown("## :material/backup: Backups and recovery")
+    st.caption("Export a point-in-time copy before bulk edits. Restoring is explicit and does not happen during ordinary validation.")
+    _rules_path = Path(__file__).resolve().parents[1] / "learned_image_rules.json"
+    _rules_payload = _rules_path.read_bytes() if _rules_path.exists() else b"[]"
+    _backup_cols = st.columns(3, gap="medium")
+    _backup_cols[0].metric("Learned rules", f"{len(_stored_df):,}")
+    _backup_cols[1].metric("File size", f"{len(_rules_payload) / 1024 / 1024:.1f} MB")
+    _backup_cols[2].metric("Last modified", datetime.fromtimestamp(_rules_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M") if _rules_path.exists() else "Unavailable")
+    st.download_button(
+        "Download learned-rules backup",
+        data=_rules_payload,
+        file_name=f"learned_image_rules_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        mime="application/json",
+        icon=":material/download:",
+        type="primary",
+        key="dashboard_download_rules_backup",
+        disabled=not _rules_path.exists(),
+    )
+    st.info("For a restore, use the existing import workflow after reviewing the file. The import remains duplicate-safe and preserves one image with multiple distinct reasons.", icon=":material/info:")
+
+
 if _admin_module == "Category learned rules":
     _render_category_admin_module()
     st.stop()
@@ -260,11 +357,23 @@ if _admin_module == "Settings":
 if _admin_module == "Diagnostics":
     _render_admin_diagnostics_module()
     st.stop()
+if _admin_module == "Performance":
+    _render_admin_diagnostics_module()
+    st.stop()
+if _admin_module == "Backups and recovery":
+    _render_admin_recovery_module()
+    st.stop()
 
 # ── Modern dashboard shell ─────────────────────────────────────────────────
 st.markdown(
     """
     <style>
+    [data-testid="stAppViewContainer"] { background:#f6f8fb; }
+    [data-testid="stSidebar"] { background:#101827; border-right:1px solid #243247; }
+    [data-testid="stSidebar"] * { color:#dbe5f0; }
+    [data-testid="stSidebar"] label { color:#94a9c2 !important; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+    [data-testid="stSidebar"] [role="radio"] { padding:9px 10px; border-radius:9px; }
+    [data-testid="stSidebar"] [role="radio"]:hover { background:#1e2b40; }
     .lr-shell { max-width: 1480px; margin: 0 auto; }
     .lr-hero { display:flex; justify-content:space-between; align-items:flex-end; gap:24px;
         padding:24px 26px; margin:0 0 18px; border-radius:18px;
@@ -277,11 +386,17 @@ st.markdown(
     .lr-hero-stat strong { display:block; font-size:30px; line-height:1; color:#fff; }
     .lr-hero-stat span { display:block; margin-top:6px; color:#bfdbfe; font-size:11px; font-weight:700; }
     .lr-card { min-height:112px; padding:17px 18px; border:1px solid #e2e8f0; border-radius:14px;
-        background:#fff; box-shadow:0 5px 18px rgba(15,23,42,.06); }
+        background:#fff; box-shadow:0 5px 18px rgba(15,23,42,.06); transition:transform .18s,box-shadow .18s; }
+    .lr-card:hover { transform:translateY(-2px); box-shadow:0 12px 28px rgba(15,23,42,.11); }
+    .lr-card-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .lr-card-icon { width:32px; height:32px; display:grid; place-items:center; border-radius:10px; background:#eff6ff; color:#2563eb; font-size:18px; }
     .lr-card-label { color:#64748b; font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.06em; }
     .lr-card-value { color:#0f172a; font-size:26px; font-weight:800; margin-top:7px; letter-spacing:-.03em; }
     .lr-card-note { color:#64748b; font-size:11px; margin-top:5px; }
-    .lr-section { margin:22px 0 8px; color:#0f172a; font-size:16px; font-weight:800; letter-spacing:-.01em; }
+    .lr-section { margin:24px 0 10px; color:#0f172a; font-size:16px; font-weight:800; letter-spacing:-.01em; display:flex; align-items:center; gap:8px; }
+    .lr-section:before { content:''; width:4px; height:18px; border-radius:4px; background:#f28c28; }
+    div[data-testid="stExpander"] { border-color:#e2e8f0; border-radius:12px; background:rgba(255,255,255,.72); }
+    div[data-testid="stMetric"] { background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:12px 14px; }
     @media (max-width: 760px) { .lr-hero { display:block; } .lr-hero-stat { text-align:left; margin-top:18px; } }
     </style>
     """,
@@ -336,15 +451,15 @@ _dashboard_review_pct = _dashboard_reviewed / len(_stored_df) if len(_stored_df)
 _dashboard_active_pct = _dashboard_active / len(_stored_df) if len(_stored_df) else 0
 st.markdown('<div class="lr-section">Rule health</div>', unsafe_allow_html=True)
 _dashboard_cols = st.columns(4, gap="medium")
-for _col, (_label, _value, _note) in zip(
+for _col, (_label, _value, _note, _icon) in zip(
     _dashboard_cols,
-    (("Active rules", _dashboard_active, "Applied during validation"),
-     ("Awaiting review", _dashboard_unreviewed, "Need a reviewer decision"),
-     ("Confirmed", _dashboard_confirmed, "Validated as reliable"),
-     ("Corrected", _dashboard_corrected, "Candidates for removal")),
+    (("Active rules", _dashboard_active, "Applied during validation", "verified"),
+     ("Awaiting review", _dashboard_unreviewed, "Need a reviewer decision", "rate_review"),
+     ("Confirmed", _dashboard_confirmed, "Validated as reliable", "task_alt"),
+     ("Corrected", _dashboard_corrected, "Candidates for removal", "edit_note")),
 ):
     with _col:
-        st.markdown(f'<div class="lr-card"><div class="lr-card-label">{_label}</div><div class="lr-card-value">{_value:,}</div><div class="lr-card-note">{_note}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="lr-card"><div class="lr-card-head"><div class="lr-card-label">{_label}</div><div class="lr-card-icon"><span class="material-symbols-outlined">{_icon}</span></div></div><div class="lr-card-value">{_value:,}</div><div class="lr-card-note">{_note}</div></div>', unsafe_allow_html=True)
 _progress_cols = st.columns(2, gap="large")
 with _progress_cols[0]:
     st.caption(f":material/task_alt: Review coverage · {_dashboard_reviewed:,} of {len(_stored_df):,}")
@@ -555,6 +670,7 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                 st.info("No image rules match the current filters.")
             else:
                 st.caption(f"Reviewing {_audit_rows.shape[0]:,} image rules. Actions update the JSON catalog immediately.")
+                _audit_selected_records = []
                 for _audit_start in range(0, len(_audit_rows), 4):
                     _audit_cols = st.columns(4, gap="small")
                     for _audit_offset, (_audit_col, (_audit_idx, _audit_row)) in enumerate(
@@ -599,6 +715,8 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                             # imports several rules at once. Include the row identity so
                             # every Streamlit widget receives a stable unique key.
                             _audit_key = f"{_audit_start + _audit_offset}_{_audit_idx}_{str(_audit_row.get('created_at', '')).replace('-', '')[-16:]}"
+                            if st.checkbox("Select for removal", key=f"audit_select_{_audit_key}", label_visibility="collapsed"):
+                                _audit_selected_records.append(_audit_row.to_dict())
                             _audit_new_flag = st.selectbox(
                                 "Reason",
                                 sorted(LEARNABLE_FLAGS),
@@ -625,6 +743,15 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                                         st.success("Removed")
                                         st.rerun()
                             st.divider()
+                if _audit_selected_records:
+                    _audit_bulk_a, _audit_bulk_b = st.columns([2, 3], gap="small")
+                    with _audit_bulk_a:
+                        if st.button("Remove selected audit rules", icon=":material/delete_sweep:", type="secondary", key="remove_selected_audit_rules", width="stretch"):
+                            _audit_removed = delete_learned_image_rules(_audit_selected_records)
+                            st.success(f"Removed {_audit_removed:,} learned rule(s).")
+                            st.rerun()
+                    with _audit_bulk_b:
+                        st.caption(f":material/checklist: {len(_audit_selected_records):,} audit card(s) selected")
         # A small gallery makes it possible to verify the image before
         # deleting its rule. Keep it bounded so a large catalog stays fast.
         _preview_rows = _view_df[
@@ -907,13 +1034,36 @@ if uploads:
         c1.metric("Eligible rows", len(preview))
         c2.metric("Unique image URLs", preview["MAIN_IMAGE"].nunique())
         c3.metric("Current learned rules", len(load_learned_image_rules()))
+        _existing_rules = load_learned_image_rules()
+        _existing_keys = {
+            (str(_rule.get("image_url", "") or "").strip(), normalize_learned_flag(_rule.get("flag", "")))
+            for _rule in _existing_rules if isinstance(_rule, dict)
+        }
+        _preview_keys = list(zip(
+            preview["MAIN_IMAGE"].astype(str).str.strip(),
+            preview["FLAG"].map(normalize_learned_flag),
+        ))
+        _duplicate_preview_count = sum(1 for _key in _preview_keys if _key in _existing_keys)
+        _new_preview_count = max(0, len(preview) - _duplicate_preview_count)
+        if _duplicate_preview_count:
+            if _new_preview_count:
+                st.warning(
+                    f"This upload contains {_duplicate_preview_count:,} rule(s) already learned and {_new_preview_count:,} potentially new rule(s). "
+                    "Duplicates will be skipped; only new rules will be written.",
+                    icon=":material/content_copy:",
+                )
+            else:
+                st.warning(
+                    f"All {len(preview):,} eligible rows are already in the learned catalog. No new rules will be added.",
+                    icon=":material/content_copy:",
+                )
         st.dataframe(
             preview[["PRODUCT_SET_SID", "MAIN_IMAGE", "FLAG", "_SOURCE_FILE"]].head(100),
             hide_index=True,
             width="stretch",
         )
 
-        if st.button("Import eligible rules", icon=":material/upload_file:", type="primary", width="stretch"):
+        if st.button("Import eligible rules", icon=":material/upload_file:", type="primary", width="stretch", help="Duplicate URL/reason rules are skipped automatically."):
             _progress = st.progress(0, text="Starting import…")
             _status = st.empty()
             _files = list(preview.groupby("_SOURCE_FILE"))

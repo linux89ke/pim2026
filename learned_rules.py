@@ -24,26 +24,42 @@ import pandas as pd
 import supabase_store
 
 RULES_PATH = Path(__file__).resolve().parent / "learned_image_rules.json"
-def _replace_rules_file(temp_path: Path, target_path: Path, retries: int = 40) -> None:
-    """Replace the catalog while tolerating transient Windows sharing locks."""
+
+def _atomic_replace_rules(temp_path: Path, target_path: Path, retries: int = 40, delay: float = 0.10) -> None:
+    """Safely replace target_path with temp_path on Windows and POSIX.
+
+    On Windows, active readers (Streamlit file watcher, antivirus, concurrent threads)
+    can hold a temporary read lock on target_path, raising PermissionError [WinError 5]
+    or OSError [WinError 32]. Retry with exponential backoff and fall back to copy if needed.
+    """
     last_error = None
     for attempt in range(retries):
         try:
             os.replace(temp_path, target_path)
             return
-        except (PermissionError, OSError) as exc:
-            last_error = exc
+        except (PermissionError, OSError) as e:
+            last_error = e
+            # Windows scanners and Streamlit's file watcher can hold the
+            # destination for several seconds. Keep the complete temp file
+            # intact while waiting; never truncate the live catalog.
             if attempt < retries - 1:
-                time.sleep(min(0.10 * (1.35 ** attempt), 1.0))
+                time.sleep(min(delay * (1.35 ** attempt), 1.0))
+                continue
+
+    # A locked destination cannot be atomically replaced. As a last resort,
+    # copy through a separate handle; this works for transient sharing locks
+    # on many Windows installations and still leaves the original untouched if
+    # the copy cannot be opened. The caller receives a clear error and the
+    # .tmp file remains available for a later retry.
     try:
         shutil.copyfile(temp_path, target_path)
         temp_path.unlink(missing_ok=True)
         return
     except Exception as copy_error:
         raise PermissionError(
-            f"Could not update {target_path.name} because Windows has the file locked. "
-            "Close other Dashboard/Streamlit tabs or antivirus preview and retry; "
-            "the staged import remains in the temporary file."
+            f"Could not update {target_path.name} because Windows has the file "
+            "locked. Close other Dashboard/Streamlit tabs or antivirus preview "
+            "and retry; the staged import remains in the temporary file."
         ) from (last_error or copy_error)
 LEARNABLE_FLAGS = frozenset({
     "Poor images", "Image Stretched", "Image Blurry", "Image Mismatch",
@@ -76,6 +92,22 @@ FLAG_ALIASES = {
     "suspected counterfeit jersey": "Suspected counterfeit Jerseys",
     "suspected counterfeit jerseys": "Suspected counterfeit Jerseys",
 }
+# When one image has several learned reasons, generic poor-image quality is
+# the least specific explanation. Keep it as a fallback so a more specific
+# learned reason remains visible and actionable after one reason is removed.
+_LEARNED_FLAG_PRIORITY = {
+    "Poor images": 10,
+    "Image Stretched": 30,
+    "Image Blurry": 30,
+    "Image Mismatch": 40,
+    "Image Too Many things displayed": 40,
+    "Image Infringing": 50,
+    "Restricted brands": 60,
+    "Brand Image Mismatch": 60,
+    "Suspected Fake product": 70,
+    "Counterfeit Sneakers": 70,
+    "Suspected counterfeit Jerseys": 70,
+}
 
 _LOCK = threading.RLock()
 _RULES_MTIME = -1.0
@@ -84,8 +116,11 @@ _WRITER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="learned-rules")
 _REMOTE_RULES = None
 _REMOTE_RULES_FETCHED_AT = 0.0
 _REMOTE_RULES_TTL = 60.0
+_REMOTE_RULES_SUSPICIOUS = False
 _PAGE_RULE_CACHE = OrderedDict()
 _PAGE_RULE_CACHE_MAX = 64
+_RUNTIME_INDEX = None
+_RUNTIME_INDEX_MTIME = -1
 _LOG = logging.getLogger(__name__)
 
 
@@ -126,14 +161,45 @@ def _load_locked() -> list:
     return _RULES
 
 
+def _local_rule_count() -> int:
+    """Read only the local catalog size without changing the in-memory cache."""
+    try:
+        with RULES_PATH.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        return len(value) if isinstance(value, list) else 0
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
 def load_learned_image_rules() -> list:
-    global _REMOTE_RULES, _REMOTE_RULES_FETCHED_AT
+    global _REMOTE_RULES, _REMOTE_RULES_FETCHED_AT, _REMOTE_RULES_SUSPICIOUS
     if supabase_store.enabled():
         now = time.monotonic()
+        if _REMOTE_RULES_SUSPICIOUS and now - _REMOTE_RULES_FETCHED_AT < _REMOTE_RULES_TTL:
+            # A previous fetch looked like a truncated remote catalog. Keep
+            # using the known-good local snapshot until it is repaired.
+            with _LOCK:
+                return list(_load_locked())
         if _REMOTE_RULES is None or now - _REMOTE_RULES_FETCHED_AT >= _REMOTE_RULES_TTL:
             try:
-                _REMOTE_RULES = supabase_store.fetch_all("learned_image_rules")
+                _fetched = supabase_store.fetch_all("learned_image_rules")
                 _REMOTE_RULES_FETCHED_AT = now
+                _local_count = _local_rule_count()
+                # Never let a partial cloud migration replace a substantially
+                # larger local catalog during an edit/import. A real remote
+                # catalog may be larger or the local file may be absent; only
+                # reject an implausibly small remote result.
+                if _local_count >= 100 and len(_fetched) < max(25, int(_local_count * 0.5)):
+                    _REMOTE_RULES = None
+                    _REMOTE_RULES_SUSPICIOUS = True
+                    _LOG.error(
+                        "Refusing partial Supabase learned catalog (%s rules vs %s local); "
+                        "repair the cloud catalog before saving learned data.",
+                        len(_fetched), _local_count,
+                    )
+                else:
+                    _REMOTE_RULES = _fetched
+                    _REMOTE_RULES_SUSPICIOUS = False
             except Exception as exc:
                 _LOG.warning("Could not read Supabase learned rules; using local fallback: %s", exc)
                 _REMOTE_RULES = None
@@ -165,10 +231,35 @@ def _remote_upsert_rules(records: list[dict]) -> None:
                 row[field] = None
         payload.append(row)
     try:
-        supabase_store.upsert("learned_image_rules", payload, on_conflict="image_url,flag")
-        global _REMOTE_RULES, _REMOTE_RULES_FETCHED_AT
+        # The production table is keyed by (phash, flag). Older deployments
+        # used (image_url, flag), which makes that conflict target return a
+        # PostgREST 400. Send hashed rows against the live constraint and send
+        # rows without a hash as nullable inserts; a duplicate insert is safe
+        # to ignore because the local JSON remains authoritative.
+        _hashed = [row for row in payload if row.get("phash")]
+        _unhashed = [row for row in payload if not row.get("phash")]
+        if _hashed:
+            try:
+                supabase_store.upsert("learned_image_rules", _hashed, on_conflict="phash,flag")
+            except Exception as _phash_conflict_exc:
+                # Compatibility with projects that retained the original
+                # image_url/flag unique constraint instead of the pHash one.
+                if "400" not in str(_phash_conflict_exc) and "constraint" not in str(_phash_conflict_exc).lower():
+                    raise
+                supabase_store.upsert("learned_image_rules", _hashed, on_conflict="image_url,flag")
+        if _unhashed:
+            for row in _unhashed:
+                row["phash"] = None
+                try:
+                    supabase_store.insert("learned_image_rules", [row])
+                except Exception as _insert_exc:
+                    # A pre-existing URL/flag row is already synchronized.
+                    if "409" not in str(_insert_exc) and "duplicate" not in str(_insert_exc).lower():
+                        raise
+        global _REMOTE_RULES, _REMOTE_RULES_FETCHED_AT, _REMOTE_RULES_SUSPICIOUS
         _REMOTE_RULES = None
         _REMOTE_RULES_FETCHED_AT = 0.0
+        _REMOTE_RULES_SUSPICIOUS = False
         _clear_page_rule_cache()
     except Exception as exc:
         _LOG.warning("Could not write learned rules to Supabase: %s", exc)
@@ -233,13 +324,109 @@ def delete_learned_image_rules(rules) -> int:
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(kept, handle, indent=2, ensure_ascii=False)
-        _replace_rules_file(temp, RULES_PATH)
+        _atomic_replace_rules(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = kept
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
         _sync_sqlite_locked(_RULES)
         _remote_delete_rules(removed_records)
         return removed
+
+
+def delete_associated_learned_image_rules(rules) -> int:
+    """Remove every rule associated with the supplied image identity.
+
+    A single image can be learned more than once under different CDN URLs or
+    flags.  Removing only the displayed URL leaves those aliases active and
+    causes the same product to be rejected again.  Treat a non-empty URL or
+    pHash from any selected rule as the identity and remove all matching
+    records from JSON, the SQLite mirror, and the remote store.
+    """
+    records = [rule for rule in (rules or []) if isinstance(rule, dict)]
+    if not records:
+        return 0
+    urls = {str(rule.get("image_url", "") or "").strip() for rule in records}
+    phashes = {str(rule.get("phash", "") or "").strip().casefold() for rule in records}
+    urls.discard("")
+    phashes.discard("")
+    if not urls and not phashes:
+        return 0
+    with _LOCK:
+        current = list(load_learned_image_rules())
+        removed_records = []
+        kept = []
+        for rule in current:
+            url = str(rule.get("image_url", "") or "").strip()
+            phash = str(rule.get("phash", "") or "").strip().casefold()
+            if (url and url in urls) or (phash and phash in phashes):
+                removed_records.append(rule)
+            else:
+                kept.append(rule)
+        if not removed_records:
+            return 0
+        temp = RULES_PATH.with_suffix(".json.tmp")
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(kept, handle, indent=2, ensure_ascii=False)
+        _atomic_replace_rules(temp, RULES_PATH)
+        global _RULES, _RULES_MTIME
+        _RULES = kept
+        _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
+        _sync_sqlite_locked(_RULES)
+        _remote_delete_rules(removed_records)
+        return len(removed_records)
+
+
+def audit_duplicate_learned_image_rules(rules=None) -> list[dict]:
+    """Return exact-pHash duplicate groups without changing the catalog.
+
+    A URL is not part of the grouping key: the same downloaded image can have
+    different CDN URLs. Flags remain part of the key because one image may
+    legitimately carry separate review reasons. Rules without a pHash are
+    reported only when their URL is repeated exactly.
+    """
+    current = list(rules if rules is not None else load_learned_image_rules())
+    groups = {}
+    for index, rule in enumerate(current):
+        if not isinstance(rule, dict):
+            continue
+        phash = str(rule.get("phash", "") or "").strip().casefold()
+        url = str(rule.get("image_url", "") or "").strip()
+        flag = normalize_learned_flag(rule.get("flag", ""))
+        key = ("phash", phash, flag) if phash else ("url", url, flag) if url else None
+        if key is not None:
+            groups.setdefault(key, []).append((index, rule))
+    duplicates = []
+    for key, entries in groups.items():
+        if len(entries) < 2:
+            continue
+        duplicates.append({
+            "match_type": "Exact pHash" if key[0] == "phash" else "Exact URL",
+            "phash": key[1] if key[0] == "phash" else "",
+            "flag": key[2],
+            "count": len(entries),
+            "urls": sorted({str(row.get("image_url", "")).strip() for _, row in entries if row.get("image_url")}),
+            "rules": [row for _, row in entries],
+        })
+    duplicates.sort(key=lambda item: item["count"], reverse=True)
+    return duplicates
+
+
+def deduplicate_learned_image_rules(rules=None) -> int:
+    """Remove redundant exact URL/pHash rules, retaining one per group."""
+    groups = audit_duplicate_learned_image_rules(rules)
+    remove = []
+    for group in groups:
+        entries = list(group.get("rules", []))
+        # Prefer a confirmed rule, then the most recently confirmed/matched,
+        # then the most recently created record so useful audit metadata wins.
+        entries.sort(key=lambda row: (
+            str(row.get("review_state", "")).casefold() == "confirmed",
+            str(row.get("last_confirmed_at", "") or ""),
+            str(row.get("last_matched_at", "") or ""),
+            str(row.get("created_at", "") or ""),
+        ), reverse=True)
+        remove.extend(entries[1:])
+    return delete_learned_image_rules(remove)
 
 
 def remove_learned_rules_by_flag(flag: str) -> int:
@@ -255,7 +442,7 @@ def remove_learned_rules_by_flag(flag: str) -> int:
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(kept, handle, indent=2, ensure_ascii=False)
-        _replace_rules_file(temp, RULES_PATH)
+        _atomic_replace_rules(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = kept
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -279,7 +466,7 @@ def restore_learned_image_rules(rules) -> int:
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(current, handle, indent=2, ensure_ascii=False)
-        _replace_rules_file(temp, RULES_PATH)
+        _atomic_replace_rules(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = current
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -318,7 +505,7 @@ def update_learned_image_rule_flag(rule: dict, new_flag: str) -> bool:
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(current, handle, indent=2, ensure_ascii=False)
-        _replace_rules_file(temp, RULES_PATH)
+        _atomic_replace_rules(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = current
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -357,7 +544,7 @@ def set_learned_image_rule_review(rule: dict, review_state: str) -> bool:
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(current, handle, indent=2, ensure_ascii=False)
-        _replace_rules_file(temp, RULES_PATH)
+        _atomic_replace_rules(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = current
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -374,25 +561,39 @@ def merge_learned_image_rules(blocked_map: dict) -> dict:
     """Merge active JSON rules into the URL/pHash matcher map."""
     merged = dict(blocked_map or {})
     with _LOCK:
-        for rule in load_learned_image_rules():
-            if str(rule.get("status", "active")).lower() != "active":
-                continue
-            if normalize_learned_flag(rule.get("flag", "")) not in LEARNABLE_FLAGS:
-                continue
-            entry = {
-                "flag": rule.get("flag", "Poor images"),
-                "brand": rule.get("brand_infringed", "") or rule.get("brand", ""),
-                "url": rule.get("image_url", ""),
-                "phash": rule.get("phash", ""),
-                "source": "json",
-            }
-            url = str(rule.get("image_url", "")).strip()
-            phash = str(rule.get("phash", "")).strip()
-            if url:
-                merged[url] = entry
-            if phash:
-                merged[phash] = entry
+        merged.update(load_learned_image_rule_index().get("by_key", {}))
     return merged
+
+
+def load_learned_image_rule_index() -> dict:
+    """Return compact URL/pHash lookups for validation runtime use."""
+    global _RUNTIME_INDEX, _RUNTIME_INDEX_MTIME
+    try:
+        mtime = RULES_PATH.stat().st_mtime_ns
+    except OSError:
+        mtime = 0
+    if _RUNTIME_INDEX is not None and _RUNTIME_INDEX_MTIME == mtime:
+        return _RUNTIME_INDEX
+    by_key, flag_counts, seller_counts = {}, {}, {}
+    for rule in load_learned_image_rules():
+        if str(rule.get("status", "active")).lower() != "active":
+            continue
+        flag = normalize_learned_flag(rule.get("flag", ""))
+        if flag not in LEARNABLE_FLAGS:
+            continue
+        entry = {"flag": flag, "brand": rule.get("brand_infringed", "") or rule.get("brand", ""), "url": rule.get("image_url", ""), "phash": rule.get("phash", ""), "source": "json"}
+        for key in (str(rule.get("image_url", "")).strip(), str(rule.get("phash", "")).strip()):
+            if key:
+                _old = by_key.get(key)
+                if _old is None or _LEARNED_FLAG_PRIORITY.get(flag, 50) >= _LEARNED_FLAG_PRIORITY.get(str(_old.get("flag", "")), 50):
+                    by_key[key] = entry
+        flag_counts[flag] = flag_counts.get(flag, 0) + 1
+        seller = str(rule.get("seller_name", "")).strip()
+        if seller:
+            seller_counts[seller] = seller_counts.get(seller, 0) + 1
+    _RUNTIME_INDEX = {"by_key": by_key, "flag_counts": flag_counts, "seller_counts": seller_counts}
+    _RUNTIME_INDEX_MTIME = mtime
+    return _RUNTIME_INDEX
 
 
 def load_learned_image_rules_for_urls(urls) -> list[dict]:
@@ -497,7 +698,17 @@ def learn_image_rejections(
         return 0
     with _LOCK:
         current = list(load_learned_image_rules())
-        keys = {(str(r.get("image_url", "")).strip(), str(r.get("phash", "")).strip(), r.get("flag", "")) for r in current}
+        # The dedupe scope is image identity + canonical reason.  Never use
+        # image identity alone: one image may legitimately be learned for
+        # different reasons (for example Poor images and Restricted brands).
+        keys = {
+            (
+                str(r.get("image_url", "")).strip(),
+                str(r.get("phash", "")).strip(),
+                normalize_learned_flag(r.get("flag", "")),
+            )
+            for r in current
+        }
         url_keys = {(url, flag) for url, _phash, flag in keys if url}
         phash_keys = {(_phash, flag) for _url, _phash, flag in keys if _phash}
         additions = []
@@ -518,7 +729,7 @@ def learn_image_rejections(
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
-        _replace_rules_file(temp, RULES_PATH)
+        _atomic_replace_rules(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = payload
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -571,7 +782,7 @@ def record_learned_image_matches(matches) -> int:
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(current, handle, indent=2, ensure_ascii=False)
-        _replace_rules_file(temp, RULES_PATH)
+        _atomic_replace_rules(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = current
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -644,10 +855,22 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
                 "last_confirmed_at": "",
                 "review_due_at": (_created_at + timedelta(days=30)).isoformat(),
             }
+            # Collapse repeated rows within the same import using the same
+            # URL/pHash + reason key used against the existing catalog. A
+            # different flag for the same image remains a valid addition.
             identity = (record["image_url"], record["phash"], record["flag"])
-            if identity not in seen:
-                seen.add(identity)
-                all_records.append(record)
+            if identity in seen:
+                continue
+            if (record["image_url"], record["flag"]) in {
+                (url_key, flag_key) for url_key, _phash_key, flag_key in seen
+            }:
+                continue
+            if record["phash"] and (record["phash"], record["flag"]) in {
+                (phash_key, flag_key) for _url_key, phash_key, flag_key in seen
+            }:
+                continue
+            seen.add(identity)
+            all_records.append(record)
         if progress_callback:
             progress_callback(batch_index, len(batches), batch)
     if not all_records:
@@ -673,7 +896,7 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
-        _replace_rules_file(temp, RULES_PATH)
+        _atomic_replace_rules(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = payload
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -721,7 +944,7 @@ def remove_image_rules_for_sids(
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(kept, handle, indent=2, ensure_ascii=False)
-        _replace_rules_file(temp, RULES_PATH)
+        _atomic_replace_rules(temp, RULES_PATH)
         global _RULES, _RULES_MTIME
         _RULES = kept
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
@@ -749,5 +972,3 @@ def reconcile_image_rules(
     flagged_values = [] if flagged_sids is None else flagged_sids
     flagged = {str(s).strip() for s in flagged_values}
     return remove_image_rules_for_sids(data, all_sids - flagged, flag, hash_by_url=hash_by_url)
-
-
