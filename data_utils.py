@@ -579,7 +579,28 @@ def _detect_and_read_csv(buf) -> pd.DataFrame:
             if found and best_sep == candidate_seps[0]:
                 break
 
-    # 3. Read the full file with detected parameters
+    def _python_engine_fallback(separator: str, encoding: str):
+        """Read malformed/very-wide CSVs after pandas' C engine gives up."""
+        for _kwargs in (
+            {},
+            {"quoting": csv.QUOTE_NONE, "escapechar": "\\"},
+        ):
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', pd.errors.ParserWarning)
+                    return pd.read_csv(
+                        BytesIO(raw_bytes), sep=separator, encoding=encoding,
+                        encoding_errors='replace', dtype=str,
+                        on_bad_lines='skip', engine='python', **_kwargs,
+                    )
+            except Exception:
+                continue
+        return None
+
+    # 3. Read the full file with detected parameters. The C engine is fastest,
+    # but pandas raises ParserError for oversized fields and some malformed
+    # exports with a "Buffer overflow caught" message. Fall back to Python's
+    # parser only for those files so normal uploads keep the fast path.
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', pd.errors.ParserWarning)
         try:
@@ -587,8 +608,10 @@ def _detect_and_read_csv(buf) -> pd.DataFrame:
                 BytesIO(raw_bytes), sep=best_sep, encoding=best_enc,
                 dtype=str, on_bad_lines='skip'
             )
-        except UnicodeDecodeError:
-            pass
+        except Exception:
+            _fallback = _python_engine_fallback(best_sep, best_enc)
+            if _fallback is not None:
+                return _fallback
 
     # 4. Hard fallback: latin1 + replace — never raises on any byte sequence
     for sep in candidate_seps:
@@ -604,12 +627,12 @@ def _detect_and_read_csv(buf) -> pd.DataFrame:
         except Exception:
             continue
 
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore', pd.errors.ParserWarning)
-        return pd.read_csv(
-            BytesIO(raw_bytes), sep=',', encoding='latin1',
-            encoding_errors='replace', dtype=str, on_bad_lines='skip'
-        )
+    _last_fallback = _python_engine_fallback(',', 'latin1')
+    if _last_fallback is not None:
+        return _last_fallback
+    # Keep the upload flow alive when a file has no recoverable tabular rows;
+    # the caller can then report an empty/invalid file instead of crashing.
+    return pd.DataFrame()
 
 
 _ILLEGAL_XML_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
