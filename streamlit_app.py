@@ -9471,6 +9471,25 @@ def render_main_results():
             if _advisory_rows: st.dataframe(pd.DataFrame(_advisory_rows), hide_index=True, width='stretch')
 
     if not rej_df.empty:
+        st.markdown(
+            """
+            <style>
+            /* Learned-rule validations are high-confidence inherited
+               rejections. Keep the normal severity colors, but add a clear
+               red treatment to the validation expander itself. */
+            div[class*="st-key-learned_validation"] [data-testid="stExpander"] > details > summary {
+                border-left: 4px solid #c62828 !important;
+                background: linear-gradient(90deg, rgba(198,40,40,.12), rgba(198,40,40,.035)) !important;
+                color: #a61b1b !important;
+            }
+            div[class*="st-key-learned_validation"] [data-testid="stExpander"] > details > summary p,
+            div[class*="st-key-learned_validation"] [data-testid="stExpander"] > details > summary svg {
+                color: #a61b1b !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
         if group_by_seller:
             # Count every seller's products once, up front. Doing this as
             # `len(data[data["SELLER_NAME"] == seller])` inside the loop is a
@@ -9569,13 +9588,19 @@ def render_main_results():
                     if is_zip:
                         exp_label += "  (Prefetched)  :material/archive: ZIP"
 
+                    # Learned matches use a red expander treatment so they are
+                    # immediately distinguishable from direct validator results.
+                    # The row key supplies a stable CSS hook without changing
+                    # Streamlit's expander label or learned counts.
+                    _row_key_prefix = "learned_validation" if _learned_cnt > 0 else "validation"
+
                     # ZIP/prefetched flags keep their orange treatment — it was
                     # doing real work telling the two sources apart. It comes
                     # from a keyed container now rather than a MutationObserver
                     # painting !important styles over the stylesheet, so it
                     # composes with the severity spine instead of erasing it.
                     _row = st.container(
-                        key=f"flagrow_{'zip' if is_zip else 'std'}_{_level}_{_i}"
+                        key=f"{_row_key_prefix}_{'zip' if is_zip else 'std'}_{_level}_{_i}"
                     )
                     with _row:
                         with st.expander(exp_label, expanded=st.session_state.get(f"exp_{title}", False)):
