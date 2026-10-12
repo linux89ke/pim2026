@@ -2842,6 +2842,15 @@ def check_suspected_fake_products(
         # was flagged over exactly this. NAME/BRAND still count: an actual
         # counterfeit still has to say "Beats" somewhere a shopper reads it.
         _NO_DESCRIPTION_SCAN_BRANDS = {"beats"}
+        # Model aliases contain useful multi-word names, but some catalogs
+        # also contain generic fragments such as ``air`` and ``pro``. Those
+        # fragments appear naturally in prose (for example ``air-dry``) and
+        # must not become a brand claim merely because a price ceiling exists.
+        _NO_DESCRIPTION_SCAN_ALIASES = {
+            "air", "pro", "max", "low", "high", "mid", "free", "plus",
+            "force", "book", "zoom", "court", "vision", "trail", "calm",
+            "mule", "rings", "shadow", "series", "signature",
+        }
 
         # Description scanning is scoped to categories the sheet already
         # audits — the sneaker codes plus every category that has a ceiling.
@@ -2885,7 +2894,7 @@ def check_suspected_fake_products(
             rx = _alias_res[a]
             _brand_hit = d["_brand_lower"] == a
             _name_hit = _name.str.contains(rx, na=False)
-            if parent in _NO_DESCRIPTION_SCAN_BRANDS or len(_scope_idx) == 0:
+            if a.casefold() in _NO_DESCRIPTION_SCAN_ALIASES or parent in _NO_DESCRIPTION_SCAN_BRANDS or len(_scope_idx) == 0:
                 _desc_hit = _no_blob
                 _short_hit = _no_blob
             else:
