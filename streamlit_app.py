@@ -991,6 +991,35 @@ def _archive_name_key(value) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())[:48]
 
 
+_MAX_ARCHIVE_MEMBERS = 20_000
+_MAX_ARCHIVE_UNCOMPRESSED = 4 * 1024 * 1024 * 1024
+_MAX_ARCHIVE_MEMBER = 1 * 1024 * 1024 * 1024
+_MAX_ARCHIVE_RATIO = 1_000
+
+
+def _check_archive_safety(archive, filename: str):
+    """Reject archive bombs before any member is decompressed."""
+    infos = archive.infolist()
+    if len(infos) > _MAX_ARCHIVE_MEMBERS:
+        archive.close()
+        raise ValueError(f"{filename} contains too many archive members ({len(infos):,}).")
+    total = 0
+    for info in infos:
+        size = int(getattr(info, "file_size", 0) or 0)
+        compressed = int(getattr(info, "compress_size", 0) or 0)
+        if size > _MAX_ARCHIVE_MEMBER:
+            archive.close()
+            raise ValueError(f"{filename} contains a member larger than 1 GB: {info.filename}")
+        if compressed and size / compressed > _MAX_ARCHIVE_RATIO:
+            archive.close()
+            raise ValueError(f"{filename} contains a suspiciously compressed member: {info.filename}")
+        total += size
+        if total > _MAX_ARCHIVE_UNCOMPRESSED:
+            archive.close()
+            raise ValueError(f"{filename} expands beyond the 4 GB safety limit.")
+    return archive
+
+
 def _open_uploaded_archive(payload, filename: str):
     """Open ZIP or RAR uploads through one archive interface."""
     if str(filename).lower().endswith(".rar"):
@@ -1004,7 +1033,9 @@ def _open_uploaded_archive(payload, filename: str):
             ) from exc
         _configure_rarfile_backend(rarfile)
         try:
-            return rarfile.RarFile(payload if isinstance(payload, (str, os.PathLike)) else BytesIO(payload))
+            return _check_archive_safety(
+                rarfile.RarFile(payload if isinstance(payload, (str, os.PathLike)) else BytesIO(payload)), filename
+            )
         except rarfile.RarCannotExec as exc:
             # rarfile is only a Python wrapper.  It delegates decompression to
             # an external unrar/bsdtar/7z/WinRAR executable, which is commonly
@@ -1015,7 +1046,9 @@ def _open_uploaded_archive(payload, filename: str):
                 "ZIP uploads do not need this dependency; converting the RAR to ZIP "
                 "is also supported."
             ) from exc
-    return zipfile.ZipFile(payload if isinstance(payload, (str, os.PathLike)) else BytesIO(payload))
+    return _check_archive_safety(
+        zipfile.ZipFile(payload if isinstance(payload, (str, os.PathLike)) else BytesIO(payload)), filename
+    )
 
 
 def _configure_rarfile_backend(rarfile_module) -> Optional[str]:
