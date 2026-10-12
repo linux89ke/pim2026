@@ -7466,7 +7466,10 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
                     _candidate["evaluated_sids"] = list(dict.fromkeys(_candidate["evaluated_sids"] + list(chunk_sids)))
                 continue
         if manifest is not None:
-            mark_batch(manifest, batch_id, status="running", rows=len(chunk), index=index + 1, total=total)
+            mark_batch(
+                manifest, batch_id, status="running", rows=len(chunk),
+                sids=sorted(chunk_sids), index=index + 1, total=total,
+            )
         try:
             if on_progress:
                 on_progress(f"Preparing validation chunk {index + 1}/{total}", index, total)
@@ -7497,7 +7500,7 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
                 _existing["evaluated_sids"] = list(dict.fromkeys(_existing["evaluated_sids"] + list(_item.get("evaluated_sids", []))))
             if manifest is not None:
                 save_chunk_results(manifest, batch_id, fr_chunk, result_chunk)
-                mark_batch(manifest, batch_id, status="complete", rows=len(chunk))
+                mark_batch(manifest, batch_id, status="complete", rows=len(chunk), sids=sorted(chunk_sids))
         except Exception:
             if manifest is not None:
                 mark_batch(manifest, batch_id, status="failed", rows=len(chunk))
