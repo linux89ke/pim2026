@@ -296,7 +296,18 @@ RULES: List[CategoryRule] = [
         # Adult Toys & Games to the FDA queue. These category branches cover
         # the regulated liquid/spray/gel products; product-name matching still
         # catches a spray filed under an unusual leaf such as Sex Toys.
-        category_keyword=["lubricants", "sexual enhancers", "sexual remedies", "safer sex"],
+        # Do not use bare ``lubricants`` here.  Ordinary maintenance products
+        # are legitimately filed under leaves such as ``Lubricants &
+        # Cleaners`` (window/door spray, hair-clipper oil, sewing-machine
+        # oil, etc.).  That broad category marker used to turn those products
+        # into FDA sexual-wellness violations.  Only category names that
+        # explicitly identify the sexual-wellness branch may supply the
+        # category-only signal; ordinary lubricants still need a high-
+        # confidence sexual term in the product name or brand.
+        category_keyword=[
+            "sexual wellness", "personal lubricants", "intimate lubricants",
+            "sexual enhancers", "sexual remedies", "safer sex",
+        ],
         except_in=[
             "Health & Beauty / Beauty & Personal Care / Personal Care / Shave & Hair Removal",
             "Health & Beauty / Personal Care / Shave & Hair Removal",
