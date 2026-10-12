@@ -8162,6 +8162,7 @@ def _reset_report_state(*, clear_uploaded_files: bool = False, clear_zip_cache: 
 
     if clear_uploaded_files:
         st.session_state.cached_uploaded_files = []
+        st.session_state._uploader_detached = False
     if clear_zip_cache:
         st.session_state.zip_image_store = {}
         st.session_state.zip_image_index = {}
@@ -8227,15 +8228,31 @@ uploaded_files = st.file_uploader("Dpload files", type=["csv", "xlsx", "zip", "r
 
 if uploaded_files:
     _new_cache = []
+    _seen_upload_hashes = set()
     for uf in uploaded_files:
         uf.seek(0)
         _raw = uf.read()
         # Digest once, here — process_signature below is rebuilt on every rerun
         # and hashing the raw upload bytes each time costs ~39ms per 10MB of
         # upload on every single click.
-        _new_cache.append({"name": uf.name, "bytes": _raw, "md5": hashlib.md5(_raw).hexdigest()})
+        _md5 = hashlib.md5(_raw).hexdigest()
+        # Streamlit can return the same file more than once when the uploader
+        # reruns. Keep one content copy per batch, even if the same archive was
+        # selected under two names.
+        if _md5 in _seen_upload_hashes:
+            continue
+        _seen_upload_hashes.add(_md5)
+        _new_cache.append({"name": uf.name, "bytes": _raw, "md5": _md5})
     st.session_state.cached_uploaded_files = _new_cache
     st.session_state._uploader_had_files = True
+    # Detach the large UploadedFile list from the widget after the first read.
+    # Otherwise Streamlit deep-copies every uploaded object during the next
+    # widget registration, which is what caused MemoryError before validation
+    # even started. The cached batch remains available under its lightweight
+    # application state while the next uploader key starts empty.
+    st.session_state._uploader_detached = True
+    st.session_state.uploader_key += 1
+    st.rerun()
 # Any state where the widget is not holding files clears the batch, not
 # just an explicitly emptied list. A None or otherwise falsy selection
 # used to fall through both branches and leave cached_uploaded_files
@@ -8243,7 +8260,7 @@ if uploaded_files:
 elif st.session_state.get("_uploader_had_files", False):
     _prev_uploader_key = st.session_state.get("_last_uploader_key", -1)
     _curr_uploader_key = st.session_state.uploader_key
-    if _prev_uploader_key == _curr_uploader_key:
+    if _prev_uploader_key == _curr_uploader_key and not st.session_state.get("_uploader_detached", False):
         _reset_report_state(clear_uploaded_files=True, clear_zip_cache=True)
         st.session_state.last_processed_files = "empty"
         st.session_state._uploader_had_files = False
