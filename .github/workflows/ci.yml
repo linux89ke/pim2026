@@ -15,5 +15,5 @@ jobs:
           python-version: "3.11"
       - run: python -m pip install --upgrade pip
       - run: pip install -r requirements.txt pytest
-      - run: python -m py_compile api.py api_client.py category_matcher_engine.py custom_country_rules.py learned_rules.py processing_automation.py streamlit_app.py ui_components.py
+      - run: python -m py_compile api.py api_client.py category_matcher_engine.py custom_country_rules.py learned_rules.py processing_automation.py streamlit_app.py ui_components.py pages/Dashboard.py
       - run: pytest -q tests

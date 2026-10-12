@@ -29,6 +29,7 @@ import streamlit.components.v1 as components
 from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
 try:
@@ -71,6 +72,30 @@ def get_image_session() -> requests.Session:
         s.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "image/*"})
         _IMAGE_SESSION = s
     return _IMAGE_SESSION
+
+
+def _normalized_image_url(value: object) -> str:
+    """Return a conservative cache key for an image URL.
+
+    CDN tracking parameters frequently create a new URL for the same bytes.
+    Only well-known analytics parameters are removed; image-transform and
+    version parameters are retained so different actual images are never
+    conflated.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        if not parsed.scheme or not parsed.netloc:
+            return raw
+        tracking = ("utm_", "fbclid", "gclid", "mc_cid", "mc_eid")
+        query = [(key, val) for key, val in parse_qsl(parsed.query, keep_blank_values=True)
+                 if not key.lower().startswith(tracking)]
+        return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path,
+                           parsed.params, urlencode(query), parsed.fragment))
+    except Exception:
+        return raw
 
 
 # ── Pre-compiled Regex Patterns ──
@@ -861,6 +886,9 @@ _IMAGE_DIM_CACHE = _BoundedDict(maxsize=50000)
 _IMAGE_HASH_CACHE = _BoundedDict(maxsize=50000)
 _IMAGE_THUMB_CACHE = _BoundedDict(maxsize=2500)
 _IMAGE_DIM_LOCK = threading.Lock()
+_IMAGE_HOST_LOCKS = {}
+_IMAGE_HOST_FAILURES = {}
+_IMAGE_HOST_LOCKS_GUARD = threading.Lock()
 
 # Staging area for the low-resolution advisory produced by check_image_blurry.
 # That check runs on a worker thread, where st.session_state writes are silently
@@ -1126,9 +1154,23 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
         return {}
     _all_urls = data["MAIN_IMAGE"].astype(str)
     urls = _all_urls[_all_urls.str.strip().str.startswith("http")].unique()
+    # Deduplicate harmless tracking-parameter variants before touching the
+    # network, while retaining the original URL for report/viewer output.
+    _canonical_to_url = {}
+    for _url in urls:
+        _canonical_to_url.setdefault(_normalized_image_url(_url), _url)
+    urls = list(_canonical_to_url.values())
     with _IMAGE_DIM_LOCK:
-        _cache_hits = sum(1 for u in urls if u and u in _IMAGE_DIM_CACHE)
-        new_urls = list(dict.fromkeys(u for u in urls if u and u not in _IMAGE_DIM_CACHE))
+        _cache_keys = {_normalized_image_url(u): u for u in _IMAGE_DIM_CACHE}
+        _cache_hits = sum(1 for u in urls if u and (u in _IMAGE_DIM_CACHE or _normalized_image_url(u) in _cache_keys))
+        new_urls = list(dict.fromkeys(u for u in urls if u and u not in _IMAGE_DIM_CACHE and _normalized_image_url(u) not in _cache_keys))
+        for _url in urls:
+            if _url not in _IMAGE_DIM_CACHE:
+                _cached_url = _cache_keys.get(_normalized_image_url(_url))
+                if _cached_url:
+                    _IMAGE_DIM_CACHE[_url] = _IMAGE_DIM_CACHE.get(_cached_url)
+                    if _cached_url in _IMAGE_HASH_CACHE:
+                        _IMAGE_HASH_CACHE[_url] = _IMAGE_HASH_CACHE[_cached_url]
 
     # An exact learned URL match already has a deterministic image decision;
     # downloading it again cannot change that decision. Keep these URLs out of
@@ -1236,21 +1278,34 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
 
     def fetch(url):
         session = get_image_session()
+        _host = urlparse(url).netloc.lower()
+        with _IMAGE_HOST_LOCKS_GUARD:
+            _host_lock = _IMAGE_HOST_LOCKS.setdefault(_host, threading.BoundedSemaphore(8))
+            _host_failures = int(_IMAGE_HOST_FAILURES.get(_host, 0))
+        # A broken CDN should not consume every worker for the full timeout.
+        if _host_failures >= 20:
+            return url, None, "", "", 0.0, 0.0, 0.0, False
         try:
             # Keep a failed external image from holding a large validation for
             # minutes. Archive matches are handled locally before this path.
-            _network_t0 = time.perf_counter()
-            r = session.get(url.replace("http://", "https://"), timeout=(2.0, 3.5))
-            _network_elapsed = time.perf_counter() - _network_t0
+            with _host_lock:
+                _network_t0 = time.perf_counter()
+                r = session.get(url.replace("http://", "https://"), timeout=(2.0, 3.5))
+                _network_elapsed = time.perf_counter() - _network_t0
             if r.status_code == 200:
+                with _IMAGE_HOST_LOCKS_GUARD:
+                    _IMAGE_HOST_FAILURES[_host] = 0
                 raw = r.content
                 _decode_t0 = time.perf_counter()
                 size, ph = _size_and_phash(raw)
                 _decode_elapsed = time.perf_counter() - _decode_t0
                 return url, size, ph, "", _network_elapsed, _decode_elapsed, 0.0, True
+            with _IMAGE_HOST_LOCKS_GUARD:
+                _IMAGE_HOST_FAILURES[_host] = _host_failures + 1
             return url, None, "", "", _network_elapsed, 0.0, 0.0, False
         except Exception:
-            pass
+            with _IMAGE_HOST_LOCKS_GUARD:
+                _IMAGE_HOST_FAILURES[_host] = _host_failures + 1
         # Keep the result shape identical to successful downloads. The image
         # prefetch collector stores (url, dimensions, phash, thumbnail); a
         # three-item failure tuple made one bad image abort the whole prefetch
@@ -7370,6 +7425,12 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
         chunk_size = 10_000
     total = max(1, (len(sids) + chunk_size - 1) // chunk_size)
     done = completed_batches(manifest or {})
+    _resume_cached_chunks = 0
+    _resume_cached_rows = 0
+    st.session_state["_resume_metrics"] = {
+        "cached_chunks": 0, "total_chunks": total,
+        "cached_rows": 0, "pending_rows": int(len(data)),
+    }
     for index in range(total):
         batch_id = f"{batch_prefix}-{index + 1}"
         chunk_sids = set(sids[index * chunk_size:(index + 1) * chunk_size])
@@ -7381,6 +7442,14 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
             saved = load_chunk_results(manifest, batch_id)
             if saved is not None:
                 saved_report, saved_results = saved
+                _resume_cached_chunks += 1
+                _resume_cached_rows += len(chunk)
+                st.session_state["_resume_metrics"] = {
+                    "cached_chunks": _resume_cached_chunks,
+                    "total_chunks": total,
+                    "cached_rows": _resume_cached_rows,
+                    "pending_rows": max(0, int(len(data)) - _resume_cached_rows),
+                }
                 frames.append(saved_report)
                 result_parts.append(saved_results)
                 _cached_names = st.session_state.get("_cached_validator_names")
@@ -7450,6 +7519,12 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
             _name: round(_value, 3) if isinstance(_value, float) else int(_value)
             for _name, _value in aggregate_image_metrics.items()
         }
+    if _resume_cached_chunks:
+        st.info(
+            f"Resumed {_resume_cached_rows:,} products from "
+            f"{_resume_cached_chunks}/{total} completed chunks; "
+            f"{max(0, len(data) - _resume_cached_rows):,} products required new validation."
+        )
     return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), combined
 
 

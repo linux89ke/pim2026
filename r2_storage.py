@@ -70,6 +70,18 @@ def upload_file(path: str | Path, key: str, content_type: str = "application/oct
         return False
 
 
+def download_bytes(key: str) -> bytes:
+    """Read an optional object from R2; return empty bytes when unavailable."""
+    client = _client()
+    if client is None:
+        return b""
+    try:
+        response = client.get_object(Bucket=_secret("R2_BUCKET"), Key=str(key))
+        return response["Body"].read()
+    except Exception:
+        return b""
+
+
 def upload_bytes_async(data: bytes, key: str, content_type: str = "application/octet-stream") -> None:
     if enabled() and data:
         _POOL.submit(upload_bytes, data, key, content_type)

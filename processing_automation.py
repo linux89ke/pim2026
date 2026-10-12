@@ -16,6 +16,7 @@ MANIFEST_DIR.mkdir(exist_ok=True, parents=True)
 THUMB_DIR.mkdir(exist_ok=True, parents=True)
 DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="image-download")
 _LOCK = threading.RLock()
+_LAST_R2_CACHE_UPLOAD = 0.0
 
 def load_image_metadata_cache(max_entries: int = 50000) -> dict:
     """Load the durable URL -> dimensions/pHash cache.
@@ -25,7 +26,11 @@ def load_image_metadata_cache(max_entries: int = 50000) -> dict:
     entries are ignored so a damaged cache never prevents validation startup.
     """
     try:
-        payload = json.loads(IMAGE_CACHE_PATH.read_text(encoding="utf-8"))
+        if IMAGE_CACHE_PATH.exists():
+            raw = IMAGE_CACHE_PATH.read_bytes()
+        else:
+            raw = r2_storage.download_bytes("validation/image_metadata.json")
+        payload = json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict):
             return {}
         entries = payload.get("entries", payload)
@@ -64,6 +69,14 @@ def save_image_metadata_cache(entries: dict, max_entries: int = 50000) -> None:
                     break
                 except (PermissionError, OSError):
                     time.sleep(0.05 * (2 ** _attempt))
+            global _LAST_R2_CACHE_UPLOAD
+            if r2_storage.enabled() and time.monotonic() - _LAST_R2_CACHE_UPLOAD > 30:
+                _LAST_R2_CACHE_UPLOAD = time.monotonic()
+                r2_storage.upload_bytes_async(
+                    json.dumps({"version": 1, "entries": clean}, separators=(",", ":")).encode("utf-8"),
+                    "validation/image_metadata.json",
+                    "application/json",
+                )
         except OSError:
             pass
 
