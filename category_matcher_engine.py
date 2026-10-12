@@ -1135,8 +1135,17 @@ class CategoryMatcherEngine:
             logger.warning(f"Boosted prediction failed: {e}")
             return ""
 
-    def batch_predict_categories(self, names: list, top_n: int = 20) -> list:
-        """Predict categories for ALL names at once using semantic embeddings."""
+    def batch_predict_categories(self, names: list, top_n: int = 20,
+                                 batch_size: int = 256) -> list:
+        """Predict categories without materialising upload-wide dense matrices.
+
+        Both the classifier probabilities and the cosine-similarity matrix can
+        be very wide (tens of thousands of categories).  A single call for a
+        large upload therefore creates multi-gigabyte dense arrays.  Process
+        bounded sparse-vector batches instead; results are identical, while
+        peak memory is proportional to ``batch_size``.
+        """
+        batch_size = max(32, int(batch_size or 256))
         n = len(names)
         results = [''] * n
 
@@ -1158,18 +1167,23 @@ class CategoryMatcherEngine:
         if pending_indices and self.correction_classifier and self.correction_vectorizer:
             try:
                 pending_clean = [clean_names[i] for i in pending_indices]
-                pending_vec = self.correction_vectorizer.transform(pending_clean)
-                pending_probs = self.correction_classifier.predict_proba(pending_vec)
                 classes = self.correction_classifier.classes_
-                for row_no, orig_idx in enumerate(pending_indices):
-                    probs = pending_probs[row_no]
-                    max_prob_idx = int(np.argmax(probs))
-                    if float(probs[max_prob_idx]) <= 0.6:
-                        continue
-                    cand = classes[max_prob_idx]
-                    neg = self.negative_db.get(clean_names[orig_idx], set())
-                    if str(cand).strip().lower() not in neg:
-                        results[orig_idx] = cand
+                for start in range(0, len(pending_indices), batch_size):
+                    chunk_indices = pending_indices[start:start + batch_size]
+                    chunk_clean = [clean_names[i] for i in chunk_indices]
+                    # Keep the TF-IDF input sparse and bound the dense
+                    # probability array to at most batch_size x class_count.
+                    chunk_vec = self.correction_vectorizer.transform(chunk_clean)
+                    chunk_probs = self.correction_classifier.predict_proba(chunk_vec)
+                    for row_no, orig_idx in enumerate(chunk_indices):
+                        probs = chunk_probs[row_no]
+                        max_prob_idx = int(np.argmax(probs))
+                        if float(probs[max_prob_idx]) <= 0.6:
+                            continue
+                        cand = classes[max_prob_idx]
+                        neg = self.negative_db.get(clean_names[orig_idx], set())
+                        if str(cand).strip().lower() not in neg:
+                            results[orig_idx] = cand
             except Exception as e:
                 logger.warning(f"Batch learned category prediction failed: {e}")
 
@@ -1180,48 +1194,59 @@ class CategoryMatcherEngine:
 
         pending_names = [names[i] for i in pending_indices]
         try:
-            name_vectors = self.vectorizer.transform(pending_names)
-            sim_matrix = _sk()["cosine_similarity"](name_vectors, self.tfidf_matrix)
+            # cosine_similarity returns a dense matrix.  Compute it in small
+            # slices so an upload cannot allocate (products x categories) at
+            # once (for example 22,745 x 30,085 ~= 5.1 GiB).
+            cosine_similarity = _sk()["cosine_similarity"]
         except Exception as e:
             logger.warning(f"Batch prediction failed: {e}")
             return results
 
         threshold = 0.35
 
-        for j, orig_idx in enumerate(pending_indices):
-            similarities = sim_matrix[j]
-            top_indices = similarities.argsort()[-top_n:][::-1]
+        for start in range(0, len(pending_indices), batch_size):
+            chunk_indices = pending_indices[start:start + batch_size]
+            chunk_names = [pending_names[start + j] for j in range(len(chunk_indices))]
+            try:
+                name_vectors = self.vectorizer.transform(chunk_names)
+                sim_matrix = cosine_similarity(name_vectors, self.tfidf_matrix)
+            except Exception as e:
+                logger.warning(f"Batch prediction chunk failed: {e}")
+                continue
+            for j, orig_idx in enumerate(chunk_indices):
+                similarities = sim_matrix[j]
+                top_indices = similarities.argsort()[-top_n:][::-1]
 
-            best_category = ""
-            best_score = -1.0
-            name_lower = names[orig_idx].lower()
-            _neg = self.negative_db.get(clean_text(names[orig_idx]), set()) if self.negative_db else set()
+                best_category = ""
+                best_score = -1.0
+                name_lower = names[orig_idx].lower()
+                _neg = self.negative_db.get(clean_text(names[orig_idx]), set()) if self.negative_db else set()
 
-            for idx in top_indices:
-                base_score = float(similarities[idx])
-                cat_path = self.categories[idx]
-                boost = 0.0
+                for idx in top_indices:
+                    base_score = float(similarities[idx])
+                    cat_path = self.categories[idx]
+                    boost = 0.0
 
-                cat_path_lower = cat_path.lower()
-                # Never re-suggest a category a human already rejected for this name
-                if _neg and (cat_path_lower.strip() in _neg
-                             or cat_path_lower.split('>')[-1].strip() in _neg
-                             or cat_path_lower.split('/')[-1].strip() in _neg):
-                    continue
-                leaf_lower = cat_path_lower.split('>')[-1].strip()
-                rule = self.compiled_rules.get(cat_path_lower) or self.compiled_rules.get(leaf_lower)
-                if rule:
-                    matches = rule['pattern'].findall(name_lower)
-                    if matches:
-                        boost = sum(rule['weights'].get(m.lower(), 0.0) for m in set(matches))
+                    cat_path_lower = cat_path.lower()
+                    # Never re-suggest a category a human already rejected for this name
+                    if _neg and (cat_path_lower.strip() in _neg
+                                 or cat_path_lower.split('>')[-1].strip() in _neg
+                                 or cat_path_lower.split('/')[-1].strip() in _neg):
+                        continue
+                    leaf_lower = cat_path_lower.split('>')[-1].strip()
+                    rule = self.compiled_rules.get(cat_path_lower) or self.compiled_rules.get(leaf_lower)
+                    if rule:
+                        matches = rule['pattern'].findall(name_lower)
+                        if matches:
+                            boost = sum(rule['weights'].get(m.lower(), 0.0) for m in set(matches))
 
-                final_score = base_score + (boost * 0.4) # Slightly lower boost for semantic matches
-                if final_score > best_score:
-                    best_score = final_score
-                    best_category = cat_path
+                    final_score = base_score + (boost * 0.4) # Slightly lower boost for semantic matches
+                    if final_score > best_score:
+                        best_score = final_score
+                        best_category = cat_path
 
-            if best_score >= threshold:
-                results[orig_idx] = best_category
+                if best_score >= threshold:
+                    results[orig_idx] = best_category
 
         return results
 
