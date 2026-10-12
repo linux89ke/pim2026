@@ -77,7 +77,7 @@ def _load_dashboard_catalog(mtime_ns: int, day_key: str) -> pd.DataFrame:
         frame["brand_infringed"] = frame["brand"] if "brand" in frame.columns else ""
 
     if frame.empty:
-        for _empty_col in ("review_state", "_cluster_key", "cluster_size", "sellers_affected", "confirmed_decisions", "review_due_at", "lifecycle", "confidence_score", "confidence"):
+        for _empty_col in ("review_state", "_cluster_key", "cluster_size", "sellers_affected", "confirmed_decisions", "review_due_at", "lifecycle", "confidence_score", "confidence", "_rule_id"):
             frame[_empty_col] = pd.Series(dtype=str)
         return frame
 
@@ -108,6 +108,10 @@ def _load_dashboard_catalog(mtime_ns: int, day_key: str) -> pd.DataFrame:
     _confidence -= frame["review_state"].eq("Corrected").astype(float) * 0.35
     frame["confidence_score"] = _confidence.clip(0, 1).round(2)
     frame["confidence"] = (frame["confidence_score"] * 100).round().astype(int).astype(str) + "%"
+    # Stable, human-friendly identity for search and deletion. It is derived
+    # from the rule identity and does not alter the JSON schema or remote row.
+    _identity = frame.reindex(columns=["image_url", "phash", "flag", "created_at"], fill_value="").fillna("").astype(str).agg("\x1f".join, axis=1)
+    frame["_rule_id"] = "LR-" + _identity.map(lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()[:10].upper())
     return frame
 
 
@@ -591,7 +595,11 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
         _filter_col, _search_col = st.columns([1, 2])
         _flag_options = ["All"] + sorted(_stored_df.get("flag", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
         _view_flag = _filter_col.selectbox("Filter by flag", _flag_options, key="learned_rules_view_flag")
-        _view_search = _search_col.text_input("Search URL, brand, seller, or source", key="learned_rules_view_search")
+        _view_search = _search_col.text_input(
+            "Search rule ID, URL, pHash, SKU, reason, brand, seller, or source",
+            key="learned_rules_view_search",
+            placeholder="LR-0000000000, pHash, SKU, NIVEA, Poor images…",
+        )
         _brand_series = _stored_df["brand_infringed"].fillna("").astype(str).str.strip()
         _brand_options = ["All"] + sorted([_brand for _brand in _brand_series.unique().tolist() if _brand])
         _view_brand = st.selectbox("Filter by infringed/claimed brand", _brand_options, key="learned_rules_view_brand")
@@ -626,7 +634,7 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
             _view_df = _view_df[_view_df["flag"].astype(str).eq(_view_flag)]
         if _view_search:
             _needle = _view_search.casefold()
-            _search_cols = [c for c in ("image_url", "brand", "seller_name", "source", "reason") if c in _view_df.columns]
+            _search_cols = [c for c in ("_rule_id", "image_url", "phash", "product_set_sid", "brand", "brand_infringed", "seller_name", "source", "flag", "reason", "comment", "category_code") if c in _view_df.columns]
             _mask = _view_df[_search_cols].astype(str).apply(lambda col: col.str.casefold().str.contains(_needle, na=False)).any(axis=1)
             _view_df = _view_df[_mask]
         if _view_source != "All" and "source" in _view_df.columns:
@@ -647,7 +655,7 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
             _view_df = _view_df.sort_values("created_at", ascending=False)
         else:
             _view_df = _view_df.sort_values("created_at", ascending=True)
-        _display_cols = [c for c in ("image_url", "phash", "flag", "reason", "brand_infringed", "brand", "seller_name", "source", "status", "created_at", "last_matched_at", "last_confirmed_at", "confidence", "cluster_size", "sellers_affected", "lifecycle", "review_due_at") if c in _view_df.columns]
+        _display_cols = [c for c in ("_rule_id", "image_url", "phash", "flag", "reason", "brand_infringed", "brand", "seller_name", "product_set_sid", "source", "status", "created_at", "last_matched_at", "last_confirmed_at", "confidence", "cluster_size", "sellers_affected", "lifecycle", "review_due_at") if c in _view_df.columns]
         st.caption(f"Showing {_view_df.shape[0]:,} of {_stored_df.shape[0]:,} rules")
         _audit_mode = st.toggle(
             "Audit card view",
@@ -683,6 +691,7 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                             except Exception:
                                 st.caption("Image unavailable")
                             _audit_flag = str(_audit_row.get("flag", ""))
+                            _audit_rule_id = str(_audit_row.get("_rule_id", ""))
                             _audit_sid = str(_audit_row.get("product_set_sid", "")).strip()
                             _audit_seller = str(_audit_row.get("seller_name", "")).strip()
                             _audit_source = str(_audit_row.get("source", "")).strip()
@@ -697,7 +706,7 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                                 _stored_df.get("phash", pd.Series(index=_stored_df.index, dtype=str)).astype(str).eq(_audit_image_key)
                             ]
                             _audit_seller_count = _audit_matches.get("seller_name", pd.Series(dtype=str)).astype(str).replace({"": pd.NA}).nunique(dropna=True)
-                            st.markdown(f"**{_audit_flag}**")
+                            st.markdown(f"**{_audit_rule_id or 'Rule ID unavailable'}** · **{_audit_flag}**")
                             if _audit_reason_text:
                                 st.markdown(f"**Rejection reason:** {_audit_reason_text}")
                             if _audit_brand:
@@ -775,6 +784,7 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                 for _preview_index, (_, _preview_row) in enumerate(_preview_rows.iterrows()):
                     _preview_url = str(_preview_row.get("image_url", "")).strip()
                     _preview_flag = str(_preview_row.get("flag", ""))
+                    _preview_rule_id = str(_preview_row.get("_rule_id", ""))
                     _preview_sid = str(_preview_row.get("sid", _preview_row.get("product_set_sid", ""))).strip()
                     _preview_review = str(_preview_row.get("review_state", "Unreviewed") or "Unreviewed")
                     _preview_key = f"{_preview_index}_{str(_preview_row.get('created_at', '')).replace('-', '')[-16:]}"
@@ -790,7 +800,7 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                             st.image(_preview_url, width="stretch", output_format="auto")
                         except Exception:
                             st.caption("Image unavailable")
-                        st.markdown(f"**{_preview_flag}**")
+                        st.markdown(f"**{_preview_rule_id or 'Rule ID unavailable'}** · **{_preview_flag}**")
                         st.caption(f"{_preview_sid or 'SKU unavailable'} · {_preview_review}")
                         _preview_reason = st.selectbox(
                             "Reason",
@@ -839,7 +849,10 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
             hide_index=True,
             width="stretch",
             disabled=[c for c in _editor_cols if c != "Remove"],
-            column_config={"Remove": st.column_config.CheckboxColumn("Remove", help="Delete this rule", default=False)},
+            column_config={
+                "Remove": st.column_config.CheckboxColumn("Remove", help="Delete this rule", default=False),
+                "_rule_id": st.column_config.TextColumn("Rule ID", help="Stable identifier used to search and remove this rule."),
+            },
             key="learned_rules_editor",
         )
         _selected = _edited[_edited["Remove"].astype(bool)] if "Remove" in _edited.columns else pd.DataFrame()
