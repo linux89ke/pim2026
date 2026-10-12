@@ -9530,6 +9530,10 @@ if (
     try:
         _current_report = st.session_state.get("final_report")
         _current_sids = _current_report["ProductSetSid"].astype(str).str.strip().tolist() if isinstance(_current_report, pd.DataFrame) and "ProductSetSid" in _current_report.columns else []
+        _already_reused = st.session_state.get("_reused_decisions")
+        if isinstance(_already_reused, pd.DataFrame) and "ProductSetSid" in _already_reused.columns:
+            _already_reused_sids = set(_already_reused["ProductSetSid"].astype(str).str.strip())
+            _current_sids = [sid for sid in _current_sids if sid not in _already_reused_sids]
         _overlap = find_overlapping_decisions(_current_sids, st.session_state.get("_process_country", ""), process_signature)
         if _overlap:
             st.session_state["_overlap_offer"] = _overlap
