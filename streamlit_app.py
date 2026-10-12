@@ -1972,6 +1972,7 @@ def _is_books_movies_music_category(cat_str: str = "", cat_code: str = "", code_
 def check_restricted_brands(
     data: pd.DataFrame, country_rules: List[Dict],
     code_to_path: Optional[Dict] = None,
+    book_category_codes: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     if data.empty or not country_rules:
         return pd.DataFrame(columns=data.columns)
@@ -1986,13 +1987,18 @@ def check_restricted_brands(
     # Keep the category exemption vectorized. The previous row-wise helper
     # called category-path lookups and several string checks once per product,
     # which became a major cost on large catalogues.
-    _cat_text = d.get("CATEGORY", pd.Series("", index=d.index)).fillna("").astype(str).str.strip()
-    for _cat_col in ("CATEGORY_PATH", "CATEGORY_NAME", "CATEGORY_FULL_PATH"):
-        if _cat_col in d.columns:
-            _cat_text = _cat_text.where(_cat_text.str.len().gt(0), d[_cat_col].fillna("").astype(str).str.strip())
     _cat_code = d.get("CATEGORY_CODE", pd.Series("", index=d.index)).fillna("").astype(str).str.strip()
     _mapped_path = _cat_code.map(code_to_path or {}).fillna("").astype(str).str.strip()
-    _cat_path = _cat_text.where(_cat_text.str.len().gt(0), _mapped_path)
+    # CATEGORY is often only the leaf (for example ``Psychology``), while the
+    # full taxonomy is available through CATEGORY_CODE. Prefer the mapped
+    # full path whenever it exists; otherwise the book exemption cannot see
+    # ``Books, Movies and Music`` and a prose match such as UNCOVER is treated
+    # as a restricted brand. Fall back to explicit path columns, then leaf.
+    _cat_path = _mapped_path.copy()
+    for _cat_col in ("CATEGORY_FULL_PATH", "CATEGORY_PATH", "CATEGORY_NAME", "CATEGORY"):
+        if _cat_col in d.columns:
+            _candidate_path = d[_cat_col].fillna("").astype(str).str.strip()
+            _cat_path = _cat_path.where(_cat_path.str.len().gt(0), _candidate_path)
     # Country rule category lists are keyed by the normalized category code.
     # Some direct CSV/ZIP uploads do not pass through the normalizer first;
     # derive the helper here so those files are checked instead of failing with
@@ -2010,7 +2016,8 @@ def check_restricted_brands(
     _is_ps &= _cat_path_l.str.contains(r"game|dlc|digital games", regex=True, na=False)
     # Books are exempt regardless of whether the feed uses the full
     # ``Books, Movies and Music`` taxonomy or a shorter ``Books / ...`` path.
-    _is_books = _cat_path_l.str.startswith("books, movies and music") | _cat_path_l.str.contains(
+    _book_codes = {clean_category_code(c) for c in (book_category_codes or [])}
+    _is_books = _cat_code.map(clean_category_code).isin(_book_codes) | _cat_path_l.str.startswith("books, movies and music") | _cat_path_l.str.contains(
         r"(?:^|[/,>])\s*books?\b", regex=True, na=False
     )
     _cat_excl_mask = _is_ps | _is_books
@@ -5997,6 +6004,7 @@ def validate_products(
                 # Resolves a category code to its full path, so a rule can be
                 # kept out of parts of the tree it has no business in.
                 "code_to_path": support_files.get("code_to_path", {}),
+                "book_category_codes": support_files.get("book_category_codes", []),
             },
         ),
 
