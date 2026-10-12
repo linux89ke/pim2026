@@ -99,6 +99,7 @@ def list_cached_sessions():
 
 MANUAL_DECISION_COLS = [
     "ProductSetSid", "Status", "Reason", "Comment", "FLAG", "Is_Manual", "Is_Zip",
+    "_ReuseFingerprint", "_ReuseImageURL", "_ReuseBrand", "_ReuseCategory", "_ReuseName",
 ]
 MANUAL_DECISION_PREFIX = "manual_"
 
@@ -154,6 +155,7 @@ def save_manual_decisions(
     *,
     file_tokens=None,
     country: str = "",
+    source_data=None,
 ) -> int:
     """Persist every manually-decided row. Returns how many were written.
 
@@ -170,6 +172,25 @@ def save_manual_decisions(
 
     fname = manual_decisions_filename(process_signature)
     decided = final_report[final_report["Is_Manual"] == True]  # noqa: E712
+    if isinstance(source_data, pd.DataFrame) and "PRODUCT_SET_SID" in source_data.columns and "ProductSetSid" in decided.columns:
+        _src = source_data.copy()
+        _src["PRODUCT_SET_SID"] = _src["PRODUCT_SET_SID"].fillna("").astype(str).str.strip()
+        _src = _src.drop_duplicates("PRODUCT_SET_SID", keep="last").set_index("PRODUCT_SET_SID")
+        _sid = decided["ProductSetSid"].fillna("").astype(str).str.strip()
+        _fields = ("MAIN_IMAGE", "BRAND", "CATEGORY_CODE", "NAME", "DESCRIPTION", "SHORT_DESCRIPTION", "SELLER_NAME")
+        _parts = []
+        for _field in _fields:
+            _mapping = _src[_field].fillna("").astype(str) if _field in _src.columns else pd.Series(dtype=str)
+            _parts.append(_sid.map(_mapping).fillna(""))
+        if _parts:
+            _fingerprint_frame = pd.concat(_parts, axis=1)
+            decided = decided.copy()
+            decided["_ReuseFingerprint"] = _fingerprint_frame.apply(
+                lambda row: hashlib.sha256("\x1f".join(str(v).strip() for v in row).encode("utf-8")).hexdigest()[:24], axis=1
+            )
+            for _field, _out in (("MAIN_IMAGE", "_ReuseImageURL"), ("BRAND", "_ReuseBrand"), ("CATEGORY_CODE", "_ReuseCategory"), ("NAME", "_ReuseName")):
+                _mapping = _src[_field].fillna("").astype(str) if _field in _src.columns else pd.Series(dtype=str)
+                decided[_out] = _sid.map(_mapping).fillna("").values
     cols = [c for c in MANUAL_DECISION_COLS if c in decided.columns]
     decided = decided[cols].drop_duplicates(subset=["ProductSetSid"], keep="last")
 

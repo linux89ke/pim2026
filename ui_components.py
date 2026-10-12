@@ -1272,6 +1272,7 @@ def checkpoint_final_report(fr: pd.DataFrame = None) -> bool:
         # written exactly as before, just not discoverable.
         file_tokens=st.session_state.get("_process_file_tokens"),
         country=st.session_state.get("_process_country", ""),
+        source_data=st.session_state.get("all_data_map"),
     )
 
     sig = st.session_state.get("current_sig_hash")

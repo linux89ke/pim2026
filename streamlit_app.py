@@ -8252,6 +8252,21 @@ def _upload_digest(rec: dict) -> str:
     return digest
 
 
+def _decision_reuse_fingerprints(frame: pd.DataFrame) -> pd.Series:
+    """Build conservative per-SKU fingerprints for cross-upload reuse."""
+    if not isinstance(frame, pd.DataFrame) or "PRODUCT_SET_SID" not in frame.columns:
+        return pd.Series(dtype=str)
+    fields = ("MAIN_IMAGE", "BRAND", "CATEGORY_CODE", "NAME", "DESCRIPTION", "SHORT_DESCRIPTION", "SELLER_NAME")
+    sid = frame["PRODUCT_SET_SID"].fillna("").astype(str).str.strip()
+    parts = [frame[c].fillna("").astype(str).str.strip() if c in frame.columns else pd.Series("", index=frame.index) for c in fields]
+    values = pd.concat(parts, axis=1)
+    return pd.Series(
+        [hashlib.sha256("\x1f".join(row).encode("utf-8")).hexdigest()[:24] for row in values.astype(str).itertuples(index=False, name=None)],
+        index=sid,
+        dtype=str,
+    )
+
+
 # Kept as a list as well as folded into the signature string. The signature is
 # hashed into an opaque filename, so on its own it cannot answer "was an
 # earlier journal written for a subset of these files?" — which is what makes
@@ -8670,6 +8685,36 @@ if st.session_state.get("last_processed_files") != process_signature:
                             data_filtered["_var_len"] = data_filtered["VARIATION"].astype(str).str.len()
                             data_filtered = data_filtered.sort_values(by="_var_len", ascending=False).drop(columns=["_var_len"])
                         data = data_filtered.drop_duplicates(subset=["PRODUCT_SET_SID"], keep="first")
+
+                        # Reuse previously reviewed SKUs only when the product
+                        # content is byte-for-byte equivalent at the fields
+                        # that affect validation. This removes repeat validator
+                        # and image work across different uploads without
+                        # carrying stale decisions onto changed listings.
+                        _reused_decisions = pd.DataFrame()
+                        if not st.session_state.get("_force_fresh_overlap", False):
+                            try:
+                                _overlap = find_overlapping_decisions(
+                                    data["PRODUCT_SET_SID"].astype(str).str.strip().tolist(),
+                                    country_validator.code,
+                                    process_signature,
+                                )
+                                if _overlap and isinstance(_overlap.get("decisions"), pd.DataFrame):
+                                    _old = _overlap["decisions"].copy()
+                                    _current_fp = _decision_reuse_fingerprints(data)
+                                    _old["ProductSetSid"] = _old["ProductSetSid"].fillna("").astype(str).str.strip()
+                                    if "_ReuseFingerprint" in _old.columns:
+                                        _valid = _old["ProductSetSid"].map(_current_fp).fillna("") == _old["_ReuseFingerprint"].fillna("").astype(str)
+                                        _reused_decisions = _old.loc[_valid].copy()
+                            except Exception:
+                                logger.debug("Cross-upload decision reuse lookup failed", exc_info=True)
+                        st.session_state["_reused_decisions"] = _reused_decisions
+                        st.session_state["_force_fresh_overlap"] = False
+                        if not _reused_decisions.empty:
+                            st.info(
+                                f"Reusing {_reused_decisions['ProductSetSid'].nunique():,} unchanged reviewed SKU(s); "
+                                "their validators and images will not run again. Changed SKUs will be checked fresh."
+                            )
                         
                         if "QC_Skip_Reason" in data.columns and "VARIATION" in data.columns:
                             mask = (data["QC_Skip_Reason"] == "Variation missing") & (data["VARIATION"].astype(str).str.strip() != "") & (data["VARIATION"].notna()) & (data["VARIATION"].astype(str).str.lower() != "nan")
@@ -8684,7 +8729,10 @@ if st.session_state.get("last_processed_files") != process_signature:
                             if _sid_col_qc: zip_sids = set(qc_zip[_sid_col_qc].astype(str).str.strip().unique())
 
                         all_sids = set(data["PRODUCT_SET_SID"].unique())
+                        _reused_sids = set(_reused_decisions["ProductSetSid"].astype(str).str.strip()) if not _reused_decisions.empty else set()
                         non_zip_sids = all_sids - zip_sids
+                        non_zip_sids -= _reused_sids
+                        zip_sids -= _reused_sids
                         fast_skip_list = _large_file_skip_validations if _total_estimated_rows > _large_file_threshold else []
 
                         st.write(f"Running validation on {len(all_sids)} products…")
@@ -8746,6 +8794,15 @@ if st.session_state.get("last_processed_files") != process_signature:
                         if zip_sids:
                             _zip_mask = final_report["ProductSetSid"].astype(str).str.strip().isin(zip_sids)
                             final_report.loc[_zip_mask, "Is_Zip"] = True
+                        if not _reused_decisions.empty:
+                            # These rows were deliberately excluded from all
+                            # validator passes above. Restore their reviewed
+                            # outcome into the combined report immediately.
+                            apply_manual_decisions(final_report, _reused_decisions)
+                            final_report.loc[
+                                final_report["ProductSetSid"].astype(str).str.strip().isin(_reused_sids),
+                                "Is_Manual",
+                            ] = True
 
                         if has_zip_source and not qc_zip.empty and _sid_col_qc:
                             data = data.copy()
@@ -9483,6 +9540,18 @@ if (
         st.session_state["_overlap_handled"] = process_signature
 
 _overlap_offer = st.session_state.get("_overlap_offer")
+_reused_now = st.session_state.get("_reused_decisions")
+if isinstance(_reused_now, pd.DataFrame) and not _reused_now.empty:
+    with st.container(border=True):
+        st.caption(
+            f"{_reused_now['ProductSetSid'].nunique():,} unchanged SKU(s) were reused from a previous review. "
+            "No validators or image downloads were run for them."
+        )
+        if st.button("Recheck reused SKUs fresh", key="recheck_reused_skus", icon=":material/refresh:"):
+            st.session_state["_force_fresh_overlap"] = True
+            st.session_state.last_processed_files = None
+            st.session_state.pop("_reused_decisions", None)
+            st.rerun()
 if _overlap_offer:
     with st.container(border=True):
         st.warning(
