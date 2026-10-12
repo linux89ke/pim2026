@@ -12,6 +12,7 @@ import os
 import pickle
 import re
 import shutil
+import tempfile
 import time
 import traceback
 import unicodedata
@@ -990,7 +991,7 @@ def _archive_name_key(value) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())[:48]
 
 
-def _open_uploaded_archive(payload: bytes, filename: str):
+def _open_uploaded_archive(payload, filename: str):
     """Open ZIP or RAR uploads through one archive interface."""
     if str(filename).lower().endswith(".rar"):
         try:
@@ -1003,7 +1004,7 @@ def _open_uploaded_archive(payload: bytes, filename: str):
             ) from exc
         _configure_rarfile_backend(rarfile)
         try:
-            return rarfile.RarFile(BytesIO(payload))
+            return rarfile.RarFile(payload if isinstance(payload, (str, os.PathLike)) else BytesIO(payload))
         except rarfile.RarCannotExec as exc:
             # rarfile is only a Python wrapper.  It delegates decompression to
             # an external unrar/bsdtar/7z/WinRAR executable, which is commonly
@@ -1014,7 +1015,7 @@ def _open_uploaded_archive(payload: bytes, filename: str):
                 "ZIP uploads do not need this dependency; converting the RAR to ZIP "
                 "is also supported."
             ) from exc
-    return zipfile.ZipFile(BytesIO(payload))
+    return zipfile.ZipFile(payload if isinstance(payload, (str, os.PathLike)) else BytesIO(payload))
 
 
 def _configure_rarfile_backend(rarfile_module) -> Optional[str]:
@@ -1120,11 +1121,11 @@ def _prepare_lazy_zip_images(uploaded_file_records: List[Dict]) -> None:
         if not uf["name"].lower().endswith((".zip", ".rar")):
             continue
         try:
-            with _open_uploaded_archive(uf["bytes"], uf["name"]) as zf:
+            with _open_uploaded_archive(_upload_path(uf) or _upload_bytes(uf), uf["name"]) as zf:
                 idx = _index_zip_images(zf)
             if idx:
                 combined_index.update(idx)
-                source_bytes_list.append(uf["bytes"])
+                source_bytes_list.append(_upload_path(uf) or _upload_bytes(uf))
         except Exception as e:
             logger.warning("Failed indexing ZIP images from %s: %s", uf["name"], e)
     st.session_state.zip_image_index = combined_index
@@ -1392,7 +1393,10 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
                             _archives = getattr(_reader_local, "archives", {})
                             _archive = _archives.get(_source_id)
                             if _archive is None:
-                                if bytes(_source[:7]) == b"Rar!\x1a\x07":
+                                _archive_name = str(_source).lower()
+                                if isinstance(_source, (str, os.PathLike)):
+                                    _archive = _open_uploaded_archive(str(_source), _archive_name)
+                                elif bytes(_source[:7]) == b"Rar!\x1a\x07":
                                     import rarfile
                                     _configure_rarfile_backend(rarfile)
                                     _archive = rarfile.RarFile(BytesIO(_source))
@@ -8192,11 +8196,71 @@ if country_choice and country_choice != current_country:
 
 country_validator = CountryValidator(st.session_state.selected_country)
 
+_UPLOAD_CACHE_DIR = Path(tempfile.gettempdir()) / "pim2026_upload_cache"
+_UPLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _materialize_uploaded_file(uploaded_file) -> dict:
+    """Spool one Streamlit upload to disk and return lightweight metadata."""
+    hasher = hashlib.sha256()
+    md5 = hashlib.md5()
+    size = 0
+    # Streamlit's UploadedFile still has to be read once, but no second full
+    # copy is retained in session state after this function returns.
+    uploaded_file.seek(0)
+    first = uploaded_file.read(1024 * 1024)
+    if not first:
+        target = _UPLOAD_CACHE_DIR / "empty-upload"
+        target.touch(exist_ok=True)
+        return {"name": uploaded_file.name, "path": str(target), "size": 0, "md5": md5.hexdigest()}
+    tmp = tempfile.NamedTemporaryFile(prefix="upload_", suffix=".part", dir=_UPLOAD_CACHE_DIR, delete=False)
+    tmp_path = Path(tmp.name)
+    try:
+        with tmp:
+            chunk = first
+            while chunk:
+                tmp.write(chunk)
+                hasher.update(chunk)
+                md5.update(chunk)
+                size += len(chunk)
+                chunk = uploaded_file.read(1024 * 1024)
+        digest = hasher.hexdigest()
+        final_path = _UPLOAD_CACHE_DIR / f"{digest}.upload"
+        if final_path.exists() and final_path.stat().st_size == size:
+            tmp_path.unlink(missing_ok=True)
+        else:
+            os.replace(tmp_path, final_path)
+        return {"name": uploaded_file.name, "path": str(final_path), "size": size, "md5": md5.hexdigest()}
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _upload_path(record: dict) -> str:
+    path = str(record.get("path", "")).strip()
+    if path and os.path.exists(path):
+        return path
+    return ""
+
+
+def _upload_bytes(record: dict) -> bytes:
+    path = _upload_path(record)
+    if path:
+        return Path(path).read_bytes()
+    return record.get("bytes", b"")
+
+
+def _upload_size(record: dict) -> int:
+    try:
+        return int(record.get("size", 0) or os.path.getsize(_upload_path(record)))
+    except Exception:
+        return len(record.get("bytes", b""))
+
 _has_files = bool(st.session_state.get("cached_uploaded_files"))
 if _has_files:
     if st.button("Run the checks again", width='stretch', help="Ignores the cached result and re-runs every check on the uploaded files"):
         for uf in st.session_state.get("cached_uploaded_files", []):
-            fhash = hashlib.sha256(uf["bytes"]).hexdigest()[:24]
+            fhash = hashlib.sha256(_upload_bytes(uf)).hexdigest()[:24]
             invalidate(country_validator.country, fhash)
         st.session_state.last_processed_files = None
         st.rerun()
@@ -8248,19 +8312,15 @@ if uploaded_files:
     _new_cache = []
     _seen_upload_hashes = set()
     for uf in uploaded_files:
-        uf.seek(0)
-        _raw = uf.read()
-        # Digest once, here — process_signature below is rebuilt on every rerun
-        # and hashing the raw upload bytes each time costs ~39ms per 10MB of
-        # upload on every single click.
-        _md5 = hashlib.md5(_raw).hexdigest()
+        _record = _materialize_uploaded_file(uf)
+        _md5 = _record["md5"]
         # Streamlit can return the same file more than once when the uploader
         # reruns. Keep one content copy per batch, even if the same archive was
         # selected under two names.
         if _md5 in _seen_upload_hashes:
             continue
         _seen_upload_hashes.add(_md5)
-        _new_cache.append({"name": uf.name, "bytes": _raw, "md5": _md5})
+        _new_cache.append(_record)
     st.session_state.cached_uploaded_files = _new_cache
     st.session_state._uploader_had_files = True
     # Detach the large UploadedFile list from the widget after the first read.
@@ -8326,7 +8386,7 @@ def _upload_digest(rec: dict) -> str:
     """Digest of one cached upload, computed once and memoised on the record."""
     digest = rec.get("md5")
     if not digest:
-        digest = hashlib.md5(rec["bytes"]).hexdigest()
+        digest = hashlib.md5(_upload_bytes(rec)).hexdigest()
         rec["md5"] = digest
     return digest
 
@@ -8363,22 +8423,22 @@ if st.session_state.get("_row_estimate_sig") != process_signature:
     _total_estimated_rows = 0
     for _fc in _files_for_processing:
         try:
-            _peek = BytesIO(_fc["bytes"])
+            _peek = BytesIO(_upload_bytes(_fc))
             _name_lower = _fc["name"].lower()
             if _name_lower.endswith((".zip", ".rar")):
-                with _open_uploaded_archive(_fc["bytes"], _fc["name"]) as _zf:
+                with _open_uploaded_archive(_upload_path(_fc) or _upload_bytes(_fc), _fc["name"]) as _zf:
                     _qc_info = next((info for info in _zf.infolist() if "qc_results" in info.filename.lower() and info.filename.lower().endswith((".xlsx", ".xls", ".csv"))), None)
                     if _qc_info:
                         # Use archive metadata for the estimate. Decompressing the
                         # complete QC CSV here caused a second full RAR pass before
                         # validation even started.
-                        _total_estimated_rows += max(1, int(getattr(_qc_info, "file_size", 0) or len(_fc["bytes"])) // 500)
-                    else: _total_estimated_rows += max(1, len(_fc["bytes"]) // 500)
+                        _total_estimated_rows += max(1, int(getattr(_qc_info, "file_size", 0) or _upload_size(_fc)) // 500)
+                    else: _total_estimated_rows += max(1, _upload_size(_fc) // 500)
             elif _name_lower.endswith(".xlsx"):
                 _total_estimated_rows += pd.read_excel(_peek, engine="openpyxl", nrows=1, dtype=str).shape[0]
-                _total_estimated_rows += max(0, len(_fc["bytes"]) // 500 - 1)
+                _total_estimated_rows += max(0, _upload_size(_fc) // 500 - 1)
             else:
-                _total_estimated_rows += _fc["bytes"].count(b"\n")
+                _total_estimated_rows += _upload_bytes(_fc).count(b"\n")
         except Exception:
             pass
     st.session_state._row_estimate_sig = process_signature
@@ -8471,7 +8531,7 @@ if st.session_state.get("last_processed_files") != process_signature:
 
                     def _read_plain_upload(item):
                         _idx, _uf = item
-                        _buf = BytesIO(_uf["bytes"])
+                        _buf = BytesIO(__upload_bytes(uf))
                         _name = _uf["name"].lower()
                         if _name.endswith((".xlsx", ".xls")):
                             _frame = pd.read_excel(_buf, engine="openpyxl" if _name.endswith(".xlsx") else None, dtype=str)
@@ -8489,11 +8549,11 @@ if st.session_state.get("last_processed_files") != process_signature:
                         _plain_frames[_idx] = _frame
 
                     for _uf_index, uf in enumerate(_files_for_processing):
-                        _buf = BytesIO(uf["bytes"])
+                        _buf = BytesIO(_upload_bytes(uf))
                         raw_data = pd.DataFrame()
                         if uf["name"].lower().endswith((".zip", ".rar")):
                             has_zip_source = True
-                            with _open_uploaded_archive(uf["bytes"], uf["name"]) as zf:
+                            with _open_uploaded_archive(_upload_bytes(uf), uf["name"]) as zf:
                                 members = zf.infolist()
                                 qc_files = [info for info in members if "qc_results" in info.filename.lower() and info.filename.lower().endswith((".xlsx", ".xls", ".csv"))]
                                 if qc_files:
@@ -8595,7 +8655,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                                 _zip_idx = _index_zip_images(zf)
                                 if _zip_idx:
                                     _accumulated_zip_img_index.update(_zip_idx)
-                                    _accumulated_zip_source_bytes.append(uf["bytes"])
+                                    _accumulated_zip_source_bytes.append(_upload_path(uf) or _upload_bytes(uf))
                         elif any(k in uf["name"].lower() for k in ("qc_results", "qc_result")):
                             has_zip_source = True
                             qdf_direct = _detect_and_read_csv(_buf) if uf["name"].lower().endswith(".csv") else pd.read_excel(_buf, engine="openpyxl", dtype=str)
@@ -10552,3 +10612,4 @@ if _lang_bridge_val:
 # needs no rerun — see end_grid_closing_overlay().
 if st.session_state.pop("_grid_closing", False):
     end_grid_closing_overlay()
+

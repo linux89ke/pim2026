@@ -993,7 +993,12 @@ def _load_zip_image_by_key(key: str) -> Optional[str]:
                 continue
             try:
                 if _ZIP_FILE_CACHE is None or _ZIP_FILE_BYTES_ID != id(sb):
-                    if bytes(sb[:7]) == b"Rar!\x1a\x07":
+                    if isinstance(sb, (str, os.PathLike)):
+                        _ZIP_FILE_CACHE = (
+                            rarfile.RarFile(sb) if str(sb).lower().endswith(".rar")
+                            else zipfile.ZipFile(sb)
+                        )
+                    elif bytes(sb[:7]) == b"Rar!\x1a\x07":
                         import rarfile
                         _ZIP_FILE_CACHE = rarfile.RarFile(BytesIO(sb))
                     else:
