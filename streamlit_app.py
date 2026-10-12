@@ -8163,6 +8163,7 @@ def _reset_report_state(*, clear_uploaded_files: bool = False, clear_zip_cache: 
     if clear_uploaded_files:
         st.session_state.cached_uploaded_files = []
         st.session_state._uploader_detached = False
+        st.session_state._uploader_safe_key = False
     if clear_zip_cache:
         st.session_state.zip_image_store = {}
         st.session_state.zip_image_index = {}
@@ -8224,7 +8225,24 @@ if _has_files:
                 st.session_state.confirm_clear_files = False
                 st.rerun()
 
-uploaded_files = st.file_uploader("Dpload files", type=["csv", "xlsx", "zip", "rar"], accept_multiple_files=True, key=f"daily_files_{st.session_state.uploader_key}", label_visibility="collapsed")
+# Rotate the widget before registration after a batch has been detached. This
+# matters because Streamlit deep-copies the previous UploadedFile list inside
+# file_uploader itself, before the upload-processing code can run.
+if st.session_state.get("_uploader_detached", False) and not st.session_state.get("_uploader_safe_key", False):
+    st.session_state.uploader_key += 1
+    st.session_state._uploader_safe_key = True
+    st.rerun()
+
+try:
+    uploaded_files = st.file_uploader("Dpload files", type=["csv", "xlsx", "zip", "rar"], accept_multiple_files=True, key=f"daily_files_{st.session_state.uploader_key}", label_visibility="collapsed")
+except MemoryError:
+    # Recover sessions created before the detached-uploader fix. Preserve the
+    # cached batch and register a fresh widget with no oversized value.
+    st.session_state.uploader_key += 1
+    st.session_state._uploader_detached = True
+    st.session_state._uploader_safe_key = True
+    st.warning("The previous upload control ran out of memory. Resetting it; your cached batch is preserved.")
+    st.rerun()
 
 if uploaded_files:
     _new_cache = []
@@ -8251,6 +8269,7 @@ if uploaded_files:
     # even started. The cached batch remains available under its lightweight
     # application state while the next uploader key starts empty.
     st.session_state._uploader_detached = True
+    st.session_state._uploader_safe_key = True
     st.session_state.uploader_key += 1
     st.rerun()
 # Any state where the widget is not holding files clears the batch, not
