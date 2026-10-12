@@ -1987,6 +1987,9 @@ def check_restricted_brands(
     # called category-path lookups and several string checks once per product,
     # which became a major cost on large catalogues.
     _cat_text = d.get("CATEGORY", pd.Series("", index=d.index)).fillna("").astype(str).str.strip()
+    for _cat_col in ("CATEGORY_PATH", "CATEGORY_NAME", "CATEGORY_FULL_PATH"):
+        if _cat_col in d.columns:
+            _cat_text = _cat_text.where(_cat_text.str.len().gt(0), d[_cat_col].fillna("").astype(str).str.strip())
     _cat_code = d.get("CATEGORY_CODE", pd.Series("", index=d.index)).fillna("").astype(str).str.strip()
     _mapped_path = _cat_code.map(code_to_path or {}).fillna("").astype(str).str.strip()
     _cat_path = _cat_text.where(_cat_text.str.len().gt(0), _mapped_path)
@@ -6958,6 +6961,9 @@ def commit_pending_validation_learning():
             # an UNCOVER book from teaching a future restricted-image rule.
             if str(flag).strip() == "Restricted brands" and isinstance(data, pd.DataFrame):
                 _cat = data.get("CATEGORY", pd.Series("", index=data.index)).fillna("").astype(str).str.strip()
+                for _cat_col in ("CATEGORY_PATH", "CATEGORY_NAME", "CATEGORY_FULL_PATH"):
+                    if _cat_col in data.columns:
+                        _cat = _cat.where(_cat.str.len().gt(0), data[_cat_col].fillna("").astype(str).str.strip())
                 _code = data.get("CATEGORY_CODE", pd.Series("", index=data.index)).fillna("").astype(str).str.strip()
                 _paths = _code.map(st.session_state.get("_validation_code_to_path", {})).fillna("").astype(str).str.strip()
                 _book_mask = _cat.where(_cat.str.len().gt(0), _paths).str.casefold().str.startswith("books, movies and music") | _cat.where(_cat.str.len().gt(0), _paths).str.casefold().str.contains(r"(?:^|[/,>])\s*books?\b", regex=True, na=False)
@@ -7012,6 +7018,26 @@ def derive_status_report(data, results, support_files, country_validator):
         if not isinstance(_bmap, dict):
             _bmap = merge_learned_image_rules({})
         _all_learned_matches = get_blocked_image_matches(data, _bmap)
+        # A restricted-brand image rule must never reject a book listing. The
+        # same exemption applies to learned image matches, otherwise a book
+        # could bypass the live validator but still be rejected by its image.
+        _book_cat = data.get("CATEGORY", pd.Series("", index=data.index)).fillna("").astype(str).str.strip()
+        for _cat_col in ("CATEGORY_PATH", "CATEGORY_NAME", "CATEGORY_FULL_PATH"):
+            if _cat_col in data.columns:
+                _book_cat = _book_cat.where(_book_cat.str.len().gt(0), data[_cat_col].fillna("").astype(str).str.strip())
+        _book_code = data.get("CATEGORY_CODE", pd.Series("", index=data.index)).fillna("").astype(str).str.strip()
+        _book_paths = _book_code.map(support_files.get("code_to_path", {})).fillna("").astype(str).str.strip()
+        _book_text = _book_cat.where(_book_cat.str.len().gt(0), _book_paths).str.casefold()
+        _book_sids = set(data.loc[
+            _book_text.str.startswith("books, movies and music")
+            | _book_text.str.contains(r"(?:^|[/,>])\s*books?\b", regex=True, na=False),
+            "PRODUCT_SET_SID",
+        ].astype(str).str.strip()) if "PRODUCT_SET_SID" in data.columns else set()
+        if _book_sids:
+            _all_learned_matches = {
+                _sid: _match for _sid, _match in _all_learned_matches.items()
+                if not (str(_sid).strip() in _book_sids and _match.get("flag") == "Restricted brands")
+            }
         # Keep the learned provenance visible for Uganda even when a
         # restricted-image match is being used only for brand consistency.
         _learned_display_matches = {
