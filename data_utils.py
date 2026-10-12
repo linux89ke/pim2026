@@ -282,6 +282,37 @@ def preview_decision_merge(final_report, decisions) -> dict:
     return out
 
 
+def find_overlapping_decisions(product_sids, country: str, current_signature: str = ""):
+    """Find reviewed decisions for SIDs reused by a different upload.
+
+    This is intentionally a lookup only. The caller must show the overlap and
+    let the reviewer choose reuse or a fresh validation.
+    """
+    wanted = {str(s).strip() for s in (product_sids or []) if str(s).strip()}
+    if not wanted:
+        return None
+    current_name = manual_decisions_filename(current_signature)
+    matches = []
+    for fname, meta in _read_manual_index().items():
+        if fname == current_name or not isinstance(meta, dict) or str(meta.get("country") or "") != str(country or ""):
+            continue
+        path = os.path.join(PARQUET_CACHE_DIR, fname)
+        if not os.path.exists(path):
+            continue
+        frame = load_df_parquet(fname)
+        if not isinstance(frame, pd.DataFrame) or frame.empty or "ProductSetSid" not in frame.columns:
+            continue
+        frame = frame[frame["ProductSetSid"].astype(str).str.strip().isin(wanted)].copy()
+        if not frame.empty:
+            frame["ProductSetSid"] = frame["ProductSetSid"].astype(str).str.strip()
+            matches.append((float(meta.get("saved_at") or 0), frame))
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[0], reverse=True)
+    merged = pd.concat([frame for _, frame in matches], ignore_index=True).drop_duplicates("ProductSetSid", keep="first")
+    return {"decisions": merged, "matched": int(len(merged)), "saved_at": matches[0][0]}
+
+
 def load_manual_decisions(process_signature: str):
     """Return the journalled decisions for an uploaded file set, or None."""
     if not process_signature or process_signature == "empty":
@@ -535,6 +566,21 @@ def _detect_and_read_csv(buf) -> pd.DataFrame:
     if sample_text is None:
         detected_enc = 'latin1'
         sample_text = sample_bytes.decode('latin1', errors='replace')
+
+    # Product exports are overwhelmingly UTF-8/CSV with a comma header. Take
+    # the direct parser path when the header clearly contains product fields;
+    # the broader encoding/separator sniff remains available for arbitrary
+    # historical reports and unusual delimiters.
+    _header = sample_text.splitlines()[0] if sample_text.splitlines() else ""
+    _header_upper = _header.upper()
+    if "," in _header and any(token in _header_upper for token in ("PRODUCT_SET_SID", "PRODUCT SET SID", "PARENTSKU")):
+        try:
+            return pd.read_csv(
+                BytesIO(raw_bytes), sep=",", encoding=detected_enc or "utf-8",
+                dtype=str, on_bad_lines="skip",
+            )
+        except Exception:
+            pass
 
     candidate_seps = [',', ';', '\t']
     if sample_text:
@@ -926,7 +972,11 @@ def _load_zip_image_by_key(key: str) -> Optional[str]:
                 continue
             try:
                 if _ZIP_FILE_CACHE is None or _ZIP_FILE_BYTES_ID != id(sb):
-                    _ZIP_FILE_CACHE = zipfile.ZipFile(BytesIO(sb))
+                    if bytes(sb[:7]) == b"Rar!\x1a\x07":
+                        import rarfile
+                        _ZIP_FILE_CACHE = rarfile.RarFile(BytesIO(sb))
+                    else:
+                        _ZIP_FILE_CACHE = zipfile.ZipFile(BytesIO(sb))
                     _ZIP_FILE_BYTES_ID = id(sb)
                 if member in _ZIP_FILE_CACHE.namelist():
                     img_bytes = _ZIP_FILE_CACHE.read(member)
