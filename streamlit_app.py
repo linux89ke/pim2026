@@ -1283,10 +1283,30 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
     # 100-connection capacity while using enough workers to hide slow CDN
     # responses on cold uploads.
     _img_workers = min(40, max(32, (os.cpu_count() or 4) * 8))
+
+    def _checkpoint_image_metadata(_items):
+        """Persist completed downloads during a long fetch, not only at end."""
+        _persisted = {}
+        with _IMAGE_DIM_LOCK:
+            for _key, _size, _ph, _thumb, _net, _decode, _thumb_seconds, _ok in _items:
+                if not _ok or (not _size and not _ph):
+                    continue
+                _IMAGE_DIM_CACHE[_key] = _size if _size else None
+                if _ph:
+                    _IMAGE_HASH_CACHE[_key] = _ph
+                _persisted[_key] = {"size": _size, "phash": _ph}
+        if _persisted:
+            save_image_metadata_cache(_persisted)
+
     if new_urls:
         with concurrent.futures.ThreadPoolExecutor(max_workers=_img_workers) as executor:
             for _image_index, _image_result in enumerate(executor.map(fetch, new_urls), start=1):
                 results.append(_image_result)
+                # A failed validation can be retried with the same upload.
+                # Persist checkpoints so URLs completed before the failure are
+                # not downloaded or hashed again.
+                if _image_index % 250 == 0:
+                    _checkpoint_image_metadata(results[-250:])
                 if progress_callback and (_image_index == len(new_urls) or _image_index % 100 == 0):
                     progress_callback(f"downloaded {min(_image_index, len(new_urls)):,}/{len(new_urls):,} external images")
 
