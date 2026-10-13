@@ -451,7 +451,7 @@ def _normalise_sheet_name(name) -> str:
     return re.sub(r"\s+", " ", str(name)).strip().lower()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=2)
 def load_qc_excel(country_code: str):
     if not country_code:
         country_code = "UG"

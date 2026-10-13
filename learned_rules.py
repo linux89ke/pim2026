@@ -64,6 +64,7 @@ def _atomic_replace_rules(temp_path: Path, target_path: Path, retries: int = 40,
 LEARNABLE_FLAGS = frozenset({
     "Poor images", "Image Stretched", "Image Blurry", "Image Mismatch",
     "Image Infringing", "Image Too Many things displayed",
+    "NSFW Images",
     "Restricted brands", "Suspected Fake product",
     "Brand Image Mismatch", "Counterfeit Sneakers",
     "Suspected counterfeit Jerseys",
@@ -71,6 +72,9 @@ LEARNABLE_FLAGS = frozenset({
 FLAG_ALIASES = {
     "poor image": "Poor images", "poor images": "Poor images",
     "poor image quality": "Poor images",
+    "nsfw image": "NSFW Images", "nsfw images": "NSFW Images",
+    "adult / nsfw content": "NSFW Images", "adult nsfw content": "NSFW Images",
+    "adult content image": "NSFW Images",
     "image stretched": "Image Stretched",
     "image blurry": "Image Blurry",
     "image mismatch": "Image Mismatch",
@@ -97,6 +101,7 @@ FLAG_ALIASES = {
 # learned reason remains visible and actionable after one reason is removed.
 _LEARNED_FLAG_PRIORITY = {
     "Poor images": 10,
+    "NSFW Images": 80,
     "Image Stretched": 30,
     "Image Blurry": 30,
     "Image Mismatch": 40,
@@ -118,7 +123,7 @@ _REMOTE_RULES_FETCHED_AT = 0.0
 _REMOTE_RULES_TTL = 60.0
 _REMOTE_RULES_SUSPICIOUS = False
 _PAGE_RULE_CACHE = OrderedDict()
-_PAGE_RULE_CACHE_MAX = 64
+_PAGE_RULE_CACHE_MAX = 16
 _RUNTIME_INDEX = None
 _RUNTIME_INDEX_MTIME = -1
 _LOG = logging.getLogger(__name__)
@@ -162,13 +167,14 @@ def _load_locked() -> list:
 
 
 def _local_rule_count() -> int:
-    """Read only the local catalog size without changing the in-memory cache."""
-    try:
-        with RULES_PATH.open("r", encoding="utf-8") as handle:
-            value = json.load(handle)
-        return len(value) if isinstance(value, list) else 0
-    except (OSError, ValueError, TypeError):
-        return 0
+    """Get local catalog size through the mtime-aware shared cache.
+
+    Parsing the 50+ MB JSON again just to count it doubled peak memory during
+    remote catalog checks. `_load_locked` already parses only when the file
+    revision changes, so reuse that result here.
+    """
+    with _LOCK:
+        return len(_load_locked())
 
 
 def load_learned_image_rules() -> list:
@@ -581,7 +587,14 @@ def load_learned_image_rule_index() -> dict:
         flag = normalize_learned_flag(rule.get("flag", ""))
         if flag not in LEARNABLE_FLAGS:
             continue
-        entry = {"flag": flag, "brand": rule.get("brand_infringed", "") or rule.get("brand", ""), "url": rule.get("image_url", ""), "phash": rule.get("phash", ""), "source": "json"}
+        entry = {
+            "flag": flag,
+            "brand": rule.get("brand_infringed", "") or rule.get("brand", ""),
+            "url": rule.get("image_url", ""),
+            "phash": rule.get("phash", ""),
+            "comment": rule.get("comment", ""),
+            "source": "json",
+        }
         for key in (str(rule.get("image_url", "")).strip(), str(rule.get("phash", "")).strip()):
             if key:
                 _old = by_key.get(key)

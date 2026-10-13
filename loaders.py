@@ -7,7 +7,9 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
+from collections import OrderedDict
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -17,8 +19,12 @@ from data_utils import clean_category_code, normalize_text
 
 logger = logging.getLogger(__name__)
 
-# Module-level cache for compiled regex patterns (avoids re-compilation cost)
-_REGEX_CACHE: dict = {}
+# Small LRU cache for compiled patterns. Validators can generate patterns from
+# uploaded files, so an unbounded global dictionary grew for the lifetime of
+# the Streamlit process.
+_REGEX_CACHE: OrderedDict = OrderedDict()
+_REGEX_CACHE_LOCK = threading.RLock()
+_REGEX_CACHE_MAX = 256
 
 
 def _atomic_to_parquet(df: pd.DataFrame, pq_path: str) -> None:
@@ -857,6 +863,12 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
             "1000042 - Kindly follow our product image upload guideline.",
             "Poor Image Quality",
         ),
+        # NSFW image decisions use the same platform reason code as poor image
+        # quality, but retain a distinct flag and comment for future matching.
+        "NSFW Images": (
+            "1000042 - Kindly follow our product image upload guideline.",
+            "The product image contains adult or sexually explicit content. Kindly replace it with a compliant product image.",
+        ),
         "Perfume Tester": (
             "1000007 - Other Reason",
             "Sale of perfume testers is not permitted on Jumia.",
@@ -1094,6 +1106,14 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
                     for flag, info in custom_mapping.items():
                         canonical = lower_to_canonical.get(flag.lower(), flag)
                         merged[canonical] = info
+                    if "NSFW Images" in merged and "Poor images" in merged:
+                        # Keep the platform reason code identical to poor-image
+                        # rejection even if reason.xlsx customizes either flag;
+                        # the user-facing comment and validation flag stay NSFW-specific.
+                        merged["NSFW Images"] = {
+                            **merged["NSFW Images"],
+                            "reason": merged["Poor images"]["reason"],
+                        }
                     return merged
     except Exception as e:
         logger.warning(f"load_flags_mapping({filename}): {e}")
@@ -1350,11 +1370,18 @@ def compile_regex_patterns(words: List[str], flags=re.IGNORECASE) -> re.Pattern:
     if not words:
         return None
     key = (tuple(sorted(words)), flags)
-    if key in _REGEX_CACHE:
-        return _REGEX_CACHE[key]
+    with _REGEX_CACHE_LOCK:
+        cached = _REGEX_CACHE.get(key)
+        if cached is not None:
+            _REGEX_CACHE.move_to_end(key)
+            return cached
     pattern = "|".join(
         r"\b" + re.escape(w) + r"\b" for w in sorted(words, key=len, reverse=True)
     )
     compiled = re.compile(pattern, flags)
-    _REGEX_CACHE[key] = compiled
+    with _REGEX_CACHE_LOCK:
+        _REGEX_CACHE[key] = compiled
+        _REGEX_CACHE.move_to_end(key)
+        while len(_REGEX_CACHE) > _REGEX_CACHE_MAX:
+            _REGEX_CACHE.popitem(last=False)
     return compiled

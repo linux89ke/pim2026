@@ -4,6 +4,7 @@ import base64, time, hashlib, io, json, os, re, threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from collections import OrderedDict
 from typing import Iterable
 import r2_storage
 
@@ -16,7 +17,28 @@ MANIFEST_DIR.mkdir(exist_ok=True, parents=True)
 THUMB_DIR.mkdir(exist_ok=True, parents=True)
 DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="image-download")
 _LOCK = threading.RLock()
+_VALIDATION_LOCKS: OrderedDict[str, threading.Lock] = OrderedDict()
 _LAST_R2_CACHE_UPLOAD = 0.0
+
+
+def validation_lock(signature: str) -> threading.Lock:
+    """Return a process-shared lock for one upload's validation artifacts."""
+    key = str(signature or "")
+    with _LOCK:
+        lock = _VALIDATION_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _VALIDATION_LOCKS[key] = lock
+        _VALIDATION_LOCKS.move_to_end(key)
+        # Bound the registry without evicting a lock currently protecting work.
+        while len(_VALIDATION_LOCKS) > 64:
+            for old_key, old_lock in tuple(_VALIDATION_LOCKS.items()):
+                if old_key != key and not old_lock.locked():
+                    _VALIDATION_LOCKS.pop(old_key, None)
+                    break
+            else:
+                break
+        return lock
 
 def load_image_metadata_cache(max_entries: int = 50000) -> dict:
     """Load the durable URL -> dimensions/pHash cache.

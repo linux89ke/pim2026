@@ -271,13 +271,27 @@ PREFETCH_VALIDATOR_SKIP_MAP = {
 def _build_zip_sid_index(qc_df: pd.DataFrame) -> None:
     if qc_df.empty:
         return
+    status_cols = [c for c in qc_df.columns if "status" in c.lower()]
     for possible in ("cod_productset_sid", "PRODUCT_SET_SID", "ProductSetSid", "SID"):
         if possible in qc_df.columns:
-            st.session_state["_zip_sid_index"] = qc_df.set_index(
-                qc_df[possible].astype(str).str.strip()
+            # The post-validation UI only reads SID membership, QC status
+            # columns, and Color_AI_Normalized. Indexing the complete QC
+            # workbook here retained a second wide copy of the archive data.
+            keep = list(dict.fromkeys([
+                possible,
+                *status_cols,
+                *(["Color_AI_Normalized"] if "Color_AI_Normalized" in qc_df.columns else []),
+            ]))
+            compact = qc_df.loc[:, keep].copy()
+            compact[possible] = compact[possible].fillna("").astype(str).str.strip()
+            st.session_state["_zip_sid_index"] = compact.set_index(possible, drop=True)
+            # derive_status_report runs once per validation chunk. Cache the
+            # normalized SID membership set once instead of materializing and
+            # normalizing the complete index on every chunk.
+            st.session_state["_zip_sid_set"] = frozenset(
+                st.session_state["_zip_sid_index"].index.astype(str).str.strip()
             )
             break
-    status_cols = [c for c in qc_df.columns if "status" in c.lower()]
     st.session_state["_zip_status_cols"] = status_cols
     st.session_state["_zip_prefetch_map"] = {
         col: PREFETCH_MAP.get(_prefetch_key_from_status_col(col),
@@ -607,14 +621,15 @@ def prune_cache_dir(directory: str, max_files: int = 500, max_age_days: int = 7)
         logger.warning(f"Cache pruning failed for {directory}: {e}")
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(ttl=1800, max_entries=1, show_spinner=False)
 def _prune_caches_once() -> bool:
-    """Prune the on-disk caches once per process, not once per rerun.
+    """Prune at startup and then at most every 30 minutes.
 
     Streamlit re-executes this whole script on every interaction, and pruning
     globs + stats + sorts every file in both cache dirs (measured at ~68ms with
     ~600 files) — pure overhead on every click. Housekeeping at startup is
-    enough; nothing here needs to react to files written mid-session.
+    A bounded interval prevents long-running processes from accumulating
+    cache files indefinitely without scanning cache directories on each rerun.
     """
     prune_cache_dir(FLAG_CACHE_DIR)
     prune_cache_dir(PARQUET_CACHE_DIR)
@@ -701,6 +716,7 @@ FLAG_RELEVANT_COLS = {
     "Discount too high": ["GLOBAL_PRICE", "GLOBAL_SALE_PRICE"],
     "Suspicious Discount": ["GLOBAL_PRICE", "GLOBAL_SALE_PRICE"],
     "Poor images": ["MAIN_IMAGE"],
+    "NSFW Images": ["MAIN_IMAGE"],
     "Image Stretched": ["MAIN_IMAGE", "NAME", "BRAND"],
     "Image Blurry": ["MAIN_IMAGE", "NAME", "BRAND"],
     "Image Mismatch": ["MAIN_IMAGE"],
@@ -885,7 +901,7 @@ class _BoundedDict(OrderedDict):
 
 _IMAGE_DIM_CACHE = _BoundedDict(maxsize=50000)
 _IMAGE_HASH_CACHE = _BoundedDict(maxsize=50000)
-_IMAGE_THUMB_CACHE = _BoundedDict(maxsize=2500)
+_IMAGE_THUMB_CACHE = _BoundedDict(maxsize=400)
 _IMAGE_DIM_LOCK = threading.Lock()
 _IMAGE_HOST_LOCKS = {}
 _IMAGE_HOST_FAILURES = {}
@@ -937,6 +953,9 @@ def _size_and_phash(img_bytes: bytes):
     try:
         img = Image.open(BytesIO(img_bytes))
         size = img.size
+        # pHash does not benefit from decoding pathological source images.
+        if size[0] <= 0 or size[1] <= 0 or size[0] * size[1] > 16_000_000:
+            return None, ""
     except Exception:
         return None, ""
     ph = ""
@@ -995,6 +1014,7 @@ _MAX_ARCHIVE_MEMBERS = 20_000
 _MAX_ARCHIVE_UNCOMPRESSED = 4 * 1024 * 1024 * 1024
 _MAX_ARCHIVE_MEMBER = 1 * 1024 * 1024 * 1024
 _MAX_ARCHIVE_RATIO = 1_000
+_MAX_IMAGE_BYTES = 12 * 1024 * 1024
 
 
 def _check_archive_safety(archive, filename: str):
@@ -1049,6 +1069,29 @@ def _open_uploaded_archive(payload, filename: str):
     return _check_archive_safety(
         zipfile.ZipFile(payload if isinstance(payload, (str, os.PathLike)) else BytesIO(payload)), filename
     )
+
+
+def _extract_archive_member_to_temp(archive, member) -> str:
+    """Copy a large ZIP/RAR member to disk in bounded blocks."""
+    suffix = Path(str(getattr(member, "filename", member))).suffix
+    handle = tempfile.NamedTemporaryFile(prefix="member_", suffix=suffix, dir=_UPLOAD_CACHE_DIR, delete=False)
+    path = handle.name
+    try:
+        with handle, archive.open(member, "r") as source:
+            shutil.copyfileobj(source, handle, length=1024 * 1024)
+        return path
+    except Exception:
+        Path(path).unlink(missing_ok=True)
+        raise
+
+
+def _read_archive_image_limited(archive, member, limit: int = _MAX_IMAGE_BYTES) -> bytes:
+    """Read an embedded image with a hard memory bound."""
+    with archive.open(member, "r") as source:
+        payload = source.read(limit + 1)
+    if len(payload) > limit:
+        raise ValueError(f"Embedded image exceeds the {limit // (1024 * 1024)} MB image limit")
+    return payload
 
 
 def _configure_rarfile_backend(rarfile_module) -> Optional[str]:
@@ -1324,16 +1367,33 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
             # minutes. Archive matches are handled locally before this path.
             with _host_lock:
                 _network_t0 = time.perf_counter()
-                r = session.get(url.replace("http://", "https://"), timeout=(2.0, 3.5))
-                _network_elapsed = time.perf_counter() - _network_t0
-            if r.status_code == 200:
+                with session.get(
+                    url.replace("http://", "https://"), timeout=(2.0, 3.5), stream=True
+                ) as r:
+                    _network_elapsed = time.perf_counter() - _network_t0
+                    if r.status_code == 200:
+                        declared_size = int(r.headers.get("Content-Length", "0") or 0)
+                        if declared_size > _MAX_IMAGE_BYTES:
+                            raise ValueError("Remote image exceeds the 12 MB image limit")
+                        raw_parts = []
+                        raw_size = 0
+                        for part in r.iter_content(chunk_size=64 * 1024):
+                            if not part:
+                                continue
+                            raw_size += len(part)
+                            if raw_size > _MAX_IMAGE_BYTES:
+                                raise ValueError("Remote image exceeds the 12 MB image limit")
+                            raw_parts.append(part)
+                        raw = b"".join(raw_parts)
+                    else:
+                        raw = None
+            if raw is not None:
                 with _IMAGE_HOST_LOCKS_GUARD:
                     _IMAGE_HOST_FAILURES[_host] = 0
-                raw = r.content
                 _decode_t0 = time.perf_counter()
                 size, ph = _size_and_phash(raw)
                 _decode_elapsed = time.perf_counter() - _decode_t0
-                return url, size, ph, "", _network_elapsed, _decode_elapsed, 0.0, True
+                return url, size, ph, "", _network_elapsed, _decode_elapsed, 0.0, bool(size or ph)
             with _IMAGE_HOST_LOCKS_GUARD:
                 _IMAGE_HOST_FAILURES[_host] = _host_failures + 1
             return url, None, "", "", _network_elapsed, 0.0, 0.0, False
@@ -1363,15 +1423,22 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
         return key, None, "", "", 0.0, 0.0, 0.0, False
 
     results = []
-    # Lowered thread concurrency limit to prevent socket exhaustion
-    # Image fetching is network-bound. Streamlit Cloud commonly reports only
-    # two CPUs, which previously reduced this pool to four workers and made a
-    # batch with hundreds of external images wait behind unreachable URLs.
-    # Keep a bounded cap, but maintain enough concurrency for I/O workloads.
-    # Image fetching is network-bound. Keep the pool below the HTTP adapter's
-    # 100-connection capacity while using enough workers to hide slow CDN
-    # responses on cold uploads.
-    _img_workers = min(40, max(32, (os.cpu_count() or 4) * 8))
+    def _retain_image_result(_item):
+        """Cache thumbnail immediately and retain only small metadata."""
+        _key, _size, _ph, _thumb, _net, _decode, _thumb_seconds, _ok = _item
+        if _ok:
+            with _IMAGE_DIM_LOCK:
+                _IMAGE_DIM_CACHE[_key] = _size if _size else None
+                if _ph:
+                    _IMAGE_HASH_CACHE[_key] = _ph
+                if _thumb:
+                    _IMAGE_THUMB_CACHE[_key] = _thumb
+        # Keep no base64 thumbnail in the upload-wide result list.
+        results.append((_key, _size, _ph, "", _net, _decode, _thumb_seconds, _ok))
+    # Bound concurrent response bodies. At 12 MB maximum per image, 12 workers
+    # cap raw image buffers near 48 MB (and temporary joins near 96 MB), rather
+    # than allowing dozens of simultaneous multi-megabyte downloads.
+    _img_workers = 4
 
     def _checkpoint_image_metadata(_items):
         """Persist completed downloads during a long fetch, not only at end."""
@@ -1390,7 +1457,7 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
     if new_urls:
         with concurrent.futures.ThreadPoolExecutor(max_workers=_img_workers) as executor:
             for _image_index, _image_result in enumerate(executor.map(fetch, new_urls), start=1):
-                results.append(_image_result)
+                _retain_image_result(_image_result)
                 # A failed validation can be retried with the same upload.
                 # Persist checkpoints so URLs completed before the failure are
                 # not downloaded or hashed again.
@@ -1404,8 +1471,8 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
         # it stays flat as batches grow. The results kept afterwards are a
         # size tuple and a hash string per image — tens of bytes — so those can
         # safely be held for all of them.
-        _ZIP_DECODE_CHUNK = 200
-        _zip_workers = min(8, _img_workers)
+        _ZIP_DECODE_CHUNK = 2
+        _zip_workers = 1
         with concurrent.futures.ThreadPoolExecutor(max_workers=_zip_workers) as executor:
             for _start in range(0, len(zip_descriptors), _ZIP_DECODE_CHUNK):
                 _slice = zip_descriptors[_start:_start + _ZIP_DECODE_CHUNK]
@@ -1438,7 +1505,7 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
                                 _archives[_source_id] = _archive
                                 _reader_local.archives = _archives
                             try:
-                                return _img_val, _archive.read(_member), _member
+                                return _img_val, _read_archive_image_limited(_archive, _member), _member
                             except KeyError:
                                 continue
                         except Exception:
@@ -1447,7 +1514,8 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
 
                 _payloads = list(executor.map(_read_zip_descriptor, _slice))
                 if _payloads:
-                    results.extend(list(executor.map(process_zip_img, _payloads)))
+                    for _image_result in executor.map(process_zip_img, _payloads):
+                        _retain_image_result(_image_result)
                 if progress_callback:
                     progress_callback(f"decoded {min(_start + len(_slice), len(zip_descriptors)):,}/{len(zip_descriptors):,} ZIP images")
                 # Dropped before the next chunk is built, so two chunks are
@@ -1481,8 +1549,18 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
     # the entry script, and streamlit_app already imports ui_components).
     # A dict copy of at most a few thousand short strings, once per validation.
     try:
-        st.session_state["_image_phash_by_url"] = dict(_IMAGE_HASH_CACHE)
-        st.session_state["_image_thumbnail_by_url"] = dict(_IMAGE_THUMB_CACHE)
+        # Publish only URLs belonging to this upload. Copying the complete
+        # process-wide thumbnail cache into session state multiplied memory
+        # use across reruns and sessions.
+        _active_urls = set(urls)
+        st.session_state["_image_phash_by_url"] = {
+            key: value for key, value in _IMAGE_HASH_CACHE.items()
+            if key in _active_urls
+        }
+        st.session_state["_image_thumbnail_by_url"] = {
+            key: value for key, value in _IMAGE_THUMB_CACHE.items()
+            if key in _active_urls
+        }
         st.session_state["image_fetch_metrics"] = {
             "unique_urls": int(len(urls)),
             "cache_hits": int(_cache_hits),
@@ -1552,7 +1630,7 @@ from learned_rules import (
 from processing_automation import (
     load_manifest, mark_batch, completed_batches, file_signature,
     save_chunk_results, load_chunk_results, save_stage_frame, load_stage_frame, thumbnail_data_uri,
-    load_image_metadata_cache, save_image_metadata_cache,
+    load_image_metadata_cache, save_image_metadata_cache, validation_lock,
 )
 
 # Restore successful image metadata between Streamlit reruns/restarts. This
@@ -4848,7 +4926,7 @@ _COLOR_COMPOUND_PHRASES = re.compile(
     # Tea & Coffee & Wine & Beverages
     r"green\s+tea|black\s+tea|white\s+tea|red\s+tea|herbal\s+tea|earl\s+grey|"
     r"tea(?:\s+(?:kettles?|pots?|makers?|infusers?|bags?|cups?|sets?|tree(?:\s+oil)?))?|"
-    r"coffee(?:\s+(?:tables?|makers?|machines?|pots?|mugs?|cups?|beans?|grinders?|sets?|press|filters?|scoops?))?|"
+    r"coffee\s+(?:tables?|makers?|machines?|pots?|mugs?|cups?|beans?|grinders?|sets?|press|filters?|scoops?)|"
     r"wine(?:\s+(?:glasses?|glass|openers?|bottles?|racks?|coolers?|chillers?|cellars?|aerators?|stoppers?|pourers?|accessories|sets?|totes?|bags?|corkscrews?|refrigerators?))?|"
     r"red\s+wine|white\s+wine|green\s+coffee|green\s+gram|"
     # Seeds, Spices, Food, Pantry
@@ -4917,13 +4995,13 @@ _COLOR_COMPOUND_PHRASES = re.compile(
     r"drakkar\s+noir|film\s+noir|cafe\s+noir|pinot\s+noir|savon\s+noir|"
     r"rouge\s+a\s+l[eè]vres|rouge\s+à\s+l[eè]vres|moulin\s+rouge|baton\s+de\s+rouge|"
     r"th[eé]\s+vert|argile\s+verte?|point\s+vert|"
-    r"(?:tempered\s+)?glass(?:\s+(?:screen\s+protector|film|bottles?|jars?|cups?|mugs?|tables?|doors?))"
+    r"champagne\s+glasses?|(?:tempered\s+)?glass(?:\s+(?:screen\s+protector|film|bottles?|jars?|cups?|mugs?|tables?|doors?))"
     r")\b",
     re.IGNORECASE,
 )
 
 _COLOR_MISMATCH_PATTERN = re.compile(
-    r"\b(?:" + "|".join(re.escape(k) for k in sorted(COLOR_VARIANT_TO_BASE.keys(), key=lambda x: (-len(x), x)) if k.lower() not in ("coffee", "wine")) + r")\b",
+    r"\b(?:" + "|".join(re.escape(k) for k in sorted(COLOR_VARIANT_TO_BASE.keys(), key=lambda x: (-len(x), x)) if k.lower() != "wine") + r")\b",
     re.IGNORECASE,
 )
 
@@ -4940,7 +5018,8 @@ def check_color_title_mismatch(
     Follows color validation rules:
     - Only checks categories that require / are checked for color (using color_categories).
     - Excludes categories that do not require color, such as groceries/food/supermarket.
-    - Excludes 'coffee' and 'wine' (catching food/drinks, tables, glasses, openers, makers, etc.).
+    - Excludes beverage/product phrases such as coffee tables, coffee makers, wine glasses,
+      and champagne glasses while allowing Coffee and Cream as color values.
     - Treats 'graphite' and 'black' as the same color.
     - Treats 'stainless steel' and 'silver' as the same color.
     - Handles color equivalences: Rose Gold = Pink/Gold, Charcoal = Black/Gray, Midnight = Black/Blue,
@@ -5101,10 +5180,9 @@ def check_color_title_mismatch(
 
         # Mask compound terms where color word is ingredient/product type (masks coffee, wine glasses/openers, face cream, olive oil, etc.)
         clean_name = _COLOR_COMPOUND_PHRASES.sub(" ", clean_name)
-        clean_name = re.sub(r"\bcoffee\b", " ", clean_name, flags=re.IGNORECASE)
         clean_name = re.sub(r"\bwine\b(?!\s*red\b)", " ", clean_name, flags=re.IGNORECASE)
 
-        title_matches = [m.group(0) for m in _COLOR_MISMATCH_PATTERN.finditer(clean_name) if m.group(0).lower() not in ("coffee", "wine")]
+        title_matches = [m.group(0) for m in _COLOR_MISMATCH_PATTERN.finditer(clean_name) if m.group(0).lower() != "wine"]
         if not title_matches:
             continue
 
@@ -5112,7 +5190,7 @@ def check_color_title_mismatch(
         if not title_bases:
             continue
 
-        dec_matches = [m.group(0) for m in _COLOR_MISMATCH_PATTERN.finditer(c_raw) if m.group(0).lower() not in ("coffee", "wine")]
+        dec_matches = [m.group(0) for m in _COLOR_MISMATCH_PATTERN.finditer(c_raw) if m.group(0).lower() != "wine"]
         dec_bases = _expand_color_bases(dec_matches, c_raw)
 
         if not dec_bases:
@@ -5628,6 +5706,7 @@ def check_duplicate_products(
     # filtered back to the subset at the end so each pass still reports only
     # its own rows.
     _subset_sids = None
+    _result_source = data
     if (
         full_data is not None
         and not full_data.empty
@@ -5635,29 +5714,19 @@ def check_duplicate_products(
         and len(full_data) > len(data)
     ):
         _subset_sids = set(data["PRODUCT_SET_SID"].astype(str).str.strip())
-        # validate_products derives its helper columns on its own copy of the
-        # batch, and full_data is the caller's frame, which has none of them.
-        # Swapping it in without rebuilding them raised KeyError('_cat_clean')
-        # on the first line that filters exempt categories — caught by the
-        # per-check error handler, so the check returned nothing and the
-        # Duplicate product expander simply never appeared.
-        full_data = full_data.copy()
-        if "_cat_clean" not in full_data.columns and "CATEGORY_CODE" in full_data.columns:
-            full_data["_cat_clean"] = full_data["CATEGORY_CODE"].apply(clean_category_code)
-        for _c, _src in (
-            ("_brand_lower", "BRAND"),
-            ("_seller_lower", "SELLER_NAME"),
-            ("_name_lower", "NAME"),
-        ):
-            if _c not in full_data.columns and _src in full_data.columns:
-                full_data[_c] = (
-                    full_data[_src].astype(str).str.lower().str.strip().fillna("")
-                )
-        data = full_data
+        _result_source = full_data
 
-    if not {"NAME", "SELLER_NAME", "BRAND"}.issubset(data.columns):
-        return pd.DataFrame(columns=data.columns)
-    d = data.copy()
+    if not {"NAME", "SELLER_NAME", "BRAND"}.issubset(_result_source.columns):
+        return pd.DataFrame(columns=_result_source.columns)
+    # Duplicate matching needs a narrow projection, not a second copy of all
+    # uploaded columns. Large QC exports may have dozens of long text fields;
+    # copying them here used to add a full-upload memory spike.
+    _needed = {
+        "PRODUCT_SET_SID", "NAME", "SELLER_NAME", "BRAND", "MAIN_IMAGE",
+        "CATEGORY_CODE", "_cat_clean", "COLOR", "COLOR_FAMILY", "_norm_name",
+        "_brand_lower", "_seller_lower", "_name_lower",
+    }
+    d = _result_source.loc[:, [c for c in _result_source.columns if c in _needed]].copy()
     for _c, _src in (
         ("_brand_lower", "BRAND"),
         ("_seller_lower", "SELLER_NAME"),
@@ -5683,7 +5752,7 @@ def check_duplicate_products(
         _exempt_keys = set(clean_category_code(c) for c in exempt_categories)
         d = d[~_category_key.isin(_exempt_keys)]
     if d.empty:
-        return pd.DataFrame(columns=data.columns)
+        return pd.DataFrame(columns=_result_source.columns)
 
     _color_pat = compile_regex_patterns(known_colors) if known_colors else None
 
@@ -5768,10 +5837,15 @@ def check_duplicate_products(
     flagged_indices: dict = {}
 
     if "MAIN_IMAGE" in d.columns:
-        with _IMAGE_DIM_LOCK:
-            _hash_snap = dict(_IMAGE_HASH_CACHE)  
-
         img_vals = d["MAIN_IMAGE"].astype(str).str.strip()
+        # Snapshot only this batch's URLs instead of copying the complete
+        # process-wide 50k-entry hash cache for every duplicate check.
+        with _IMAGE_DIM_LOCK:
+            _hash_snap = {
+                u: _IMAGE_HASH_CACHE.get(u, "")
+                for u in img_vals.unique()
+                if u
+            }
         _null_like = {"nan", "none", "", "n/a", "-", "null"}
         valid_img = (img_vals.str.len() > 5) & (~img_vals.str.lower().isin(_null_like))
 
@@ -5888,11 +5962,11 @@ def check_duplicate_products(
         _progress_callback("strict ring-seller keys complete")
 
     if not flagged_indices:
-        return pd.DataFrame(columns=data.columns)
+        return pd.DataFrame(columns=_result_source.columns)
 
-    rdf = d.loc[list(flagged_indices.keys())].copy()
+    rdf = _result_source.loc[list(flagged_indices.keys())].copy()
     rdf["Comment_Detail"] = rdf.index.map(flagged_indices)
-    base_cols = data.columns.tolist()
+    base_cols = _result_source.columns.tolist()
     extra_cols = [c for c in ["Comment_Detail"] if c not in base_cols]
     _out = rdf[base_cols + extra_cols].drop_duplicates(subset=["PRODUCT_SET_SID"])
     # Grouped over the whole batch above; report only this pass's rows.
@@ -5969,30 +6043,16 @@ def validate_products(
 ):
     _pipeline_started = time.perf_counter()
     st.session_state["_validation_code_to_path"] = support_files.get("code_to_path", {})
-    data = data.copy()
+    # The chunk selector already isolates rows. Use a shallow frame copy here:
+    # validators add derived columns but should not duplicate every object
+    # block in a 5k–10k row chunk before they begin.
+    data = data.copy(deep=False)
     # ROW_LEVEL_VALIDATORS map a check's result back onto `data` by index label,
     # which is only meaningful when labels are unique (a concat of per-file
     # frames can repeat them).
     if not data.index.is_unique:
         data = data.reset_index(drop=True)
     data["PRODUCT_SET_SID"] = data["PRODUCT_SET_SID"].astype(str).str.strip()
-
-    # Build the review/validation lookup maps once per upload instead of
-    # repeatedly scanning the full frame for each SID or seller. Validators
-    # and the iframe can reuse these maps without changing verdict semantics.
-    _lookup_source = full_batch if isinstance(full_batch, pd.DataFrame) and not full_batch.empty else data
-    # The review UI can build its detail maps after validation.  Materialising
-    # every row with ``to_dict('records')`` and grouping every seller here was
-    # a large, repeated cost for each validation chunk, while none of those
-    # maps are read by the validators themselves.
-    st.session_state["_validation_lookup_maps"] = {
-        "sid_to_report": {},
-        "sid_to_flags": {},
-        "sid_to_comment": {},
-        "url_to_phash": dict(st.session_state.get("_image_phash_by_url", {})),
-        "phash_to_sids": {},
-        "seller_to_sids": {},
-    }
 
     if "_name_lower" not in data.columns:
         data["_name_lower"] = data["NAME"].astype(str).str.lower().fillna("")
@@ -6476,6 +6536,9 @@ def validate_products(
     restricted_keys = {}
     validation_errors = []
     evaluated_sids_by_flag = {}
+    # Several validators share the same frame. Build the normalized SID set
+    # once per frame instead of recasting and allocating it for every check.
+    _sid_set_by_frame_id = {}
     validation_timings = {}
     _last_progress_t = 0.0
 
@@ -6561,9 +6624,13 @@ def validate_products(
                         _emit_progress(name, processed_count, total_tasks)
                         continue
 
-                evaluated_sids_by_flag[name] = set(
-                    working_data["PRODUCT_SET_SID"].astype(str).str.strip()
-                ) if "PRODUCT_SET_SID" in working_data.columns else set()
+                _frame_id = id(working_data)
+                if _frame_id not in _sid_set_by_frame_id:
+                    _sid_set_by_frame_id[_frame_id] = (
+                        set(working_data["PRODUCT_SET_SID"].fillna("").astype(str).str.strip())
+                        if "PRODUCT_SET_SID" in working_data.columns else set()
+                    )
+                evaluated_sids_by_flag[name] = _sid_set_by_frame_id[_frame_id]
 
                 ckwargs = {"data": working_data, **kwargs}
                 # Empty for the built-in checks, so their cache keys are
@@ -6723,6 +6790,9 @@ def validate_products(
         # from hiding image-based duplicates.
         _duplicate_cache_key = f"dup-v4:{duplicate_batch_sig}:{len(_duplicate_source)}"
         _duplicate_cache = st.session_state.setdefault("_duplicate_validation_cache", {})
+        for _stale_key in list(_duplicate_cache):
+            if _stale_key != _duplicate_cache_key:
+                _duplicate_cache.pop(_stale_key, None)
         _duplicate_spec = next((item for item in validations if item[0] == "Duplicate product"), None)
         if not _duplicate_spec or _skipped(_duplicate_spec[0], _duplicate_spec[1]):
             return
@@ -6754,8 +6824,8 @@ def validate_products(
             _duplicate_precomputed = _duplicate_precomputed[
                 ~_duplicate_precomputed["PRODUCT_SET_SID"].astype(str).str.strip().isin(rejected_sids)
             ]
-        while len(_duplicate_cache) > 4:
-            _duplicate_cache.pop(next(iter(_duplicate_cache)))
+        # Retain one upload's full duplicate result, not four historical
+        # wide result frames in Streamlit session memory.
         validation_timings.setdefault("Duplicate product", []).append(time.perf_counter() - _duplicate_started)
 
     # Only now prepare image dimensions and pHashes, and only for products that
@@ -6912,7 +6982,7 @@ def validate_products(
 
     _learnable_flags = {
         "Poor images", "Image Stretched", "Image Blurry", "Image Mismatch",
-        "Image Infringing", "Image Too Many things displayed",
+        "Image Infringing", "Image Too Many things displayed", "NSFW Images",
         "Restricted brands", "Suspected Fake product", "Prohibited products",
         "FDA", "Brand Image Mismatch", "Counterfeit Sneakers",
         "Suspected counterfeit Jerseys",
@@ -6960,37 +7030,6 @@ def validate_products(
         "hash_by_url": _learn_hashes,
         "flags": _pending_learning,
     }
-    try:
-        _maps = st.session_state.get("_validation_lookup_maps", {})
-        _sid_flags, _sid_comments = {}, {}
-        for _flag_name, _flag_frame in results.items():
-            if not isinstance(_flag_frame, pd.DataFrame) or "PRODUCT_SET_SID" not in _flag_frame.columns:
-                continue
-            _flag_sid = _flag_frame["PRODUCT_SET_SID"].astype(str).str.strip()
-            _flag_comment_by_sid = {}
-            if "Comment_Detail" in _flag_frame.columns:
-                _flag_comment_by_sid = (
-                    pd.DataFrame({"_sid": _flag_sid, "_comment": _flag_frame["Comment_Detail"]})
-                    .drop_duplicates("_sid", keep="first")
-                    .set_index("_sid")["_comment"]
-                    .astype(str)
-                    .to_dict()
-                )
-            for _sid in _flag_sid.unique():
-                _sid_flags.setdefault(_sid, []).append(_flag_name)
-                _sid_comments.setdefault(_sid, []).append(_flag_comment_by_sid.get(_sid, ""))
-        _maps["sid_to_flags"] = _sid_flags
-        _maps["sid_to_comment"] = _sid_comments
-        _maps["phash_to_sids"] = {}
-        if "MAIN_IMAGE" in _lookup_source.columns:
-            for _, _lookup_row in _lookup_source[["PRODUCT_SET_SID", "MAIN_IMAGE"]].drop_duplicates().iterrows():
-                _phash = _maps.get("url_to_phash", {}).get(str(_lookup_row["MAIN_IMAGE"]).strip(), "")
-                if _phash:
-                    _maps["phash_to_sids"].setdefault(_phash, []).append(str(_lookup_row["PRODUCT_SET_SID"]).strip())
-        st.session_state["_validation_lookup_maps"] = _maps
-    except Exception:
-        logger.debug("Could not finalize validation lookup maps", exc_info=True)
-
     _report_started = time.perf_counter()
     _derived = derive_status_report(data, results, support_files, country_validator)
     st.session_state.setdefault("validation_stage_timings", {})["Report generation"] = round(time.perf_counter() - _report_started, 3)
@@ -7058,10 +7097,16 @@ def derive_status_report(data, results, support_files, country_validator):
     # "overturned" — the system made a specific decision on them. Products
     # that were never in the ZIP have no prior decision to overturn.
     try:
-        _zip_idx = st.session_state.get("_zip_sid_index")
-        _zip_sids: set = set(_zip_idx.index.astype(str).str.strip()) if _zip_idx is not None else set()
+        _zip_sids = st.session_state.get("_zip_sid_set")
+        if _zip_sids is None:
+            _zip_idx = st.session_state.get("_zip_sid_index")
+            _zip_sids = (
+                frozenset(_zip_idx.index.astype(str).str.strip())
+                if _zip_idx is not None else frozenset()
+            )
+            st.session_state["_zip_sid_set"] = _zip_sids
     except Exception:
-        _zip_sids = set()
+        _zip_sids = frozenset()
 
     # Check all products in the upload for matches against learned blocked image catalog
     _blocked_img_matches = {}
@@ -7154,7 +7199,7 @@ def derive_status_report(data, results, support_files, country_validator):
         "Suspicious Discount", "NG - Gift Card Seller", "NG - TV Brand Seller", "NG - HP Toners Seller",
         "NG - Apple Seller", "NG - Xmas Tree Seller", "NG - Rice Brand Seller", "GH - Smart Glasses with Camera",
         "MA - Marque Interdite", "Powerbank Not Authorized",
-        "Poor images", "Image Stretched", "Image Blurry", "Image Mismatch", "Image Infringing", "Image Too Many things displayed",
+        "Poor images", "Image Stretched", "Image Blurry", "Image Mismatch", "Image Infringing", "Image Too Many things displayed", "NSFW Images",
         "Brand Image - Apple Acc Overturned"
     ]
     all_flags = known_flags + [f for f in results.keys() if f not in known_flags]
@@ -7295,28 +7340,33 @@ def derive_status_report(data, results, support_files, country_validator):
     # validator matched this SID first. Make the learned issue the primary
     # flag/reason while retaining the earlier validator's explanation.
     if _blocked_img_matches and "ProductSetSid" in final_df.columns:
-        _report_sids = final_df["ProductSetSid"].astype(str).str.strip()
-        for _sid, _match in _blocked_img_matches.items():
-            _row_mask = _report_sids.eq(str(_sid).strip())
-            if not _row_mask.any():
-                continue
-            _learned_flag = _match.get("flag", "Poor images")
-            _learned_info = flags_mapping.get(
-                _learned_flag,
-                {"reason": "1000007 - Poor image quality"},
-            )
-            _learned_comment = f"{_match.get('detail', 'Image matched known blocked image.')} (image fingerprint match)"
-            _prior_row = final_df.loc[_row_mask].iloc[0]
-            _prior_flag = str(_prior_row.get("FLAG", "") or "").strip()
-            _prior_comment = str(_prior_row.get("Comment", "") or "").strip()
-            if _prior_flag and _prior_flag != _learned_flag and _prior_comment:
-                _learned_comment += f" | Other validation ({_prior_flag}): {_prior_comment}"
-            final_df.loc[_row_mask, "Comment"] = _learned_comment
+        # One vectorized pass avoids rescanning the whole report once per
+        # learned-image match (which became quadratic for large match sets).
+        _report_sids = final_df["ProductSetSid"].fillna("").astype(str).str.strip()
+        _match_by_sid = {str(_sid).strip(): _match for _sid, _match in _blocked_img_matches.items()}
+        _row_mask = _report_sids.isin(_match_by_sid)
+        if _row_mask.any():
+            _matched_sids = _report_sids.loc[_row_mask]
+            _matched = [_match_by_sid[_sid] for _sid in _matched_sids]
+            _learned_flags = [str(_match.get("flag", "Poor images")) for _match in _matched]
+            _learned_reasons = [
+                flags_mapping.get(flag, {}).get("reason", "1000007 - Poor image quality")
+                for flag in _learned_flags
+            ]
+            _prior_flags = final_df.loc[_row_mask, "FLAG"].fillna("").astype(str).str.strip().tolist()
+            _prior_comments = final_df.loc[_row_mask, "Comment"].fillna("").astype(str).str.strip().tolist()
+            _learned_comments = []
+            for _match, _learned_flag, _prior_flag, _prior_comment in zip(
+                _matched, _learned_flags, _prior_flags, _prior_comments
+            ):
+                _comment = f"{_match.get('detail', 'Image matched known blocked image.')} (image fingerprint match)"
+                if _prior_flag and _prior_flag != _learned_flag and _prior_comment:
+                    _comment += f" | Other validation ({_prior_flag}): {_prior_comment}"
+                _learned_comments.append(_comment)
+            final_df.loc[_row_mask, "Comment"] = _learned_comments
             final_df.loc[_row_mask, "Status"] = "Rejected"
-            final_df.loc[_row_mask, "FLAG"] = _learned_flag
-            final_df.loc[_row_mask, "Reason"] = _learned_info.get(
-                "reason", "1000007 - Poor image quality"
-            )
+            final_df.loc[_row_mask, "FLAG"] = _learned_flags
+            final_df.loc[_row_mask, "Reason"] = _learned_reasons
 
     final_df["PRODUCT_SET_SID"] = final_df["ProductSetSid"]
     # Display-only provenance used by the validation expanders. A true value
@@ -7438,10 +7488,10 @@ def cached_validate_products(
     )
 
 
-def validate_in_chunks(data, support_files, country_validator, data_has_warranty,
+def _validate_in_chunks_unlocked(data, support_files, country_validator, data_has_warranty,
                       *, cache_prefix, skip_validators=None, on_progress=None,
                       full_batch=None, rules_revision=0.0, manifest=None,
-                      batch_prefix="batch", chunk_size=5000):
+                      batch_prefix="batch", chunk_size=1000):
     """Run validation in bounded SID chunks and checkpoint each completed chunk."""
     if data is None or data.empty:
         return pd.DataFrame(), {}
@@ -7464,7 +7514,8 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
                 _save_revision_manifest(manifest)
             except Exception:
                 logger.debug("Could not reset stale validation manifest", exc_info=True)
-    sids = data["PRODUCT_SET_SID"].astype(str).str.strip().drop_duplicates().tolist()
+    _sid_series = data["PRODUCT_SET_SID"].astype(str).str.strip()
+    sids = _sid_series.drop_duplicates().tolist()
     frames, result_parts = [], []
     # A resumed manifest should be visible in diagnostics as cached work,
     # while a fresh run remains clearly marked Active.
@@ -7498,11 +7549,11 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
             logger.debug("Could not persist normalized stage artifact", exc_info=True)
     pending_data = data
     pending_hashes = st.session_state.get("_image_phash_by_url", {})
-    # Larger chunks reduce repeated validator setup and dataframe hashing. Keep
-    # a bounded ceiling so very large uploads still checkpoint and resume
-    # without building one enormous in-memory validation frame.
-    if len(sids) > 5_000 and chunk_size < 10_000:
-        chunk_size = 10_000
+    # Keep chunks small enough that the validation copy fits even when the
+    # source DataFrame, archive cache, and image metadata are already resident.
+    # The prior 10k promotion caused a MemoryError while copying 83 object
+    # columns on ordinary 20k+ uploads.
+    chunk_size = max(250, min(int(chunk_size or 1000), 1000))
     total = max(1, (len(sids) + chunk_size - 1) // chunk_size)
     done = completed_batches(manifest or {})
     _resume_cached_chunks = 0
@@ -7514,7 +7565,7 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
     for index in range(total):
         batch_id = f"{batch_prefix}-{index + 1}"
         chunk_sids = set(sids[index * chunk_size:(index + 1) * chunk_size])
-        chunk = data[data["PRODUCT_SET_SID"].astype(str).str.strip().isin(chunk_sids)].copy()
+        chunk = data.loc[_sid_series.isin(chunk_sids)]
         # A manifest is only resumable when its completed artifact is loaded
         # back into the merge. If the JSON says complete but a Parquet file is
         # missing/corrupt, fall through and recompute that chunk safely.
@@ -7611,6 +7662,36 @@ def validate_in_chunks(data, support_files, country_validator, data_has_warranty
     return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), combined
 
 
+def validate_in_chunks(data, support_files, country_validator, data_has_warranty,
+                      *, cache_prefix, skip_validators=None, on_progress=None,
+                      full_batch=None, rules_revision=0.0, manifest=None,
+                      batch_prefix="batch", chunk_size=1000):
+    """Serialize identical upload chunks across Streamlit sessions.
+
+    Tabs have separate session state. Refresh the manifest after obtaining the
+    shared per-upload lock so a second tab restores completed chunk artifacts
+    rather than rerunning validators or overwriting them from stale state.
+    """
+    signature = str((manifest or {}).get("signature", "") or "")
+    if not signature:
+        return _validate_in_chunks_unlocked(
+            data, support_files, country_validator, data_has_warranty,
+            cache_prefix=cache_prefix, skip_validators=skip_validators,
+            on_progress=on_progress, full_batch=full_batch,
+            rules_revision=rules_revision, manifest=manifest,
+            batch_prefix=batch_prefix, chunk_size=chunk_size,
+        )
+    with validation_lock(f"chunks:{signature}"):
+        current_manifest = load_manifest(signature)
+        return _validate_in_chunks_unlocked(
+            data, support_files, country_validator, data_has_warranty,
+            cache_prefix=cache_prefix, skip_validators=skip_validators,
+            on_progress=on_progress, full_batch=full_batch,
+            rules_revision=rules_revision, manifest=current_manifest,
+            batch_prefix=batch_prefix, chunk_size=chunk_size,
+        )
+
+
 try:
     register_learning_commit(commit_pending_validation_learning)
     register_direct_pipeline(
@@ -7634,6 +7715,24 @@ if "all_data_map" not in st.session_state:
     st.session_state.all_data_map = pd.DataFrame()
 if "all_data_rows" not in st.session_state:
     st.session_state.all_data_rows = pd.DataFrame()
+
+
+# These lookup structures are built lazily for iframe cluster/review actions.
+# They duplicate a few columns of the current upload in Python dictionaries,
+# so release them when the iframe closes or a different upload replaces it.
+_GRID_LOOKUP_CACHE_KEYS = (
+    "_image_maps", "_image_maps_df_id",
+    "_sid_name_map", "_sid_name_map_df_id",
+    "_sid_category_maps", "_sid_category_maps_df_id",
+    "_phash_maps", "_phash_maps_df_id",
+    "_phash_bktree", "_phash_bktree_df_id",
+    "_validation_lookup_maps",
+)
+
+
+def _clear_grid_lookup_caches():
+    for _key in _GRID_LOOKUP_CACHE_KEYS:
+        st.session_state.pop(_key, None)
 if "post_qc_summary" not in st.session_state:
     st.session_state.post_qc_summary = pd.DataFrame()
 if "post_qc_results" not in st.session_state:
@@ -8164,6 +8263,7 @@ def _reset_report_state(*, clear_uploaded_files: bool = False, clear_zip_cache: 
     st.session_state.display_df_cache = {}
     st.session_state.pop("_grid_review_data_cache", None)
     st.session_state.pop("_grid_warm_urls", None)
+    _clear_grid_lookup_caches()
 
     # Everything below is scoped to one uploaded batch and used to survive a
     # new upload, which is how products from a previous file kept appearing.
@@ -8177,7 +8277,7 @@ def _reset_report_state(*, clear_uploaded_files: bool = False, clear_zip_cache: 
     # batch's report was saved over the previous batch's cache entry.
     for _k in (
         "quick_rejects", "_stagedRejections", "post_qc_results", "zip_qc_results",
-        "_zip_sid_index", "_zip_status_cols", "_zip_prefetch_map",
+        "_zip_sid_index", "_zip_sid_set", "_zip_status_cols", "_zip_prefetch_map",
         "current_sig_hash", "_data_filtered_ref",
         # PIM_QC_Result.xlsx and the verdict map derived from it. These were
         # missed when the rest of the ZIP state was added here, and they are
@@ -8263,7 +8363,10 @@ def _materialize_uploaded_file(uploaded_file) -> dict:
             tmp_path.unlink(missing_ok=True)
         else:
             os.replace(tmp_path, final_path)
-        return {"name": uploaded_file.name, "path": str(final_path), "size": size, "md5": md5.hexdigest()}
+        return {
+            "name": uploaded_file.name, "path": str(final_path), "size": size,
+            "md5": md5.hexdigest(), "sha256_prefix": digest[:24],
+        }
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
@@ -8283,17 +8386,49 @@ def _upload_bytes(record: dict) -> bytes:
     return record.get("bytes", b"")
 
 
+def _upload_sha256_prefix(record: dict) -> str:
+    digest = record.get("sha256_prefix")
+    if digest:
+        return str(digest)
+    path = _upload_path(record)
+    if path:
+        hasher = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                hasher.update(block)
+        return hasher.hexdigest()[:24]
+    return hashlib.sha256(_upload_bytes(record)).hexdigest()[:24]
+
+
 def _upload_size(record: dict) -> int:
     try:
         return int(record.get("size", 0) or os.path.getsize(_upload_path(record)))
     except Exception:
         return len(record.get("bytes", b""))
 
+
+def _open_upload_buffer(record: dict):
+    """Open an upload from disk when possible; legacy records may hold bytes."""
+    path = _upload_path(record)
+    return open(path, "rb") if path else BytesIO(record.get("bytes", b""))
+
+
+def _count_file_lines(record: dict) -> int:
+    """Count CSV lines in bounded memory for a row estimate."""
+    path = _upload_path(record)
+    if path:
+        count = 0
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                count += block.count(b"\n")
+        return count
+    return record.get("bytes", b"").count(b"\n")
+
 _has_files = bool(st.session_state.get("cached_uploaded_files"))
 if _has_files:
     if st.button("Run the checks again", width='stretch', help="Ignores the cached result and re-runs every check on the uploaded files"):
         for uf in st.session_state.get("cached_uploaded_files", []):
-            fhash = hashlib.sha256(_upload_bytes(uf)).hexdigest()[:24]
+            fhash = _upload_sha256_prefix(uf)
             invalidate(country_validator.country, fhash)
         st.session_state.last_processed_files = None
         st.rerun()
@@ -8456,7 +8591,6 @@ if st.session_state.get("_row_estimate_sig") != process_signature:
     _total_estimated_rows = 0
     for _fc in _files_for_processing:
         try:
-            _peek = BytesIO(_upload_bytes(_fc))
             _name_lower = _fc["name"].lower()
             if _name_lower.endswith((".zip", ".rar")):
                 with _open_uploaded_archive(_upload_path(_fc) or _upload_bytes(_fc), _fc["name"]) as _zf:
@@ -8468,10 +8602,11 @@ if st.session_state.get("_row_estimate_sig") != process_signature:
                         _total_estimated_rows += max(1, int(getattr(_qc_info, "file_size", 0) or _upload_size(_fc)) // 500)
                     else: _total_estimated_rows += max(1, _upload_size(_fc) // 500)
             elif _name_lower.endswith(".xlsx"):
-                _total_estimated_rows += pd.read_excel(_peek, engine="openpyxl", nrows=1, dtype=str).shape[0]
+                _source = _upload_path(_fc) or _open_upload_buffer(_fc)
+                _total_estimated_rows += pd.read_excel(_source, engine="openpyxl", nrows=1, dtype=str).shape[0]
                 _total_estimated_rows += max(0, _upload_size(_fc) // 500 - 1)
             else:
-                _total_estimated_rows += _upload_bytes(_fc).count(b"\n")
+                _total_estimated_rows += _count_file_lines(_fc)
         except Exception:
             pass
     st.session_state._row_estimate_sig = process_signature
@@ -8512,7 +8647,10 @@ if st.session_state.get("last_processed_files") != process_signature:
             _prepare_lazy_zip_images(_files_for_processing)
             st.session_state.final_report = cached_report
             st.session_state.all_data_map = cached_data
-            st.session_state.all_data_rows = cached_data_rows if cached_data_rows is not None else cached_data.copy()
+            # `all_data_rows` is only a fallback when the dedicated rows
+            # parquet is absent. Alias the loaded frame instead of allocating
+            # another full DataFrame copy for large cached uploads.
+            st.session_state.all_data_rows = cached_data_rows if cached_data_rows is not None else cached_data
             st.session_state.last_processed_files = process_signature
             # Restoring from cache must also restore the checkpoint target —
             # without it checkpoint_final_report() silently no-ops and manual
@@ -8547,6 +8685,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                     _accumulated_rejection_reasons = []
                     st.session_state.zip_qc_results = pd.DataFrame()
                     st.session_state.pop("_zip_sid_index", None)
+                    st.session_state.pop("_zip_sid_set", None)
                     st.session_state.pop("_zip_status_cols", None)
                     st.session_state.pop("_zip_prefetch_map", None)
                     _sid_col_qc: str | None = None
@@ -8564,17 +8703,17 @@ if st.session_state.get("last_processed_files") != process_signature:
 
                     def _read_plain_upload(item):
                         _idx, _uf = item
-                        _buf = BytesIO(__upload_bytes(uf))
+                        _source = _upload_path(_uf) or _open_upload_buffer(_uf)
                         _name = _uf["name"].lower()
                         if _name.endswith((".xlsx", ".xls")):
-                            _frame = pd.read_excel(_buf, engine="openpyxl" if _name.endswith(".xlsx") else None, dtype=str)
+                            _frame = pd.read_excel(_source, engine="openpyxl" if _name.endswith(".xlsx") else None, dtype=str)
                         else:
-                            _frame = _detect_and_read_csv(_buf)
+                            _frame = _detect_and_read_csv(_source)
                         return _idx, _frame
 
                     _plain_frames = {}
                     if len(_plain_uploads) > 1:
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(_plain_uploads))) as _read_pool:
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, len(_plain_uploads))) as _read_pool:
                             for _idx, _frame in _read_pool.map(_read_plain_upload, _plain_uploads):
                                 _plain_frames[_idx] = _frame
                     elif _plain_uploads:
@@ -8582,17 +8721,17 @@ if st.session_state.get("last_processed_files") != process_signature:
                         _plain_frames[_idx] = _frame
 
                     for _uf_index, uf in enumerate(_files_for_processing):
-                        _buf = BytesIO(_upload_bytes(uf))
+                        _buf = _upload_path(uf) or _open_upload_buffer(uf)
                         raw_data = pd.DataFrame()
                         if uf["name"].lower().endswith((".zip", ".rar")):
                             has_zip_source = True
-                            with _open_uploaded_archive(_upload_bytes(uf), uf["name"]) as zf:
+                            with _open_uploaded_archive(_upload_path(uf) or _upload_bytes(uf), uf["name"]) as zf:
                                 members = zf.infolist()
                                 qc_files = [info for info in members if "qc_results" in info.filename.lower() and info.filename.lower().endswith((".xlsx", ".xls", ".csv"))]
                                 if qc_files:
                                     for qcf in qc_files:
                                         try:
-                                            qc_data = zf.read(qcf)
+                                            _member_path = _extract_archive_member_to_temp(zf, qcf)
                                         except Exception as _qc_read_error:
                                             # A damaged/truncated RAR member should
                                             # not abort every other file in the
@@ -8605,7 +8744,10 @@ if st.session_state.get("last_processed_files") != process_signature:
                                                 "Other valid members will continue processing."
                                             )
                                             continue
-                                        qdf = (_detect_and_read_csv(BytesIO(qc_data)) if qcf.filename.lower().endswith(".csv") else pd.read_excel(BytesIO(qc_data), dtype=str))
+                                        try:
+                                            qdf = (_detect_and_read_csv(_member_path) if qcf.filename.lower().endswith(".csv") else pd.read_excel(_member_path, dtype=str))
+                                        finally:
+                                            Path(_member_path).unlink(missing_ok=True)
                                         
                                         if "QC_Skip_Reason" in qdf.columns:
                                             qdf["QC_Skip_Reason"] = qdf["QC_Skip_Reason"].astype(str).replace(
@@ -8639,11 +8781,14 @@ if st.session_state.get("last_processed_files") != process_signature:
                                     ]
                                     for _product_info in _product_members:
                                         try:
-                                            _product_bytes = zf.read(_product_info)
-                                            if _product_info.filename.lower().endswith(".csv"):
-                                                _product_frame = _detect_and_read_csv(BytesIO(_product_bytes))
-                                            else:
-                                                _product_frame = pd.read_excel(BytesIO(_product_bytes), dtype=str)
+                                            _member_path = _extract_archive_member_to_temp(zf, _product_info)
+                                            try:
+                                                if _product_info.filename.lower().endswith(".csv"):
+                                                    _product_frame = _detect_and_read_csv(_member_path)
+                                                else:
+                                                    _product_frame = pd.read_excel(_member_path, dtype=str)
+                                            finally:
+                                                Path(_member_path).unlink(missing_ok=True)
                                             if not _product_frame.empty:
                                                 raw_data = _product_frame
                                                 st.info(
@@ -8668,22 +8813,29 @@ if st.session_state.get("last_processed_files") != process_signature:
                                     None,
                                 )
                                 if _pim is not None:
+                                    _pim_path = None
                                     try:
-                                        _pb = BytesIO(zf.read(_pim))
-                                        _xl = pd.ExcelFile(_pb)
-                                        if "ProductSets" in _xl.sheet_names:
-                                            _verd = _xl.parse("ProductSets", dtype=str).fillna("")
-                                            _verd.columns = [str(c).strip() for c in _verd.columns]
-                                            _accumulated_pim_verdicts.append(_verd)
-                                        if "RejectionReasons" in _xl.sheet_names:
-                                            _rr = _xl.parse("RejectionReasons", dtype=str).fillna("")
-                                            _rr_list = (
-                                                _rr.iloc[:, 0].astype(str).str.strip()
-                                                .loc[lambda s: s.ne("")].tolist()
-                                            )
-                                            _accumulated_rejection_reasons.extend(_rr_list)
+                                        _pim_path = _extract_archive_member_to_temp(zf, _pim)
+                                        # ExcelFile keeps the workbook stream open.
+                                        # Close it before unlinking the extracted
+                                        # temporary file (required on Windows).
+                                        with pd.ExcelFile(_pim_path) as _xl:
+                                            if "ProductSets" in _xl.sheet_names:
+                                                _verd = _xl.parse("ProductSets", dtype=str).fillna("")
+                                                _verd.columns = [str(c).strip() for c in _verd.columns]
+                                                _accumulated_pim_verdicts.append(_verd)
+                                            if "RejectionReasons" in _xl.sheet_names:
+                                                _rr = _xl.parse("RejectionReasons", dtype=str).fillna("")
+                                                _rr_list = (
+                                                    _rr.iloc[:, 0].astype(str).str.strip()
+                                                    .loc[lambda s: s.ne("")].tolist()
+                                                )
+                                                _accumulated_rejection_reasons.extend(_rr_list)
                                     except Exception as _pim_err:
                                         logger.warning("PIM_QC_Result read failed: %s", _pim_err)
+                                    finally:
+                                        if _pim_path:
+                                            Path(_pim_path).unlink(missing_ok=True)
 
                                 _zip_idx = _index_zip_images(zf)
                                 if _zip_idx:
@@ -8701,12 +8853,14 @@ if st.session_state.get("last_processed_files") != process_signature:
 
                     if _accumulated_zip_qc_dfs:
                         st.session_state.zip_qc_results = pd.concat(_accumulated_zip_qc_dfs, ignore_index=True)
+                        _accumulated_zip_qc_dfs.clear()
                         _build_zip_sid_index(st.session_state.zip_qc_results)
                         zip_raw_data = _repair_mojibake(st.session_state.zip_qc_results.copy())
                         all_dfs.append(zip_raw_data)
 
                     if _accumulated_pim_verdicts:
                         st.session_state.zip_pim_verdicts = pd.concat(_accumulated_pim_verdicts, ignore_index=True)
+                        _accumulated_pim_verdicts.clear()
                     if _accumulated_rejection_reasons:
                         # Keep unique ordered reasons
                         st.session_state.zip_rejection_reasons = list(dict.fromkeys(_accumulated_rejection_reasons))
@@ -8734,13 +8888,25 @@ if st.session_state.get("last_processed_files") != process_signature:
                             if "PRODUCT_SET_SID" in _std.columns: _std["PRODUCT_SET_SID"] = _std["PRODUCT_SET_SID"].astype(str).str.strip()
                             _std["_has_warranty_data"] = ("PRODUCT_WARRANTY" in _std.columns or "WARRANTY_DURATION" in _std.columns)
                             return _std
-                        if len(all_dfs) > 1:
-                            with concurrent.futures.ThreadPoolExecutor(max_workers=len(all_dfs)) as _std_pool:
-                                std_dfs = list(_std_pool.map(_standardize_one, all_dfs))
-                        else: std_dfs = [_standardize_one(all_dfs[0])]
+                        # Standardise sequentially: parallel copies of several
+                        # wide object frames can exceed memory before concat.
+                        std_dfs = []
+                        for _frame_index, _raw_frame in enumerate(all_dfs):
+                            std_dfs.append(_standardize_one(_raw_frame))
+                            all_dfs[_frame_index] = None
                         for _std in std_dfs:
                             if "PRODUCT_SET_SID" in _std.columns: file_sids_sets.append(set(_std["PRODUCT_SET_SID"].unique()))
                         merged_data = pd.concat(std_dfs, ignore_index=True)
+                        # Release per-file intermediates before schema checks,
+                        # country filtering, and validation allocate more data.
+                        del std_dfs, all_dfs, _plain_frames, _raw_frame
+                        if "_frame" in locals():
+                            del _frame
+                        if "raw_data" in locals():
+                            del raw_data
+                        if "zip_raw_data" in locals():
+                            del zip_raw_data
+                        gc.collect()
                         st.session_state.intersection_sids = (set.intersection(*file_sids_sets) if len(file_sids_sets) > 1 else set())
                         st.session_state.intersection_count = len(st.session_state.intersection_sids)
                         st.write("Validating file schema…")
@@ -8843,6 +9009,14 @@ if st.session_state.get("last_processed_files") != process_signature:
                                     st.rerun()
                             st.stop()
 
+                        # Country filtering has produced the only rows needed
+                        # for this run, and the mismatch checks above are the
+                        # final readers of the unfiltered frame. Drop both
+                        # aliases now so the large all-country DataFrame is
+                        # not kept alongside its filtered copy through the
+                        # validation pipeline.
+                        del data_prop, merged_data
+
                         actual_counts = data_filtered.groupby("PRODUCT_SET_SID")["PRODUCT_SET_SID"].transform("count")
                         if "COUNT_VARIATIONS" in data_filtered.columns:
                             file_counts = pd.to_numeric(data_filtered["COUNT_VARIATIONS"], errors="coerce").fillna(1)
@@ -8916,7 +9090,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                         _validation_manifest = load_manifest(sig_hash)
 
                         if non_zip_sids:
-                            data_non_zip = data[data["PRODUCT_SET_SID"].isin(non_zip_sids)].copy()
+                            data_non_zip = data[data["PRODUCT_SET_SID"].isin(non_zip_sids)]
                             _prog = st.progress(0, text="Preparing validation...")
                             def _on_flag_done(flag_name: str, i: int, total: int): _prog.progress(int(i / total * 100), text=f"Checking: {flag_name}")
                             # sig_hash prefixes the key so the validation cache is tied to
@@ -8931,7 +9105,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                             results_parts.append(res_non_zip)
 
                         if zip_sids:
-                            data_zip = data[data["PRODUCT_SET_SID"].isin(zip_sids)].copy()
+                            data_zip = data[data["PRODUCT_SET_SID"].isin(zip_sids)]
                             skip_list = sorted(set(_derive_prefetched_skip_list(qc_zip)) | set(fast_skip_list))
                             st.caption(
                                 f"ZIP validators skipped from QC: {len(skip_list):,}"
@@ -9520,13 +9694,28 @@ if st.session_state.get("last_processed_files") != process_signature:
 
                         st.session_state.final_report = final_report
                         st.session_state.all_data_map = data
-                        st.session_state.all_data_rows = None 
-                        st.session_state._data_filtered_ref = data_filtered
+                        # The complete export source has already been written
+                        # to the rows parquet below. Keep it out of
+                        # session_state; render_exports_section loads that
+                        # parquet lazily when the reviewer requests an export.
+                        st.session_state.all_data_rows = None
+                        st.session_state.pop("_data_filtered_ref", None)
                         st.session_state.last_processed_files = process_signature
 
-                        save_df_parquet(data, f"{sig_hash}_data.parquet")
-                        save_df_parquet(data_filtered, f"{sig_hash}_data_rows.parquet")
-                        save_df_parquet(final_report, f"{sig_hash}_report.parquet")
+                        # Identical tabs can finish the cached chunks at nearly
+                        # the same time. Serialize immutable output artifacts
+                        # and let the later tab reuse the first tab's files
+                        # instead of rewriting/re-uploading the same frames.
+                        with validation_lock(f"outputs:{sig_hash}"):
+                            for _frame, _suffix in (
+                                (data, "data"),
+                                (data_filtered, "data_rows"),
+                                (final_report, "report"),
+                            ):
+                                _artifact_name = f"{sig_hash}_{_suffix}.parquet"
+                                _artifact_path = Path(PARQUET_CACHE_DIR) / _artifact_name
+                                if not _artifact_path.exists():
+                                    save_df_parquet(_frame, _artifact_name)
                         st.session_state.current_sig_hash = sig_hash
                         _prepare_lazy_zip_images(_files_for_processing)
 
@@ -9551,6 +9740,16 @@ if st.session_state.get("last_processed_files") != process_signature:
 
                         _rej_count = int(final_report[final_report["Status"] == "Rejected"].shape[0])
                         _app_count = int(final_report[final_report["Status"] == "Approved"].shape[0])
+                        # These maps contain upload-wide intermediate verdicts.
+                        # They are needed across chunks and report assembly, but
+                        # not after a complete report has been persisted. Keep
+                        # them on exceptions so a retry can reuse completed work.
+                        st.session_state.pop("_duplicate_validation_cache", None)
+                        st.session_state.pop("_upload_wide_validator_cache", None)
+                        # Drop this session's merged URL/pHash dict copy. The
+                        # shared learned-rule index remains cached process-wide
+                        # for other sessions and faster subsequent validations.
+                        st.session_state.pop("_learned_image_rule_map_cache", None)
                         _status.update(label=f"Done — {_app_count:,} approved, {_rej_count:,} rejected", state="complete", expanded=False)
 
             except Exception as e:
@@ -9682,7 +9881,7 @@ if _offer:
         if _b1.button(f"Re-apply {_pv['matched']:,} decisions", type="primary",
                       width="stretch", key="pred_apply"):
             _n = apply_manual_decisions(st.session_state.final_report, _offer["decisions"])
-            checkpoint_final_report(st.session_state.final_report)
+            checkpoint_final_report(st.session_state.final_report, write_report=False)
             st.session_state._predecessor_handled = process_signature
             st.session_state.pop("_predecessor_offer", None)
             st.toast(f"Re-applied {_n:,} decision(s)", icon=":material/history:")
@@ -9755,7 +9954,7 @@ if _overlap_offer:
         _oc1, _oc2 = st.columns(2)
         if _oc1.button(f"Reuse {_overlap_offer['matched']:,} reviewed decisions", type="primary", width="stretch", key="overlap_apply"):
             _n = apply_manual_decisions(st.session_state.final_report, _overlap_offer["decisions"])
-            checkpoint_final_report(st.session_state.final_report)
+            checkpoint_final_report(st.session_state.final_report, write_report=False)
             st.session_state["_overlap_handled"] = process_signature
             st.session_state.pop("_overlap_offer", None)
             st.toast(f"Reused {_n:,} reviewed SKU decision(s).", icon=":material/history:")
@@ -9830,7 +10029,7 @@ def _drain_review_batch_queue():
         # The journal is enough to recover these decisions and is much smaller
         # than the complete report.  Avoid a full Parquet rewrite on iframe
         # close; the report remains in session memory for the rerun.
-        checkpoint_final_report(st.session_state.final_report, write_report=True)
+        checkpoint_final_report(st.session_state.final_report, write_report=False)
         _clear_result_caches(clear_streamlit_cache=False)
         _fr = st.session_state.get("final_report")
         if isinstance(_fr, pd.DataFrame):
@@ -9915,7 +10114,7 @@ def handle_jtbridge():
                     # large report Parquet made closing the iframe appear to
                     # hang even though the in-memory report was already up to
                     # date.
-                    checkpoint_final_report(st.session_state.final_report, write_report=True)
+                    checkpoint_final_report(st.session_state.final_report, write_report=False)
                     _clear_result_caches(clear_streamlit_cache=False)
                     _fr_flush = st.session_state.get("final_report")
                     if isinstance(_fr_flush, pd.DataFrame):
@@ -9929,6 +10128,9 @@ def handle_jtbridge():
                         f"Saved {_changed:,} review decision(s)" if _changed else f"Saved {_restored:,} review change(s)"
                     )
                 st.session_state.show_review_modal = False
+                st.session_state.pop("_grid_review_data_cache", None)
+                st.session_state.pop("_grid_warm_urls", None)
+                _clear_grid_lookup_caches()
                 st.session_state.pop("_grid_pending_report_sync", None)
                 st.session_state["main_bridge_counter"] = st.session_state.get("main_bridge_counter", 0) + 1
                 st.session_state["_grid_closing"] = True
@@ -10018,14 +10220,18 @@ def handle_jtbridge():
                 st.session_state.grid_filter_flag = _msg.get("payload", "")
                 st.session_state["main_bridge_counter"] = st.session_state.get("main_bridge_counter", 0) + 1
                 st.rerun()
-            elif _msg.get("action") == "grid_load_more":
-                _fr_more = st.session_state.get("final_report", pd.DataFrame())
-                _ipp_more = min(500, int(st.session_state.get("grid_items_per_page", 200) or 200))
-                _total_more = len(_fr_more) if isinstance(_fr_more, pd.DataFrame) else 0
-                _max_page_more = max(0, (_total_more - 1) // max(1, _ipp_more))
-                _current_page_more = int(st.session_state.get("grid_page", 0) or 0)
-                if _current_page_more < _max_page_more:
-                    st.session_state.grid_page = _current_page_more + 1
+            elif _msg.get("action") == "grid_set_page":
+                _page_payload = _msg.get("payload", {})
+                try:
+                    _requested_page = int(_page_payload.get("page")) if isinstance(_page_payload, dict) else -1
+                except (TypeError, ValueError):
+                    _requested_page = -1
+                _page_count = max(1, int(st.session_state.get("_grid_total_pages", 1) or 1))
+                if 0 <= _requested_page < _page_count and _requested_page != int(st.session_state.get("grid_page", 0) or 0):
+                    # The iframe and footer page controls converge on this
+                    # target. Defer updating their widget keys until the next
+                    # run, before those widgets are instantiated.
+                    st.session_state["_grid_page_nav_target"] = _requested_page
                     st.session_state["main_bridge_counter"] = st.session_state.get("main_bridge_counter", 0) + 1
                     st.rerun()
             elif _msg.get("action") == "remove_learned_rule":
@@ -10083,6 +10289,9 @@ def handle_jtbridge():
                 st.rerun()
             elif _msg.get("action") == "close_review":
                 st.session_state.show_review_modal = False
+                st.session_state.pop("_grid_review_data_cache", None)
+                st.session_state.pop("_grid_warm_urls", None)
+                _clear_grid_lookup_caches()
                 st.session_state.pop("_grid_pending_report_sync", None)
                 st.session_state["main_bridge_counter"] = st.session_state.get("main_bridge_counter", 0) + 1
                 st.session_state["_grid_closing"] = True
@@ -10099,29 +10308,30 @@ def handle_jtbridge():
             logger.error(f"Bridge parse error: {_e}")
 
 
-@st.cache_data(show_spinner=False, hash_funcs={pd.DataFrame: df_hash})
 def get_enriched_results(fr_df, data_df):
     if fr_df.empty: 
         return pd.DataFrame()
-    # Explicitly pull ONLY required columns to prevent cloning wide datasets
-    needed_cols = [c for c in ["PRODUCT_SET_SID", "SELLER_NAME", "BRAND"] if c in data_df.columns]
-    enriched = pd.merge(
-        fr_df, 
-        data_df[needed_cols], 
-        left_on="ProductSetSid", 
-        right_on="PRODUCT_SET_SID", 
-        how="left"
-    )
-    # Preserve the cheap manual-edit key on the derived frame so the chart
-    # cache does not hash the entire enriched report again on this rerun.
-    _stamp = fr_df.attrs.get("__pim_hash__")
-    if _stamp:
-        enriched.attrs["__pim_hash__"] = f"enriched:{_stamp}"
-        enriched.attrs["__pim_hash_stamp__"] = (enriched.shape, tuple(enriched.columns))
-    return enriched
+    # Attach the two dashboard fields to the existing compact report instead
+    # of merging/caching a second full report-sized DataFrame on every upload.
+    if "SELLER_NAME" not in fr_df.columns:
+        fr_df["SELLER_NAME"] = fr_df.get("SellerName", "").fillna("").astype(str) if isinstance(fr_df.get("SellerName"), pd.Series) else ""
+    if "BRAND" not in fr_df.columns and isinstance(data_df, pd.DataFrame) and "BRAND" in data_df.columns:
+        _needed = [c for c in ("PRODUCT_SET_SID", "BRAND") if c in data_df.columns]
+        if len(_needed) == 2 and "ProductSetSid" in fr_df.columns:
+            _brand_source = data_df.loc[:, _needed].copy()
+            _brand_source["PRODUCT_SET_SID"] = _brand_source["PRODUCT_SET_SID"].fillna("").astype(str).str.strip()
+            _brand_source = _brand_source.drop_duplicates("PRODUCT_SET_SID", keep="last").set_index("PRODUCT_SET_SID")
+            _report_sids = fr_df["ProductSetSid"].fillna("").astype(str).str.strip()
+            fr_df["BRAND"] = _report_sids.map(_brand_source["BRAND"]).fillna("")
+    fr_df.attrs.pop("__pim_hash__", None)
+    fr_df.attrs.pop("__pim_hash_stamp__", None)
+    _stamp = f"{st.session_state.get('current_sig_hash', '')}:{st.session_state.get('data_version', 0)}"
+    fr_df.attrs["__pim_hash__"] = _stamp
+    fr_df.attrs["__pim_hash_stamp__"] = (fr_df.shape, tuple(fr_df.columns))
+    return fr_df
 
 
-@st.cache_data(show_spinner=False, hash_funcs={pd.DataFrame: df_hash})
+@st.cache_data(show_spinner=False, max_entries=1, hash_funcs={pd.DataFrame: df_hash})
 def _build_dashboard_figures(fr_meta: pd.DataFrame, manual_hours: float):
     """Builds the dashboard's aggregates/plotly figures. Cached (keyed on the cheap
     df_hash signature, not a full-object hash) so repeated fragment reruns — e.g. a
@@ -10291,10 +10501,34 @@ def render_main_results():
                 width="stretch",
                 disabled="undo_snapshot" not in st.session_state,
             ):
-                st.session_state.final_report = st.session_state.undo_snapshot["final_report"]
-                # Undo bypasses apply_status_change, so checkpoint here too —
-                # otherwise disk keeps the state the user just undid.
-                checkpoint_final_report(st.session_state.final_report)
+                _undo = st.session_state.undo_snapshot
+                _report = st.session_state.final_report
+                if isinstance(_undo, dict) and isinstance(_undo.get("rows"), pd.DataFrame):
+                    _undo_rows = _undo["rows"]
+                    _undo_cols = [c for c in _undo.get("columns", []) if c in _report.columns]
+                    if _undo_cols and len(_undo_rows):
+                        _report.loc[_undo_rows.index, _undo_cols] = _undo_rows[_undo_cols]
+                        _report.attrs.pop("__pim_hash__", None)
+                        _report.attrs.pop("__pim_hash_stamp__", None)
+                        _quick = st.session_state.get("quick_rejects", {})
+                        if isinstance(_quick, dict) and "Status" in _undo_rows.columns:
+                            for _sid, _row in zip(
+                                _report.loc[_undo_rows.index, "ProductSetSid"].astype(str),
+                                _undo_rows.itertuples(index=False),
+                            ):
+                                _old_status = str(getattr(_row, "Status", ""))
+                                if _old_status == "Rejected":
+                                    _quick[_sid.strip()] = str(getattr(_row, "FLAG", ""))
+                                else:
+                                    _quick.pop(_sid.strip(), None)
+                elif isinstance(_undo, dict) and isinstance(_undo.get("final_report"), pd.DataFrame):
+                    # Backward compatibility for undo snapshots from before
+                    # sparse snapshots were introduced.
+                    st.session_state.final_report = _undo["final_report"]
+                    _report = st.session_state.final_report
+                # Journal the restored decisions without copying/serializing
+                # the entire report again.
+                checkpoint_final_report(_report, write_report=False)
                 st.session_state.pop("show_undo_toast", None)
                 st.toast(f"Restored {ut['count']:,} products", icon=":material/undo:")
                 st.rerun()

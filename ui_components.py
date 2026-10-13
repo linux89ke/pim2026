@@ -1232,7 +1232,7 @@ def render_sibling_prompt():
                 # Already the cascade — do not look for siblings of siblings.
                 propagate_siblings=False,
             )
-            checkpoint_final_report()
+            checkpoint_final_report(write_report=False)
             st.session_state.pop("_sibling_prompt", None)
             st.session_state.setdefault("main_toasts", []).append(
                 (f"Rejected {n:,} matching listing(s) as {label}", ":material/content_copy:")
@@ -1446,8 +1446,16 @@ def apply_status_change(
     from datetime import datetime
 
     if snapshot:
+        _undo_columns = [
+            c for c in ("Status", "Reason", "Comment", "FLAG", "Is_Manual", "Is_Zip")
+            if c in fr.columns
+        ]
         st.session_state["undo_snapshot"] = {
-            "final_report": fr.copy(),
+            # A sparse undo payload stores only the rows and fields this action
+            # will overwrite. A full report copy here duplicated hundreds of
+            # MB for a single approval on large uploads.
+            "rows": fr.loc[mask, _undo_columns].copy(),
+            "columns": _undo_columns,
             "timestamp": datetime.now(),
         }
 
@@ -1506,7 +1514,11 @@ def apply_status_change(
     # Every manual approve/reject funnels through here, so this is the one place
     # a checkpoint is needed to make decisions survive a disconnect.
     if checkpoint:
-        checkpoint_final_report(fr)
+        # The content-addressed manual-decision journal is sufficient to
+        # restore decisions after reconnect. Avoid serializing the full report
+        # after every click; exports and explicit final checkpoints still
+        # write the complete Parquet report.
+        checkpoint_final_report(fr, write_report=False)
 
     return int(mask.sum())
 
@@ -3031,10 +3043,13 @@ def build_fast_grid_html(
     _zip_img_cache: dict = st.session_state._zip_img_cache
     _ZIP_IMG_CACHE_MAX = 300
 
-    _zip_index_ss = st.session_state.get("_zip_sid_index")
-    _zip_sid_set = set()
-    if _zip_index_ss is not None and not _zip_index_ss.empty:
-        _zip_sid_set = set(_zip_index_ss.index.astype(str).tolist())
+    _zip_sid_set = st.session_state.get("_zip_sid_set")
+    if not isinstance(_zip_sid_set, (set, frozenset)):
+        _zip_index_ss = st.session_state.get("_zip_sid_index")
+        _zip_sid_set = set()
+        if _zip_index_ss is not None and not _zip_index_ss.empty:
+            _zip_sid_set = set(_zip_index_ss.index.astype(str).tolist())
+            st.session_state["_zip_sid_set"] = frozenset(_zip_sid_set)
     _fr_ss = st.session_state.get("final_report", pd.DataFrame())
     if not _zip_sid_set:
         if not _fr_ss.empty and "Is_Zip" in _fr_ss.columns and "ProductSetSid" in _fr_ss.columns:
@@ -3370,7 +3385,18 @@ def build_fast_grid_html(
 
     # Restores into #card-grid rather than the window: the document no longer
     # scrolls, the grid container does.
-    scroll_js = """
+    if scroll_to_top:
+        scroll_js = """
+        window.addEventListener('DOMContentLoaded', function() {
+            try { sessionStorage.removeItem('__inner_iframe_scroll__'); } catch(e) {}
+            setTimeout(function() {
+                var g = document.getElementById('card-grid');
+                if (g) { g.scrollTop = 0; }
+            }, 50);
+        });
+        """
+    else:
+        scroll_js = """
         window.addEventListener('DOMContentLoaded', function() {
             var savedInnerScroll = sessionStorage.getItem('__inner_iframe_scroll__');
             if (savedInnerScroll) {
@@ -3382,7 +3408,7 @@ def build_fast_grid_html(
                 }, 50);
             }
         });
-    """
+        """
 
 
     def _sel(val, curr): return "selected" if val == curr else ""
@@ -3445,7 +3471,7 @@ def build_fast_grid_html(
     <option value="REJECT_BRAND_MISMATCH">Brand Image Mismatch</option>
     </optgroup>
     <optgroup label="Compliance">
-    <option value="REJECT_NSFW">Adult / NSFW Content</option>
+    <option value="REJECT_NSFW">Adult / NSFW Image</option>
     </optgroup>
     <optgroup label="Seller Approval">
     <option value="REJECT_REFURB">Seller Not Approved (Refurb)</option>
@@ -4065,6 +4091,11 @@ def build_fast_grid_html(
 </div>
 
 <div class="ctrl-bar bottom-bar">
+  <span class="page-nav" aria-label="Review page">
+    <button class="desel-btn" id="iframe-page-prev" type="button" onclick="window.changeServerPage(-1)" aria-label="Previous page" title="Previous page">‹</button>
+    <span class="page-pill" id="iframe-page-pill" aria-live="polite">Page 1 / 1</span>
+    <button class="desel-btn" id="iframe-page-next" type="button" onclick="window.changeServerPage(1)" aria-label="Next page" title="Next page">›</button>
+  </span>
   <span class="lang-wrap" title="Change language">
     <span class="lang-ico">{_ICON_GLOBE}</span>
     <select id="iframe-lang-sel" class="lang-sel" aria-label="Change language" onchange="document.getElementById('lang-loading').style.display='flex'; sendMsg('change_lang', this.value)">
@@ -4204,14 +4235,26 @@ window.addEventListener('message', function(e) {{
       // the browser doesn't tear down/rebuild the whole DOM.
       var sig = e.data.cards_sig || null;
       if (sig === null || sig !== _lastCardsSig) {{
+        var incomingServerPage = Number(e.data.server_page || 0);
+        var serverPageChanged = window._activeServerPage !== incomingServerPage;
         CARDS = e.data.cards;
         _lastCardsSig = sig;
         cardsChanged = true;
+        window._activeServerPage = incomingServerPage;
+        // Keep the in-page scroll depth when a batch only updates card status.
+        // Reset it only after the reviewer changes the server page.
+        if (serverPageChanged) PAGE_STATE.autoPages = 1;
       }}
     }}
     if (e.data.committed) COMMITTED = e.data.committed;
     if (e.data.poor_img_sids) POOR_IMG_SIDS = new Set(e.data.poor_img_sids);
     if (e.data.prefetch) PREFETCH_URLS = e.data.prefetch;
+    if (Object.prototype.hasOwnProperty.call(e.data, 'server_page')) {{
+      window._serverPage = Math.max(0, Number(e.data.server_page) || 0);
+      window._serverPageCount = Math.max(1, Number(e.data.server_page_count) || 1);
+      window._serverPagePending = false;
+      updateServerPageControls();
+    }}
     if (Object.prototype.hasOwnProperty.call(e.data, 'grid_sort')) {{
       window._currentSort = e.data.grid_sort || '';
       ['sort-sel-top','sort-sel-bottom'].forEach(function(id) {{
@@ -4615,6 +4658,7 @@ function buildCardActionsHtml(safeSid, warnings, cardData) {{
     'Wrong Brand':            ['REJECT_WRONG_BRAND',    LABELS.wrong_brand],
     'Suspected Fake product': ['REJECT_FAKE',           LABELS.fake_prod],
     'Poor images':            ['REJECT_POOR_IMAGE',     LABELS.poor_img],
+    'NSFW Images':            ['REJECT_NSFW',           'Adult / NSFW Image'],
     'Image Quality Check':    ['REJECT_POOR_IMAGE',     LABELS.poor_img],
     'Brand Image Check':      ['REJECT_POOR_IMAGE',     LABELS.poor_img],
     'Product Warranty':       ['REJECT_WARRANTY',       'Product Warranty'],
@@ -4662,6 +4706,7 @@ function buildCardActionsHtml(safeSid, warnings, cardData) {{
     ['REJECT_IMG_MISMATCH',  'Image Mismatch'],
     ['REJECT_IMG_INFRINGING','Image Infringing'],
     ['REJECT_IMG_TOO_MANY',  'Image Too Many Things'],
+    ['REJECT_NSFW',          'Adult / NSFW Image'],
     ['REJECT_WRONG_CAT',     escapeHtml(LABELS.wrong_cat)],
     ['REJECT_FAKE',          escapeHtml(LABELS.fake_prod)],
     ['REJECT_BRAND',         escapeHtml(LABELS.restr_brand)],
@@ -5231,6 +5276,30 @@ function _updatePageControls(totalCount) {{
   if (next) next.disabled = PAGE_STATE.page >= totalPages;
 }}
 
+// The iframe toolbar and Streamlit footer use the same server page state.
+// Python confirms every requested change and broadcasts the resulting page.
+window._serverPage = window._serverPage || 0;
+window._serverPageCount = window._serverPageCount || 1;
+window._serverPagePending = false;
+function updateServerPageControls() {{
+  var page = Math.max(0, Number(window._serverPage) || 0);
+  var total = Math.max(1, Number(window._serverPageCount) || 1);
+  var pill = document.getElementById('iframe-page-pill');
+  var prev = document.getElementById('iframe-page-prev');
+  var next = document.getElementById('iframe-page-next');
+  if (pill) pill.textContent = 'Page ' + (page + 1) + ' / ' + total;
+  if (prev) prev.disabled = page <= 0 || window._serverPagePending;
+  if (next) next.disabled = page >= total - 1 || window._serverPagePending;
+}}
+window.changeServerPage = function(delta) {{
+  if (window._serverPagePending) return;
+  var nextPage = Math.max(0, Math.min(window._serverPageCount - 1, window._serverPage + Number(delta || 0)));
+  if (nextPage === window._serverPage) return;
+  window._serverPagePending = true;
+  updateServerPageControls();
+  sendMsg('grid_set_page', {{page: nextPage}});
+}};
+
 window.goPage = function(delta) {{
   var total = getBaseFilteredCards().length;
   var totalPages = Math.max(1, Math.ceil(total / _pageSizeValue()));
@@ -5341,18 +5410,6 @@ function renderAll() {{
           }}
         }}, {{root: grid, rootMargin: '320px'}});
         window._moreObserver.observe(sentinel);
-      }} else if (PAGE_STATE.autoLoad && totalBase > 0 && !window._serverMoreRequested) {{
-        // The current server window is exhausted. Ask Streamlit for the next
-        // bounded window automatically instead of requiring the reviewer to
-        // press Next.
-        var requestMore = document.createElement('div');
-        requestMore.id = 'load-more-sentinel';
-        requestMore.className = 'empty-state';
-        requestMore.style.cssText = 'min-height:44px;padding:10px;justify-content:center;';
-        requestMore.textContent = 'Loading more products…';
-        grid.appendChild(requestMore);
-        window._serverMoreRequested = true;
-        sendMsg('grid_load_more', {{}});
       }}
       activateLazyImages();
       updateSelCount();
@@ -6446,7 +6503,11 @@ def visual_review_modal(support_files):
             or data["MAIN_IMAGE"].fillna("").astype(str).str.strip().eq("").all()
         )
     if _cache_valid:
-        review_data = _cached_review.copy()
+        # The cached frame is a compact projection already. Reuse it here;
+        # the display frame is copied only after the current filters are
+        # applied below, avoiding a second full-grid copy while the iframe is
+        # open.
+        review_data = _cached_review
     else:
         available_cols = [c for c in GRID_COLS if c in data.columns]
         if "CATEGORY_CODE" in data.columns and "CATEGORY_CODE" not in available_cols:
@@ -6464,7 +6525,6 @@ def visual_review_modal(support_files):
         )
         _code_to_path = support_files.get("code_to_path", {})
         if _code_to_path and "CATEGORY_CODE" in review_data.columns:
-            review_data = review_data.copy()
             review_data["CATEGORY"] = resolve_category_paths(review_data, _code_to_path)
 
     # Carry learned-rule provenance into the iframe without changing verdicts.
@@ -6686,7 +6746,7 @@ def visual_review_modal(support_files):
                 options=_ipp_opts,
                 key=_slider_key,
                 on_change=_on_ipp_change,
-            help="The iframe loads up to 100 cards initially and appends more as you scroll.",
+            help="Cards append as you scroll within this page. Use Prev/Next to change pages.",
             )
         st.session_state.grid_items_per_page = int(st.session_state[_slider_key])
 
@@ -6852,6 +6912,16 @@ def visual_review_modal(support_files):
 
     ipp = min(500, int(st.session_state.get("grid_items_per_page", 200) or 200))
     total_pages = max(1, (len(review_data) + ipp - 1) // ipp)
+    st.session_state["_grid_total_pages"] = total_pages
+    _pending_iframe_page = st.session_state.pop("_grid_page_nav_target", None)
+    if _pending_iframe_page is not None:
+        _pending_iframe_page = max(0, min(total_pages - 1, int(_pending_iframe_page)))
+        st.session_state.grid_page = _pending_iframe_page
+        # These are widget-backed values. Apply a bridge request before the
+        # number-input widgets below are instantiated on this run.
+        st.session_state.jump_top = _pending_iframe_page + 1
+        st.session_state.jump_bot = _pending_iframe_page + 1
+        st.session_state.do_scroll_top = True
     if st.session_state.get("grid_page", 0) >= total_pages:
         # Clamp to the nearest valid page instead of bouncing all the way
         # back to page 0 — e.g. a user on page 9 who applies a filter that
@@ -7158,6 +7228,8 @@ def visual_review_modal(support_files):
         grid_sort: {json.dumps(curr_sort or '')},
         grid_filter: {json.dumps(curr_flag or '')},
         grid_page_size: {int(ipp)},
+        server_page: {int(st.session_state.get('grid_page', 0) or 0)},
+        server_page_count: {int(total_pages)},
         {_cards_field}
         {_images_field}
         cards_sig: {json.dumps(_cards_sig)},
@@ -7338,6 +7410,14 @@ def render_manual_review_buttons(support_files):
             ):
                 st.session_state.show_review_modal = True
                 st.session_state.show_targeted_audit_modal = False
+                # A new review session always opens on its first page and
+                # clears any scroll restored from an earlier iframe session.
+                st.session_state.grid_page = 0
+                st.session_state.jump_top = 1
+                st.session_state.jump_bot = 1
+                st.session_state.do_scroll_top = True
+                st.session_state.pop("_grid_page_contexts", None)
+                st.session_state.pop("_grid_last_ctx", None)
                 # Opening the modal always builds a NEW iframe, whose
                 # CARDS start empty. The resend guard keys off the grid
                 # document's hash, and reopening produces byte-identical
@@ -7382,6 +7462,12 @@ def render_manual_review_buttons(support_files):
             ):
                 st.session_state.show_review_modal = True
                 st.session_state.show_targeted_audit_modal = False
+                st.session_state.grid_page = 0
+                st.session_state.jump_top = 1
+                st.session_state.jump_bot = 1
+                st.session_state.do_scroll_top = True
+                st.session_state.pop("_grid_page_contexts", None)
+                st.session_state.pop("_grid_last_ctx", None)
                 # Opening the modal always builds a NEW iframe, whose
                 # CARDS start empty. The resend guard keys off the grid
                 # document's hash, and reopening produces byte-identical

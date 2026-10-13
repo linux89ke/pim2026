@@ -31,7 +31,7 @@ _PHASH_INDEX_CACHE = {}
 # the key includes the upload's SID/image fingerprint and the learned-map
 # identity, so a changed catalog cannot return stale decisions.
 _MATCH_RESULT_CACHE = {}
-_MATCH_RESULT_CACHE_MAX = 8
+_MATCH_RESULT_CACHE_MAX = 2
 
 _MODULE_DIR = Path(__file__).resolve().parent
 _BLOCKED_IMG_EXCEL = str(_MODULE_DIR / "Image_learn.xlsx")
@@ -52,6 +52,9 @@ _BLOCKED_FLAG_MAP = {
     "image too many things displayed": "Image Too Many things displayed",
     "restricted brands":            "Restricted brands",
     "restricted brand":             "Restricted brands",
+    "nsfw image":                   "NSFW Images",
+    "nsfw images":                  "NSFW Images",
+    "adult / nsfw content":         "NSFW Images",
     "suspected counterfeit":         "Suspected Fake product",
     "counterfeit product":           "Suspected Fake product",
 }
@@ -316,6 +319,11 @@ def get_blocked_image_matches(
             brand = entry.get("brand", "")
             if flag == "Restricted brands" and brand:
                 detail = f"Image matched known restricted brand image ({brand})."
+            elif flag == "NSFW Images":
+                detail = str(
+                    entry.get("comment", "")
+                    or "Image matches previously confirmed adult or sexually explicit content."
+                ).strip()
             else:
                 detail = f"Image matched known blocked image."
             if matched_by == "near-phash":

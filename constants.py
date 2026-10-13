@@ -105,7 +105,7 @@ COLOR_PATTERNS = {
     'orange': ['orange', 'tangerine', 'peach', 'coral', 'apricot'],
     'pink': ['pink', 'rose', 'magenta', 'fuchsia', 'salmon', 'blush', 'rose gold', 'rosegold'],
     'purple': ['purple', 'violet', 'lavender', 'plum', 'mauve', 'lilac', 'pourpre'],
-    'brown': ['brown', 'tan', 'beige', 'khaki', 'chocolate', 'bronze', 'marron', 'camel', 'nude', 'caramel', 'wood', 'wooden', 'bois'],
+    'brown': ['brown', 'tan', 'beige', 'khaki', 'chocolate', 'coffee', 'bronze', 'marron', 'camel', 'nude', 'caramel', 'wood', 'wooden', 'bois'],
     'multicolor': ['multicolor', 'multicolour', 'multi-color', 'multi colour', 'multi-colour', 'rainbow', 'mixed', 'multicolored', 'multicoloured', 'multicolore']
 }
 
@@ -142,7 +142,7 @@ REASON_MAP = {
     "REJECT_BRAND":          "Restricted brands",
     "REJECT_POT_RESTRICTED": "Potential Restricted Brand",
     "REJECT_PROHIBITED":     "Prohibited products",
-    "REJECT_NSFW":           "Adult / NSFW content",
+    "REJECT_NSFW":           "NSFW Images",
     "REJECT_COLOR":          "Missing COLOR",
     "REJECT_COLOR_MISMATCH": "Color Mismatch: Title vs COLOR Column",
     "REJECT_WRONG_BRAND":    "Generic branded products with genuine brands",

@@ -173,11 +173,17 @@ def save_manual_decisions(
     fname = manual_decisions_filename(process_signature)
     decided = final_report[final_report["Is_Manual"] == True]  # noqa: E712
     if isinstance(source_data, pd.DataFrame) and "PRODUCT_SET_SID" in source_data.columns and "ProductSetSid" in decided.columns:
-        _src = source_data.copy()
+        _sid = decided["ProductSetSid"].fillna("").astype(str).str.strip()
+        _wanted_sids = set(_sid)
+        _fields = ("MAIN_IMAGE", "BRAND", "CATEGORY_CODE", "NAME", "DESCRIPTION", "SHORT_DESCRIPTION", "SELLER_NAME")
+        # Keep the manual-decision lookup proportional to the selected SKUs.
+        # Copying source_data here duplicated the entire wide upload on every
+        # approval/rejection and could exhaust memory on large files.
+        _source_cols = ["PRODUCT_SET_SID", *[c for c in _fields if c in source_data.columns]]
+        _source_sid = source_data["PRODUCT_SET_SID"].fillna("").astype(str).str.strip()
+        _src = source_data.loc[_source_sid.isin(_wanted_sids), _source_cols].copy()
         _src["PRODUCT_SET_SID"] = _src["PRODUCT_SET_SID"].fillna("").astype(str).str.strip()
         _src = _src.drop_duplicates("PRODUCT_SET_SID", keep="last").set_index("PRODUCT_SET_SID")
-        _sid = decided["ProductSetSid"].fillna("").astype(str).str.strip()
-        _fields = ("MAIN_IMAGE", "BRAND", "CATEGORY_CODE", "NAME", "DESCRIPTION", "SHORT_DESCRIPTION", "SELLER_NAME")
         _parts = []
         for _field in _fields:
             _mapping = _src[_field].fillna("").astype(str) if _field in _src.columns else pd.Series(dtype=str)
@@ -564,17 +570,29 @@ def extract_product_attributes(name: str, explicit_color: Optional[str] = None, 
 def _detect_and_read_csv(buf) -> pd.DataFrame:
     # latin1 never raises UnicodeDecodeError so it acts as the final safe fallback
     _ENCODINGS = ['utf-8-sig', 'utf-8', 'cp1252', 'iso-8859-1', 'latin1']
-    if hasattr(buf, 'seek'):
-        try:
-            buf.seek(0)
-        except Exception:
-            pass
-    raw_bytes = buf.read()
-    if not raw_bytes:
-        return pd.DataFrame()
+    source_path = None
+    if isinstance(buf, (str, os.PathLike)):
+        source_path = os.fspath(buf)
+        if not os.path.exists(source_path) or os.path.getsize(source_path) == 0:
+            return pd.DataFrame()
+        with open(source_path, "rb") as _sample_file:
+            sample_bytes = _sample_file.read(16384)
+        raw_bytes = None
+    else:
+        if hasattr(buf, 'seek'):
+            try:
+                buf.seek(0)
+            except Exception:
+                pass
+        raw_bytes = buf.read()
+        if not raw_bytes:
+            return pd.DataFrame()
+        sample_bytes = raw_bytes[:16384]
+
+    def _csv_source():
+        return source_path if source_path is not None else BytesIO(raw_bytes)
 
     # 1. Fast sniff using Python's csv.Sniffer on the initial chunk
-    sample_bytes = raw_bytes[:16384]
     detected_enc = None
     sample_text = None
     for enc in _ENCODINGS:
@@ -597,7 +615,7 @@ def _detect_and_read_csv(buf) -> pd.DataFrame:
     if "," in _header and any(token in _header_upper for token in ("PRODUCT_SET_SID", "PRODUCT SET SID", "PARENTSKU")):
         try:
             return pd.read_csv(
-                BytesIO(raw_bytes), sep=",", encoding=detected_enc or "utf-8",
+                _csv_source(), sep=",", encoding=detected_enc or "utf-8",
                 dtype=str, on_bad_lines="skip",
             )
         except Exception:
@@ -627,7 +645,7 @@ def _detect_and_read_csv(buf) -> pd.DataFrame:
             for sep in candidate_seps:
                 try:
                     df_chunk = pd.read_csv(
-                        BytesIO(raw_bytes), sep=sep, encoding=enc,
+                        _csv_source(), sep=sep, encoding=enc,
                         dtype=str, nrows=20, on_bad_lines='skip'
                     )
                     cols_count = len(df_chunk.columns)
@@ -656,7 +674,7 @@ def _detect_and_read_csv(buf) -> pd.DataFrame:
                 with warnings.catch_warnings():
                     warnings.simplefilter('ignore', pd.errors.ParserWarning)
                     return pd.read_csv(
-                        BytesIO(raw_bytes), sep=separator, encoding=encoding,
+                        _csv_source(), sep=separator, encoding=encoding,
                         encoding_errors='replace', dtype=str,
                         on_bad_lines='skip', engine='python', **_kwargs,
                     )
@@ -672,7 +690,7 @@ def _detect_and_read_csv(buf) -> pd.DataFrame:
         warnings.simplefilter('ignore', pd.errors.ParserWarning)
         try:
             return pd.read_csv(
-                BytesIO(raw_bytes), sep=best_sep, encoding=best_enc,
+                _csv_source(), sep=best_sep, encoding=best_enc,
                 dtype=str, on_bad_lines='skip'
             )
         except Exception:
@@ -686,7 +704,7 @@ def _detect_and_read_csv(buf) -> pd.DataFrame:
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore', pd.errors.ParserWarning)
                 df = pd.read_csv(
-                    BytesIO(raw_bytes), sep=sep, encoding='latin1',
+                    _csv_source(), sep=sep, encoding='latin1',
                     encoding_errors='replace', dtype=str, on_bad_lines='skip'
                 )
             if len(df.columns) > 1:

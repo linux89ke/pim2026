@@ -419,11 +419,12 @@ with st.container(border=True):
     st.caption("Upload multiple Excel, CSV, or ZIP reports. ZIP files are expanded automatically and duplicate image rules are skipped.")
     with st.expander(":material/help: Accepted upload columns", expanded=False):
         st.markdown(
-            "Use **FLAG** to identify the learned reason. A brand column is optional and can be used with any learned reason, including counterfeit, prohibited product, or restricted-brand rules. FDA remains category-validator owned."
+            "Include an image-link column and **FLAG**. **BRAND_INFRINGED** is optional and is not needed for NSFW image rules. FDA remains category-validator owned."
         )
         st.dataframe(
             pd.DataFrame([
                 {"PRODUCT_SET_SID": "optional", "IMAGE_URL": "required", "FLAG": "required", "REASON": "optional detail", "BRAND_INFRINGED": "optional", "SELLER_NAME": "optional", "CATEGORY_CODE": "optional", "STATUS": "optional"},
+                {"PRODUCT_SET_SID": "not needed", "IMAGE_URL": "https://example.com/nsfw-image.jpg", "FLAG": "NSFW Images", "REASON": "optional", "BRAND_INFRINGED": "not needed", "SELLER_NAME": "optional", "CATEGORY_CODE": "optional", "STATUS": "optional"},
                 {"PRODUCT_SET_SID": "SKU-001", "IMAGE_URL": "https://example.com/image.jpg", "FLAG": "Counterfeit Sneakers", "REASON": "Brand logo appears unauthorized", "BRAND_INFRINGED": "Example Brand", "SELLER_NAME": "Seller A", "CATEGORY_CODE": "fashion", "STATUS": "rejected"},
             ]),
             hide_index=True,
@@ -877,11 +878,12 @@ def _normalise_columns(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False, max_entries=24)
-def _read_report_cached(source_name: str, source_bytes: bytes, _parser_version: str = "v3") -> pd.DataFrame:
+def _read_report_cached(source_name: str, source_bytes: bytes, _parser_version: str = "v4") -> pd.DataFrame:
     """Cache parsed report frames so reruns do not reopen the same workbook."""
     _required = {
         "PRODUCT_SET_SID", "PRODUCTSETSID", "PRODUCT_SET_SID_", "SID",
         "MAIN_IMAGE", "IMAGE1", "IMAGE", "IMAGE_URL", "MAIN_IMAGE_URL",
+        "IMAGE_LINK", "IMAGE_LINKS", "PRODUCT_IMAGE", "PRODUCT_IMAGE_URL", "URL", "LINK",
         "FLAG", "REJECTION_FLAG", "ISSUE", "REASON_FLAG", "STATUS", "LISTING_STATUS",
         "REASON", "COMMENT", "COMMENT_DETAIL", "BRAND", "BRAND_INFRINGED", "INFRINGED_BRAND", "BRAND_CLAIMED", "CLAIMED_BRAND", "CATEGORY_CODE", "SELLER_NAME",
     }
@@ -968,13 +970,16 @@ if uploads:
                 "application/octet-stream",
             )
             try:
-                frame = _read_report_cached(source_name, source_bytes, "v3")
+                frame = _read_report_cached(source_name, source_bytes, "v4")
             except Exception as exc:
                 problems.append(f"{source_name}: could not read ({exc})")
                 continue
 
             sid_col = _pick(frame.columns, ["PRODUCT_SET_SID", "PRODUCTSETSID", "PRODUCT_SET_SID_", "SID"])
-            image_col = _pick(frame.columns, ["MAIN_IMAGE", "IMAGE1", "IMAGE", "IMAGE_URL", "MAIN_IMAGE_URL"])
+            image_col = _pick(frame.columns, [
+                "MAIN_IMAGE", "IMAGE1", "IMAGE", "IMAGE_URL", "MAIN_IMAGE_URL",
+                "IMAGE_LINK", "IMAGE_LINKS", "PRODUCT_IMAGE", "PRODUCT_IMAGE_URL", "URL", "LINK",
+            ])
             flag_col = _pick(frame.columns, ["FLAG", "REJECTION_FLAG", "ISSUE", "REASON_FLAG"])
             status_col = _pick(frame.columns, ["STATUS", "LISTING_STATUS"])
             reason_col = _pick(frame.columns, ["REASON", "COMMENT", "COMMENT_DETAIL"])
@@ -1046,8 +1051,8 @@ if uploads:
         c1, c2, c3 = st.columns(3)
         c1.metric("Eligible rows", len(preview))
         c2.metric("Unique image URLs", preview["MAIN_IMAGE"].nunique())
-        c3.metric("Current learned rules", len(load_learned_image_rules()))
         _existing_rules = load_learned_image_rules()
+        c3.metric("Current learned rules", len(_existing_rules))
         _existing_keys = {
             (str(_rule.get("image_url", "") or "").strip(), normalize_learned_flag(_rule.get("flag", "")))
             for _rule in _existing_rules if isinstance(_rule, dict)
