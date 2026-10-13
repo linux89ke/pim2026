@@ -116,6 +116,14 @@ class FdaRule:
     # Optional category signal. When present, a product in a matching category
     # is regulated even if the seller uses a bland name and brand.
     category_keyword: object = None
+    # Optional conjunction for category-scoped rules: a match must also be
+    # under this category branch, and one of `keyword` or the category path
+    # must identify the regulated item. This avoids broad item terms (e.g.
+    # spice) firing in unrelated departments.
+    required_category_keyword: object = None
+    # Terms that identify packaging/equipment or other non-regulated products
+    # even when the category or name contains a regulated item word.
+    exclude_keyword: object = None
     except_in: List[str] = field(default_factory=list)
     match: str = "word"
     countries: Optional[List[str]] = None
@@ -313,6 +321,93 @@ RULES: List[CategoryRule] = [
             "Health & Beauty / Personal Care / Shave & Hair Removal",
         ],
         comment="Sexual wellness product with no FDA registration number",
+        overturned=False,
+    ),
+
+    FdaRule(
+        id="health-beauty-regulated-products-needs-fda",
+        flag="FDA - Health & Beauty",
+        label="Health & Beauty product without FDA registration",
+        # Personal-care products covered by the user's FDA policy. Keep this
+        # scoped to Health & Beauty so ordinary grocery products such as ice
+        # cream cannot match the skincare word "cream".
+        keyword=[
+            "vitamin", "supplement", "spice", "tea", "herbal tea",
+            "cream", "face cream", "skin cream", "face wash", "facewash",
+            "gel wash", "body wash", "body oil", "massage oil", "body butter",
+            "butter", "skin", "skincare", "skin care", "moisturizer",
+            "moisturiser", "soap", "shampoo", "conditioner", "hair care",
+            "haircare", "hair oil", "hair serum", "hair cream", "scalp",
+            "hair treatment", "hair relaxer", "hair dye", "hair color",
+            "hair colour", "lotion", "cleanser", "toner", "sunscreen",
+            "sunblock", "face mask", "facial", "scrub", "exfoliant",
+            "balm", "ointment", "skin treatment", "skin brightening",
+            "skin lightening", "skin whitening", "serum",
+        ],
+        category_keyword=[
+            "vitamin", "supplement", "spice", "tea", "herbal tea",
+            "skin care", "skincare", "face care", "facial care", "body care",
+            "hair care", "hair & scalp", "hair and scalp", "hair treatment",
+            "shampoo", "conditioner", "skin treatment", "bath & body",
+            "bath and body", "oral care", "cosmetic skincare",
+        ],
+        required_category_keyword=["health & beauty", "health and beauty"],
+        exclude_keyword=[
+            "tea cup", "tea cups", "teacup", "teacups", "tea mug", "tea mugs",
+            "tea pot", "teapot", "tea set", "tea infuser",
+            "hair accessory", "hair accessories", "hair extension", "hair extensions",
+            "wig", "wigs", "hair brush", "hair comb", "makeup brush",
+            "makeup sponge", "cosmetic bag", "beauty tool", "beauty tools",
+        ],
+        comment="Health & Beauty skincare, haircare, ingestible, or personal-care product with no FDA registration number",
+        reason="1000007 - Other Reason",
+        overturned=False,
+    ),
+
+    FdaRule(
+        id="grocery-ingestibles-needs-fda",
+        flag="FDA - Ingestibles",
+        label="Ingestible product without FDA registration",
+        # Grocery is a separate scope from skincare: this rule covers
+        # ingestible goods and drinks without letting skincare terms such as
+        # "cream" match food products. Category signals catch bland names;
+        # product terms catch ingestibles filed under unusual grocery leaves.
+        keyword=[
+            "food", "edible", "ingestible", "beverage", "drink", "juice",
+            "water", "soda", "soft drink", "energy drink", "sports drink",
+            "tea", "herbal tea", "coffee", "cocoa", "chocolate", "candy",
+            "sweets", "snack", "chips", "crisps", "biscuit", "biscuits",
+            "cookie", "cookies", "cereal", "oats", "grain", "flour", "rice",
+            "pasta", "noodle", "noodles", "bread", "bakery", "milk", "dairy",
+            "cheese", "yogurt", "yoghurt", "butter", "honey", "spice",
+            "herb", "seasoning", "condiment", "sauce", "soup", "canned",
+            "tinned", "beans", "lentils", "nuts", "seeds", "cooking oil",
+            "baby food", "infant formula", "vitamin", "supplement", "gummy",
+            "gummies", "capsule", "capsules", "protein powder", "meal replacement",
+        ],
+        category_keyword=[
+            "food cupboard", "food & beverages", "food and beverages", "drinks",
+            "beverages", "snacks", "biscuits", "cookies", "cereals", "grains",
+            "dairy", "milk", "canned", "tins & cans", "bakery", "coffee",
+            "tea", "cocoa", "juice", "water", "soft drinks", "alcoholic",
+            "herbs & spices", "spices", "sauces",
+            "condiments", "baby food", "infant formula", "health supplements",
+            "vitamins", "dietary supplements",
+        ],
+        required_category_keyword=[
+            "grocery", "food & beverages", "food and beverages",
+        ],
+        exclude_keyword=[
+            "tea cup", "tea cups", "teacup", "teacups", "tea mug", "tea mugs",
+            "tea pot", "teapot", "tea set", "tea infuser", "coffee cup",
+            "coffee cups", "coffee mug", "coffee mugs", "drinkware", "glassware",
+            "food container", "food storage", "lunch box", "lunchbox", "cutlery",
+            "utensil", "utensils", "kitchen appliance", "food processor",
+            # Alcohol has its own seller-authorization validation.
+            "alcoholic", "beer", "wine", "spirits", "spirit", "liquor", "liquors",
+        ],
+        comment="Ingestible food, drink, or supplement product with no FDA registration number",
+        reason="1000007 - Other Reason",
         overturned=False,
     ),
 
@@ -572,10 +667,41 @@ def _fda_missing(data):
     return v.isin(_FDA_EMPTY)
 
 
-def _make_fda_check(rule, except_codes: set):
+def _category_text_hit(data, pat):
+    hit = pd.Series(False, index=data.index)
+    if pat is None:
+        return hit
+    for col in ("CATEGORY", "FULL_CATEGORY_PATH", "CATEGORY_PATH"):
+        if col in data.columns:
+            hit |= data[col].fillna("").astype(str).str.contains(pat, na=False)
+    return hit
+
+
+def _codes_matching_category_terms(code_to_path, required_pat, item_pat=None):
+    """Resolve category-code paths satisfying the required scope and item."""
+    out = set()
+    if required_pat is None:
+        return out
+    for code, path in (code_to_path or {}).items():
+        text = str(path or "")
+        if required_pat.search(text) and (item_pat is None or item_pat.search(text)):
+            out.add(clean_category_code(str(code)))
+    return out
+
+
+def _make_fda_check(rule, except_codes: set, code_to_path=None):
     pat = _keyword_pattern(rule.keyword, rule.match)
     brand_pat = _keyword_pattern(getattr(rule, "brand_keyword", None), rule.match)
     category_pat = _keyword_pattern(getattr(rule, "category_keyword", None), "substring")
+    required_category_pat = _keyword_pattern(
+        getattr(rule, "required_category_keyword", None), "substring")
+    exclude_pat = _keyword_pattern(getattr(rule, "exclude_keyword", None), rule.match)
+    required_category_codes = _codes_matching_category_terms(
+        code_to_path, required_category_pat)
+    category_item_codes = _codes_matching_category_terms(
+        code_to_path, required_category_pat, category_pat)
+    excluded_category_codes = _codes_matching_category_terms(
+        code_to_path, exclude_pat)
 
     def _check(data, **_kwargs):
         if data is None or data.empty or (pat is None and brand_pat is None and category_pat is None):
@@ -588,9 +714,29 @@ def _make_fda_check(rule, except_codes: set):
         # Use the category as a high-confidence signal, without changing the
         # behaviour of unrelated FDA rules that have no category_keyword.
         if category_pat is not None:
-            for _cat_col in ("CATEGORY", "FULL_CATEGORY_PATH", "CATEGORY_PATH"):
-                if _cat_col in data.columns:
-                    hit |= data[_cat_col].fillna("").astype(str).str.contains(category_pat, na=False)
+            hit |= _category_text_hit(data, category_pat)
+        if required_category_pat is not None:
+            category_scope = _category_text_hit(data, required_category_pat)
+            if required_category_codes and "CATEGORY_CODE" in data.columns:
+                category_scope |= _cat_series(data).isin(required_category_codes)
+            item_in_category = _category_text_hit(data, category_pat)
+            if category_item_codes and "CATEGORY_CODE" in data.columns:
+                item_in_category |= _cat_series(data).isin(category_item_codes)
+            # For this conjunction, item evidence must come from the product
+            # name or its category; a brand-only mention is too weak to claim
+            # that the product itself is a regulated vitamin/serum/etc.
+            item_in_name = _text_hit(data, pat, None)
+            if item_in_name is None:
+                item_in_name = pd.Series(False, index=data.index)
+            hit = category_scope & (item_in_name | item_in_category)
+        if exclude_pat is not None:
+            excluded = _text_hit(data, exclude_pat, None)
+            if excluded is None:
+                excluded = pd.Series(False, index=data.index)
+            excluded |= _category_text_hit(data, exclude_pat)
+            if excluded_category_codes and "CATEGORY_CODE" in data.columns:
+                excluded |= _cat_series(data).isin(excluded_category_codes)
+            hit &= ~excluded
         if except_codes and "CATEGORY_CODE" in data.columns:
             hit &= ~_cat_series(data).isin(except_codes)
         # Do not send toys or games to the FDA queue. This is deliberately
@@ -665,7 +811,7 @@ def build_validators(support_files: Dict, country_code: str = "") -> List[tuple]
             # except_in may legitimately be empty — the rule then applies
             # everywhere, so an empty scope is not a failure here.
             out.append((_flag_name(rule),
-                        _make_fda_check(rule, _codes_under(rule.except_in, code_to_path)), {}))
+                        _make_fda_check(rule, _codes_under(rule.except_in, code_to_path), code_to_path), {}))
             continue
 
         codes = _codes_under(rule.wrong_in, code_to_path)
@@ -709,6 +855,21 @@ def build_scopes(code_to_path: Dict, country_code: str = "") -> Dict:
                               else _keyword_pattern(getattr(rule, "brand_keyword", None), rule.match)),
             "category_pattern": (None if isinstance(rule, GenericCategoryRule)
                                  else _keyword_pattern(getattr(rule, "category_keyword", None), "substring")),
+            "required_category_pattern": (None if isinstance(rule, GenericCategoryRule)
+                                          else _keyword_pattern(getattr(rule, "required_category_keyword", None), "substring")),
+            "required_category_codes": (_codes_matching_category_terms(
+                code_to_path,
+                _keyword_pattern(getattr(rule, "required_category_keyword", None), "substring"),
+            ) if isinstance(rule, FdaRule) else set()),
+            "category_item_codes": (_codes_matching_category_terms(
+                code_to_path,
+                _keyword_pattern(getattr(rule, "required_category_keyword", None), "substring"),
+                _keyword_pattern(getattr(rule, "category_keyword", None), "substring"),
+            ) if isinstance(rule, FdaRule) else set()),
+            "excluded_category_codes": (_codes_matching_category_terms(
+                code_to_path,
+                _keyword_pattern(getattr(rule, "exclude_keyword", None), rule.match),
+            ) if isinstance(rule, FdaRule) else set()),
             "exclude_pattern": (None if isinstance(rule, GenericCategoryRule)
                                 else _keyword_pattern(getattr(rule, "exclude_keyword", None), rule.match)),
         }
@@ -752,7 +913,13 @@ def audit_record(rec: Dict, scopes: Dict, country_code: str = "") -> List[Dict]:
             for _col in ("CATEGORY", "FULL_CATEGORY_PATH", "CATEGORY_PATH")
         )
         category_hit = bool(category_pat and category_pat.search(category_text))
-        if pat is not None or brand_pat is not None or category_pat is not None:
+        required_category_pat = scope.get("required_category_pattern")
+        required_category_hit = bool(required_category_pat and required_category_pat.search(category_text))
+        # A category-scoped FDA rule can be proven entirely by the resolved
+        # category code (the source record may have no readable category text),
+        # so leave its conjunction to the FDA branch below.
+        _category_scoped_fda = isinstance(rule, FdaRule) and scope.get("required_category_pattern") is not None
+        if not _category_scoped_fda and (pat is not None or brand_pat is not None or category_pat is not None):
             if not ((pat is not None and pat.search(name))
                     or (brand_pat is not None and brand_pat.search(brand))
                     or category_hit):
@@ -761,6 +928,21 @@ def audit_record(rec: Dict, scopes: Dict, country_code: str = "") -> List[Dict]:
                 continue
 
         if isinstance(rule, FdaRule):
+            if required_category_pat is not None:
+                required_category_hit = required_category_hit or code in scope.get("required_category_codes", set())
+                item_pat = scope.get("category_pattern")
+                item_in_category = bool(item_pat and item_pat.search(category_text)) or code in scope.get("category_item_codes", set())
+                item_in_name = bool(pat and pat.search(name))
+                if not (required_category_hit and (item_in_category or item_in_name)):
+                    continue
+            elif pat is not None or brand_pat is not None or category_pat is not None:
+                if not ((pat is not None and pat.search(name))
+                        or (brand_pat is not None and brand_pat.search(brand))
+                        or category_hit):
+                    continue
+            if excl_pat is not None:
+                if excl_pat.search(name) or excl_pat.search(category_text) or code in scope.get("excluded_category_codes", set()):
+                    continue
             if code and code in scope["wrong"]:
                 continue                       # the category rule owns this one
             fda = str(rec.get("FDA", "") or "").strip().lower()
@@ -808,6 +990,8 @@ def relevant_columns() -> Dict[str, List[str]]:
             cols.add("BRAND")
         if getattr(r, "category_keyword", None):
             cols.update({"CATEGORY", "FULL_CATEGORY_PATH", "CATEGORY_PATH"})
+        if getattr(r, "required_category_keyword", None):
+            cols.update({"CATEGORY", "FULL_CATEGORY_PATH", "CATEGORY_PATH", "CATEGORY_CODE"})
         # Union: several rules can share a flag, and last-wins would drop
         # the columns every rule but one depends on.
         out[_flag_name(r)] = sorted(set(out.get(_flag_name(r), [])) | cols)

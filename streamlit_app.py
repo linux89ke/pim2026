@@ -30,7 +30,7 @@ import streamlit.components.v1 as components
 from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 
 try:
@@ -991,7 +991,19 @@ def _find_sid_col(df: pd.DataFrame) -> Optional[str]:
 
 
 def _basename_lower(value) -> str:
-    name = str(value).strip().replace("\\", "/").split("/")[-1].lower()
+    raw = str(value or "").strip()
+    if not raw or raw.casefold() == "nan":
+        return ""
+    # Product image URLs commonly include cache-busting query strings. Archive
+    # members contain only the filename, so compare the decoded URL path rather
+    # than treating `photo.jpg?version=...` as a different basename.
+    try:
+        parsed = urlparse(raw)
+        if parsed.scheme and parsed.netloc:
+            raw = parsed.path
+    except Exception:
+        pass
+    name = unquote(raw.split("#", 1)[0].split("?", 1)[0]).replace("\\", "/").split("/")[-1].lower()
     return name if name and name != "nan" else ""
 
 
@@ -2964,16 +2976,6 @@ def check_suspected_fake_products(
         # was flagged over exactly this. NAME/BRAND still count: an actual
         # counterfeit still has to say "Beats" somewhere a shopper reads it.
         _NO_DESCRIPTION_SCAN_BRANDS = {"beats"}
-        # Model aliases contain useful multi-word names, but some catalogs
-        # also contain generic fragments such as ``air`` and ``pro``. Those
-        # fragments appear naturally in prose (for example ``air-dry``) and
-        # must not become a brand claim merely because a price ceiling exists.
-        _NO_DESCRIPTION_SCAN_ALIASES = {
-            "air", "pro", "max", "low", "high", "mid", "free", "plus",
-            "force", "book", "zoom", "court", "vision", "trail", "calm",
-            "mule", "rings", "shadow", "series", "signature",
-        }
-
         # Description scanning is scoped to categories the sheet already
         # audits — the sneaker codes plus every category that has a ceiling.
         # Widened from sneaker-only because sellers hide "WH-1000XM5" or "Flip
@@ -3016,14 +3018,15 @@ def check_suspected_fake_products(
             rx = _alias_res[a]
             _brand_hit = d["_brand_lower"] == a
             _name_hit = _name.str.contains(rx, na=False)
-            if a.casefold() in _NO_DESCRIPTION_SCAN_ALIASES or parent in _NO_DESCRIPTION_SCAN_BRANDS or len(_scope_idx) == 0:
-                _desc_hit = _no_blob
-                _short_hit = _no_blob
-            else:
-                _desc_hit = pd.Series(False, index=d.index)
-                _desc_hit.loc[_scope_idx] = _desc_clean.str.contains(rx, na=False)
-                _short_hit = pd.Series(False, index=d.index)
-                _short_hit.loc[_scope_idx] = _short_clean.str.contains(rx, na=False)
+            # Model aliases are only evidence when present in the declared
+            # brand or product name. Marketing/spec copy commonly contains
+            # ordinary phrases that collide with model names (e.g. "Day-Date
+            # Display" is a watch feature, not a Rolex claim; Nike aliases
+            # like "mike" can also occur in prose). Direct brand names still
+            # scan descriptions above, but aliases must not create a claim
+            # from description text alone.
+            _desc_hit = _no_blob
+            _short_hit = _no_blob
             _claims[parent] = _claims.get(parent, pd.Series(False, index=d.index)) | (_brand_hit | _name_hit | _desc_hit | _short_hit)
             _claim_sources.setdefault(parent, (_no_blob, _no_blob, _no_blob, _no_blob))
             _old_brand, _old_name, _old_desc, _old_short = _claim_sources[parent]
@@ -4966,6 +4969,9 @@ _COLOR_COMPOUND_PHRASES = re.compile(
     r"(?:self|sun|de|spray|fake)?\s*tan(?:ning)?\s*(?:oil|lotion|cream|spray|scrub|remover|removal|pack|foam|mousse|drops|accelerator|booster|towel)\b|"
     # Technology, Optics, Hardware
     r"anti[- ]?blue(?:[- ]?light)?|blue[- ]?light(?:\s+(?:blocking|blocker|filter|cut|protective|screen|glasses|protection|shield|lenses?))?|"
+    # Laptop power adapters describe the connector by its blue pin/tip;
+    # this is connector type, not the charger's body color.
+    r"blue\s+(?:pins?|tips?)(?:\s+(?:connector|plug|jack))?|"
     r"blue\s*tooth|bluetooth|"
     r"blue\s+ray|blu\s+ray|blu-ray|"
     r"water\s+jet|jet\s+(?:flame|torch|lighter|nozzle|flosser|cleaner|engine|washer)|ink\s*jet|turbo\s*jet|"
@@ -6636,6 +6642,16 @@ def validate_products(
                 # Empty for the built-in checks, so their cache keys are
                 # unchanged; set by general_rules on the checks it builds.
                 _key_extra = getattr(func, "_rule_id", "")
+                if name == "Suspected Fake product":
+                    # Bump this when claim-surface semantics change. The
+                    # cache is keyed by input/rule-file revision, not Python
+                    # source, so otherwise pre-fix alias-in-description false
+                    # positives would keep being served after restart.
+                    _key_extra = f"{_key_extra}|claim-surfaces-v2"
+                elif name == "Color Mismatch: Title vs COLOR Column":
+                    # Invalidate cached color mismatches after adding known
+                    # non-color product phrases such as "Blue Pin" chargers.
+                    _key_extra = f"{_key_extra}|color-compounds-v2"
                 # The duplicate check reads the whole upload, not just the rows
                 # it is handed, so the digest of those rows does not identify
                 # its answer. Without this the cache is actively wrong in the
@@ -6988,23 +7004,12 @@ def validate_products(
         "Suspected counterfeit Jerseys",
     }
 
-    # JSON-learned matches are evidence for future runs, not a reason to keep
-    # themselves alive forever. If the underlying validator no longer rejects
-    # the image, discard the JSON-only result now; Excel rules remain intact.
-    for _self_healing_flag in _learnable_flags:
-        _self_healing_res = results.get(_self_healing_flag)
-        if not isinstance(_self_healing_res, pd.DataFrame) or _self_healing_res.empty:
-            continue
-        if "_blocked_source" not in _self_healing_res.columns:
-            continue
-        _source_json = _self_healing_res["_blocked_source"].astype(str).str.casefold().eq("json")
-        if not _source_json.any():
-            continue
-        _non_json_sids = set(
-            _self_healing_res.loc[~_source_json, "PRODUCT_SET_SID"].astype(str).str.strip()
-        )
-        _keep = (~_source_json) | _self_healing_res["PRODUCT_SET_SID"].astype(str).str.strip().isin(_non_json_sids)
-        results[_self_healing_flag] = _self_healing_res[_keep].copy()
+    # Keep a learned-image match as an actual rejection. Dropping JSON-only
+    # matches here made commit_pending_validation_learning interpret those
+    # still-rejected products as approvals; reconcile_image_rules then deleted
+    # their learned entries. A rule should be removed only by an explicit
+    # approval/removal action for that reason, never because another validator
+    # did not independently recognize the same image.
 
     # Stage confirmed validator findings. They are committed only when the
     # user clicks Generate Reports, so a preview/re-run cannot teach the
@@ -8457,6 +8462,33 @@ if _has_files:
                 st.session_state.confirm_clear_files = False
                 st.rerun()
 
+# The uploader is deliberately rotated after files are spooled to disk so
+# Streamlit doesn't deep-copy large UploadedFile objects on every rerun. That
+# leaves the widget itself empty while validation continues; keep a compact,
+# persistent list of cached file names so the reviewer can see which batch is
+# being processed (including when several files were uploaded together).
+_batch_files_for_display = st.session_state.get("cached_uploaded_files", [])
+if _batch_files_for_display:
+    def _format_upload_size_label(value):
+        try:
+            size = max(0, int(value or 0))
+        except (TypeError, ValueError):
+            size = 0
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
+            size /= 1024
+
+    with st.container(border=True):
+        st.markdown("**Files in the current validation batch**")
+        for _upload_record in _batch_files_for_display[:8]:
+            st.caption(
+                f"{_upload_record.get('name', 'Uploaded file')} · "
+                f"{_format_upload_size_label(_upload_size(_upload_record))}"
+            )
+        if len(_batch_files_for_display) > 8:
+            st.caption(f"+ {len(_batch_files_for_display) - 8:,} more files in this batch")
+
 # Rotate the widget before registration after a batch has been detached. This
 # matters because Streamlit deep-copies the previous UploadedFile list inside
 # file_uploader itself, before the upload-processing code can run.
@@ -9682,9 +9714,12 @@ if st.session_state.get("last_processed_files") != process_signature:
                                 if _col in _learned_source_report.columns
                             }
                             _final_sid = final_report["ProductSetSid"].astype(str).str.strip()
-                            final_report["Learned Match"] = _final_sid.map(_learned_maps.get("Learned Match", {})).fillna(False).map(
-                                lambda value: value is True or str(value).strip().casefold() in {"true", "1", "yes", "y"}
-                            )
+                            _learned_match_values = _final_sid.map(_learned_maps.get("Learned Match", {}))
+                            final_report["Learned Match"] = _learned_match_values.map(
+                                lambda value: False if pd.isna(value) else (
+                                    value is True or str(value).strip().casefold() in {"true", "1", "yes", "y"}
+                                )
+                            ).astype(bool)
                             final_report["Learned Match Method"] = _final_sid.map(_learned_maps.get("Learned Match Method", {})).fillna("")
                             final_report["Learned Match Distance"] = _final_sid.map(_learned_maps.get("Learned Match Distance", {}))
                         else:
@@ -10847,10 +10882,16 @@ with _rail_slot:
 
 handle_jtbridge()
 
-# Compatibility path for messages from an older iframe build. Current review
-# actions are flushed once on close and never populate this queue.
+# Batch decisions are sent immediately by the iframe. Apply them to the report
+# before the results fragment is rendered so validation tables cannot keep
+# showing the products as approved after the cards optimistically turn red.
 if st.session_state.get("_review_batch_queue"):
     _drain_review_batch_queue()
+if st.session_state.pop("_grid_pending_report_sync", False):
+    # The iframe message caused this run, but its parent results fragment may
+    # have been scheduled before the report mutation. One clean rerun makes the
+    # updated report authoritative everywhere (tables, counts, exports, paging).
+    st.rerun()
 
 render_main_results()
 

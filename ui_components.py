@@ -59,6 +59,9 @@ from learned_rules import (
     load_learned_image_rules,
     load_learned_image_rules_for_urls,
     delete_learned_image_rules,
+    delete_associated_learned_image_rules,
+    remove_learned_rule_match,
+    normalize_learned_flag,
 )
 import importlib
 import targeted_audit as _ta_mod
@@ -1413,6 +1416,66 @@ def apply_status_change(
     mask = _get_norm_col(fr, "ProductSetSid").isin(sid_set)
     if not mask.any():
         return 0
+
+    # A reviewer explicitly approving a product rejected by a learned image
+    # rule is correcting that learned reason. Remove only the matched rule
+    # (same flag plus matched URL/pHash); other reasons for the same image are
+    # deliberately left intact. Automatic validation/reconciliation never
+    # reaches this path because this is gated on an explicit manual approval.
+    if status == "Approved" and is_manual and "Learned Match" in fr.columns and "FLAG" in fr.columns:
+        try:
+            _learned_mask = mask & _get_norm_col(fr, "Status").str.casefold().eq("rejected")
+            _learned_values = fr["Learned Match"]
+            _learned_mask &= _learned_values.map(
+                lambda value: value is True
+                or str(value).strip().casefold() in {"true", "1", "yes"}
+            )
+            _removed_learned = 0
+            if _learned_mask.any():
+                _selected_learned = fr.loc[_learned_mask]
+                _rule_urls_col = (
+                    _selected_learned["Learned Rule URL"]
+                    if "Learned Rule URL" in _selected_learned.columns
+                    else pd.Series("", index=_selected_learned.index)
+                )
+                _rule_phashes_col = (
+                    _selected_learned["Learned Rule pHash"]
+                    if "Learned Rule pHash" in _selected_learned.columns
+                    else pd.Series("", index=_selected_learned.index)
+                )
+                _groups = {}
+                for _row_index, _row in _selected_learned.iterrows():
+                    _learned_flag = normalize_learned_flag(_row.get("FLAG", ""))
+                    if not _learned_flag:
+                        continue
+                    _url_value = _rule_urls_col.loc[_row_index]
+                    _phash_value = _rule_phashes_col.loc[_row_index]
+                    _url = "" if pd.isna(_url_value) else str(_url_value).strip()
+                    _phash = "" if pd.isna(_phash_value) else str(_phash_value).strip()
+                    if not _url and not _phash:
+                        continue
+                    _group = _groups.setdefault(_learned_flag, {"urls": set(), "phashes": set()})
+                    if _url:
+                        _group["urls"].add(_url)
+                    if _phash:
+                        _group["phashes"].add(_phash)
+                for _learned_flag, _identities in _groups.items():
+                    _removed_learned += remove_learned_rule_match(
+                        _learned_flag,
+                        rule_urls=_identities["urls"],
+                        rule_phashes=_identities["phashes"],
+                        explicit_approval=True,
+                    )
+            if _removed_learned:
+                st.toast(
+                    f"Removed {_removed_learned} learned rule(s) for the approved reason; other reasons remain active.",
+                    icon=":material/verified:",
+                )
+        except Exception:
+            # Keep the review action usable, but make a failed catalog update
+            # visible so the reviewer knows the rule may still match later.
+            logger.exception("Could not remove learned rule after manual approval")
+            st.warning("The product was approved, but its learned rule could not be removed. Check the Dashboard and retry the rule removal.")
 
     # Record only sibling listings that will actually be updated, grouped by
     # seller. ProductSetSid is the unique SKU/listing identifier in this data.
@@ -2922,6 +2985,9 @@ def build_fast_grid_html(
     items_per_page=50,
 ):
     if support_files is None: support_files = {}
+    # Read the optional ZIP/QC index at function entry so the modal's
+    # Streamlit-fragment reruns always have a defined lookup value.
+    _zip_color_index = st.session_state.get("_zip_sid_index")
     _thumbnail_map = st.session_state.get("_image_thumbnail_by_url", {}) or {}
 
     from translations import get_translation
@@ -3043,12 +3109,15 @@ def build_fast_grid_html(
     _zip_img_cache: dict = st.session_state._zip_img_cache
     _ZIP_IMG_CACHE_MAX = 300
 
+    # The card loop also consults the ZIP/QC index for prefetched color values.
+    # Initialize it unconditionally: previously it was assigned only while
+    # rebuilding _zip_sid_set, so a cached _zip_sid_set caused an
+    # UnboundLocalError when the card reached its color display logic.
     _zip_sid_set = st.session_state.get("_zip_sid_set")
     if not isinstance(_zip_sid_set, (set, frozenset)):
-        _zip_index_ss = st.session_state.get("_zip_sid_index")
         _zip_sid_set = set()
-        if _zip_index_ss is not None and not _zip_index_ss.empty:
-            _zip_sid_set = set(_zip_index_ss.index.astype(str).tolist())
+        if _zip_color_index is not None and not _zip_color_index.empty:
+            _zip_sid_set = set(_zip_color_index.index.astype(str).tolist())
             st.session_state["_zip_sid_set"] = frozenset(_zip_sid_set)
     _fr_ss = st.session_state.get("final_report", pd.DataFrame())
     if not _zip_sid_set:
@@ -3188,8 +3257,8 @@ def build_fast_grid_html(
         color_ai = str(row.get("Color_AI_Normalized", "")).strip()
         if color_ai.lower() in ("nan", "none", "null", ""):
             color_ai = ""
-        if not color_ai and _zip_index_ss is not None and sid in _zip_index_ss.index:
-            _zr = _zip_index_ss.loc[sid]
+        if not color_ai and _zip_color_index is not None and sid in _zip_color_index.index:
+            _zr = _zip_color_index.loc[sid]
             if hasattr(_zr, "iloc") and len(getattr(_zr, "shape", (1,))) == 2:
                 _zr = _zr.iloc[0]
             _zai = str(_zr.get("Color_AI_Normalized", "")).strip()

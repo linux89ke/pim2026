@@ -153,6 +153,11 @@ VERB_USED_RE = re.compile(
 # Component / Accessory Guard (REF-07)
 COMPONENT_ACCESSORY_GUARD_RE = re.compile(
     r"\b("
+    # Chargers, adapters, and network adapters are standalone accessories.
+    # Their titles commonly mention retired laptop families for compatibility;
+    # those mentions must not make the accessory look like a refurbished laptop.
+    r"(?:LAPTOP|NOTEBOOK|COMPUTER)\s+(?:AC\s+)?(?:POWER\s+)?CHARGERS?|"
+    r"(?:AC|POWER)\s+ADAPTERS?|(?:NETWORK|WIRELESS|USB|BLUETOOTH)\s+ADAPTERS?|"
     r"LCD\s?INVERTER|SCREEN\s?ONLY|CASING\s?ONLY|BATTERY\s?ONLY|STYLUS\s?ONLY|"
     r"SPARE\s?PART|REPLACEMENT\s?(?:SCREEN|BATTERY|KEYBOARD|HOUSING|GLASS|CASING|MOTHERBOARD|FAN|CHARGER|ADAPTER)|"
     r"KEYBOARD\s?FOR\b|BATTERY\s?FOR\b|CHARGER\s?FOR\b|SCREEN\s?FOR\b|ADAPTER\s?FOR\b"
@@ -764,11 +769,20 @@ def _match_discontinued_model(title: str, brand: str = "") -> Optional[str]:
 def _is_refurb_eligible_category(cat_str: str, cat_code: str = "") -> bool:
     """Return True if category is eligible for refurbished listings.
 
-    Priority order:
-      1. Exact category-code match against REFURB_ELIGIBLE_CATEGORY_CODES (most precise).
-      2. Path-string keyword match for phones/tablets (not covered by the code list).
-      3. Ineligible-branch exclusion for everything else.
+    Accessory category leaves are excluded first, even when nested under a
+    laptop/computing code. Then use the exact code list and conservative path
+    fallback for eligible device categories.
     """
+    # Accessory leaves override the broad computer/laptop code whitelist.
+    # Some taxonomies place chargers and network adapters under laptop or
+    # computing branches; those are still not refurbished-device categories.
+    c = cat_str.lower() if cat_str else ""
+    if any(branch in c for branch in (
+        "network adapter", "power adapter", "ac adapter",
+        "laptop charger", "computer charger",
+    )):
+        return False
+
     # 1. Code whitelist — fastest, most precise
     if cat_code and cat_code.strip():
         if cat_code.strip() in REFURB_ELIGIBLE_CATEGORY_CODES:
@@ -791,6 +805,12 @@ def _is_refurb_eligible_category(cat_str: str, cat_code: str = "") -> bool:
         "paper", "stationery", "writing pads", "office & school supplies",
         "book", "books", "novel", "literature", "media", "magazine",
         "phone accessories", "laptop accessories", "tablet accessories",
+        # These are accessory branches, not refurbished devices. Keep the
+        # match specific so the parent "Computers & Accessories" path does
+        # not accidentally exclude actual laptop descendants.
+        "network adapter", "network adapters", "power adapter", "power adapters",
+        "ac adapter", "ac adapters", "laptop charger", "laptop chargers",
+        "computer charger", "computer chargers",
         "bag", "case", "cover", "holder",
     )
     if any(b in c for b in ineligible_branches):

@@ -48,6 +48,7 @@ _BLOCKED_FLAG_MAP = {
     "image stretched":              "Image Stretched",
     "image mismatch":               "Image Mismatch",
     "image infringing":             "Image Infringing",
+    "reject_img_infringing":        "Image Infringing",
     "image too many things":        "Image Too Many things displayed",
     "image too many things displayed": "Image Too Many things displayed",
     "restricted brands":            "Restricted brands",

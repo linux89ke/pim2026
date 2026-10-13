@@ -15,7 +15,7 @@ import re
 import shutil
 import threading
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +24,54 @@ import pandas as pd
 import supabase_store
 
 RULES_PATH = Path(__file__).resolve().parent / "learned_image_rules.json"
+DELETED_RULES_ARCHIVE = RULES_PATH.with_name("learned_image_rules.deleted.jsonl")
+_RULES_LOAD_ERROR = None
+
+
+def _archive_deleted_rules(records) -> None:
+    """Persist deliberately removed records before changing the live catalog.
+
+    This append-only recovery log is separate from the active rules file, so an
+    explicit Dashboard deletion can be undone even after a restart.
+    """
+    rows = [row for row in (records or []) if isinstance(row, dict)]
+    if not rows:
+        return
+    deleted_at = datetime.now(timezone.utc).isoformat()
+    DELETED_RULES_ARCHIVE.parent.mkdir(parents=True, exist_ok=True)
+    with DELETED_RULES_ARCHIVE.open("a", encoding="utf-8") as archive:
+        for row in rows:
+            archive.write(json.dumps({"deleted_at": deleted_at, "rule": row}, ensure_ascii=False) + "\n")
+        archive.flush()
+        os.fsync(archive.fileno())
+
+
+def _rule_identity_counts(records) -> Counter:
+    """Count stable rule identities, excluding fields users can edit."""
+    return Counter(
+        (
+            str(row.get("image_url", "") or "").strip(),
+            str(row.get("phash", "") or "").strip().casefold(),
+            str(row.get("created_at", "") or "").strip(),
+            str(row.get("product_set_sid", "") or "").strip(),
+            str(row.get("seller_name", "") or "").strip(),
+            str(row.get("source", "") or "").strip(),
+        )
+        for row in records
+        if isinstance(row, dict)
+    )
+
+
+def _assert_no_rules_lost(previous, proposed) -> None:
+    """Reject any routine catalog write that drops an existing rule identity."""
+    before = previous if isinstance(previous, Counter) else _rule_identity_counts(previous)
+    after = _rule_identity_counts(proposed)
+    missing = before - after
+    if missing:
+        raise RuntimeError(
+            f"Refusing learned-rule write: {sum(missing.values()):,} existing rule(s) "
+            "would disappear. Use an explicit archived removal action instead."
+        )
 
 def _atomic_replace_rules(temp_path: Path, target_path: Path, retries: int = 40, delay: float = 0.10) -> None:
     """Safely replace target_path with temp_path on Windows and POSIX.
@@ -32,6 +80,11 @@ def _atomic_replace_rules(temp_path: Path, target_path: Path, retries: int = 40,
     can hold a temporary read lock on target_path, raising PermissionError [WinError 5]
     or OSError [WinError 32]. Retry with exponential backoff and fall back to copy if needed.
     """
+    if target_path.resolve() == RULES_PATH.resolve() and _RULES_LOAD_ERROR:
+        raise RuntimeError(
+            "Learned rules could not be read safely; refusing to overwrite the catalog. "
+            f"Repair or restore {RULES_PATH.name} first. Details: {_RULES_LOAD_ERROR}"
+        )
     last_error = None
     for attempt in range(retries):
         try:
@@ -79,6 +132,7 @@ FLAG_ALIASES = {
     "image blurry": "Image Blurry",
     "image mismatch": "Image Mismatch",
     "image infringing": "Image Infringing",
+    "reject_img_infringing": "Image Infringing",
     "too many things": "Image Too Many things displayed",
     "too many things displayed": "Image Too Many things displayed",
     "image too many things": "Image Too Many things displayed",
@@ -145,7 +199,7 @@ def normalize_learned_flag(value: str) -> str:
 
 
 def _load_locked() -> list:
-    global _RULES_MTIME, _RULES
+    global _RULES_MTIME, _RULES, _RULES_LOAD_ERROR
     try:
         # Nanosecond precision matters when two browser tabs write the same
         # catalog within one filesystem second. Second-resolution mtimes could
@@ -159,8 +213,13 @@ def _load_locked() -> list:
     try:
         with RULES_PATH.open("r", encoding="utf-8") as handle:
             loaded = json.load(handle)
-        _RULES = loaded if isinstance(loaded, list) else []
-    except (OSError, ValueError, TypeError):
+        if not isinstance(loaded, list):
+            raise ValueError("catalog root must be a JSON array")
+        _RULES = loaded
+        _RULES_LOAD_ERROR = None
+    except (OSError, ValueError, TypeError) as exc:
+        _RULES_LOAD_ERROR = f"{type(exc).__name__}: {exc}"
+        _LOG.error("Learned rules catalog is unreadable; preserving it and disabling writes: %s", _RULES_LOAD_ERROR)
         _RULES = []
     _RULES_MTIME = mtime
     return _RULES
@@ -190,21 +249,25 @@ def load_learned_image_rules() -> list:
             try:
                 _fetched = supabase_store.fetch_all("learned_image_rules")
                 _REMOTE_RULES_FETCHED_AT = now
+                _active_fetched = [
+                    row for row in _fetched
+                    if str(row.get("status", "active") or "active").strip().casefold() not in {"removed", "deleted", "archived"}
+                ]
                 _local_count = _local_rule_count()
                 # Never let a partial cloud migration replace a substantially
                 # larger local catalog during an edit/import. A real remote
                 # catalog may be larger or the local file may be absent; only
                 # reject an implausibly small remote result.
-                if _local_count >= 100 and len(_fetched) < max(25, int(_local_count * 0.5)):
+                if _local_count >= 100 and len(_active_fetched) < max(25, int(_local_count * 0.5)):
                     _REMOTE_RULES = None
                     _REMOTE_RULES_SUSPICIOUS = True
                     _LOG.error(
                         "Refusing partial Supabase learned catalog (%s rules vs %s local); "
                         "repair the cloud catalog before saving learned data.",
-                        len(_fetched), _local_count,
+                        len(_active_fetched), _local_count,
                     )
                 else:
-                    _REMOTE_RULES = _fetched
+                    _REMOTE_RULES = _active_fetched
                     _REMOTE_RULES_SUSPICIOUS = False
             except Exception as exc:
                 _LOG.warning("Could not read Supabase learned rules; using local fallback: %s", exc)
@@ -275,17 +338,16 @@ def _remote_delete_rules(records: list[dict]) -> None:
     if not records or not supabase_store.enabled():
         return
     try:
+        # Keep cloud history too: user-requested removals are soft-deleted in
+        # Supabase. The runtime loader filters these records from active rules.
+        archived = []
+        now = supabase_store.now_iso()
         for record in records:
-            filters = {}
-            if record.get("id") is not None:
-                filters["id"] = record.get("id")
-            else:
-                for field in ("image_url", "phash", "flag", "created_at"):
-                    value = str(record.get(field, "") or "").strip()
-                    if value:
-                        filters[field] = value
-            if filters:
-                supabase_store.delete_where("learned_image_rules", filters)
+            row = dict(record)
+            row["status"] = "removed"
+            row["updated_at"] = now
+            archived.append(row)
+        _remote_upsert_rules(archived)
         global _REMOTE_RULES, _REMOTE_RULES_FETCHED_AT
         _REMOTE_RULES = None
         _REMOTE_RULES_FETCHED_AT = 0.0
@@ -327,6 +389,7 @@ def delete_learned_image_rules(rules) -> int:
                 kept.append(rule)
         if not removed:
             return 0
+        _archive_deleted_rules(removed_records)
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(kept, handle, indent=2, ensure_ascii=False)
@@ -337,6 +400,43 @@ def delete_learned_image_rules(rules) -> int:
         _sync_sqlite_locked(_RULES)
         _remote_delete_rules(removed_records)
         return removed
+
+
+def remove_learned_rule_match(
+    flag: str,
+    *,
+    rule_urls=None,
+    rule_phashes=None,
+    explicit_approval: bool = False,
+) -> int:
+    """Remove only the matched learned image rule for an explicit approval.
+
+    This is intentionally separate from validation reconciliation: only a
+    reviewer action may call it, and the reason must match exactly after flag
+    normalization. Other reasons attached to the same image remain active.
+    Removed records are archived and soft-deleted remotely by the normal
+    explicit deletion path.
+    """
+    if not explicit_approval:
+        return 0
+    canonical_flag = normalize_learned_flag(flag)
+    urls = {str(value or "").strip() for value in (rule_urls or [])}
+    phashes = {str(value or "").strip().casefold() for value in (rule_phashes or [])}
+    urls.discard("")
+    phashes.discard("")
+    if not canonical_flag or (not urls and not phashes):
+        return 0
+
+    matched_rules = [
+        rule for rule in load_learned_image_rules()
+        if isinstance(rule, dict)
+        and normalize_learned_flag(rule.get("flag", "")) == canonical_flag
+        and (
+            (str(rule.get("image_url", "") or "").strip() in urls)
+            or (str(rule.get("phash", "") or "").strip().casefold() in phashes)
+        )
+    ]
+    return delete_learned_image_rules(matched_rules)
 
 
 def delete_associated_learned_image_rules(rules) -> int:
@@ -370,6 +470,7 @@ def delete_associated_learned_image_rules(rules) -> int:
                 kept.append(rule)
         if not removed_records:
             return 0
+        _archive_deleted_rules(removed_records)
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(kept, handle, indent=2, ensure_ascii=False)
@@ -435,8 +536,15 @@ def deduplicate_learned_image_rules(rules=None) -> int:
     return delete_learned_image_rules(remove)
 
 
-def remove_learned_rules_by_flag(flag: str) -> int:
-    """Remove all learned image rules for a flag that is now validator-owned."""
+def remove_learned_rules_by_flag(flag: str, *, confirmed: bool = False) -> int:
+    """Explicitly remove every rule for a flag after caller confirmation.
+
+    Routine validator/code changes must not prune the learned catalog. Callers
+    must pass ``confirmed=True`` to make this destructive migration possible.
+    """
+    if not confirmed:
+        _LOG.warning("Refusing learned-rule deletion by flag without explicit confirmation: %s", flag)
+        return 0
     canonical = normalize_learned_flag(flag)
     with _LOCK:
         current = list(load_learned_image_rules())
@@ -445,6 +553,7 @@ def remove_learned_rules_by_flag(flag: str) -> int:
         removed = len(current) - len(kept)
         if not removed:
             return 0
+        _archive_deleted_rules(removed_records)
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(kept, handle, indent=2, ensure_ascii=False)
@@ -464,11 +573,13 @@ def restore_learned_image_rules(rules) -> int:
         return 0
     with _LOCK:
         current = list(load_learned_image_rules())
+        existing_identities = _rule_identity_counts(current)
         keys = {(str(r.get("image_url", "")).strip(), str(r.get("phash", "")).strip(), str(r.get("created_at", "")).strip()) for r in current}
         new_items = [r for r in additions if (str(r.get("image_url", "")).strip(), str(r.get("phash", "")).strip(), str(r.get("created_at", "")).strip()) not in keys]
         if not new_items:
             return 0
         current.extend(new_items)
+        _assert_no_rules_lost(existing_identities, current)
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(current, handle, indent=2, ensure_ascii=False)
@@ -479,6 +590,23 @@ def restore_learned_image_rules(rules) -> int:
         _sync_sqlite_locked(_RULES)
         _remote_upsert_rules(new_items)
         return len(new_items)
+
+
+def restore_archived_learned_image_rules() -> int:
+    """Restore all records from the append-only explicit-deletion archive."""
+    if not DELETED_RULES_ARCHIVE.exists():
+        return 0
+    archived = []
+    with DELETED_RULES_ARCHIVE.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                payload = json.loads(line)
+                record = payload.get("rule") if isinstance(payload, dict) else None
+                if isinstance(record, dict):
+                    archived.append(record)
+            except (ValueError, TypeError):
+                _LOG.warning("Skipping malformed line in learned-rule deletion archive")
+    return restore_learned_image_rules(archived)
 
 
 def update_learned_image_rule_flag(rule: dict, new_flag: str) -> bool:
@@ -495,6 +623,7 @@ def update_learned_image_rule_flag(rule: dict, new_flag: str) -> bool:
     )
     with _LOCK:
         current = list(load_learned_image_rules())
+        existing_identities = _rule_identity_counts(current)
         changed = False
         for item in current:
             key = (
@@ -508,6 +637,7 @@ def update_learned_image_rule_flag(rule: dict, new_flag: str) -> bool:
                 break
         if not changed:
             return False
+        _assert_no_rules_lost(existing_identities, current)
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(current, handle, indent=2, ensure_ascii=False)
@@ -536,6 +666,7 @@ def set_learned_image_rule_review(rule: dict, review_state: str) -> bool:
     )
     with _LOCK:
         current = list(load_learned_image_rules())
+        existing_identities = _rule_identity_counts(current)
         changed = False
         for item in current:
             key = (str(item.get("image_url", "")).strip(), str(item.get("phash", "")).strip(), str(item.get("created_at", "")).strip())
@@ -547,6 +678,7 @@ def set_learned_image_rule_review(rule: dict, review_state: str) -> bool:
                 break
         if not changed:
             return False
+        _assert_no_rules_lost(existing_identities, current)
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(current, handle, indent=2, ensure_ascii=False)
@@ -711,6 +843,7 @@ def learn_image_rejections(
         return 0
     with _LOCK:
         current = list(load_learned_image_rules())
+        existing_identities = _rule_identity_counts(current)
         # The dedupe scope is image identity + canonical reason.  Never use
         # image identity alone: one image may legitimately be learned for
         # different reasons (for example Poor images and Restricted brands).
@@ -739,6 +872,7 @@ def learn_image_rejections(
         if not additions:
             return 0
         payload = current + additions
+        _assert_no_rules_lost(existing_identities, payload)
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
@@ -775,6 +909,7 @@ def record_learned_image_matches(matches) -> int:
     cutoff = now_dt - timedelta(days=1)
     with _LOCK:
         current = list(load_learned_image_rules())
+        existing_identities = _rule_identity_counts(current)
         changed = 0
         for rule in current:
             if str(rule.get("image_url", "")).strip() in urls or str(rule.get("phash", "")).strip() in phashes:
@@ -792,6 +927,7 @@ def record_learned_image_matches(matches) -> int:
                 changed += 1
         if not changed:
             return 0
+        _assert_no_rules_lost(existing_identities, current)
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(current, handle, indent=2, ensure_ascii=False)
@@ -890,6 +1026,7 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
         return 0
     with _LOCK:
         current = list(load_learned_image_rules())
+        existing_identities = _rule_identity_counts(current)
         keys = {(str(r.get("image_url", "")).strip(), str(r.get("phash", "")).strip(), normalize_learned_flag(r.get("flag", ""))) for r in current}
         url_keys = {(url, flag) for url, _phash, flag in keys if url}
         phash_keys = {(_phash, flag) for _url, _phash, flag in keys if _phash}
@@ -906,6 +1043,7 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
         if not additions:
             return 0
         payload = current + additions
+        _assert_no_rules_lost(existing_identities, payload)
         temp = RULES_PATH.with_suffix(".json.tmp")
         with temp.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
@@ -924,49 +1062,12 @@ def remove_image_rules_for_sids(
     flag: str,
     hash_by_url: dict | None = None,
 ) -> int:
-    """Remove rules for images that now pass the named validation."""
-    flag = normalize_learned_flag(flag)
-    if flag not in LEARNABLE_FLAGS or data is None or data.empty:
-        return 0
-    sid_values = [] if sids is None else sids
-    sid_set = {str(s).strip() for s in sid_values}
-    if not sid_set or "PRODUCT_SET_SID" not in data.columns:
-        return 0
-    image_col = next((c for c in ("MAIN_IMAGE", "IMAGE1", "image1", "IMAGE_URL") if c in data.columns), None)
-    if not image_col:
-        return 0
-    hash_by_url = hash_by_url or {}
-    subset = data[data["PRODUCT_SET_SID"].astype(str).str.strip().isin(sid_set)]
-    urls = {str(v).strip() for v in subset[image_col] if str(v).strip() and str(v).strip().lower() not in {"nan", "none", "n/a"}}
-    phashes = {str(hash_by_url.get(url, "")).strip() for url in urls if hash_by_url.get(url)}
-    if not urls and not phashes:
-        return 0
-    with _LOCK:
-        current = list(load_learned_image_rules())
-        kept = []
-        removed = 0
-        for rule in current:
-            same_flag = normalize_learned_flag(rule.get("flag", "")) == flag
-            same_image = str(rule.get("image_url", "")).strip() in urls or str(rule.get("phash", "")).strip() in phashes
-            if same_flag and same_image:
-                removed += 1
-            else:
-                kept.append(rule)
-        if not removed:
-            return 0
-        temp = RULES_PATH.with_suffix(".json.tmp")
-        with temp.open("w", encoding="utf-8") as handle:
-            json.dump(kept, handle, indent=2, ensure_ascii=False)
-        _atomic_replace_rules(temp, RULES_PATH)
-        global _RULES, _RULES_MTIME
-        _RULES = kept
-        _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
-        _sync_sqlite_locked(_RULES)
-        _remote_delete_rules([
-            rule for rule in current
-            if rule not in kept and normalize_learned_flag(rule.get("flag", "")) == flag
-        ])
-        return removed
+    """Deprecated no-op: approval/re-evaluation never deletes learned rules.
+
+    Learned rules are durable knowledge. Removing one must happen through an
+    explicit Dashboard action, which archives the record first.
+    """
+    return 0
 
 
 def reconcile_image_rules(
@@ -976,12 +1077,10 @@ def reconcile_image_rules(
     hash_by_url: dict | None = None,
     evaluated_sids=None,
 ) -> int:
-    """Remove stale rules for evaluated products, then leave flagged rules intact."""
-    if data is None or data.empty or "PRODUCT_SET_SID" not in data.columns:
-        return 0
-    all_sids = set(data["PRODUCT_SET_SID"].astype(str).str.strip()) if evaluated_sids is None else {
-        str(s).strip() for s in evaluated_sids
-    }
-    flagged_values = [] if flagged_sids is None else flagged_sids
-    flagged = {str(s).strip() for s in flagged_values}
-    return remove_image_rules_for_sids(data, all_sids - flagged, flag, hash_by_url=hash_by_url)
+    """Keep learned rules unchanged when validation later approves a product.
+
+    A validation result can be transient or based on changed code. It must
+    never erase learned knowledge; use the explicit Dashboard removal action.
+    Kept as a compatibility function because the report pipeline still calls it.
+    """
+    return 0

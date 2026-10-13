@@ -190,6 +190,7 @@ keys.txt
 
 # ── Local debug / scratch output (not part of the app) ──
 debug_*.txt
+learned_image_rules.deleted.jsonl
 cats_out.txt
 parents_out.txt
 reasons_output.txt
