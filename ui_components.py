@@ -3411,6 +3411,7 @@ def build_fast_grid_html(
                     or str(row.get("Learned Match", False)).strip().casefold()
                     in {"true", "1", "yes", "y"}
                 ),
+                "status": str(row.get("Status", "")),
                 "learned_match_method": str(row.get("Learned Match Method", "")),
                 "learned_match_distance": row.get("Learned Match Distance", None),
                 "learned_confidence": row.get("Learned Confidence", None),
@@ -4198,6 +4199,9 @@ def build_fast_grid_html(
   <button class="desel-btn" onclick="doDeselAll()">{labels_dict["deselect_all"]}</button>
   {sort_html}
   {filter_html}
+  <button class="desel-btn" id="toggle-learned-rejected" type="button"
+          onclick="window.toggleLearnedRejectedVisibility()" aria-pressed="false"
+          title="Hide cards rejected by learned rules">Hide learned rejects</button>
 <span class="cols-group">
     <span class="cols-label">Cards per row</span>
     {_cols_btns}
@@ -4446,9 +4450,11 @@ CARDS.forEach(c => {{
 }});
 window._currentSort = window._currentSort || (function() {{ try {{ return sessionStorage.getItem('pim_grid_sort') || ''; }} catch(e) {{ return ''; }} }})();
 window._currentFilter = window._currentFilter || (function() {{ try {{ return sessionStorage.getItem('pim_grid_filter') || ''; }} catch(e) {{ return ''; }} }})();
+window._hideLearnedRejected = window._hideLearnedRejected === true || (function() {{ try {{ return sessionStorage.getItem('pim_hide_learned_rejected') === '1'; }} catch(e) {{ return false; }} }})();
 setTimeout(function() {{
   ['sort-sel-top','sort-sel-bottom'].forEach(function(id) {{ var el = document.getElementById(id); if (el) el.value = window._currentSort || ''; }});
   ['filter-sel-top','filter-sel-bottom'].forEach(function(id) {{ var el = document.getElementById(id); if (el) el.value = window._currentFilter || ''; }});
+  updateLearnedRejectedButton();
   var s = document.getElementById('grid-search');
   if (s && PAGE_STATE.search) s.value = PAGE_STATE.search;
   _setMultiSelectValues('seller-filter', PAGE_STATE.sellers);
@@ -5257,6 +5263,7 @@ function getSortedCards() {{
 
 function getBaseFilteredCards() {{
   var cards = getSortedCards();
+  if (window._hideLearnedRejected) cards = cards.filter(function(c) {{ return !(c.learned_match && String(c.status || '').trim().toLowerCase() === 'rejected'); }});
   var f = window._currentFilter;
   if (f) {{
     if (f === 'committed') cards = cards.filter(function(c) {{ return c.sid in COMMITTED; }});
@@ -5416,6 +5423,23 @@ window.applyFilter = function(val) {{
   try {{ sessionStorage.setItem('pim_grid_filter', val); }} catch(e) {{}}
   ['filter-sel-top','filter-sel-bottom'].forEach(function(id) {{ var el=document.getElementById(id); if(el) el.value=val; }});
   saveGridViewState();
+  renderAll();
+}};
+
+function updateLearnedRejectedButton() {{
+  var button = document.getElementById('toggle-learned-rejected');
+  if (!button) return;
+  button.setAttribute('aria-pressed', window._hideLearnedRejected ? 'true' : 'false');
+  button.textContent = window._hideLearnedRejected ? 'Show learned rejects' : 'Hide learned rejects';
+  button.title = window._hideLearnedRejected
+    ? 'Show cards rejected by learned rules'
+    : 'Hide cards rejected by learned rules';
+}}
+
+window.toggleLearnedRejectedVisibility = function() {{
+  window._hideLearnedRejected = !window._hideLearnedRejected;
+  try {{ sessionStorage.setItem('pim_hide_learned_rejected', window._hideLearnedRejected ? '1' : '0'); }} catch(e) {{}}
+  updateLearnedRejectedButton();
   renderAll();
 }};
 
