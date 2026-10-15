@@ -4087,7 +4087,10 @@ _WEBSITE_RE = re.compile(
     r"https?://" + _YOUTUBE_LOOKAHEAD + _IPV4_LOOKAHEAD + r"\S+"
     r"|\bwww\.(?!(?:[a-z0-9_\-]+\.)?(?:youtube\.com|youtu\.be|youtube-nocookie\.com))\S+"
     r"|wa\.me/\S+"
-    r"|\b(?!(?:[a-z0-9_\-]+\.)?(?:youtube\.com|youtu\.be|youtube-nocookie\.com))" + r"[a-z0-9][a-z0-9\-]{1,30}\.(?:com|net|org|shop|store|biz|info|"
+    # Bare .shop/.store matches are omitted: sentence fragments like
+    # "only.shop in-store" are not reliable domain evidence. Explicit
+    # http(s):// and www. links still match above.
+    r"|\b(?!(?:[a-z0-9_\-]+\.)?(?:youtube\.com|youtu\.be|youtube-nocookie\.com))" + r"[a-z0-9][a-z0-9\-]{1,30}\.(?:com|net|org|biz|info|"
     r"co\.ke|co\.ug|com\.ng|com\.gh|co\.za|ma|eg|sn|ci)\b"
     r")",
     re.IGNORECASE,

@@ -149,6 +149,18 @@ def manual_decisions_filename(process_signature: str) -> str:
     return f"{MANUAL_DECISION_PREFIX}{hashlib.md5(str(process_signature).encode()).hexdigest()}.parquet"
 
 
+def _safe_sequence(value):
+    """Turn optional iterable session state into a list without truth-testing arrays."""
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)):
+        return [value] if value else []
+    try:
+        return list(value)
+    except TypeError:
+        return [value]
+
+
 def save_manual_decisions(
     process_signature: str,
     final_report,
@@ -163,6 +175,12 @@ def save_manual_decisions(
     built from. It is recorded in the index so a later, larger upload can find
     this journal; without it the entry is still written, just unmatchable.
     """
+    # Normalize stale/array-like session state before comparison; truth-testing
+    # a NumPy array here raises an ambiguous truth-value TypeError.
+    if process_signature is None:
+        return 0
+    if not isinstance(process_signature, str):
+        process_signature = str(process_signature)
     if not process_signature or process_signature == "empty":
         return 0
     if not isinstance(final_report, pd.DataFrame) or final_report.empty:
@@ -215,7 +233,7 @@ def save_manual_decisions(
 
     save_df_parquet(decided, fname)
     index[fname] = {
-        "files": sorted(str(t) for t in (file_tokens or [])),
+        "files": sorted(str(t) for t in _safe_sequence(file_tokens)),
         "country": str(country or ""),
         "saved_at": time.time(),
         "n": int(len(decided)),
@@ -235,7 +253,7 @@ def find_predecessor_decisions(file_tokens, country: str, current_signature: str
     Returns the best candidate as a dict with its loaded decisions, or None.
     Best means most overlap with the current upload, then most recent.
     """
-    tokens = {str(t) for t in (file_tokens or [])}
+    tokens = {str(t) for t in _safe_sequence(file_tokens)}
     if not tokens:
         return None
 
@@ -249,7 +267,7 @@ def find_predecessor_decisions(file_tokens, country: str, current_signature: str
         # market would apply the wrong rules' verdicts onto this report.
         if str(meta.get("country") or "") != str(country or ""):
             continue
-        old = {str(t) for t in (meta.get("files") or [])}
+        old = {str(t) for t in _safe_sequence(meta.get("files"))}
         if not old or not old < tokens:      # strict subset only
             continue
         if not os.path.exists(os.path.join(PARQUET_CACHE_DIR, fname)):
