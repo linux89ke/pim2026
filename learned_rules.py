@@ -313,7 +313,15 @@ def _remote_upsert_rules(records: list[dict]) -> None:
             except Exception as _phash_conflict_exc:
                 # Compatibility with projects that retained the original
                 # image_url/flag unique constraint instead of the pHash one.
-                if "400" not in str(_phash_conflict_exc) and "constraint" not in str(_phash_conflict_exc).lower():
+                _phash_error = str(_phash_conflict_exc).lower()
+                _is_conflict_target_error = any(
+                    marker in _phash_error
+                    for marker in (
+                        "on conflict", "conflict target", "unique constraint",
+                        "no unique", "exclusion constraint",
+                    )
+                )
+                if not _is_conflict_target_error:
                     raise
                 supabase_store.upsert("learned_image_rules", _hashed, on_conflict="image_url,flag")
         if _unhashed:

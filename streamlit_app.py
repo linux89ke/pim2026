@@ -7600,12 +7600,17 @@ def _validate_in_chunks_unlocked(data, support_files, country_validator, data_ha
     # deliberately treated as stale once and recomputed instead of silently
     # restoring a report produced before a rule was added or changed.
     if manifest is not None:
-        try:
-            _general_rules_path = Path("general_rules.py")
-            _general_rules_revision = _general_rules_path.stat().st_mtime_ns if _general_rules_path.exists() else 0
-        except OSError:
-            _general_rules_revision = 0
-        _validation_revision = f"{rules_revision}:{_general_rules_revision}"
+        _validator_digest = hashlib.sha256()
+        for _validator_module in ("streamlit_app.py", "custom_country_rules.py", "general_rules.py"):
+            _validator_path = Path(__file__).resolve().parent / _validator_module
+            try:
+                _validator_digest.update(_validator_module.encode("utf-8"))
+                with _validator_path.open("rb") as _validator_file:
+                    for _block in iter(lambda: _validator_file.read(1024 * 1024), b""):
+                        _validator_digest.update(_block)
+            except OSError:
+                _validator_digest.update(b"missing")
+        _validation_revision = f"{rules_revision}:{_validator_digest.hexdigest()[:20]}"
         if manifest.get("validation_revision") != _validation_revision:
             manifest["validation_revision"] = _validation_revision
             manifest["batches"] = {}

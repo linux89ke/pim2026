@@ -6609,7 +6609,9 @@ def visual_review_modal(support_files):
         # the display frame is copied only after the current filters are
         # applied below, avoiding a second full-grid copy while the iframe is
         # open.
-        review_data = _cached_review
+        # A cached projection may have originated from a filtered frame. Own
+        # it before adding per-session derived columns below.
+        review_data = _cached_review.copy()
     else:
         available_cols = [c for c in GRID_COLS if c in data.columns]
         if "CATEGORY_CODE" in data.columns and "CATEGORY_CODE" not in available_cols:

@@ -54,6 +54,19 @@ def _endpoint(table: str) -> str:
     return f"{url}/rest/v1/{table}"
 
 
+def _raise_for_status(response: requests.Response) -> None:
+    """Raise a compact Supabase error that includes PostgREST's diagnostic."""
+    if response.ok:
+        return
+    detail = (response.text or "").strip().replace("\r", " ").replace("\n", " ")
+    if len(detail) > 1200:
+        detail = detail[:1200] + "…"
+    raise requests.HTTPError(
+        f"Supabase request failed ({response.status_code}): {detail or response.reason}",
+        response=response,
+    )
+
+
 def fetch_all(table: str, *, page_size: int = 1000, order: str = "id") -> list[dict]:
     """Fetch a table through PostgREST pagination."""
     if not enabled():
@@ -67,7 +80,7 @@ def fetch_all(table: str, *, page_size: int = 1000, order: str = "id") -> list[d
             headers=_headers(),
             timeout=120,
         )
-        response.raise_for_status()
+        _raise_for_status(response)
         page = response.json()
         if not isinstance(page, list):
             raise RuntimeError(f"Unexpected Supabase response for {table}")
@@ -96,7 +109,7 @@ def fetch_where(table: str, params: dict[str, str], *, select: str = "*", page_s
         response = _session.get(
             _endpoint(table), params=query, headers=_headers(), timeout=120
         )
-        response.raise_for_status()
+        _raise_for_status(response)
         page = response.json()
         if not isinstance(page, list):
             raise RuntimeError(f"Unexpected Supabase response for {table}")
@@ -121,7 +134,7 @@ def upsert(table: str, rows: list[dict], *, on_conflict: str | None = None) -> N
         json=payload,
         timeout=120,
     )
-    response.raise_for_status()
+    _raise_for_status(response)
 
 
 def insert(table: str, rows: list[dict]) -> None:
@@ -136,7 +149,7 @@ def insert(table: str, rows: list[dict]) -> None:
         json=payload,
         timeout=120,
     )
-    response.raise_for_status()
+    _raise_for_status(response)
 
 
 def delete_by_ids(table: str, ids: list, *, id_column: str = "id") -> None:
@@ -149,7 +162,7 @@ def delete_by_ids(table: str, ids: list, *, id_column: str = "id") -> None:
         headers=_headers(),
         timeout=120,
     )
-    response.raise_for_status()
+    _raise_for_status(response)
 
 
 def delete_where(table: str, filters: dict[str, object]) -> None:
@@ -162,7 +175,7 @@ def delete_where(table: str, filters: dict[str, object]) -> None:
         headers=_headers(),
         timeout=120,
     )
-    response.raise_for_status()
+    _raise_for_status(response)
 
 
 def now_iso() -> str:
