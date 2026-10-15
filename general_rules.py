@@ -360,6 +360,9 @@ RULES: List[CategoryRule] = [
             "cologne", "colognes", "eau de parfum", "eau de toilette",
             "eau de cologne", "body mist", "fragrance mist", "aftershave",
             "after shave",
+            # Electrical grooming tools do not require FDA registration.
+            "hair clipper", "hair clippers", "hair trimmer", "hair trimmers",
+            "hair cutting tools", "hair clippers & accessories",
             "tea cup", "tea cups", "teacup", "teacups", "tea mug", "tea mugs",
             "tea pot", "teapot", "tea set", "tea infuser",
             "hair accessory", "hair accessories", "hair extension", "hair extensions",

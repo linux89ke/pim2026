@@ -607,7 +607,7 @@ def load_kebs_fda_keywords():
         return None
 
 
-def check_kebs_fda(data: pd.DataFrame) -> pd.DataFrame:
+def check_kebs_fda(data: pd.DataFrame, code_to_path: dict | None = None) -> pd.DataFrame:
     required = {"PRODUCT_SET_SID", "NAME", "BRAND", "CATEGORY_CODE"}
     if data.empty or not required.issubset(data.columns):
         return pd.DataFrame(columns=data.columns)
@@ -625,6 +625,23 @@ def check_kebs_fda(data: pd.DataFrame) -> pd.DataFrame:
     # Filter for H&B categories
     cat_mask = d["CATEGORY_CODE"].astype(str).str.strip().isin(hb_codes)
     target = d[cat_mask]
+    if target.empty:
+        return pd.DataFrame(columns=data.columns)
+
+    # Grooming devices such as hair clippers are not FDA-regulated products.
+    # Exclude them even when the broad KEBS H&B category list contains their
+    # category code.
+    tool_pattern = re.compile(
+        r"\bhair\s+(?:clipper|clippers|trimmer|trimmers)\b|"
+        r"\bhair\s+cutting\s+tools\b|hair\s+clippers\s*&\s*accessories",
+        re.IGNORECASE,
+    )
+    tool_mask = target["NAME"].fillna("").astype(str).str.contains(tool_pattern, na=False)
+    if code_to_path:
+        path_by_code = {str(code).strip(): str(path or "") for code, path in code_to_path.items()}
+        resolved_path = target["CATEGORY_CODE"].astype(str).str.strip().map(path_by_code).fillna("")
+        tool_mask |= resolved_path.str.contains(tool_pattern, na=False)
+    target = target.loc[~tool_mask]
     if target.empty:
         return pd.DataFrame(columns=data.columns)
 

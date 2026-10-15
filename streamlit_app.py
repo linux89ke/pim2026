@@ -3154,7 +3154,37 @@ def check_refurb_seller_approval(
     return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
-def check_fda(data: pd.DataFrame, country_code: str) -> pd.DataFrame:
+def _fda_nonregulated_hair_tools_mask(
+    data: pd.DataFrame, code_to_path: Optional[Dict[str, str]] = None
+) -> pd.Series:
+    """Identify grooming devices that must not enter FDA registration checks."""
+    excluded = pd.Series(False, index=data.index)
+    pattern = re.compile(
+        r"\bhair\s+(?:clipper|clippers|trimmer|trimmers)\b|"
+        r"\bhair\s+cutting\s+tools\b|hair\s+clippers\s*&\s*accessories",
+        re.IGNORECASE,
+    )
+    for column in ("NAME", "CATEGORY", "FULL_CATEGORY_PATH", "CATEGORY_PATH"):
+        if column in data.columns:
+            excluded |= data[column].fillna("").astype(str).str.contains(pattern, na=False)
+
+    if code_to_path:
+        paths_by_code = {str(code).strip(): str(path or "") for code, path in code_to_path.items()}
+        category_codes = (
+            data["CATEGORY_CODE"] if "CATEGORY_CODE" in data.columns
+            else data["_cat_clean"] if "_cat_clean" in data.columns
+            else pd.Series("", index=data.index)
+        )
+        mapped_paths = category_codes.astype(str).str.strip().map(paths_by_code).fillna("")
+        excluded |= mapped_paths.str.contains(pattern, na=False)
+    return excluded
+
+
+def check_fda(
+    data: pd.DataFrame,
+    country_code: str,
+    code_to_path: Optional[Dict[str, str]] = None,
+) -> pd.DataFrame:
     try:
         from targeted_audit_filters import load_qc_excel
         rules = load_qc_excel(country_code)
@@ -3180,6 +3210,11 @@ def check_fda(data: pd.DataFrame, country_code: str) -> pd.DataFrame:
         d["_cat_clean"].isin(mandatory_cats) |
         d["CATEGORY_CODE"].astype(str).str.strip().isin(mandatory_cats)
     ].copy()
+    # Hair clippers and related grooming devices are not FDA-regulated
+    # consumables. Exclude their product/category branch even if a QC workbook
+    # marks the category as requiring FDA documentation.
+    if not flagged.empty:
+        flagged = flagged.loc[~_fda_nonregulated_hair_tools_mask(flagged, code_to_path)].copy()
     if flagged.empty:
         return pd.DataFrame(columns=d.columns)
 
@@ -6170,7 +6205,10 @@ def validate_products(
         (
             "FDA",
             check_fda,
-            {"country_code": country_validator.code},
+            {
+                "country_code": country_validator.code,
+                "code_to_path": support_files.get("code_to_path", {}),
+            },
         ),
         (
             "Seller Approve to sell books",
@@ -6419,7 +6457,11 @@ def validate_products(
 
     if country_validator.code == "KE":
         validations.append(("KEBS Banned Products", check_kebs_banned_products, {}))
-        validations.append(("KEBS FDA", check_kebs_fda, {}))
+        validations.append((
+            "KEBS FDA",
+            check_kebs_fda,
+            {"code_to_path": support_files.get("code_to_path", {})},
+        ))
         # Evasion check: pseudo-brand + restricted product-line in title — KE only
         # (signatures sourced exclusively from KE restricted brands catalog)
         validations.append((
