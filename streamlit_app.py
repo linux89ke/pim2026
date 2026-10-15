@@ -8487,6 +8487,20 @@ def _clear_persisted_upload_batch(records: list[dict]) -> None:
         logger.warning("Could not invalidate R2 upload recovery metadata", exc_info=True)
 
 
+# A session restored by an older app version may still carry an implicitly
+# recovered upload in Streamlit session state. Drop that in-session batch on
+# upgrade too; a validation run must be started by a fresh uploader selection.
+# Keep the durable one-day spool intact, but do not load or process it here.
+if st.session_state.pop("_upload_batch_recovered", False):
+    st.session_state.cached_uploaded_files = []
+    _reset_report_state(clear_uploaded_files=False, clear_zip_cache=True)
+    st.session_state._uploader_had_files = False
+    st.session_state._uploader_detached = False
+    st.session_state._uploader_safe_key = False
+    st.session_state.last_processed_files = "empty"
+    st.session_state.uploader_key = int(st.session_state.get("uploader_key", 0) or 0) + 1
+
+
 def _materialize_uploaded_file(uploaded_file) -> dict:
     """Spool one Streamlit upload to disk and return lightweight metadata."""
     hasher = hashlib.sha256()
