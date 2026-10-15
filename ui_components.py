@@ -6650,7 +6650,7 @@ def visual_review_modal(support_files):
         _review_values = dict(zip(_fr_sid_key, _review_source))
         review_data[_review_col] = review_data["ProductSetSid"].astype(str).str.strip().map(_review_values)
         if _default is not None:
-            review_data[_review_col] = review_data[_review_col].fillna(_default)
+            review_data[_review_col] = review_data[_review_col].fillna(_default).infer_objects(copy=False)
     review_data["Learned Review Match"] = review_data["Learned Review Match"].fillna(False).astype(bool)
     # The iframe only needs provenance for the images on the current page.
     # Fetching the complete learned catalog here made every review rerun pay
