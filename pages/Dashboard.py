@@ -9,6 +9,8 @@ from io import BytesIO
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
+APP_ROOT = Path(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
+
 import pandas as pd
 import streamlit as st
 import r2_storage
@@ -61,7 +63,7 @@ if _runtime_review_matches:
 # click. Parsing and enriching tens of thousands of JSON rules on every rerun
 # made the admin page progressively heavier. Cache the complete derived frame
 # by the JSON nanosecond mtime; edits from another tab still invalidate it.
-_rules_path = Path(__file__).resolve().parents[1] / "learned_image_rules.json"
+_rules_path = APP_ROOT / "learned_image_rules.json"
 try:
     _rules_mtime_ns = _rules_path.stat().st_mtime_ns
 except OSError:
@@ -225,7 +227,7 @@ def _render_category_admin_module():
     st.caption("Review category corrections and negative category decisions used by the category matcher.")
     try:
         from category_matcher_engine import CategoryMatcherEngine
-        _db_path = Path(__file__).resolve().parents[1] / "cat_learning.db"
+        _db_path = APP_ROOT / "cat_learning.db"
         try:
             _db_mtime = _db_path.stat().st_mtime_ns
         except OSError:
@@ -306,8 +308,8 @@ def _render_admin_settings_module():
         st.toggle("Show technical diagnostics", key="dashboard_show_diagnostics")
     with _settings_cols[1]:
         st.markdown("### Data locations")
-        st.code(str(Path(__file__).resolve().parents[1] / "learned_image_rules.json"), language="text")
-        st.code(str(Path(__file__).resolve().parents[1] / "cat_learning.db"), language="text")
+        st.code(str(APP_ROOT / "learned_image_rules.json"), language="text")
+        st.code(str(APP_ROOT / "cat_learning.db"), language="text")
         if st.button("Reload learned catalog", icon=":material/refresh:", key="dashboard_reload_catalog"):
             st.cache_data.clear()
             st.success("Catalog caches cleared. The next validation will reload current rules.")
@@ -321,8 +323,8 @@ def _render_admin_diagnostics_module():
         st.dataframe(pd.DataFrame([{"Stage": key, "Seconds": value} for key, value in _timings.items()]).sort_values("Seconds", ascending=False), hide_index=True, width="stretch")
     else:
         st.info("No validation timings are available in this session yet.")
-    _rules_path = Path(__file__).resolve().parents[1] / "learned_image_rules.json"
-    _category_path = Path(__file__).resolve().parents[1] / "cat_learning.db"
+    _rules_path = APP_ROOT / "learned_image_rules.json"
+    _category_path = APP_ROOT / "cat_learning.db"
     _health = pd.DataFrame([
         {"Component": "Learned image rules", "Status": "Available" if _rules_path.exists() else "Missing", "Size": f"{_rules_path.stat().st_size / 1024 / 1024:.1f} MB" if _rules_path.exists() else "—"},
         {"Component": "Category learning", "Status": "Available" if _category_path.exists() else "Missing", "Size": f"{_category_path.stat().st_size / 1024 / 1024:.1f} MB" if _category_path.exists() else "—"},
@@ -333,7 +335,7 @@ def _render_admin_diagnostics_module():
 def _render_admin_recovery_module():
     st.markdown("## :material/backup: Backups and recovery")
     st.caption("Export a point-in-time copy before bulk edits. Restoring is explicit and does not happen during ordinary validation.")
-    _rules_path = Path(__file__).resolve().parents[1] / "learned_image_rules.json"
+    _rules_path = APP_ROOT / "learned_image_rules.json"
     _rules_payload = _rules_path.read_bytes() if _rules_path.exists() else b"[]"
     _backup_cols = st.columns(3, gap="medium")
     _backup_cols[0].metric("Learned rules", f"{len(_stored_df):,}")
@@ -904,7 +906,7 @@ def _pick(columns, names):
 
 
 def _load_hash_cache() -> dict:
-    path = Path(__file__).resolve().parents[1] / "Image_learn_cache.json"
+    path = APP_ROOT / "Image_learn_cache.json"
     try:
         with path.open("r", encoding="utf-8") as handle:
             value = json.load(handle)

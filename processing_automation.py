@@ -8,7 +8,7 @@ from collections import OrderedDict
 from typing import Iterable
 import r2_storage
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(os.path.abspath(os.path.dirname(__file__)))
 AUTOMATION_DIR = ROOT / ".validation_automation"
 MANIFEST_DIR = AUTOMATION_DIR / "manifests"
 THUMB_DIR = AUTOMATION_DIR / "thumbnails"

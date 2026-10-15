@@ -32,6 +32,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
+_APP_DIR = Path(os.path.abspath(os.path.dirname(__file__)))
+
 
 try:
     from streamlit.runtime.scriptrunner_utils.script_run_context import add_script_run_ctx, get_script_run_ctx
@@ -7601,17 +7603,24 @@ def _validate_in_chunks_unlocked(data, support_files, country_validator, data_ha
     # restoring a report produced before a rule was added or changed.
     if manifest is not None:
         _validator_digest = hashlib.sha256()
+        _validator_code_complete = True
         for _validator_module in ("streamlit_app.py", "custom_country_rules.py", "general_rules.py"):
-            _validator_path = Path(__file__).resolve().parent / _validator_module
+            _validator_path = _APP_DIR / _validator_module
             try:
                 _validator_digest.update(_validator_module.encode("utf-8"))
                 with _validator_path.open("rb") as _validator_file:
                     for _block in iter(lambda: _validator_file.read(1024 * 1024), b""):
                         _validator_digest.update(_block)
             except OSError:
-                _validator_digest.update(b"missing")
-        _validation_revision = f"{rules_revision}:{_validator_digest.hexdigest()[:20]}"
-        if manifest.get("validation_revision") != _validation_revision:
+                # A transient Windows resource error is not a source change;
+                # preserve completed chunks so a retry can resume safely.
+                _validator_code_complete = False
+                break
+        _validation_revision = (
+            f"{rules_revision}:{_validator_digest.hexdigest()[:20]}"
+            if _validator_code_complete else None
+        )
+        if _validation_revision and manifest.get("validation_revision") != _validation_revision:
             manifest["validation_revision"] = _validation_revision
             manifest["batches"] = {}
             try:
@@ -8435,10 +8444,10 @@ if country_choice and country_choice != current_country:
 
 country_validator = CountryValidator(st.session_state.selected_country)
 
-_UPLOAD_CACHE_DIR = Path(__file__).resolve().parent / ".validation_automation" / "uploads"
+_UPLOAD_CACHE_DIR = _APP_DIR / ".validation_automation" / "uploads"
 _UPLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 _UPLOAD_BATCH_REGISTRY = _UPLOAD_CACHE_DIR / "current_batch.json"
-_UPLOAD_R2_NAMESPACE = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(__file__).resolve().parent.name)[:80] or "pim-app"
+_UPLOAD_R2_NAMESPACE = re.sub(r"[^A-Za-z0-9_.-]+", "_", _APP_DIR.name)[:80] or "pim-app"
 _UPLOAD_R2_PREFIX = f"validation/uploads/{_UPLOAD_R2_NAMESPACE}/"
 
 
@@ -8450,7 +8459,7 @@ def _persist_upload_batch(records: list[dict]) -> None:
             continue
         path = Path(str(record.get("path") or ""))
         try:
-            path.resolve().relative_to(_UPLOAD_CACHE_DIR.resolve())
+            Path(os.path.abspath(os.fspath(path))).relative_to(_UPLOAD_CACHE_DIR)
         except (OSError, ValueError):
             continue
         if not path.is_file():
@@ -8514,7 +8523,7 @@ def _restore_upload_batch() -> list[dict]:
         try:
             digest = str(record.get("sha256") or "").lower()
             size = int(record.get("size") or 0)
-            path = (_UPLOAD_CACHE_DIR / f"{digest}.upload").resolve()
+            path = Path(os.path.abspath(os.fspath(_UPLOAD_CACHE_DIR / f"{digest}.upload")))
             created_raw = str(record.get("created_at") or "").strip()
             created_at = datetime.fromisoformat(created_raw.replace("Z", "+00:00")) if created_raw else datetime.now(timezone.utc)
             if created_at.tzinfo is None:
@@ -8554,8 +8563,8 @@ def _clear_persisted_upload_batch(records: list[dict]) -> None:
     """Clear local source uploads and invalidate the R2 current-batch pointer."""
     for record in records or []:
         try:
-            path = Path(str(record.get("path") or "")).resolve()
-            path.relative_to(_UPLOAD_CACHE_DIR.resolve())
+            path = Path(os.path.abspath(str(record.get("path") or "")))
+            path.relative_to(_UPLOAD_CACHE_DIR)
             path.unlink(missing_ok=True)
         except (OSError, ValueError):
             continue
