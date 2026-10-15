@@ -35,6 +35,7 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 def save_df_parquet(df, filename):
+    tmp_path = None
     try:
         os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
         pq_path = os.path.join(PARQUET_CACHE_DIR, filename)
@@ -43,8 +44,15 @@ def save_df_parquet(df, filename):
         df.to_parquet(tmp_path)
         os.replace(tmp_path, pq_path)
         r2_storage.upload_file_async(pq_path, f"validation/parquet/{filename}", "application/octet-stream")
+        return True
     except Exception as e:
         logger.warning(f"Failed to save parquet {filename}: {e}")
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        return False
 
 
 def load_df_parquet(filename):
@@ -149,6 +157,50 @@ def manual_decisions_filename(process_signature: str) -> str:
     return f"{MANUAL_DECISION_PREFIX}{hashlib.md5(str(process_signature).encode()).hexdigest()}.parquet"
 
 
+def _manual_decision_json_path(filename: str) -> str:
+    """Small, low-memory recovery journal stored beside legacy Parquet journals."""
+    return os.path.join(PARQUET_CACHE_DIR, os.path.splitext(filename)[0] + ".json")
+
+
+def _manual_decision_exists(filename: str) -> bool:
+    return any(os.path.exists(path) for path in (
+        os.path.join(PARQUET_CACHE_DIR, filename),
+        _manual_decision_json_path(filename),
+    ))
+
+
+def _load_manual_decision_file(filename: str):
+    """Load the JSON recovery copy first, falling back to older Parquet data."""
+    json_path = _manual_decision_json_path(filename)
+    try:
+        if os.path.isfile(json_path):
+            return pd.read_json(json_path, orient="records")
+    except Exception as e:
+        logger.warning("Failed to load manual-decision recovery journal %s: %s", json_path, e)
+    return load_df_parquet(filename)
+
+
+def _write_manual_decision_json(frame, filename: str) -> bool:
+    """Atomically write the compact human-review state without a Parquet allocation."""
+    path = _manual_decision_json_path(filename)
+    tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
+        frame.to_json(tmp, orient="records", force_ascii=False)
+        with open(tmp, "rb+") as handle:
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        r2_storage.upload_file_async(path, f"validation/parquet/{os.path.basename(path)}", "application/json")
+        return True
+    except Exception as e:
+        logger.warning("Failed to save manual-decision recovery journal %s: %s", path, e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
 def _safe_sequence(value):
     """Turn optional iterable session state into a list without truth-testing arrays."""
     if value is None:
@@ -168,8 +220,8 @@ def save_manual_decisions(
     file_tokens=None,
     country: str = "",
     source_data=None,
-) -> int:
-    """Persist every manually-decided row. Returns how many were written.
+) -> Optional[int]:
+    """Persist every manually-decided row. None means the checkpoint failed.
 
     file_tokens is the per-file "name+content-digest" list the signature was
     built from. It is recorded in the index so a later, larger upload can find
@@ -178,15 +230,15 @@ def save_manual_decisions(
     # Normalize stale/array-like session state before comparison; truth-testing
     # a NumPy array here raises an ambiguous truth-value TypeError.
     if process_signature is None:
-        return 0
+        return None
     if not isinstance(process_signature, str):
         process_signature = str(process_signature)
     if not process_signature or process_signature == "empty":
-        return 0
+        return None
     if not isinstance(final_report, pd.DataFrame) or final_report.empty:
-        return 0
+        return None
     if not {"Is_Manual", "ProductSetSid"}.issubset(final_report.columns):
-        return 0
+        return None
 
     fname = manual_decisions_filename(process_signature)
     decided = final_report[final_report["Is_Manual"] == True]  # noqa: E712
@@ -227,11 +279,19 @@ def save_manual_decisions(
             os.remove(os.path.join(PARQUET_CACHE_DIR, fname))
         except OSError:
             pass
+        try:
+            os.remove(_manual_decision_json_path(fname))
+        except OSError:
+            pass
         if index.pop(fname, None) is not None:
             _write_manual_index(index)
         return 0
 
-    save_df_parquet(decided, fname)
+    # Preserve reviewer decisions even when Parquet allocation fails under
+    # Windows resource pressure. Existing Parquet journals remain readable.
+    if not _write_manual_decision_json(decided, fname):
+        if not save_df_parquet(decided, fname):
+            return None
     index[fname] = {
         "files": sorted(str(t) for t in _safe_sequence(file_tokens)),
         "country": str(country or ""),
@@ -270,7 +330,7 @@ def find_predecessor_decisions(file_tokens, country: str, current_signature: str
         old = {str(t) for t in _safe_sequence(meta.get("files"))}
         if not old or not old < tokens:      # strict subset only
             continue
-        if not os.path.exists(os.path.join(PARQUET_CACHE_DIR, fname)):
+        if not _manual_decision_exists(fname):
             continue                          # index outlived its journal
         rank = (len(old), float(meta.get("saved_at") or 0))
         if best is None or rank > best["_rank"]:
@@ -285,7 +345,7 @@ def find_predecessor_decisions(file_tokens, country: str, current_signature: str
     if best is None:
         return None
 
-    decisions = load_df_parquet(best["filename"])
+    decisions = _load_manual_decision_file(best["filename"])
     if decisions is None or decisions.empty:
         return None
     best["decisions"] = decisions
@@ -342,9 +402,9 @@ def find_overlapping_decisions(product_sids, country: str, current_signature: st
         if fname == current_name or not isinstance(meta, dict) or str(meta.get("country") or "") != str(country or ""):
             continue
         path = os.path.join(PARQUET_CACHE_DIR, fname)
-        if not os.path.exists(path):
+        if not _manual_decision_exists(fname):
             continue
-        frame = load_df_parquet(fname)
+        frame = _load_manual_decision_file(fname)
         if not isinstance(frame, pd.DataFrame) or frame.empty or "ProductSetSid" not in frame.columns:
             continue
         frame = frame[frame["ProductSetSid"].astype(str).str.strip().isin(wanted)].copy()
@@ -362,7 +422,7 @@ def load_manual_decisions(process_signature: str):
     """Return the journalled decisions for an uploaded file set, or None."""
     if not process_signature or process_signature == "empty":
         return None
-    return load_df_parquet(manual_decisions_filename(process_signature))
+    return _load_manual_decision_file(manual_decisions_filename(process_signature))
 
 
 def manual_decisions_mtime(process_signature: str) -> int:
@@ -376,8 +436,16 @@ def manual_decisions_mtime(process_signature: str) -> int:
     if not process_signature or process_signature == "empty":
         return 0
     try:
-        return int(os.stat(os.path.join(PARQUET_CACHE_DIR, manual_decisions_filename(process_signature))).st_mtime_ns)
-    except OSError:
+        filename = manual_decisions_filename(process_signature)
+        return max(
+            int(os.stat(path).st_mtime_ns)
+            for path in (
+                os.path.join(PARQUET_CACHE_DIR, filename),
+                _manual_decision_json_path(filename),
+            )
+            if os.path.exists(path)
+        )
+    except (OSError, ValueError):
         return 0
 
 

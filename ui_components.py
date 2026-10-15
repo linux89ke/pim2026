@@ -1268,8 +1268,9 @@ def checkpoint_final_report(fr: pd.DataFrame = None, *, write_report: bool = Tru
     # Journal first: it is keyed on the uploaded file content alone, so it is
     # the copy that still resolves when sig_hash shifts (learning DB grows,
     # cache version bumps) and the report checkpoint below is orphaned.
+    _journal_saved = False
     try:
-        save_manual_decisions(
+        _journal_count = save_manual_decisions(
             st.session_state.get("last_processed_files"),
             fr,
             # Recorded alongside the journal so a later upload that merely adds a
@@ -1279,15 +1280,22 @@ def checkpoint_final_report(fr: pd.DataFrame = None, *, write_report: bool = Tru
             country=st.session_state.get("_process_country", ""),
             source_data=st.session_state.get("all_data_map"),
         )
+        _journal_saved = _journal_count is not None
     except Exception:
         # A cache/journal write must never interrupt an approval or rejection.
         logger.exception("Could not journal manual review decisions")
+    st.session_state["_review_save_status"] = {
+        "status": "saved" if _journal_saved else "failed",
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if not _journal_saved:
+        logger.error("Manual review checkpoint was not persisted; keep the current report open and retry saving")
 
     # Review actions already hold the updated report in memory. The manual
     # decision journal is enough to recover them after reconnect; rewriting a
     # full report Parquet on every action is slow and can exhaust Cloud memory.
     if not write_report:
-        return True
+        return _journal_saved
 
     sig = st.session_state.get("current_sig_hash")
     if not sig:
