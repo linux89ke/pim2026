@@ -3244,6 +3244,23 @@ def check_fda(
     return flagged.drop_duplicates(subset=["PRODUCT_SET_SID"])
 
 
+def check_kebs_fda_with_tool_exclusion(
+    data: pd.DataFrame, code_to_path: Optional[Dict[str, str]] = None
+) -> pd.DataFrame:
+    """Apply shared tool exclusions before calling the KEBS FDA validator.
+
+    This adapter intentionally passes no keyword arguments to the imported
+    custom validator, so mixed Cloud deployments with an older module revision
+    do not fail on ``code_to_path``. Category paths are handled here first.
+    """
+    if data is None or data.empty:
+        return pd.DataFrame(columns=getattr(data, "columns", []))
+    eligible = data.loc[~_fda_nonregulated_hair_tools_mask(data, code_to_path)]
+    if eligible.empty:
+        return pd.DataFrame(columns=data.columns)
+    return check_kebs_fda(eligible)
+
+
 def check_product_warranty(
     data: pd.DataFrame, warranty_category_codes: List[str]
 ) -> pd.DataFrame:
@@ -6478,7 +6495,7 @@ def validate_products(
         validations.append(("KEBS Banned Products", check_kebs_banned_products, {}))
         validations.append((
             "KEBS FDA",
-            check_kebs_fda,
+            check_kebs_fda_with_tool_exclusion,
             {"code_to_path": support_files.get("code_to_path", {})},
         ))
         # Evasion check: pseudo-brand + restricted product-line in title — KE only
