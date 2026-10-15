@@ -628,15 +628,38 @@ def check_kebs_fda(data: pd.DataFrame, code_to_path: dict | None = None) -> pd.D
     if target.empty:
         return pd.DataFrame(columns=data.columns)
 
-    # Grooming devices such as hair clippers are not FDA-regulated products.
-    # Exclude them even when the broad KEBS H&B category list contains their
-    # category code.
+    # Tools and appliances are not FDA-regulated consumables. Exclude their
+    # names and resolved categories even if the broad KEBS H&B list includes
+    # their code (for example curling irons, hair dryers, and clippers).
     tool_pattern = re.compile(
-        r"\bhair\s+(?:clipper|clippers|trimmer|trimmers)\b|"
-        r"\bhair\s+cutting\s+tools\b|hair\s+clippers\s*&\s*accessories",
+        r"\b(?:hair\s+)?(?:clipper|clippers|trimmer|trimmers)\b|"
+        r"\bhair\s+cutting\s+tools?\b|hair\s+clippers?\s*&\s*accessories|"
+        r"\bstyling\s+tools?\s*(?:&|and)\s*appliances?\b|"
+        r"\bcurling\s+(?:irons?|wands?)\b|\bcrimp(?:ing)?\s+irons?\b|"
+        r"\b(?:crimpers?|wavers?|waving\s+irons?|hair\s+irons?)\b|\bhair\s+straighteners?\b|"
+        r"\bhot[ -]air\s+brush(?:es)?\b|\bhair\s+dryers?\b|"
+        r"\bhair\s+rollers?\b|\bheated\s+rollers?\b|"
+        r"\b(?:hair|beard|mustache|nose|ear|eyebrow)\s+(?:brush(?:es)?|combs?|trimmers?)\b|"
+        r"\b(?:electric|powered)\s+(?:toothbrush(?:es)?|shavers?|flossers?)\b|"
+        r"\b(?:oral\s+irrigators?|water\s+flossers?|power\s+dental\s+flossers?)\b|"
+        r"\b(?:facial|face|skin)\s+(?:devices?|tools?|massagers?|steamers?|rollers?)\b|"
+        r"\b(?:facial\s+massagers?\s*(?:&|and)\s*steamers?)\b|"
+        r"\b(?:epilators?|personal\s+groomers?|body\s+groomers?|electric\s+shavers?)\b|"
+        r"\b(?:laser|light)\s+hair\s+removal\b|\bhair\s+removal\s+(?:devices?|machines?)\b|"
+        r"\b(?:nail\s+drills?|electric\s+nail\s+files?|uv\s+nail\s+lamps?|"
+        r"manicure\s+(?:&|and)\s+pedicure\s+tools?|"
+        r"manicure\s+machines?|pedicure\s+machines?)\b|"
+        r"\b(?:tattoo\s+machines?|wax\s+warmers?|hot\s+lather\s+machines?)\b|"
+        r"\b(?:massage\s+tools?|massage\s+equipment|electric\s+massagers?|"
+        r"handheld\s+massagers?|foot\s+massagers?|back\s+massagers?)\b|"
+        r"\b(?:hair|makeup|shaving|tooth)\s+brush(?:es)?\b|"
+        r"\b(?:hair|beard|mustache)\s+combs?\b",
         re.IGNORECASE,
     )
     tool_mask = target["NAME"].fillna("").astype(str).str.contains(tool_pattern, na=False)
+    for column in ("CATEGORY", "FULL_CATEGORY_PATH", "CATEGORY_PATH"):
+        if column in target.columns:
+            tool_mask |= target[column].fillna("").astype(str).str.contains(tool_pattern, na=False)
     if code_to_path:
         path_by_code = {str(code).strip(): str(path or "") for code, path in code_to_path.items()}
         resolved_path = target["CATEGORY_CODE"].astype(str).str.strip().map(path_by_code).fillna("")

@@ -3157,11 +3157,31 @@ def check_refurb_seller_approval(
 def _fda_nonregulated_hair_tools_mask(
     data: pd.DataFrame, code_to_path: Optional[Dict[str, str]] = None
 ) -> pd.Series:
-    """Identify grooming devices that must not enter FDA registration checks."""
+    """Identify non-consumable tools/devices that must not enter FDA checks."""
     excluded = pd.Series(False, index=data.index)
     pattern = re.compile(
-        r"\bhair\s+(?:clipper|clippers|trimmer|trimmers)\b|"
-        r"\bhair\s+cutting\s+tools\b|hair\s+clippers\s*&\s*accessories",
+        r"\b(?:hair\s+)?(?:clipper|clippers|trimmer|trimmers)\b|"
+        r"\bhair\s+cutting\s+tools?\b|hair\s+clippers?\s*&\s*accessories|"
+        r"\bstyling\s+tools?\s*(?:&|and)\s*appliances?\b|"
+        r"\bcurling\s+(?:irons?|wands?)\b|\bcrimp(?:ing)?\s+irons?\b|"
+        r"\b(?:crimpers?|wavers?|waving\s+irons?|hair\s+irons?)\b|\bhair\s+straighteners?\b|"
+        r"\bhot[ -]air\s+brush(?:es)?\b|\bhair\s+dryers?\b|"
+        r"\bhair\s+rollers?\b|\bheated\s+rollers?\b|"
+        r"\b(?:hair|beard|mustache|nose|ear|eyebrow)\s+(?:brush(?:es)?|combs?|trimmers?)\b|"
+        r"\b(?:electric|powered)\s+(?:toothbrush(?:es)?|shavers?|flossers?)\b|"
+        r"\b(?:oral\s+irrigators?|water\s+flossers?|power\s+dental\s+flossers?)\b|"
+        r"\b(?:facial|face|skin)\s+(?:devices?|tools?|massagers?|steamers?|rollers?)\b|"
+        r"\b(?:facial\s+massagers?\s*(?:&|and)\s*steamers?)\b|"
+        r"\b(?:epilators?|personal\s+groomers?|body\s+groomers?|electric\s+shavers?)\b|"
+        r"\b(?:laser|light)\s+hair\s+removal\b|\bhair\s+removal\s+(?:devices?|machines?)\b|"
+        r"\b(?:nail\s+drills?|electric\s+nail\s+files?|uv\s+nail\s+lamps?|"
+        r"manicure\s+(?:&|and)\s+pedicure\s+tools?|"
+        r"manicure\s+machines?|pedicure\s+machines?)\b|"
+        r"\b(?:tattoo\s+machines?|wax\s+warmers?|hot\s+lather\s+machines?)\b|"
+        r"\b(?:massage\s+tools?|massage\s+equipment|electric\s+massagers?|"
+        r"handheld\s+massagers?|foot\s+massagers?|back\s+massagers?)\b|"
+        r"\b(?:hair|makeup|shaving|tooth)\s+brush(?:es)?\b|"
+        r"\b(?:hair|beard|mustache)\s+combs?\b",
         re.IGNORECASE,
     )
     for column in ("NAME", "CATEGORY", "FULL_CATEGORY_PATH", "CATEGORY_PATH"):
@@ -3210,9 +3230,8 @@ def check_fda(
         d["_cat_clean"].isin(mandatory_cats) |
         d["CATEGORY_CODE"].astype(str).str.strip().isin(mandatory_cats)
     ].copy()
-    # Hair clippers and related grooming devices are not FDA-regulated
-    # consumables. Exclude their product/category branch even if a QC workbook
-    # marks the category as requiring FDA documentation.
+    # Tools and appliances are not FDA-regulated consumables. Exclude their
+    # product/category branches even if a QC workbook marks them mandatory.
     if not flagged.empty:
         flagged = flagged.loc[~_fda_nonregulated_hair_tools_mask(flagged, code_to_path)].copy()
     if flagged.empty:
