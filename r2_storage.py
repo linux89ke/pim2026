@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -64,9 +65,83 @@ def upload_bytes(data: bytes, key: str, content_type: str = "application/octet-s
 
 def upload_file(path: str | Path, key: str, content_type: str = "application/octet-stream") -> bool:
     try:
-        return upload_bytes(Path(path).read_bytes(), key, content_type)
+        client = _client()
+        source = Path(path)
+        if client is None or not source.is_file():
+            return False
+        client.upload_file(
+            str(source), _secret("R2_BUCKET"), str(key),
+            ExtraArgs={"ContentType": content_type},
+        )
+        return True
     except Exception as exc:
         logger.warning("Could not read R2 upload file %s: %s", path, exc)
+        return False
+
+
+def upload_file_verified(path: str | Path, key: str, content_type: str = "application/octet-stream") -> bool:
+    """Stream a file to R2 and verify its size and SHA-256 metadata."""
+    source = Path(path)
+    client = _client()
+    if client is None or not source.is_file():
+        return False
+    try:
+        digest = hashlib.sha256()
+        with source.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        sha256 = digest.hexdigest()
+        try:
+            remote = client.head_object(Bucket=_secret("R2_BUCKET"), Key=str(key))
+            if (
+                int(remote.get("ContentLength", -1)) == source.stat().st_size
+                and str(remote.get("Metadata", {}).get("sha256", "")).lower() == sha256
+            ):
+                return True
+        except Exception:
+            pass
+        client.upload_file(
+            str(source), _secret("R2_BUCKET"), str(key),
+            ExtraArgs={"ContentType": content_type, "Metadata": {"sha256": sha256}},
+        )
+        remote = client.head_object(Bucket=_secret("R2_BUCKET"), Key=str(key))
+        return (
+            int(remote.get("ContentLength", -1)) == source.stat().st_size
+            and str(remote.get("Metadata", {}).get("sha256", "")).lower() == sha256
+        )
+    except Exception as exc:
+        logger.warning("Verified R2 upload failed for %s: %s", key, exc)
+        return False
+
+
+def download_file_verified(
+    key: str, path: str | Path, *, expected_sha256: str = "", expected_size: int | None = None,
+) -> bool:
+    """Stream an R2 object to disk, then verify it before exposing the file."""
+    client = _client()
+    target = Path(path)
+    if client is None:
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(target.name + ".download")
+    try:
+        client.download_file(_secret("R2_BUCKET"), str(key), str(temp))
+        if expected_size is not None and temp.stat().st_size != int(expected_size):
+            temp.unlink(missing_ok=True)
+            return False
+        if expected_sha256:
+            digest = hashlib.sha256()
+            with temp.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest().lower() != str(expected_sha256).lower():
+                temp.unlink(missing_ok=True)
+                return False
+        os.replace(temp, target)
+        return True
+    except Exception as exc:
+        logger.warning("R2 download failed for %s: %s", key, exc)
+        temp.unlink(missing_ok=True)
         return False
 
 

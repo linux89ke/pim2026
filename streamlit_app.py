@@ -18,7 +18,7 @@ import traceback
 import unicodedata
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -1464,7 +1464,7 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
                     _IMAGE_HASH_CACHE[_key] = _ph
                 _persisted[_key] = {"size": _size, "phash": _ph}
         if _persisted:
-            save_image_metadata_cache(_persisted)
+            append_image_metadata_checkpoint(_persisted)
 
     if new_urls:
         with concurrent.futures.ThreadPoolExecutor(max_workers=_img_workers) as executor:
@@ -1528,6 +1528,11 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
                 if _payloads:
                     for _image_result in executor.map(process_zip_img, _payloads):
                         _retain_image_result(_image_result)
+                    # Archive images are also pHashed locally. Journal these
+                    # in bounded groups so a restart can reuse completed work.
+                    _done = _start + len(_slice)
+                    if _done % 50 < len(_slice) or _done >= len(zip_descriptors):
+                        _checkpoint_image_metadata(results[-min(50, len(results)):])
                 if progress_callback:
                     progress_callback(f"decoded {min(_start + len(_slice), len(zip_descriptors)):,}/{len(zip_descriptors):,} ZIP images")
                 # Dropped before the next chunk is built, so two chunks are
@@ -1642,7 +1647,7 @@ from learned_rules import (
 from processing_automation import (
     load_manifest, mark_batch, completed_batches, file_signature,
     save_chunk_results, load_chunk_results, save_stage_frame, load_stage_frame, thumbnail_data_uri,
-    load_image_metadata_cache, save_image_metadata_cache, validation_lock,
+    load_image_metadata_cache, save_image_metadata_cache, append_image_metadata_checkpoint, validation_lock,
 )
 
 # Restore successful image metadata between Streamlit reruns/restarts. This
@@ -8306,6 +8311,7 @@ def _reset_report_state(*, clear_uploaded_files: bool = False, clear_zip_cache: 
         st.session_state.pop(_k, None)
 
     if clear_uploaded_files:
+        _clear_persisted_upload_batch(st.session_state.get("cached_uploaded_files", []))
         st.session_state.cached_uploaded_files = []
         st.session_state._uploader_detached = False
         st.session_state._uploader_safe_key = False
@@ -8337,8 +8343,150 @@ if country_choice and country_choice != current_country:
 
 country_validator = CountryValidator(st.session_state.selected_country)
 
-_UPLOAD_CACHE_DIR = Path(tempfile.gettempdir()) / "pim2026_upload_cache"
+_UPLOAD_CACHE_DIR = Path(__file__).resolve().parent / ".validation_automation" / "uploads"
 _UPLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+_UPLOAD_BATCH_REGISTRY = _UPLOAD_CACHE_DIR / "current_batch.json"
+_UPLOAD_R2_NAMESPACE = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(__file__).resolve().parent.name)[:80] or "pim-app"
+_UPLOAD_R2_PREFIX = f"validation/uploads/{_UPLOAD_R2_NAMESPACE}/"
+
+
+def _persist_upload_batch(records: list[dict]) -> None:
+    """Atomically save the current batch index and mirror it to R2 when configured."""
+    files = []
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        path = Path(str(record.get("path") or ""))
+        try:
+            path.resolve().relative_to(_UPLOAD_CACHE_DIR.resolve())
+        except (OSError, ValueError):
+            continue
+        if not path.is_file():
+            continue
+        files.append({
+            "name": str(record.get("name") or path.name), "path": str(path),
+            "size": int(record.get("size") or path.stat().st_size),
+            "md5": str(record.get("md5") or ""),
+            "sha256": str(record.get("sha256") or path.stem),
+            "sha256_prefix": str(record.get("sha256_prefix") or path.stem[:24]),
+            "r2_key": str(record.get("r2_key") or f"{_UPLOAD_R2_PREFIX}{path.stem}.upload"),
+            "r2_saved": bool(record.get("r2_saved", False)),
+            "created_at": str(record.get("created_at") or datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()),
+        })
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=_UPLOAD_CACHE_DIR,
+            prefix="current_batch_", suffix=".tmp", delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump({"version": 1, "files": files}, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, _UPLOAD_BATCH_REGISTRY)
+    except OSError:
+        if temp_path:
+            temp_path.unlink(missing_ok=True)
+        logger.exception("Could not save upload recovery metadata locally")
+        return
+    try:
+        import r2_storage
+        if r2_storage.enabled():
+            saved = r2_storage.upload_file_verified(
+                _UPLOAD_BATCH_REGISTRY, f"{_UPLOAD_R2_PREFIX}current_batch.json", "application/json"
+            )
+            st.session_state["_upload_r2_registry_saved"] = bool(saved)
+    except Exception:
+        logger.warning("Could not mirror upload recovery metadata to R2", exc_info=True)
+        st.session_state["_upload_r2_registry_saved"] = False
+
+
+def _restore_upload_batch() -> list[dict]:
+    """Restore this host's latest unexpired upload batch from disk or R2."""
+    records = []
+    try:
+        payload = json.loads(_UPLOAD_BATCH_REGISTRY.read_text(encoding="utf-8"))
+        records = payload.get("files", []) if isinstance(payload, dict) else []
+    except (OSError, ValueError, TypeError):
+        try:
+            import r2_storage
+            raw = r2_storage.download_bytes(f"{_UPLOAD_R2_PREFIX}current_batch.json") if r2_storage.enabled() else b""
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+            records = payload.get("files", []) if isinstance(payload, dict) else []
+        except (OSError, ValueError, TypeError):
+            return []
+    recovered = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        try:
+            digest = str(record.get("sha256") or "").lower()
+            size = int(record.get("size") or 0)
+            path = (_UPLOAD_CACHE_DIR / f"{digest}.upload").resolve()
+            created_raw = str(record.get("created_at") or "").strip()
+            created_at = datetime.fromisoformat(created_raw.replace("Z", "+00:00")) if created_raw else datetime.now(timezone.utc)
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - created_at > timedelta(hours=24):
+                path.unlink(missing_ok=True)
+                continue
+            local_ok = path.is_file() and path.stat().st_size == size
+            if local_ok:
+                check = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for block in iter(lambda: handle.read(1024 * 1024), b""):
+                        check.update(block)
+                local_ok = check.hexdigest() == digest
+            if not local_ok:
+                import r2_storage
+                if not digest or not r2_storage.enabled() or not r2_storage.download_file_verified(
+                    str(record.get("r2_key") or f"{_UPLOAD_R2_PREFIX}{digest}.upload"), path,
+                    expected_sha256=digest, expected_size=size,
+                ):
+                    continue
+            recovered.append({
+                "name": str(record.get("name") or path.name), "path": str(path),
+                "size": size, "md5": str(record.get("md5") or ""),
+                "sha256": digest, "sha256_prefix": str(record.get("sha256_prefix") or digest[:24]),
+                "r2_key": str(record.get("r2_key") or f"{_UPLOAD_R2_PREFIX}{digest}.upload"),
+                "r2_saved": bool(record.get("r2_saved", False)), "created_at": created_at.isoformat(),
+            })
+        except (OSError, ValueError, TypeError):
+            continue
+    if recovered:
+        _persist_upload_batch(recovered)
+    return recovered
+
+
+def _clear_persisted_upload_batch(records: list[dict]) -> None:
+    """Clear local source uploads and invalidate the R2 current-batch pointer."""
+    for record in records or []:
+        try:
+            path = Path(str(record.get("path") or "")).resolve()
+            path.relative_to(_UPLOAD_CACHE_DIR.resolve())
+            path.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            continue
+    _UPLOAD_BATCH_REGISTRY.unlink(missing_ok=True)
+    try:
+        import r2_storage
+        if r2_storage.enabled():
+            r2_storage.upload_bytes(
+                b'{"version":1,"files":[]}', f"{_UPLOAD_R2_PREFIX}current_batch.json", "application/json"
+            )
+    except Exception:
+        logger.warning("Could not invalidate R2 upload recovery metadata", exc_info=True)
+
+
+if not st.session_state.get("cached_uploaded_files"):
+    _recovered_uploads = _restore_upload_batch()
+    if _recovered_uploads:
+        st.session_state.cached_uploaded_files = _recovered_uploads
+        st.session_state._uploader_had_files = True
+        st.session_state._uploader_detached = True
+        st.session_state._uploader_safe_key = True
+        st.session_state.setdefault("uploader_key", 0)
+        st.session_state._upload_batch_recovered = True
 
 
 def _materialize_uploaded_file(uploaded_file) -> dict:
@@ -8351,9 +8499,9 @@ def _materialize_uploaded_file(uploaded_file) -> dict:
     uploaded_file.seek(0)
     first = uploaded_file.read(1024 * 1024)
     if not first:
-        target = _UPLOAD_CACHE_DIR / "empty-upload"
+        target = _UPLOAD_CACHE_DIR / (hashlib.sha256(b"").hexdigest() + ".upload")
         target.touch(exist_ok=True)
-        return {"name": uploaded_file.name, "path": str(target), "size": 0, "md5": md5.hexdigest()}
+        return {"name": uploaded_file.name, "path": str(target), "size": 0, "md5": md5.hexdigest(), "sha256": hashlib.sha256(b"").hexdigest(), "sha256_prefix": hashlib.sha256(b"").hexdigest()[:24]}
     tmp = tempfile.NamedTemporaryFile(prefix="upload_", suffix=".part", dir=_UPLOAD_CACHE_DIR, delete=False)
     tmp_path = Path(tmp.name)
     try:
@@ -8367,13 +8515,20 @@ def _materialize_uploaded_file(uploaded_file) -> dict:
                 chunk = uploaded_file.read(1024 * 1024)
         digest = hasher.hexdigest()
         final_path = _UPLOAD_CACHE_DIR / f"{digest}.upload"
+        existing_valid = False
         if final_path.exists() and final_path.stat().st_size == size:
+            existing_hash = hashlib.sha256()
+            with final_path.open("rb") as existing_file:
+                for block in iter(lambda: existing_file.read(1024 * 1024), b""):
+                    existing_hash.update(block)
+            existing_valid = existing_hash.hexdigest() == digest
+        if existing_valid:
             tmp_path.unlink(missing_ok=True)
         else:
             os.replace(tmp_path, final_path)
         return {
             "name": uploaded_file.name, "path": str(final_path), "size": size,
-            "md5": md5.hexdigest(), "sha256_prefix": digest[:24],
+            "md5": md5.hexdigest(), "sha256": digest, "sha256_prefix": digest[:24],
         }
     except Exception:
         tmp_path.unlink(missing_ok=True)
@@ -8484,6 +8639,21 @@ if _batch_files_for_display:
 
     with st.container(border=True):
         st.markdown("**Files in the current validation batch**")
+        if st.session_state.get("_upload_batch_recovered"):
+            st.info(
+                "Recovered this batch after the app restarted. Completed validation chunks and saved image checks can be reused.",
+                icon=":material/history:",
+            )
+        try:
+            import r2_storage
+            if r2_storage.enabled() and st.session_state.get("_upload_r2_registry_saved"):
+                st.caption("Verified R2 recovery copy is available. Configure the bucket lifecycle prefix `validation/uploads/` to expire objects after 1 day.")
+            elif r2_storage.enabled():
+                st.caption("Local recovery is available; the R2 copy could not be verified, so Cloud restart recovery is not guaranteed.")
+            else:
+                st.caption("This batch is saved locally for restart recovery. R2 is not configured for Cloud recovery.")
+        except Exception:
+            st.caption("This batch is saved locally for restart recovery.")
         for _upload_record in _batch_files_for_display[:8]:
             st.caption(
                 f"{_upload_record.get('name', 'Uploaded file')} · "
@@ -8516,6 +8686,19 @@ if uploaded_files:
     _seen_upload_hashes = set()
     for uf in uploaded_files:
         _record = _materialize_uploaded_file(uf)
+        _record["created_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            import r2_storage
+            if r2_storage.enabled():
+                _record["r2_key"] = f"{_UPLOAD_R2_PREFIX}{_record['sha256']}.upload"
+                _record["r2_saved"] = r2_storage.upload_file_verified(
+                    _record["path"], _record["r2_key"], "application/octet-stream"
+                )
+            else:
+                _record["r2_saved"] = False
+        except Exception:
+            logger.warning("Could not save uploaded source file to R2", exc_info=True)
+            _record["r2_saved"] = False
         _md5 = _record["md5"]
         # Streamlit can return the same file more than once when the uploader
         # reruns. Keep one content copy per batch, even if the same archive was
@@ -8524,7 +8707,12 @@ if uploaded_files:
             continue
         _seen_upload_hashes.add(_md5)
         _new_cache.append(_record)
+        # Journal each completed upload so a multi-file batch can recover even
+        # if the process exits before the remaining files finish spooling.
+        _persist_upload_batch(_new_cache)
     st.session_state.cached_uploaded_files = _new_cache
+    st.session_state.pop("_upload_batch_recovered", None)
+    _persist_upload_batch(_new_cache)
     st.session_state._uploader_had_files = True
     # Detach the large UploadedFile list from the widget after the first read.
     # Otherwise Streamlit deep-copies every uploaded object during the next

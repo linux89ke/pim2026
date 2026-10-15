@@ -13,6 +13,7 @@ AUTOMATION_DIR = ROOT / ".validation_automation"
 MANIFEST_DIR = AUTOMATION_DIR / "manifests"
 THUMB_DIR = AUTOMATION_DIR / "thumbnails"
 IMAGE_CACHE_PATH = AUTOMATION_DIR / "image_metadata.json"
+IMAGE_JOURNAL_PATH = AUTOMATION_DIR / "image_metadata.checkpoints.jsonl"
 MANIFEST_DIR.mkdir(exist_ok=True, parents=True)
 THUMB_DIR.mkdir(exist_ok=True, parents=True)
 DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="image-download")
@@ -58,9 +59,49 @@ def load_image_metadata_cache(max_entries: int = 50000) -> dict:
         entries = payload.get("entries", payload)
         if not isinstance(entries, dict):
             return {}
-        return dict(list(entries.items())[-max_entries:])
+        entries = dict(list(entries.items())[-max_entries:])
     except (OSError, ValueError, TypeError):
-        return {}
+        entries = {}
+    try:
+        with IMAGE_JOURNAL_PATH.open("r", encoding="utf-8") as journal:
+            for line in journal:
+                try:
+                    item = json.loads(line)
+                    url, value = str(item.get("url") or "").strip(), item.get("value")
+                    if url and isinstance(value, dict):
+                        entries[url] = value
+                except (ValueError, TypeError):
+                    continue
+    except OSError:
+        pass
+    return dict(list(entries.items())[-max_entries:])
+
+
+def append_image_metadata_checkpoint(entries: dict) -> None:
+    """Journal successful image checks so an interrupted run can reuse them."""
+    if not isinstance(entries, dict) or not entries:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    lines = []
+    for url, value in entries.items():
+        if not str(url).strip() or not isinstance(value, dict):
+            continue
+        size, phash = value.get("size"), str(value.get("phash") or "").strip()
+        if not phash and not size:
+            continue
+        lines.append(json.dumps({"url": str(url), "value": {
+            "size": list(size) if isinstance(size, (tuple, list)) and len(size) == 2 else None,
+            "phash": phash, "updated_at": value.get("updated_at") or now,
+        }}, ensure_ascii=False, separators=(",", ":")))
+    if not lines:
+        return
+    try:
+        with _LOCK, IMAGE_JOURNAL_PATH.open("a", encoding="utf-8") as journal:
+            journal.write("\n".join(lines) + "\n")
+            journal.flush()
+            os.fsync(journal.fileno())
+    except OSError:
+        pass
 
 def save_image_metadata_cache(entries: dict, max_entries: int = 50000) -> None:
     """Atomically persist successful image metadata without touching rules."""
@@ -85,12 +126,19 @@ def save_image_metadata_cache(entries: dict, max_entries: int = 50000) -> None:
         try:
             tmp = IMAGE_CACHE_PATH.with_suffix(".tmp")
             tmp.write_text(json.dumps({"version": 1, "entries": clean}, separators=(",", ":")), encoding="utf-8")
+            replaced = False
             for _attempt in range(5):
                 try:
                     os.replace(tmp, IMAGE_CACHE_PATH)
+                    replaced = True
                     break
                 except (PermissionError, OSError):
                     time.sleep(0.05 * (2 ** _attempt))
+            if replaced:
+                try:
+                    IMAGE_JOURNAL_PATH.write_text("", encoding="utf-8")
+                except OSError:
+                    pass
             global _LAST_R2_CACHE_UPLOAD
             if r2_storage.enabled() and time.monotonic() - _LAST_R2_CACHE_UPLOAD > 30:
                 _LAST_R2_CACHE_UPLOAD = time.monotonic()
