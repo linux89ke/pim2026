@@ -8487,17 +8487,6 @@ def _clear_persisted_upload_batch(records: list[dict]) -> None:
         logger.warning("Could not invalidate R2 upload recovery metadata", exc_info=True)
 
 
-if not st.session_state.get("cached_uploaded_files"):
-    _recovered_uploads = _restore_upload_batch()
-    if _recovered_uploads:
-        st.session_state.cached_uploaded_files = _recovered_uploads
-        st.session_state._uploader_had_files = True
-        st.session_state._uploader_detached = True
-        st.session_state._uploader_safe_key = True
-        st.session_state.setdefault("uploader_key", 0)
-        st.session_state._upload_batch_recovered = True
-
-
 def _materialize_uploaded_file(uploaded_file) -> dict:
     """Spool one Streamlit upload to disk and return lightweight metadata."""
     hasher = hashlib.sha256()
