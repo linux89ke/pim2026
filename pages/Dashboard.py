@@ -5,9 +5,10 @@ import hashlib
 import os
 import shutil
 import zipfile
-from io import BytesIO
+from io import BytesIO, TextIOWrapper
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+import tempfile
 
 APP_ROOT = Path(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
 
@@ -865,12 +866,33 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
             st.success(f"Deleted {_deleted:,} learned rule(s).")
             st.rerun()
         st.download_button(
-            "Download filtered rules (CSV)",
-            _view_df[_display_cols].to_csv(index=False).encode("utf-8"),
-            file_name="learned_image_rules.csv",
-            mime="text/csv",
+            "Download filtered rules (compressed CSV)",
+            data=lambda _frame=_view_df, _columns=_display_cols: _make_compressed_csv_download(_frame, _columns),
+            file_name="learned_image_rules.csv.gz",
+            mime="application/gzip",
             key="download_learned_rules_csv",
         )
+
+
+def _make_compressed_csv_download(frame: pd.DataFrame, columns: list[str]):
+    """Build a CSV.gz on demand, without an intermediate full-size CSV string."""
+    output = tempfile.SpooledTemporaryFile(max_size=2 * 1024 * 1024, mode="w+b")
+    compressed = gzip.GzipFile(fileobj=output, mode="wb", mtime=0)
+    text = TextIOWrapper(compressed, encoding="utf-8", newline="")
+    try:
+        frame.to_csv(text, columns=columns, index=False)
+        text.flush()
+        text.detach()
+        compressed.close()
+        output.seek(0)
+        return output
+    except Exception:
+        try:
+            text.close()
+        except Exception:
+            pass
+        output.close()
+        raise
 
 
 def _normalise_columns(frame: pd.DataFrame) -> pd.DataFrame:
