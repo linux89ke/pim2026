@@ -353,6 +353,13 @@ RULES: List[CategoryRule] = [
         ],
         required_category_keyword=["health & beauty", "health and beauty"],
         exclude_keyword=[
+            # Fragrances and scent products are governed by the main,
+            # category-eligibility FDA check. Do not reject them through the
+            # broader Health & Beauty product-keyword rule.
+            "perfume", "perfumes", "fragrance", "fragrances", "scent", "scents",
+            "cologne", "colognes", "eau de parfum", "eau de toilette",
+            "eau de cologne", "body mist", "fragrance mist", "aftershave",
+            "after shave",
             "tea cup", "tea cups", "teacup", "teacups", "tea mug", "tea mugs",
             "tea pot", "teapot", "tea set", "tea infuser",
             "hair accessory", "hair accessories", "hair extension", "hair extensions",

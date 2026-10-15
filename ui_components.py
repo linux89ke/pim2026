@@ -12,7 +12,7 @@ import logging
 import re
 import time
 import zipfile
-from datetime import datetime
+import datetime as _dt
 from collections import OrderedDict
 from io import BytesIO
 
@@ -1517,8 +1517,6 @@ def apply_status_change(
                 "by_seller": _by_seller,
             }
 
-    from datetime import datetime
-
     if snapshot:
         _undo_columns = [
             c for c in ("Status", "Reason", "Comment", "FLAG", "Is_Manual", "Is_Zip")
@@ -1530,7 +1528,7 @@ def apply_status_change(
             # MB for a single approval on large uploads.
             "rows": fr.loc[mask, _undo_columns].copy(),
             "columns": _undo_columns,
-            "timestamp": datetime.now(),
+            "timestamp": _dt.datetime.now(),
         }
 
     fr.loc[mask, ["Status", "Reason", "Comment", "FLAG", "Is_Manual", "Is_Zip"]] = [
@@ -1582,7 +1580,7 @@ def apply_status_change(
         st.session_state["show_undo_toast"] = {
             "count": len(sid_set),
             "status": status,
-            "time": datetime.now(),
+            "time": _dt.datetime.now(),
         }
 
     # Every manual approve/reject funnels through here, so this is the one place
