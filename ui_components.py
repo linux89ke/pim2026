@@ -1246,7 +1246,7 @@ def render_sibling_prompt():
             st.rerun()
 
 
-def checkpoint_final_report(fr: pd.DataFrame = None) -> bool:
+def checkpoint_final_report(fr: pd.DataFrame = None, *, write_report: bool = True) -> bool:
     """Persist the current report — including manual decisions — to disk.
 
     Manual approvals/rejections otherwise live only in st.session_state, and
@@ -1277,6 +1277,12 @@ def checkpoint_final_report(fr: pd.DataFrame = None) -> bool:
         country=st.session_state.get("_process_country", ""),
         source_data=st.session_state.get("all_data_map"),
     )
+
+    # Review actions already hold the updated report in memory. The manual
+    # decision journal is enough to recover them after reconnect; rewriting a
+    # full report Parquet on every action is slow and can exhaust Cloud memory.
+    if not write_report:
+        return True
 
     sig = st.session_state.get("current_sig_hash")
     if not sig:
