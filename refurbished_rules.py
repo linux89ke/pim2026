@@ -194,6 +194,11 @@ DISCONTINUED_MODELS_CONFIG: List[Tuple[str, re.Pattern, str]] = [
         "HP EliteBook series",
     ),
     (
+        "HP Elite x2 Tablets",
+        re.compile(r"\b(?:HP\s*)?Elite\s*x2\s*(?:1012(?:\s*G[12])?|G4)\b", re.IGNORECASE),
+        "HP Elite x2 1012 / G4",
+    ),
+    (
         "HP ProBook Series",
         re.compile(r"\b(?:HP\s*)?ProBook\s*(?:[46][0-9][05]\s*G[1-9]|x360\s*11\s*G[34]\s*EE)\b", re.IGNORECASE),
         "HP ProBook series",
@@ -239,7 +244,7 @@ DISCONTINUED_MODELS_CONFIG: List[Tuple[str, re.Pattern, str]] = [
     # ------------------------------------------------------------------
     (
         "Lenovo ThinkPad Series",
-        re.compile(r"\b(?:Lenovo\s*)?ThinkPad\s*(?:X2[0-8]0|X390|X13\s*Gen\s*[12]|T4[3-9][05]s?|T495s?|T1[45]\s*Gen\s*[1-3]|L[34][4-9]0|X1\s*Carbon\s*(?:Gen\s*)?[1-8]|T25|11e|Yoga\s*11e|P5[0-3]|P14s\s*Gen\s*1|E4[89]0|E14\s*Gen\s*[12])\b", re.IGNORECASE),
+        re.compile(r"\b(?:Lenovo\s*)?ThinkPad\s*(?:X2[0-8]0|X390|X13\s*Gen\s*[12]|T4[3-9][05]s?|T495s?|T1[45]\s*Gen\s*[1-3]|L[34][4-9]0|X1\s*Carbon\s*(?:(?:Gen\s*)|G)?[1-8]|T25|11e|Yoga\s*11e|P5[0-3]|P14s\s*Gen\s*1|E4[89]0|E14\s*Gen\s*[12])\b", re.IGNORECASE),
         "Lenovo ThinkPad series",
     ),
     (
@@ -299,11 +304,12 @@ DISCONTINUED_MODELS_CONFIG: List[Tuple[str, re.Pattern, str]] = [
 
     # ------------------------------------------------------------------
     # Apple MacBooks, Desktops, Monitors & Discontinued iPhones/iPads
-    # REF-08 guard: current lineup (iPhone 15/16/17) must not be matched
+    # MacBook models listed as out of market through 2023, including common
+    # Apple model identifiers that sellers often omit the model year for.
     # ------------------------------------------------------------------
     (
         "Apple MacBooks",
-        re.compile(r"\bMacBook\s*(?:Pro|Air|12[- ]inch)?\b.*?\b(?:201[0-9]|2020|Touch\s*Bar|M[123])\b", re.IGNORECASE),
+        re.compile(r"\bMacBook\s*(?:Pro|Air|12(?:[- ]inch)?)?\b.*?\b(?:20(?:1[0-9]|2[0-3])|Touch\s*Bar|M[123](?:\s*(?:Pro|Max|Ultra))?|A(?:1369|1370|1377|1398|1425|1465|1466|1502|1534|1706|1707|1708|1932|1989|1990|2141|2179|2251|2289))\b", re.IGNORECASE),
         "Apple MacBook",
     ),
     (
