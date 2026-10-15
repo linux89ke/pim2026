@@ -1647,8 +1647,17 @@ from learned_rules import (
 from processing_automation import (
     load_manifest, mark_batch, completed_batches, file_signature,
     save_chunk_results, load_chunk_results, save_stage_frame, load_stage_frame, thumbnail_data_uri,
-    load_image_metadata_cache, save_image_metadata_cache, append_image_metadata_checkpoint, validation_lock,
+    load_image_metadata_cache, save_image_metadata_cache, validation_lock,
 )
+
+# Older Cloud checkouts may have the durable image cache helpers but predate
+# the append-only checkpoint journal. Fall back to the atomic cache writer so
+# a stale deployment remains usable while still persisting completed images.
+try:
+    from processing_automation import append_image_metadata_checkpoint
+except ImportError:
+    def append_image_metadata_checkpoint(entries):
+        save_image_metadata_cache(entries)
 
 # Restore successful image metadata between Streamlit reruns/restarts. This
 # cache contains only derived dimensions and pHashes; it never contains
