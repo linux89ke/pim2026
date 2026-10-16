@@ -295,9 +295,30 @@ def normalize_learned_flag(value: str) -> str:
     return FLAG_ALIASES.get(raw.casefold(), raw)
 
 
-def _country_scope_for_learned_flag(flag: str) -> list[str]:
-    """Keep learned image rules Kenya-only until another market is enabled."""
-    return ["KE"]
+def _country_scope_for_learned_flag(flag: str, country_code: str = "") -> list[str]:
+    """Scope new rules to the market being learned, sharing KE/UG poor images."""
+    country = str(country_code or "KE").strip().upper()
+    country_aliases = {
+        "KENYA": "KE", "UGANDA": "UG", "NIGERIA": "NG", "GHANA": "GH",
+        "MOROCCO": "MA", "EGYPT": "EG", "SENEGAL": "SN", "IVORY COAST": "CI",
+    }
+    country = country_aliases.get(country, country)
+    if country not in SUPPORTED_RULE_COUNTRIES:
+        country = "KE"
+    if normalize_learned_flag(flag) == "Poor images" and country in {"KE", "UG"}:
+        return ["KE", "UG"]
+    return [country]
+
+
+def _merge_rule_countries(existing, incoming) -> list[str]:
+    current = (
+        normalize_rule_countries(existing, legacy_global=True)
+        if existing is not None else []
+    )
+    added = normalize_rule_countries(incoming, legacy_global=False)
+    if "*" in current:
+        return current
+    return sorted(set(current).union(added))
 
 
 def normalize_rule_countries(value, *, legacy_global: bool = True) -> list[str]:
@@ -1244,7 +1265,7 @@ def learn_image_rejections(
     _unique["_learn_image_url"] = _unique[image_col].fillna("").astype(str).str.strip()
     _unique = _unique[~_unique["_learn_image_url"].str.casefold().isin({"", "nan", "none", "n/a"})]
     _created_at = datetime.now(timezone.utc).isoformat()
-    _countries = _country_scope_for_learned_flag(flag)
+    _countries = _country_scope_for_learned_flag(flag, country_code)
     records = [{
             "image_url": url,
             "phash": str(hash_by_url.get(url, "") or "").strip(),
@@ -1304,7 +1325,10 @@ def learn_image_rejections(
                      or (record["phash"] and str(item.get("phash", "")).strip().casefold() == record["phash"].casefold()))), None)
             if existing is not None:
                 old_countries = normalize_rule_countries(existing.get("countries"), legacy_global=True)
-                desired_countries = _country_scope_for_learned_flag(record["flag"])
+                desired_countries = _merge_rule_countries(
+                    old_countries,
+                    _country_scope_for_learned_flag(record["flag"], country_code),
+                )
                 if record["flag"] == "Restricted brands":
                     _brands_by_country = existing.setdefault("brand_infringed_by_country", {})
                     if not isinstance(_brands_by_country, dict):
@@ -1465,7 +1489,7 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
             continue
         hash_by_url = batch.get("hash_by_url", {}) or {}
         _country = str(batch.get("country_code", "") or "").strip().upper()
-        _countries = _country_scope_for_learned_flag(flag)
+        _countries = _country_scope_for_learned_flag(flag, _country)
         subset = data[data["PRODUCT_SET_SID"].astype(str).str.strip().isin(sid_set)]
         unique = subset.drop_duplicates(subset=["PRODUCT_SET_SID"]).copy()
         unique["_learn_image_url"] = unique[image_col].fillna("").astype(str).str.strip()
@@ -1513,7 +1537,9 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
                 continue
             # One durable image/reason row can track country-specific brands
             # without broadening the actual restriction to another market.
-            pending["countries"] = _country_scope_for_learned_flag(flag)
+            pending["countries"] = _merge_rule_countries(
+                pending.get("countries"), record.get("countries")
+            )
             pending_brands = pending.setdefault("brand_infringed_by_country", {})
             for code, brands in (record.get("brand_infringed_by_country") or {}).items():
                 current_brands = pending_brands.setdefault(code, [])
@@ -1536,7 +1562,10 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
                      or (record["phash"] and str(item.get("phash", "")).strip().casefold() == record["phash"].casefold()))), None)
             if existing is not None:
                 old_countries = normalize_rule_countries(existing.get("countries"), legacy_global=True)
-                desired_countries = _country_scope_for_learned_flag(record["flag"])
+                desired_countries = _merge_rule_countries(
+                    old_countries,
+                    record.get("countries"),
+                )
                 if record["flag"] == "Restricted brands":
                     existing_brands = existing.setdefault("brand_infringed_by_country", {})
                     for country, brands in (record.get("brand_infringed_by_country") or {}).items():
