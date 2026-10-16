@@ -296,8 +296,8 @@ def normalize_learned_flag(value: str) -> str:
 
 
 def _country_scope_for_learned_flag(flag: str) -> list[str]:
-    """Share poor-image rules between KE/UG; keep other learning KE-only."""
-    return ["KE", "UG"] if normalize_learned_flag(flag) == "Poor images" else ["KE"]
+    """Keep learned image rules Kenya-only until another market is enabled."""
+    return ["KE"]
 
 
 def normalize_rule_countries(value, *, legacy_global: bool = True) -> list[str]:
