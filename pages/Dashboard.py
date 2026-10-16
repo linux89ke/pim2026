@@ -20,6 +20,7 @@ import streamlit as st
 import r2_storage
 import supabase_store
 from processing_automation import clear_derived_image_cache
+from operational_rule_lists import render_rule_lists_admin_module
 
 from learned_rules import (
     DELETED_RULES_ARCHIVE,
@@ -420,6 +421,7 @@ with st.sidebar:
         "Module",
         [
             "Learned image rules",
+            "Rule lists",
             "Category learned rules",
             "Settings",
             "Diagnostics",
@@ -927,6 +929,9 @@ def _render_admin_recovery_module():
     st.info("Restores merge duplicate-safely. They never replace the live catalog; the last ten dashboard removals also have an Undo action.", icon=":material/info:")
 
 
+if _admin_module == "Rule lists":
+    render_rule_lists_admin_module()
+    st.stop()
 if _admin_module == "Category learned rules":
     _render_category_admin_module()
     st.stop()

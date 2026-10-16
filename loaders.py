@@ -16,6 +16,7 @@ import pandas as pd
 import streamlit as st
 
 from data_utils import clean_category_code, normalize_text
+from operational_rule_lists import get_rule_list_override, normalize_seller_name
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +270,28 @@ def load_restricted_brands_from_local(country_name: Optional[str] = None) -> Dic
                 }
                 for b_lower, data in brand_dict.items()
             ]
+            _managed_brands = get_rule_list_override("restricted_brands", tab_name)
+            if isinstance(_managed_brands, list):
+                country_rules = []
+                for _managed in _managed_brands:
+                    if not isinstance(_managed, dict):
+                        continue
+                    _brand_raw = str(_managed.get("brand_raw", _managed.get("brand", "")) or "").strip()
+                    _brand = normalize_text(str(_managed.get("brand", _brand_raw) or _brand_raw).strip())
+                    if not _brand:
+                        continue
+                    _categories = {
+                        clean_category_code(str(value).strip())
+                        for value in (_managed.get("categories") or [])
+                        if str(value).strip()
+                    }
+                    country_rules.append({
+                        "brand": _brand,
+                        "brand_raw": _brand_raw,
+                        "sellers": {normalize_text(str(value).strip()) for value in (_managed.get("sellers") or []) if str(value).strip()},
+                        "categories": _categories,
+                        "variations": [normalize_text(str(value).strip()) for value in (_managed.get("variations") or []) if str(value).strip()],
+                    })
             config_by_country[country_name] = country_rules
         except Exception as e:
             logger.warning(f"load_restricted_brands tab={tab_name}: {e}")
@@ -300,6 +323,12 @@ def load_refurb_data_from_local(country_tab: Optional[str] = None) -> dict:
         except Exception as e:
             logger.warning(f"load_refurb_data tab={tab}: {e}")
             result["sellers"][tab] = {"Phones": set(), "Laptops": set()}
+        _managed_refurb = get_rule_list_override("refurb_sellers", tab)
+        if isinstance(_managed_refurb, dict):
+            result["sellers"][tab] = {
+                "Phones": {normalize_seller_name(value) for value in (_managed_refurb.get("Phones") or []) if normalize_seller_name(value)},
+                "Laptops": {normalize_seller_name(value) for value in (_managed_refurb.get("Laptops") or []) if normalize_seller_name(value)},
+            }
     try:
         df_cats = safe_excel_read(FILE_NAME, sheet_name="Categories", usecols=[0, 1])
         if df_cats.empty:
@@ -365,6 +394,9 @@ def load_perfume_data_from_local(country_tab: Optional[str] = None) -> Dict:
         except Exception as e:
             logger.warning(f"load_perfume_data tab={tab}: {e}")
             result["sellers"][tab] = set()
+        _managed_perfume = get_rule_list_override("perfume_sellers", tab)
+        if isinstance(_managed_perfume, list):
+            result["sellers"][tab] = {normalize_seller_name(value) for value in _managed_perfume if normalize_seller_name(value)}
     try:
         df_kw = safe_excel_read(FILE_NAME, sheet_name="Keywords")
         if not df_kw.empty:
@@ -434,6 +466,9 @@ def load_books_data_from_local(country_tab: Optional[str] = None) -> Dict:
         except Exception as e:
             logger.warning(f"load_books_data tab={tab}: {e}")
             result["sellers"][tab] = set()
+        _managed_books = get_rule_list_override("books_sellers", tab)
+        if isinstance(_managed_books, list):
+            result["sellers"][tab] = {normalize_seller_name(value) for value in _managed_books if normalize_seller_name(value)}
     try:
         df_cats = safe_excel_read(FILE_NAME, sheet_name="Categories")
         if not df_cats.empty:
@@ -477,6 +512,9 @@ def load_alcohol_data_from_local() -> Dict:
             )
     except Exception as e:
         logger.warning("load_alcohol_data failed: %s", e)
+    _managed_alcohol = get_rule_list_override("alcohol_sellers", "KE")
+    if isinstance(_managed_alcohol, list):
+        result["sellers"]["KE"] = {normalize_seller_name(value) for value in _managed_alcohol if normalize_seller_name(value)}
     return result
 
 
