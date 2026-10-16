@@ -297,14 +297,14 @@ def normalize_learned_flag(value: str) -> str:
 
 def _country_scope_for_learned_flag(flag: str, country_code: str = "") -> list[str]:
     """Scope new rules to the market being learned, sharing KE/UG poor images."""
-    country = str(country_code or "KE").strip().upper()
+    country = str(country_code or "").strip().upper()
     country_aliases = {
         "KENYA": "KE", "UGANDA": "UG", "NIGERIA": "NG", "GHANA": "GH",
         "MOROCCO": "MA", "EGYPT": "EG", "SENEGAL": "SN", "IVORY COAST": "CI",
     }
     country = country_aliases.get(country, country)
     if country not in SUPPORTED_RULE_COUNTRIES:
-        country = "KE"
+        return []
     if normalize_learned_flag(flag) == "Poor images" and country in {"KE", "UG"}:
         return ["KE", "UG"]
     return [country]
@@ -1266,6 +1266,8 @@ def learn_image_rejections(
     _unique = _unique[~_unique["_learn_image_url"].str.casefold().isin({"", "nan", "none", "n/a"})]
     _created_at = datetime.now(timezone.utc).isoformat()
     _countries = _country_scope_for_learned_flag(flag, country_code)
+    if not _countries:
+        return 0
     records = [{
             "image_url": url,
             "phash": str(hash_by_url.get(url, "") or "").strip(),
@@ -1490,6 +1492,10 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
         hash_by_url = batch.get("hash_by_url", {}) or {}
         _country = str(batch.get("country_code", "") or "").strip().upper()
         _countries = _country_scope_for_learned_flag(flag, _country)
+        if not _countries:
+            if progress_callback:
+                progress_callback(batch_index, len(batches), batch)
+            continue
         subset = data[data["PRODUCT_SET_SID"].astype(str).str.strip().isin(sid_set)]
         unique = subset.drop_duplicates(subset=["PRODUCT_SET_SID"]).copy()
         unique["_learn_image_url"] = unique[image_col].fillna("").astype(str).str.strip()
