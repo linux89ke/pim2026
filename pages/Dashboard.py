@@ -4,6 +4,7 @@ import json
 import hashlib
 import gzip
 import os
+import re
 import getpass
 import shutil
 import zipfile
@@ -1534,6 +1535,15 @@ def _flag_name(value):
     return normalize_learned_flag(value)
 
 
+def _infer_source_country(source_name):
+    """Infer KE/UG provenance from report/archive names when no column exists."""
+    tokens = re.findall(r"(?<![A-Z0-9])(KENYA|UGANDA|KE|UG)(?![A-Z0-9])", str(source_name or "").upper())
+    codes = ["KE" if token in {"KENYA", "KE"} else "UG" for token in tokens]
+    # An archive and its member should normally repeat the same country. If
+    # their names disagree, leave provenance blank instead of guessing.
+    return codes[-1] if codes and len(set(codes)) == 1 else ""
+
+
 def _report_frames(uploaded):
     """Yield (display_name, bytes) for reports or reports inside ZIP/RAR files."""
     name = uploaded.name.lower()
@@ -1656,7 +1666,10 @@ if uploads:
                 )
                 work.loc[~work["_COUNTRY_CODE"].isin(SUPPORTED_RULE_COUNTRIES), "_COUNTRY_CODE"] = ""
             else:
-                work["_COUNTRY_CODE"] = ""
+                work["_COUNTRY_CODE"] = _infer_source_country(source_name)
+            _source_country = _infer_source_country(source_name)
+            if _source_country:
+                work.loc[work["_COUNTRY_CODE"].eq(""), "_COUNTRY_CODE"] = _source_country
             work["_SOURCE_FILE"] = source_name
             work["_REASON"] = work[reason_col].astype(str) if reason_col else "Imported historical rejection"
             prepared.append(work)
@@ -1700,8 +1713,19 @@ if uploads:
                     f"All {len(preview):,} eligible rows are already in the learned catalog. No new rules will be added.",
                     icon=":material/content_copy:",
                 )
+        preview["_APPLIES_IN"] = preview["FLAG"].map(
+            lambda value: "Kenya, Uganda" if normalize_learned_flag(value) == "Poor images" else "Kenya"
+        )
+        st.caption("Source country is inferred from the file when possible. Applies in shows the learned-rule scope that will be saved.")
+        preview_display = preview[[
+            "PRODUCT_SET_SID", "MAIN_IMAGE", "FLAG", "_COUNTRY_CODE", "_APPLIES_IN", "_SOURCE_FILE"
+        ]].rename(columns={
+            "_COUNTRY_CODE": "SOURCE COUNTRY",
+            "_APPLIES_IN": "APPLIES IN",
+            "_SOURCE_FILE": "SOURCE FILE",
+        })
         st.dataframe(
-            preview[["PRODUCT_SET_SID", "MAIN_IMAGE", "FLAG", "_COUNTRY_CODE", "_SOURCE_FILE"]].head(100),
+            preview_display.head(100),
             hide_index=True,
             width="stretch",
         )
