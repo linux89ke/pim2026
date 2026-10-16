@@ -297,6 +297,14 @@ def normalize_learned_flag(value: str) -> str:
 
 def _country_scope_for_learned_flag(flag: str, country_code: str = "") -> list[str]:
     """Scope new rules to the market being learned, sharing KE/UG poor images."""
+    normalized_flag = normalize_learned_flag(flag)
+    if normalized_flag in {
+        "Suspected Fake product",
+        "Counterfeit Sneakers",
+        "Suspected counterfeit Jerseys",
+        "Category Check – Replica Jersey / IP Violation",
+    }:
+        return ["*"]
     country = str(country_code or "").strip().upper()
     country_aliases = {
         "KENYA": "KE", "UGANDA": "UG", "NIGERIA": "NG", "GHANA": "GH",
@@ -305,7 +313,7 @@ def _country_scope_for_learned_flag(flag: str, country_code: str = "") -> list[s
     country = country_aliases.get(country, country)
     if country not in SUPPORTED_RULE_COUNTRIES:
         return []
-    if normalize_learned_flag(flag) == "Poor images" and country in {"KE", "UG"}:
+    if normalized_flag == "Poor images" and country in {"KE", "UG"}:
         return ["KE", "UG"]
     return [country]
 
@@ -317,7 +325,9 @@ def _merge_rule_countries(existing, incoming) -> list[str]:
     )
     added = normalize_rule_countries(incoming, legacy_global=False)
     if "*" in current:
-        return current
+        return ["*"]
+    if "*" in added:
+        return ["*"]
     return sorted(set(current).union(added))
 
 
