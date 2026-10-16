@@ -128,11 +128,21 @@ def import_image_rules(
     key: str,
     path: Path,
     batch_size: int,
+    allow_small: bool = False,
 ) -> int:
     with path.open("r", encoding="utf-8") as handle:
         source = json.load(handle)
     if not isinstance(source, list):
         raise ValueError(f"{path} must contain a JSON list")
+    valid_count = sum(
+        1 for raw in source
+        if isinstance(raw, dict) and _clean_url(raw.get("image_url")) and _clean(raw.get("flag"))
+    )
+    if valid_count < 100 and not allow_small:
+        raise ValueError(
+            f"Refusing to migrate only {valid_count:,} learned rules from {path}. "
+            "This may be a partial catalog; pass --allow-small-rules only after confirming it."
+        )
 
     def rows():
         for raw in source:
@@ -166,9 +176,26 @@ def import_image_rules(
             yield item
 
     imported = 0
+    seen = set()
     for batch in _chunks(rows(), batch_size):
-        _post_batch(session, endpoint, batch, key, on_conflict="image_url,flag")
-        imported += len(batch)
+        unique = []
+        for item in batch:
+            identity = (item.get("phash") or item.get("image_url"), item.get("flag"))
+            if identity not in seen:
+                seen.add(identity)
+                unique.append(item)
+        hashed = [item for item in unique if item.get("phash")]
+        unhashed = [item for item in unique if not item.get("phash")]
+        if hashed:
+            _post_batch(session, endpoint, hashed, key, on_conflict="phash,flag")
+            imported += len(hashed)
+        for item in unhashed:
+            try:
+                _post_batch(session, endpoint, [item], key)
+                imported += 1
+            except RuntimeError as exc:
+                if "409" not in str(exc) and "duplicate" not in str(exc).lower():
+                    raise
         print(f"Image rules: {imported:,} uploaded", flush=True)
     return imported
 
@@ -245,6 +272,11 @@ def main() -> int:
     )
     parser.add_argument("--skip-rules", action="store_true")
     parser.add_argument("--skip-categories", action="store_true")
+    parser.add_argument(
+        "--allow-small-rules",
+        action="store_true",
+        help="Allow migration of fewer than 100 learned image rules after manual review",
+    )
     args = parser.parse_args()
 
     if args.batch_size < 1 or args.batch_size > 2_000:
@@ -260,6 +292,7 @@ def main() -> int:
                 key,
                 args.rules,
                 args.batch_size,
+                args.allow_small_rules,
             )
         if not args.skip_categories:
             import_categories(

@@ -13,6 +13,7 @@ import re
 import time
 import zipfile
 import datetime as _dt
+from pathlib import Path
 from collections import OrderedDict
 from io import BytesIO
 
@@ -25,6 +26,7 @@ from PIL import Image
 
 from constants import (
     GRID_COLS, JUMIA_COLORS,
+    PARQUET_CACHE_DIR,
     PHASH_MATCH_MAX_DISTANCE,
     SNEAKER_BRAND_ALIASES as _SNEAKER_ALIASES,
     # Shared with check_image_stretched: the grid badges the band the server
@@ -64,15 +66,31 @@ from learned_rules import (
     remove_learned_rule_match,
     normalize_learned_flag,
 )
-import importlib
-import targeted_audit as _ta_mod
-try:
-    importlib.reload(_ta_mod)
-except Exception:
-    pass
 from targeted_audit import targeted_audit_modal
 
 logger = logging.getLogger(__name__)
+
+
+def _persist_timing_history_stage(stage: str, seconds: float) -> None:
+    """Attach a later report/export timing to the current upload history row."""
+    signature = str(st.session_state.get("last_processed_files", "") or "")
+    if not signature or signature in {"empty", "error"}:
+        return
+    path = Path(PARQUET_CACHE_DIR) / "validation_timing_history.json"
+    try:
+        history = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+        if not isinstance(history, list):
+            return
+        row = next((item for item in history if isinstance(item, dict) and item.get("signature") == signature), None)
+        if row is None:
+            return
+        row.setdefault("stages", {})[str(stage)] = round(float(seconds), 3)
+        temp = path.with_suffix(".json.tmp")
+        temp.write_text(json.dumps(history, ensure_ascii=False), encoding="utf-8")
+        temp.replace(path)
+        st.session_state["validation_timing_history"] = history
+    except (OSError, ValueError, TypeError):
+        logger.exception("Could not update timing history for %s", stage)
 
 # Registered by streamlit_app after its pipeline functions are defined. Calling
 # back through this hook avoids importing/re-executing streamlit_app from
@@ -859,12 +877,34 @@ def _add_sids_to_post_qc_results(sid_set: set, flag: str, comment: str = "") -> 
         results[base_flag] = base_rows
 
 
+def _preferred_image_series(all_data):
+    """Return the first non-empty image value from IMAGE1/MAIN_IMAGE fields."""
+    if all_data is None:
+        return None
+    # Validation result frames are intentionally narrow and, depending on the
+    # upload source, the image may be stored under any of these aliases.  Keep
+    # one canonical SID -> image map so the gallery can recover the original
+    # URL even when the result row itself omitted image columns.
+    cols = [
+        c for c in (
+            "IMAGE1", "image1", "MAIN_IMAGE", "MAIN_IMAGE_URL", "IMAGE_URL",
+            "IMAGE", "Image", "MainImage", "IMAGE_URL_1", "Image1",
+        )
+        if c in all_data.columns
+    ]
+    if not cols:
+        return None
+    values = all_data[cols].replace(r"^\s*$", pd.NA, regex=True)
+    return values.bfill(axis=1).iloc[:, 0]
+
+
 def _get_image_maps(all_data):
     if "_image_maps" not in st.session_state or st.session_state.get("_image_maps_df_id") != id(all_data):
-        if all_data is None or "PRODUCT_SET_SID" not in all_data.columns or "IMAGE1" not in all_data.columns:
+        _images = _preferred_image_series(all_data)
+        if all_data is None or "PRODUCT_SET_SID" not in all_data.columns or _images is None:
             st.session_state["_image_maps"] = ({}, {})
         else:
-            sid_to_img = dict(zip(all_data["PRODUCT_SET_SID"].astype(str).str.strip(), all_data["IMAGE1"]))
+            sid_to_img = dict(zip(all_data["PRODUCT_SET_SID"].astype(str).str.strip(), _images))
             img_to_sids = {}
             for sid, img in sid_to_img.items():
                 if pd.isna(img) or not str(img).strip():
@@ -982,6 +1022,7 @@ def _get_phash_maps(all_data):
     keys lets the cascade find near hashes within the shared conservative
     distance threshold without comparing every product pair.
     """
+    _images = _preferred_image_series(all_data)
     if (
         "_phash_maps" in st.session_state
         and st.session_state.get("_phash_maps_df_id") == id(all_data)
@@ -993,12 +1034,12 @@ def _get_phash_maps(all_data):
         all_data is None
         or not hash_by_url
         or "PRODUCT_SET_SID" not in getattr(all_data, "columns", [])
-        or "MAIN_IMAGE" not in getattr(all_data, "columns", [])
+        or _images is None
     ):
         maps = ({}, {})
     else:
         sids = all_data["PRODUCT_SET_SID"].astype(str).str.strip()
-        imgs = all_data["MAIN_IMAGE"].astype(str)
+        imgs = _images.astype(str)
         sid_to_phash = {}
         phash_to_sids = {}
         for sid, img in zip(sids, imgs):
@@ -1274,29 +1315,32 @@ def checkpoint_final_report(fr: pd.DataFrame = None, *, write_report: bool = Tru
             st.session_state.get("last_processed_files"),
             fr,
             # Recorded alongside the journal so a later upload that merely adds a
-            # file to this set can still find it. Without these the journal is
-            # written exactly as before, just not discoverable.
+            # file to this set can still find it. Without these the entry is still
+            # written, just not discoverable.
             file_tokens=st.session_state.get("_process_file_tokens"),
             country=st.session_state.get("_process_country", ""),
             source_data=st.session_state.get("all_data_map"),
         )
         _journal_saved = _journal_count is not None
+        if not _journal_saved:
+            logger.error("Manual review checkpoint was not persisted; keep the current report open and retry saving")
     except Exception:
         # A cache/journal write must never interrupt an approval or rejection.
+        # The in-session report remains authoritative and the failure is visible
+        # in logs for diagnosis.
         logger.exception("Could not journal manual review decisions")
     st.session_state["_review_save_status"] = {
         "status": "saved" if _journal_saved else "failed",
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "saved_at": _dt.datetime.now().isoformat(timespec="seconds"),
     }
-    if not _journal_saved:
-        logger.error("Manual review checkpoint was not persisted; keep the current report open and retry saving")
 
-    # Review actions already hold the updated report in memory. The manual
-    # decision journal is enough to recover them after reconnect; rewriting a
-    # full report Parquet on every action is slow and can exhaust Cloud memory.
+    # The manual journal is the durable, content-addressed recovery source.
+    # Visual-review close actions already have the updated report in memory;
+    # rewriting a large report Parquet here duplicates the work and blocks the
+    # close rerun.  Full report checkpoints remain available to callers that
+    # need an on-disk snapshot (startup/export/undo paths).
     if not write_report:
         return _journal_saved
-
     sig = st.session_state.get("current_sig_hash")
     if not sig:
         return False
@@ -1359,11 +1403,19 @@ def apply_status_change(
     _sibling_sids = sorted({s for v in _sibling_map.values() for s in v})
     _severity = flag_severity(flag) if _sibling_sids else None
     _same_category_rule = flag in {"Wrong Category", "Category Check"}
+    # These image findings describe a property of the shared photo, so apply
+    # them to matching listings automatically as well as the existing blocker
+    # reasons. Keep the URL/pHash and product-name safeguards below; this does
+    # not turn a shared stock photo on unrelated listings into a cascade.
+    _auto_image_flags = {
+        "Image Too Many things displayed",
+        "Image Mismatch",
+        "NSFW Images",
+    }
     _cascadeable = (
         _severity == "blocker"
-        or flag == "Image Too Many things displayed"
-        or _is_image_rej
         or _same_category_rule
+        or (_is_image_rej and flag in _auto_image_flags)
     )
 
     if _sibling_sids and _cascadeable:
@@ -1405,7 +1457,8 @@ def apply_status_change(
     # no phash was computed yet).  Applies the same name-match guard.
     if _is_image_rej:
         all_data = st.session_state.get("all_data_map")
-        if all_data is not None and "PRODUCT_SET_SID" in all_data.columns and "IMAGE1" in all_data.columns:
+        _images = _preferred_image_series(all_data)
+        if all_data is not None and "PRODUCT_SET_SID" in all_data.columns and _images is not None:
             sid_to_img, img_to_sids = _get_image_maps(all_data)
             _name_map_url = _get_sid_name_map(all_data)
             # snapshot the set BEFORE expanding so we compare against originals
@@ -1462,9 +1515,14 @@ def apply_status_change(
                     if "Learned Rule pHash" in _selected_learned.columns
                     else pd.Series("", index=_selected_learned.index)
                 )
+                _rule_flags_col = (
+                    _selected_learned["Learned Rule Flag"]
+                    if "Learned Rule Flag" in _selected_learned.columns
+                    else _selected_learned["FLAG"]
+                )
                 _groups = {}
                 for _row_index, _row in _selected_learned.iterrows():
-                    _learned_flag = normalize_learned_flag(_row.get("FLAG", ""))
+                    _learned_flag = normalize_learned_flag(_rule_flags_col.loc[_row_index])
                     if not _learned_flag:
                         continue
                     _url_value = _rule_urls_col.loc[_row_index]
@@ -1483,6 +1541,7 @@ def apply_status_change(
                         _learned_flag,
                         rule_urls=_identities["urls"],
                         rule_phashes=_identities["phashes"],
+                        country_code=str(st.session_state.get("_process_country", "") or ""),
                         explicit_approval=True,
                     )
             if _removed_learned:
@@ -1559,6 +1618,7 @@ def apply_status_change(
                 comment=comment,
                 source="iframe",
                 hash_by_url=st.session_state.get("_image_phash_by_url", {}),
+                country_code=str(st.session_state.get("_process_country", "") or ""),
             )
         except Exception:
             logger.exception("Could not persist iframe learned image rule for %s", flag)
@@ -2112,9 +2172,11 @@ def _resolve_preview_urls(df: pd.DataFrame) -> list:
         usable = empty & ~_candidate_text.str.casefold().isin({"", "nan", "none", "null"})
         img_s.loc[usable] = candidate[usable]
 
-    # Compact validation result rows may carry the SID and issue text but no
-    # image column. Recover the original upload image from the per-upload SID
-    # map so the gallery does not incorrectly show "Image unavailable".
+    # A validator result is deliberately compact and can contain only the
+    # SID, name and detected issue.  In that case the row has no image column
+    # even though the uploaded product did.  Recover it from the source map
+    # built once for the current upload instead of reporting a misleading
+    # "Image unavailable" state.
     _source = st.session_state.get("all_data_map")
     if isinstance(_source, pd.DataFrame) and not _source.empty:
         try:
@@ -2124,16 +2186,18 @@ def _resolve_preview_urls(df: pd.DataFrame) -> list:
             )
             if _sid_col and "PRODUCT_SET_SID" in _source.columns:
                 _sid_to_img, _ = _get_image_maps(_source)
+                _sids = df[_sid_col].fillna("").astype(str).str.strip().tolist()
                 _fallback = [
-                    _sid_to_img.get(sid, "")
-                    for sid in df[_sid_col].fillna("").astype(str).str.strip()
+                    _sid_to_img.get(sid, "") if sid else ""
+                    for sid in _sids
                 ]
                 _fallback_s = pd.Series(_fallback, index=df.index, dtype=object)
                 _empty = img_s.fillna("").astype(str).str.strip().str.casefold().isin({"", "nan", "none", "null"})
                 _fallback_ok = ~_fallback_s.fillna("").astype(str).str.strip().str.casefold().isin({"", "nan", "none", "null"})
                 img_s = img_s.mask(_empty & _fallback_ok, _fallback_s)
         except Exception:
-            # Preview recovery must never prevent the validation table from rendering.
+            # Preview recovery is best effort and must never prevent a
+            # validation table from rendering.
             pass
 
     names = df.get("NAME", pd.Series([""] * len(df), index=df.index)).fillna("").astype(str).values
@@ -2166,6 +2230,7 @@ def render_flag_expander(
     support_files,
     country_validator,
     validation_runner,
+    cache_revision=None,
 ):
     try:
         from category_matcher_engine import get_engine
@@ -2174,7 +2239,17 @@ def render_flag_expander(
     except ImportError:
         _CAT_MATCHER_AVAILABLE = False
 
-    cache_key = f"display_df_{title}_{df_hash(data)}_{df_hash(df_flagged_sids)}_prefetch_context_v6_learned_remove"
+    # The caller can provide an upload/report revision. Hashing both complete
+    # frames here ran once per validation expander, turning a UI redraw into
+    # dozens of full-frame hashing passes. Keep content hashing as a safe
+    # fallback for other callers.
+    if cache_revision is None:
+        cache_revision = f"{df_hash(data)}:{df_hash(df_flagged_sids)}"
+    _display_version = st.session_state.get(f"df_ver_{title}", 0)
+    cache_key = (
+        f"display_df_{title}_{cache_revision}_"
+        f"{_display_version}_prefetch_context_v6_learned_remove"
+    )
     base_display_cols = [
         "PRODUCT_SET_SID",
         "NAME",
@@ -2287,12 +2362,12 @@ def render_flag_expander(
         if df_display["Overturned"].eq("").all():
             _extra_cols = [c for c in _extra_cols if c != "Overturned"]
         else:
-            # Streamlit/pandas may preserve a categorical dtype here. Cast to
-            # object before replacing so current pandas versions do not emit a
-            # FutureWarning on every validation expander rerun.
-            df_display["Overturned"] = df_display["Overturned"].astype(object).replace(
-                {"Overturned": "🔓 Overturned"}
-            )
+            # Streamlit/pandas may preserve a categorical dtype here. Convert
+            # through map/object so current pandas versions do not emit a
+            # downcasting warning on every validation expander rerun.
+            df_display["Overturned"] = df_display["Overturned"].map(
+                lambda value: "🔓 Overturned" if value == "Overturned" else value
+            ).astype(object)
 
         _di = df_display["Detected Issue"].astype(str).str.strip()
         df_display["Detected Issue"] = _di.where(
@@ -2466,6 +2541,20 @@ def render_flag_expander(
         df_view = df_view.sort_values("CATEGORY", na_position="last")
     df_view = df_view.reset_index(drop=True)
 
+    # In image mode, put learned rejections first so the reviewer can audit
+    # the highest-impact rows immediately.  Stable sorting preserves the
+    # existing category/order within each group.
+    if show_table_images and "Learned Match" in df_view.columns:
+        _learned_sort = df_view["Learned Match"].map(
+            lambda value: 1 if value is True or str(value).strip().casefold() in {"true", "1", "yes", "y"} else 0
+        )
+        df_view = (
+            df_view.assign(_learned_first=_learned_sort)
+            .sort_values("_learned_first", ascending=False, kind="stable")
+            .drop(columns=["_learned_first"])
+            .reset_index(drop=True)
+        )
+
     # The "Source" column is gone. ZIP provenance is already stated twice
     # around this table — in the expander label ("⚡ ZIP") and in the flag
     # header badge — so a whole column repeating it per row was spending the
@@ -2621,9 +2710,22 @@ def render_flag_expander(
         # Keep the table for selection, and add a readable gallery for normal
         # review. It is limited to the current page to avoid extra network work.
         st.markdown("**Image gallery**")
-        _gallery_learned_rules = load_learned_image_rules_for_urls(
-            _preview_urls[: min(len(_preview_urls), 40)]
-        )
+        _GALLERY_PAGE_SIZE = 24
+        _gallery_total = len(df_view)
+        _gallery_pages = max(1, (_gallery_total + _GALLERY_PAGE_SIZE - 1) // _GALLERY_PAGE_SIZE)
+        _gallery_page = st.pagination(_gallery_pages, key=f"flag_gallery_pg_{title}_{_flag_pg}") - 1
+        _gallery_lo = _gallery_page * _GALLERY_PAGE_SIZE
+        _gallery_hi = min(_gallery_lo + _GALLERY_PAGE_SIZE, _gallery_total)
+        st.caption(f"Image review {_gallery_lo + 1:,}–{_gallery_hi:,} of {_gallery_total:,}")
+        _gallery_df = df_view.iloc[_gallery_lo:_gallery_hi].reset_index(drop=True)
+        _gallery_preview_urls = _resolve_preview_urls(_gallery_df)
+        # A pHash match can point at a different CDN URL than the product's
+        # current image. Fetch the stored rule URL as well so the remove
+        # action is available for exact and near-pHash matches alike.
+        _gallery_rule_urls = list(_gallery_preview_urls)
+        if "Learned Rule URL" in _gallery_df.columns:
+            _gallery_rule_urls.extend(_gallery_df["Learned Rule URL"].fillna("").astype(str).tolist())
+        _gallery_learned_rules = load_learned_image_rules_for_urls(_gallery_rule_urls)
         _gallery_rules_by_url = {
             str(_r.get("image_url", "")).strip(): _r
             for _r in _gallery_learned_rules
@@ -2638,23 +2740,28 @@ def render_flag_expander(
             and str(_r.get("status", "active")).casefold() == "active"
             and str(_r.get("phash", "")).strip()
         }
-        _gallery_limit = min(len(df_view), 40)
+        _gallery_limit = len(_gallery_df)
+        _gallery_bulk_rules = {}
         for _gallery_start in range(0, _gallery_limit, 4):
             _gallery_cols = st.columns(4, gap="small")
             for _gallery_col, _gallery_idx in zip(
                 _gallery_cols, range(_gallery_start, min(_gallery_start + 4, _gallery_limit))
             ):
                 with _gallery_col:
-                    _gallery_row = df_view.iloc[_gallery_idx]
+                    _gallery_row = _gallery_df.iloc[_gallery_idx]
                     _gallery_sid = str(_gallery_row.get("PRODUCT_SET_SID", "")).strip()
                     _gallery_name = str(_gallery_row.get("NAME", "")).strip()
                     _gallery_issue = str(_gallery_row.get("Detected Issue", "")).strip()
                     if _gallery_issue.casefold() in {"nan", "none", "rejected", "manual rejection"}:
                         _gallery_issue = ""
                     _gallery_brand = str(_gallery_row.get("BRAND", "")).strip()
+                    _gallery_comment = str(_gallery_row.get("Comment", "") or _gallery_row.get("COMMENT", "") or "").strip()
                     _gallery_learned = _gallery_row.get("Learned Match", False)
-                    _gallery_tag = "Learned rule" if _gallery_learned is True or str(_gallery_learned).casefold() in {"true", "1", "yes"} else ""
+                    _learned_bool = _gallery_learned is True or str(_gallery_learned).casefold() in {"true", "1", "yes"}
+                    _learned_text = "image fingerprint match" in (_gallery_issue + " " + _gallery_comment).casefold() or "known blocked image" in (_gallery_issue + " " + _gallery_comment).casefold()
+                    _gallery_tag = "Learned rule" if _learned_bool or _learned_text else ""
                     _gallery_overturned = str(_gallery_row.get("Overturned", "")).strip().casefold() in {"overturned", "🔓 overturned"}
+                    _gallery_url = _gallery_preview_urls[_gallery_idx]
                     _gallery_rule = None
                     if _gallery_tag:
                         _gallery_rule_url = str(_gallery_row.get("Learned Rule URL", "") or "").strip()
@@ -2666,8 +2773,39 @@ def render_flag_expander(
                         if _gallery_rule is None:
                             _gallery_image_url = str(_gallery_row.get("MAIN_IMAGE", "") or "").strip()
                             _gallery_rule = _gallery_rules_by_url.get(_gallery_image_url)
-                    _gallery_url = _preview_urls[_gallery_idx]
-                    if _gallery_url:
+                    # A cached report can retain learned provenance after the
+                    # page-level rule lookup has expired, especially for a
+                    # pHash match whose stored URL differs from the current
+                    # CDN URL. Keep the action visible by using the recorded
+                    # URL/pHash as the deletion identity; the deletion helper
+                    # will remove every associated catalog record.
+                    if _gallery_tag and _gallery_rule is None:
+                        _fallback_rule_url = str(
+                            _gallery_row.get("Learned Rule URL", "")
+                            or _gallery_row.get("MAIN_IMAGE", "")
+                            or _gallery_url
+                        ).strip()
+                        _fallback_rule_phash = str(
+                            _gallery_row.get("Learned Rule pHash", "") or ""
+                        ).strip()
+                        if _fallback_rule_url or _fallback_rule_phash:
+                            _gallery_rule = {
+                                "image_url": _fallback_rule_url,
+                                "phash": _fallback_rule_phash,
+                                "flag": str(_gallery_row.get("FLAG", title) or title),
+                            }
+                    if _gallery_tag and _gallery_rule:
+                        _gallery_bulk_rules[_gallery_sid] = _gallery_rule
+                    if _gallery_url and _gallery_tag:
+                        _ring_url = html_lib.escape(str(_gallery_url), quote=True)
+                        st.markdown(
+                            f"<div style='width:220px;height:220px;padding:4px;border:4px solid #dc2626;"
+                            f"border-radius:14px;box-shadow:0 0 0 3px rgba(220,38,38,.18),0 4px 12px rgba(220,38,38,.18);"
+                            f"box-sizing:border-box;background:#fff;'><img src='{_ring_url}' alt='Learned image match' "
+                            f"style='width:100%;height:100%;object-fit:contain;border-radius:8px;'></div>",
+                            unsafe_allow_html=True,
+                        )
+                    elif _gallery_url:
                         st.image(_gallery_url, width=220)
                     else:
                         st.markdown(
@@ -2701,24 +2839,59 @@ def render_flag_expander(
                         if _gallery_brand and _gallery_brand.casefold() not in {"nan", "none"} else ""
                     )
                     if _gallery_tag and _gallery_rule:
+                        _identity_urls = {str(_gallery_rule.get("image_url", "") or "").strip(), str(_gallery_url or "").strip()}
+                        _identity_phash = str(_gallery_rule.get("phash", "") or "").strip()
+                        _other_learned_reasons = sorted({
+                            str(_r.get("flag", "")).strip() for _r in _gallery_learned_rules
+                            if isinstance(_r, dict)
+                            and str(_r.get("flag", "")).strip()
+                            and ((str(_r.get("image_url", "")).strip() in _identity_urls and str(_r.get("image_url", "")).strip())
+                                 or (_identity_phash and str(_r.get("phash", "")).strip() == _identity_phash))
+                        })
+                        if len(_other_learned_reasons) > 1:
+                            st.caption("Other learned reasons remain: " + ", ".join(_other_learned_reasons))
+                        _select_key = "select_learned_preview_" + hashlib.md5(
+                            f"{title}|{_gallery_sid}".encode("utf-8", "ignore")
+                        ).hexdigest()[:12]
+                        st.checkbox(
+                            "Select for removal",
+                            key=_select_key,
+                            help="Include this learned image reason in a bulk removal.",
+                        )
                         _remove_key = "remove_learned_preview_" + hashlib.md5(
                             f"{title}|{_gallery_sid}".encode("utf-8", "ignore")
                         ).hexdigest()[:12]
                         if st.button(
-                            "Remove learned rule",
+                            "Remove this learned reason",
                             key=_remove_key,
                             type="secondary",
                             icon=":material/delete:",
-                            help="Remove the exact learned image rule matched by this product.",
+                            help="Remove this reason for the matched image. Other reasons for the same image remain.",
                         ):
                             _removed = delete_learned_image_rules([_gallery_rule])
                             if _removed:
                                 st.session_state.display_df_cache = {}
                                 st.session_state.pop("_learned_image_rule_map_cache", None)
                                 st.toast(
-                                    "Learned image rule removed. Run validation again to refresh this product's verdict.",
+                                    "Learned reason removed. Other learned reasons and normal validators can still reject this product; rerun validation to refresh its verdict.",
                                     icon=":material/check_circle:",
                                 )
+                                st.rerun()
+                        _remove_all_key = "remove_all_learned_preview_" + hashlib.md5(
+                            f"{title}|{_gallery_sid}|all".encode("utf-8", "ignore")
+                        ).hexdigest()[:12]
+                        if st.button(
+                            "Remove all reasons for this image",
+                            key=_remove_all_key,
+                            type="secondary",
+                            icon=":material/delete_sweep:",
+                            help="Remove every learned reason associated with this image URL or pHash.",
+                        ):
+                            _removed = delete_associated_learned_image_rules([_gallery_rule])
+                            if _removed:
+                                st.session_state.display_df_cache = {}
+                                st.session_state.pop("_learned_image_rule_map_cache", None)
+                                st.toast(f"Removed {_removed:,} learned rule(s) for this image.", icon=":material/check_circle:")
                                 st.rerun()
                     st.markdown(
                         f"<div style='margin-top:7px;padding:8px 9px;border:1px solid #e5e7eb;"
@@ -2733,8 +2906,36 @@ def render_flag_expander(
                         f"</div>",
                         unsafe_allow_html=True,
                     )
-        if len(df_view) > _gallery_limit:
-            st.caption(f"Showing {_gallery_limit:,} gallery images from this page; use pagination to view more.")
+        _selected_gallery_sids = [
+            _sid for _sid in _gallery_bulk_rules
+            if st.session_state.get(
+                "select_learned_preview_" + hashlib.md5(f"{title}|{_sid}".encode("utf-8", "ignore")).hexdigest()[:12],
+                False,
+            )
+        ]
+        if _selected_gallery_sids:
+            st.info(f"{len(_selected_gallery_sids):,} learned image reason(s) selected.", icon=":material/checklist:")
+            _bulk_reason_col, _bulk_image_col = st.columns(2)
+            with _bulk_reason_col:
+                if st.button("Remove selected reasons", key=f"bulk_remove_reasons_{title}_{_gallery_page}", icon=":material/delete:"):
+                    _removed = delete_learned_image_rules([_gallery_bulk_rules[_sid] for _sid in _selected_gallery_sids])
+                    if _removed:
+                        for _sid in _selected_gallery_sids:
+                            st.session_state.pop("select_learned_preview_" + hashlib.md5(f"{title}|{_sid}".encode("utf-8", "ignore")).hexdigest()[:12], None)
+                        st.session_state.display_df_cache = {}
+                        st.session_state.pop("_learned_image_rule_map_cache", None)
+                        st.toast(f"Removed {_removed:,} learned reason(s).", icon=":material/check_circle:")
+                        st.rerun()
+            with _bulk_image_col:
+                if st.button("Remove all reasons for selected images", key=f"bulk_remove_images_{title}_{_gallery_page}", icon=":material/delete_sweep:"):
+                    _removed = delete_associated_learned_image_rules([_gallery_bulk_rules[_sid] for _sid in _selected_gallery_sids])
+                    if _removed:
+                        for _sid in _selected_gallery_sids:
+                            st.session_state.pop("select_learned_preview_" + hashlib.md5(f"{title}|{_sid}".encode("utf-8", "ignore")).hexdigest()[:12], None)
+                        st.session_state.display_df_cache = {}
+                        st.session_state.pop("_learned_image_rule_map_cache", None)
+                        st.toast(f"Removed {_removed:,} learned rule(s) for selected images.", icon=":material/check_circle:")
+                        st.rerun()
 
     # Apply the provenance tint in both table modes. Learned rows must remain
     # identifiable while image previews are enabled; previously the image
@@ -3868,6 +4069,7 @@ def build_fast_grid_html(
      visible even when the card is also dimmed as a committed rejection. */
   .card.learned-rej{{background:#e6f4ff;border-color:#93c5fd;}}
   .card.committed-rej.learned-rej{{background:#e6f4ff;border-color:#60a5fa;opacity:.82;}}
+  .card.learned-rej .card-img-wrap{{border:3px solid #dc2626;box-shadow:0 0 0 3px rgba(220,38,38,.18),0 4px 12px rgba(220,38,38,.16);}}
   .card.committed-rej.learned-rej .rej-overlay{{background:rgba(219,234,254,.88) !important;}}
   .card.manual-review{{border-color:#dc2626;box-shadow:0 0 0 3px rgba(220,38,38,0.25);}}
   .card.zip-card{{border-left:4px solid #3b82f6;box-shadow:-4px 0 8px rgba(59,130,246,0.20);}}
@@ -3954,6 +4156,10 @@ def build_fast_grid_html(
 
   .card.committed-rej .rej-badge{{background:{R};color:#fff;padding:6px 12px;border-radius:6px;font-size:15px;font-weight:800;letter-spacing:0.5px;}}
   .card.committed-rej .rej-label{{font-size:12px;color:{R};font-weight:700;max-width:130px;}}
+  .card.queued-rej{{border-color:#d97706;opacity:.88;}}
+  .card.queued-rej .rej-overlay{{display:flex;background:rgba(255,247,237,.92);}}
+  .card.queued-rej .rej-badge{{background:#d97706;color:#fff;padding:6px 10px;border-radius:6px;font-size:13px;font-weight:800;}}
+  .card.queued-rej .rej-label{{font-size:12px;color:#92400e;font-weight:700;max-width:145px;text-align:center;}}
 
   .undo-btn{{margin-top:8px;padding:6px 14px;background:#313133;color:#fff;border:none;border-radius:4px;font-size:11px;font-weight:bold;cursor:pointer;}}
   .undo-btn:hover{{background:#000;}}
@@ -4192,6 +4398,7 @@ def build_fast_grid_html(
     </select>
   </span>
   <span class="sel-count-text" style="font-weight:700; color:var(--accent-text); font-size:13px; font-family:var(--font-mono); font-variant-numeric:tabular-nums slashed-zero;">0 {labels_dict["items_pending"]}</span>
+  <span id="review-save-state" style="font-size:11px;font-weight:700;color:#64748b;padding:4px 8px;border:1px solid #e2e8f0;border-radius:999px;">Saved</span>
   <select class="reason-sel" id="batch-reason-bottom">
     <option value="REJECT_POOR_IMAGE">{labels_dict["poor_img"]}</option>
     <option value="REJECT_IMG_STRETCHED">Image Stretched</option>
@@ -4359,7 +4566,26 @@ window.addEventListener('message', function(e) {{
         if (_filterEl) _filterEl.value = window._currentFilter;
       }});
     }}
-    closeGhostOverlay();
+    if (
+      window._batchSavePending &&
+      String(e.data.review_batch_id || '') === String(window._batchSavePending.id || '')
+    ) {{
+      var _savedBatch = window._batchSavePending;
+      window._batchSavePending = null;
+      var _pendingSave = window._pendingReview || {{}};
+      (_savedBatch.sids || []).forEach(function(sid) {{
+        delete (_pendingSave.decisions || {{}})[sid];
+        delete (_pendingSave.comments || {{}})[sid];
+      }});
+      _savePendingReview();
+      closeGhostOverlay();
+      showGhostOverlay(
+        _savedBatch.count + ' product' + (_savedBatch.count === 1 ? '' : 's') + ' saved to the report.',
+        3500
+      );
+    }} else if (!window._batchSavePending) {{
+      closeGhostOverlay();
+    }}
 
     // Scroll state lives on #card-grid now, not the window.
     var _g = document.getElementById('card-grid');
@@ -4446,13 +4672,20 @@ function _restoreGridSelection() {{
 }}
 function _saveGridSelection(selectedState, stagedState) {{
   try {{
-    var payload = {{selected: selectedState || {{}}, staged: stagedState || {{}}}};
+    var reasonEl = document.getElementById('batch-reason-bottom');
+    var reason = reasonEl ? String(reasonEl.value || '') : String(window._reviewReason || '');
+    window._reviewReason = reason;
+    var payload = {{selected: selectedState || {{}}, staged: stagedState || {{}}, reason: reason}};
     sessionStorage.setItem('pim_grid_selection', JSON.stringify(payload));
   }} catch(e) {{}}
 }}
 var _savedGridSelection = _restoreGridSelection();
-window._gridSelected = window._gridSelected || _savedGridSelection.selected || {{}};
-window._stagedRejections = window._stagedRejections || _savedGridSelection.staged || {{}};
+// Merge browser state from the previous iframe document rather than choosing
+// one object with `||`. A Streamlit page turn can recreate the document while
+// the previous selection is still the freshest copy in sessionStorage.
+window._gridSelected = Object.assign({{}}, _savedGridSelection.selected || {{}}, window._gridSelected || {{}});
+window._stagedRejections = Object.assign({{}}, _savedGridSelection.staged || {{}}, window._stagedRejections || {{}});
+window._reviewReason = String(_savedGridSelection.reason || 'REJECT_POOR_IMAGE');
 window.currentZoomSid = null;
 window._imageIssues = window._imageIssues || {{}};
 // URLs whose images have already loaded once in this iframe session. Cards with
@@ -4476,10 +4709,37 @@ setTimeout(function() {{
   if (s && PAGE_STATE.search) s.value = PAGE_STATE.search;
   _setMultiSelectValues('seller-filter', PAGE_STATE.sellers);
   _setMultiSelectValues('category-filter', PAGE_STATE.categories);
+  var _reasonEl = document.getElementById('batch-reason-bottom');
+  if (_reasonEl) {{
+    _reasonEl.value = window._reviewReason || _reasonEl.value || 'REJECT_POOR_IMAGE';
+    _reasonEl.addEventListener('change', function() {{
+      window._reviewReason = String(this.value || '');
+      _saveGridSelection(selected, staged);
+    }});
+  }}
 }}, 0);
 
 window._pendingUndos = window._pendingUndos || {{}};
 window._undoTimer = null;
+
+// Batch decisions stay in the iframe until the reviewer closes it.  Sending
+// one bridge message for every batch reject makes Streamlit rerun the whole
+// script repeatedly, which is especially expensive for large reports.
+function _restorePendingReview() {{
+  try {{
+    var saved = JSON.parse(sessionStorage.getItem('pim_review_pending') || 'null');
+    return saved && typeof saved === 'object' ? saved : {{}};
+  }} catch(e) {{ return {{}}; }}
+}}
+var _savedPendingReview = _restorePendingReview();
+window._pendingReview = window._pendingReview || {{
+  decisions: _savedPendingReview.decisions || {{}},
+  comments: _savedPendingReview.comments || {{}},
+  approvals: _savedPendingReview.approvals || {{}}
+}};
+function _savePendingReview() {{
+  try {{ sessionStorage.setItem('pim_review_pending', JSON.stringify(window._pendingReview)); }} catch(e) {{}}
+}}
 
 var selected = window._gridSelected;
 var staged = window._stagedRejections;
@@ -4495,11 +4755,13 @@ function showGhostOverlay(msgText, autoHideMs) {{
   ghost.innerHTML = '<div style="font-size:15px;font-weight:700;">' + msgText + '<div style="font-size:12px;font-weight:normal;color:#64748b;margin-top:5px;">You can continue reviewing other pages.</div></div>';
   ghost.onclick = closeGhostOverlay;
   document.body.appendChild(ghost);
-  var hideDelay = (typeof autoHideMs === 'number') ? Math.min(autoHideMs, 8000) : 4000;
-  setTimeout(function() {{
-    var g = document.getElementById('__grid_ghost__');
-    if (g) {{ g.style.opacity = '0'; setTimeout(function() {{ if(g && g.parentNode) g.remove(); }}, 400); }}
-  }}, hideDelay);
+  if (autoHideMs !== false) {{
+    var hideDelay = (typeof autoHideMs === 'number') ? Math.min(autoHideMs, 8000) : 4000;
+    setTimeout(function() {{
+      var g = document.getElementById('__grid_ghost__');
+      if (g) {{ g.style.opacity = '0'; setTimeout(function() {{ if(g && g.parentNode) g.remove(); }}, 400); }}
+    }}, hideDelay);
+  }}
 }}
 
 function closeGhostOverlay() {{
@@ -4517,7 +4779,31 @@ function closeVisualReview() {{
     if (typeof _applyBatchReject === 'function') {{
       _applyBatchReject(br);
     }}
-    setTimeout(_doCloseModal, 350);
+    setTimeout(_flushPendingReviewAndClose, 50);
+    return;
+  }}
+  _flushPendingReviewAndClose();
+}}
+
+function _flushPendingReviewAndClose() {{
+  var p = window._pendingReview || {{decisions: {{}}, comments: {{}}, approvals: {{}}}};
+  var hasDecisions = Object.keys(p.decisions || {{}}).length > 0;
+  var hasApprovals = Object.keys(p.approvals || {{}}).length > 0;
+  if (hasDecisions || hasApprovals) {{
+    var saveState = document.getElementById('review-save-state');
+    if (saveState) {{ saveState.textContent = 'Saving'; saveState.style.color = '#2563eb'; saveState.style.borderColor = '#93c5fd'; }}
+    // The close message performs the single server-side commit and closes the
+    // modal in that same rerun.  Clear browser state now so reopening the
+    // review cannot replay an already submitted batch.
+    try {{
+      sessionStorage.removeItem('pim_review_pending');
+      sessionStorage.removeItem('pim_grid_selection');
+    }} catch(e) {{}}
+    sendMsg('flush_review', {{
+      sids: p.decisions || {{}},
+      comments: p.comments || {{}},
+      approvals: Object.keys(p.approvals || {{}})
+    }});
     return;
   }}
   _doCloseModal();
@@ -5169,6 +5455,13 @@ function updateSelCount() {{
   var pendingText = pendingCount + ' ' + LABELS.items_pending;
   document.querySelectorAll('.sel-count-text').forEach(el => el.textContent = pendingText);
   _saveGridSelection(selected, staged);
+  _savePendingReview();
+  var saveState = document.getElementById('review-save-state');
+  if (saveState) {{
+    saveState.textContent = pendingCount ? 'Unsaved decisions' : 'Saved';
+    saveState.style.color = pendingCount ? '#b45309' : '#64748b';
+    saveState.style.borderColor = pendingCount ? '#fcd34d' : '#e2e8f0';
+  }}
   updateParentPagination();
 }}
 
@@ -5669,14 +5962,17 @@ window.clearStaged = function(sid) {{
 
 window.undoReject = function(sid) {{
   delete COMMITTED[sid];
-  window._pendingUndos[sid] = true;
+  var pending = window._pendingReview || (window._pendingReview = {{decisions: {{}}, comments: {{}}, approvals: {{}}}});
+  delete pending.decisions[sid];
+  delete pending.comments[sid];
+  pending.approvals[sid] = true;
   if (sid in selected) delete selected[sid];
 
   var safeSid = sid.replace(/'/g, "\\\\'");
   var cardEl = document.getElementById('card-' + escapeHtml(sid));
 
   if (cardEl) {{
-      cardEl.classList.remove('committed-rej', 'poor-img-rej', 'brand-image-rej', 'pot-restricted-rej');
+      cardEl.classList.remove('committed-rej', 'queued-rej', 'poor-img-rej', 'brand-image-rej', 'pot-restricted-rej');
 
       var overlay = cardEl.querySelector('.rej-overlay');
       if (overlay) overlay.remove();
@@ -5702,30 +5998,19 @@ window.undoReject = function(sid) {{
     }}
   }} catch(e) {{}}
 
+  _savePendingReview();
   if (window._undoTimer) clearTimeout(window._undoTimer);
   window._undoTimer = setTimeout(function() {{
-    var payload = Object.assign({{}}, window._pendingUndos);
-    window._pendingUndos = {{}};
-    if (!Object.keys(payload).length) return;
-
-    requestAnimationFrame(function() {{
-      requestAnimationFrame(function() {{
-        sendMsg('undo', payload);
-
-        setTimeout(function() {{
-          try {{
-            var fe = window.frameElement;
-            if (fe) {{
-              fe.style.removeProperty('min-height');
-              delete fe.dataset.pinnedHeight;
-              if (fe.parentElement) fe.parentElement.style.removeProperty('min-height');
-            }}
-          }} catch(e) {{}}
-          document.querySelectorAll('.card.undo-processing').forEach(function(c) {{
-            c.classList.remove('undo-processing');
-          }});
-        }}, 1000);
-      }});
+    try {{
+      var fe = window.frameElement;
+      if (fe) {{
+        fe.style.removeProperty('min-height');
+        delete fe.dataset.pinnedHeight;
+        if (fe.parentElement) fe.parentElement.style.removeProperty('min-height');
+      }}
+    }} catch(e) {{}}
+    document.querySelectorAll('.card.undo-processing').forEach(function(c) {{
+      c.classList.remove('undo-processing');
     }});
   }}, 400);
 }};
@@ -5735,7 +6020,7 @@ window.undoReject = function(sid) {{
 // onclick in the markup does not have to change; ignored.
 window.doBatchReject = function(pos) {{
   var sel = document.getElementById('batch-reason-bottom');
-  if (!sel) return;
+  if (!sel) {{ showGhostOverlay('Reject controls are still loading. Try again.'); return; }}
   var br = sel.value;
   if (br === 'OTHER_CUSTOM') {{
     showCustomReasonPanel(function(cmt) {{
@@ -5764,21 +6049,52 @@ function _applyBatchReject(br) {{
     for (var s in selected) delete selected[s];
     for (var s in staged) delete staged[s];
     updateSelCount();
-    return;
+    showGhostOverlay('Select at least one product before batch reject.');
+    return 0;
   }}
   var allSids = Object.assign({{}}, selected, staged);
   for (var s in payload) {{ COMMITTED[s] = payload[s]; }}
   for (var s in allSids) {{ delete selected[s]; delete staged[s]; }}
-  // Show a non-blocking status toast while the queued commit drains.
-  showGhostOverlay('Applying rejections…', 90000);
+  // Save this page immediately. The server groups the decisions and writes
+  // the report once for the batch, so moving to the next page is safe.
+  var pending = window._pendingReview || (window._pendingReview = {{decisions: {{}}, comments: {{}}, approvals: {{}}}});
+  for (var ps in payload) {{
+    pending.decisions[ps] = payload[ps];
+    if (commentPayload[ps]) pending.comments[ps] = commentPayload[ps];
+    delete pending.approvals[ps];
+  }}
+  _savePendingReview();
+  var batchId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 9);
+  window._batchSavePending = {{id: batchId, count: count, sids: Object.keys(payload)}};
+  showGhostOverlay('Saving ' + count + ' product' + (count === 1 ? '' : 's') + ' to the report…', false);
+  sendMsg('reject', {{ sids: payload, comments: commentPayload, batch_id: batchId }});
+  // Keep a durable copy until the server echoes this batch ID in SYNC_STATE.
+  // If the browser/server connection drops mid-save, close-review can still
+  // flush the decisions instead of silently losing them.
   // Update card classes directly instead of full renderAll() to avoid blocking the
-  // main thread for 500 cards. The queue is persisted by a background fragment.
+  // main thread for 500 cards. The pending decision is persisted in sessionStorage.
   var grid = document.getElementById('card-grid');
   for (var s in payload) {{
     var el = grid ? grid.querySelector('#card-' + escapeHtml(s)) : null;
     if (!el) continue;
     el.classList.remove('selected', 'staged-rej');
-    el.classList.add('committed-rej');
+    el.classList.add('committed-rej', 'queued-rej');
+    var wrap = el.querySelector('.card-img-wrap');
+    if (wrap && !wrap.querySelector('.rej-overlay.queued')) {{
+      var queuedOverlay = document.createElement('div');
+      queuedOverlay.className = 'rej-overlay queued';
+      var reasonText = String(payload[s] || 'REJECT_POOR_IMAGE');
+      var customPrefix = 'Other Reason (Custom): ';
+      if (reasonText.indexOf(customPrefix) === 0) {{
+        reasonText = reasonText.slice(customPrefix.length);
+      }} else {{
+        var reasonSelect = document.getElementById('batch-reason-bottom');
+        var reasonOption = reasonSelect && Array.from(reasonSelect.options).find(function(opt) {{ return opt.value === reasonText; }});
+        reasonText = reasonOption ? reasonOption.textContent.trim() : reasonText.replace(/^REJECT_/, '').replace(/_/g, ' ');
+      }}
+      queuedOverlay.innerHTML = '<div class="rej-badge">Queued</div><div class="rej-label">' + escapeHtml(reasonText) + '</div>';
+      wrap.appendChild(queuedOverlay);
+    }}
     // Dim the card visually so the user gets instant feedback
     el.style.opacity = '0.55';
     // One-shot ring so a bulk reject reads as an event, not a silent
@@ -5792,7 +6108,7 @@ function _applyBatchReject(br) {{
     }});
   }}
   updateSelCount();
-  sendMsg('reject', {{ sids: payload, comments: commentPayload }});
+  return count;
 }}
 
 var _customReasonCallback = null;
@@ -5821,23 +6137,21 @@ document.getElementById('custom-reason-input').addEventListener('keydown', funct
 
 window.doBatchUndo = function() {{
   if (window._undoTimer) {{ clearTimeout(window._undoTimer); window._undoTimer = null; }}
-  var payload = Object.assign({{}}, window._pendingUndos);
-  window._pendingUndos = {{}};
+  var pending = window._pendingReview || (window._pendingReview = {{decisions: {{}}, comments: {{}}, approvals: {{}}}});
   var count = 0;
   for (var s in selected) {{
-    if (s in COMMITTED) {{ payload[s] = true; count++; }}
+    if (s in COMMITTED || s in pending.decisions) {{ pending.approvals[s] = true; count++; }}
   }}
-  if (Object.keys(payload).length === 0) {{
+  if (count === 0) {{
     for (var s in selected) delete selected[s];
     updateSelCount();
     return;
   }}
-  for (var s in payload) {{ delete COMMITTED[s]; }}
+  for (var s in pending.approvals) {{ delete pending.decisions[s]; delete pending.comments[s]; delete COMMITTED[s]; }}
   for (var s in selected) {{ delete selected[s]; }}
 
   renderAll();
   updateSelCount();
-  sendMsg('undo', payload);
 }};
 
 window.doDeselAll = function() {{
@@ -6910,6 +7224,10 @@ def visual_review_modal(support_files):
             review_data["BRAND"].astype(str).isin(search_brands)
         ]
 
+    # Filtering above can return a view.  Make the display frame owned before
+    # adding derived columns so review reruns do not emit SettingWithCopyWarning.
+    review_data = review_data.copy()
+
     # --- Shared warning computation -------------------------------------
     # Single source of truth for per-SID warnings, used both for the
     # flag/sort filter pass (over review_data, potentially many rows) and
@@ -7335,6 +7653,7 @@ def visual_review_modal(support_files):
       var PAYLOAD = {{
         type: 'SYNC_STATE',
         committed: {_committed_json},
+        review_batch_id: {json.dumps(str(st.session_state.get('_grid_review_batch_id', '') or ''))},
         poor_img_sids: {_poor_img_sids_json},
         prefetch: {_prefetch_json},
         grid_sort: {json.dumps(curr_sort or '')},
@@ -7624,9 +7943,8 @@ def render_grid_closing_overlay():
           <div class="gco-card">
             <div class="gco-ring"><span></span><span></span><span></span></div>
             <div class="gco-title">Saving your review…</div>
-            <div class="gco-sub">Applying your decisions and rebuilding the
-              report. This takes a moment on a large batch — please don't
-              refresh.</div>
+            <div class="gco-sub">Saving your decisions and refreshing the
+              results. Your changes are kept while this finishes.</div>
             <div class="gco-bar"><i></i></div>
           </div>
         </div>
@@ -7888,6 +8206,10 @@ def render_exports_section(support_files, country_validator):
                             "mime": mime,
                         }
             st.session_state.setdefault("validation_stage_timings", {})["Report export"] = round(time.perf_counter() - _export_t0, 3)
+            _persist_timing_history_stage(
+                "Report export",
+                st.session_state["validation_stage_timings"]["Report export"],
+            )
             st.rerun()
 
     cols_count = 4 if st.session_state.get("layout_mode") == "wide" else 2

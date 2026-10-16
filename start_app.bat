@@ -1,6 +1,18 @@
 @echo off
 cd /d "%~dp0"
 
+:: Configure the RAR extractor for this app process.  WinRAR can be
+:: installed without adding UnRAR.exe to PATH, so set rarfile's explicit
+:: tool path before starting Streamlit (and the optional API server).
+set "UNRAR_TOOL="
+if exist "%ProgramFiles%\WinRAR\UnRAR.exe" set "UNRAR_TOOL=%ProgramFiles%\WinRAR\UnRAR.exe"
+if not defined UNRAR_TOOL if exist "%ProgramFiles(x86)%\WinRAR\UnRAR.exe" set "UNRAR_TOOL=%ProgramFiles(x86)%\WinRAR\UnRAR.exe"
+if defined UNRAR_TOOL (
+    echo RAR extractor: %UNRAR_TOOL%
+) else (
+    echo RAR extractor not found - RAR uploads will show setup instructions.
+)
+
 echo ============================================
 echo  Welcome to PIM QC Tool - Startup 
 echo  In Case of Issue Contact Charles Kireki
@@ -57,8 +69,11 @@ if %errorlevel%==0 (
         start "PIM QC API Server" /min py -3.11 run_api.py
     )
 ) else (
-    echo Redis not detected on port 6379 - the app will validate in direct mode.
-    echo TIP: install and start Redis, then rerun this script for faster cached runs.
+    echo Redis not detected - starting the local worker with its built-in store.
+    echo Results are kept in the local temporary validation directory.
+    set PIM_LOCAL_API_STORE=1
+    set VALIDATOR_WORKERS=4
+    start "PIM QC API Server" /min py -3.11 run_api.py
 )
 echo.
 
@@ -79,10 +94,11 @@ echo.
 start "" /min powershell -NoProfile -WindowStyle Hidden -Command ^
   "for($i=0; $i -lt 240; $i++){ try { $r = Invoke-WebRequest -Uri 'http://localhost:%PORT%/_stcore/health' -UseBasicParsing -TimeoutSec 2; if($r.StatusCode -eq 200){ Start-Process 'http://localhost:%PORT%'; break } } catch { Start-Sleep -Milliseconds 500 } }"
 
-:: Start Streamlit with Python 3.11
-py -3.11 -m streamlit run streamlit_app.py ^
+:: Start Streamlit through the Windows selector-loop wrapper. This avoids
+:: Proactor accept-loop errors when a local browser connection is interrupted.
+py -3.11 run_streamlit.py streamlit_app.py ^
 --server.port %PORT% ^
---server.maxUploadSize 500 ^
+--server.maxUploadSize 200 ^
 --server.headless true
 
 echo.

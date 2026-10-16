@@ -64,13 +64,16 @@ def upload_bytes(data: bytes, key: str, content_type: str = "application/octet-s
 
 
 def upload_file(path: str | Path, key: str, content_type: str = "application/octet-stream") -> bool:
+    client = _client()
+    if client is None:
+        return False
     try:
-        client = _client()
-        source = Path(path)
-        if client is None or not source.is_file():
-            return False
+        # boto3 streams files from disk. Reading a report or snapshot into one
+        # Python bytes object needlessly doubles its peak memory use.
         client.upload_file(
-            str(source), _secret("R2_BUCKET"), str(key),
+            str(Path(path)),
+            _secret("R2_BUCKET"),
+            str(key),
             ExtraArgs={"ContentType": content_type},
         )
         return True
@@ -79,45 +82,31 @@ def upload_file(path: str | Path, key: str, content_type: str = "application/oct
         return False
 
 
-def upload_file_verified(path: str | Path, key: str, content_type: str = "application/octet-stream") -> bool:
-    """Stream a file to R2 and verify its size and SHA-256 metadata."""
-    source = Path(path)
+def download_bytes(key: str) -> bytes:
+    """Read an optional object from R2; return empty bytes when unavailable."""
     client = _client()
-    if client is None or not source.is_file():
-        return False
+    if client is None:
+        return b""
     try:
-        digest = hashlib.sha256()
-        with source.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        sha256 = digest.hexdigest()
+        response = client.get_object(Bucket=_secret("R2_BUCKET"), Key=str(key))
+        body = response["Body"]
         try:
-            remote = client.head_object(Bucket=_secret("R2_BUCKET"), Key=str(key))
-            if (
-                int(remote.get("ContentLength", -1)) == source.stat().st_size
-                and str(remote.get("Metadata", {}).get("sha256", "")).lower() == sha256
-            ):
-                return True
-        except Exception:
-            pass
-        client.upload_file(
-            str(source), _secret("R2_BUCKET"), str(key),
-            ExtraArgs={"ContentType": content_type, "Metadata": {"sha256": sha256}},
-        )
-        remote = client.head_object(Bucket=_secret("R2_BUCKET"), Key=str(key))
-        return (
-            int(remote.get("ContentLength", -1)) == source.stat().st_size
-            and str(remote.get("Metadata", {}).get("sha256", "")).lower() == sha256
-        )
+            return body.read()
+        finally:
+            body.close()
     except Exception as exc:
-        logger.warning("Verified R2 upload failed for %s: %s", key, exc)
-        return False
+        logger.warning("R2 download failed for %s: %s", key, exc)
+        return b""
 
 
 def download_file_verified(
-    key: str, path: str | Path, *, expected_sha256: str = "", expected_size: int | None = None,
+    key: str,
+    path: str | Path,
+    *,
+    expected_sha256: str = "",
+    expected_size: int | None = None,
 ) -> bool:
-    """Stream an R2 object to disk, then verify it before exposing the file."""
+    """Stream an R2 object to disk and verify it before exposing the file."""
     client = _client()
     target = Path(path)
     if client is None:
@@ -141,20 +130,98 @@ def download_file_verified(
         return True
     except Exception as exc:
         logger.warning("R2 download failed for %s: %s", key, exc)
-        temp.unlink(missing_ok=True)
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
         return False
 
 
-def download_bytes(key: str) -> bytes:
-    """Read an optional object from R2; return empty bytes when unavailable."""
+def list_objects(prefix: str, *, limit: int = 100) -> list[dict]:
+    """List recent objects for a prefix when R2 is configured."""
     client = _client()
     if client is None:
-        return b""
+        return []
     try:
-        response = client.get_object(Bucket=_secret("R2_BUCKET"), Key=str(key))
-        return response["Body"].read()
-    except Exception:
-        return b""
+        response = client.list_objects_v2(
+            Bucket=_secret("R2_BUCKET"), Prefix=str(prefix), MaxKeys=max(1, min(int(limit), 1000))
+        )
+        return [
+            {"key": str(item.get("Key", "")), "size": int(item.get("Size", 0)), "modified": item.get("LastModified")}
+            for item in response.get("Contents", [])
+            if item.get("Key")
+        ]
+    except Exception as exc:
+        logger.warning("R2 listing failed for %s: %s", prefix, exc)
+        return []
+
+
+def upload_file_verified(path: str | Path, key: str, content_type: str = "application/octet-stream") -> bool:
+    """Upload a disk artifact with a SHA-256 metadata tag and verify it remotely."""
+    source = Path(path)
+    client = _client()
+    if client is None or not source.is_file():
+        return False
+    try:
+        digest = hashlib.sha256()
+        with source.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        sha256 = digest.hexdigest()
+        try:
+            remote = client.head_object(Bucket=_secret("R2_BUCKET"), Key=str(key))
+            if (
+                int(remote.get("ContentLength", -1)) == source.stat().st_size
+                and str(remote.get("Metadata", {}).get("sha256", "")).lower() == sha256
+            ):
+                return True
+        except Exception:
+            # A missing object or an endpoint without HEAD support falls
+            # through to the verified upload path.
+            pass
+        client.upload_file(
+            str(source),
+            _secret("R2_BUCKET"),
+            str(key),
+            ExtraArgs={"ContentType": content_type, "Metadata": {"sha256": sha256}},
+        )
+        remote = client.head_object(Bucket=_secret("R2_BUCKET"), Key=str(key))
+        remote_sha256 = str(remote.get("Metadata", {}).get("sha256", "")).lower()
+        return (
+            int(remote.get("ContentLength", -1)) == source.stat().st_size
+            and remote_sha256 == sha256
+        )
+    except Exception as exc:
+        logger.warning("R2 upload verification failed for %s: %s", key, exc)
+        return False
+
+
+def prune_prefix(prefix: str, *, keep: int = 100) -> int:
+    """Retain the newest objects under one explicit prefix; return deletions."""
+    client = _client()
+    if client is None:
+        return 0
+    try:
+        paginator = client.get_paginator("list_objects_v2")
+        objects = []
+        for page in paginator.paginate(Bucket=_secret("R2_BUCKET"), Prefix=str(prefix)):
+            objects.extend(page.get("Contents", []))
+        objects.sort(key=lambda item: item.get("LastModified"), reverse=True)
+        expired = objects[max(0, int(keep)):]
+        removed = 0
+        for start in range(0, len(expired), 1000):
+            batch = expired[start:start + 1000]
+            if not batch:
+                continue
+            response = client.delete_objects(
+                Bucket=_secret("R2_BUCKET"),
+                Delete={"Objects": [{"Key": item["Key"]} for item in batch if item.get("Key")], "Quiet": True},
+            )
+            removed += len(batch) - len(response.get("Errors", []))
+        return removed
+    except Exception as exc:
+        logger.warning("R2 snapshot retention failed for %s: %s", prefix, exc)
+        return 0
 
 
 def upload_bytes_async(data: bytes, key: str, content_type: str = "application/octet-stream") -> None:

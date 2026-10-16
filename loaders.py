@@ -1121,21 +1121,36 @@ def load_flags_mapping(filename="reason.xlsx") -> Dict[str, dict]:
     return default_mapping
 
 
-def _load_ring_sellers(path: str) -> dict:
+def _load_ring_sellers(path: str, additional_paths: tuple[str, ...] = ()) -> dict:
+    """Load the legacy ring table and seller-per-sheet workbooks.
+
+    Returns ``{seller_name_lower: ring_id}``. The established
+    ``ring_sellers.xlsx`` format has explicit SELLER_NAME/RING_ID columns;
+    ``duplicate_sellers.xlsx`` may instead name its sheets Ring1, Ring2, etc.
+    Merge both so an added seller workbook is not silently ignored.
     """
-    Returns {seller_name_lower: ring_id} for all known seller rings.
-    Returns {} if the file is missing — the ring duplicate check is then a no-op.
-    """
-    if not os.path.exists(path):
-        return {}
-    try:
-        df = pd.read_excel(path, dtype=str).dropna(subset=["SELLER_NAME"])
-        df["SELLER_NAME"] = df["SELLER_NAME"].str.strip()
-        df["RING_ID"]     = df["RING_ID"].str.strip()
-        return dict(zip(df["SELLER_NAME"].str.lower(), df["RING_ID"]))
-    except Exception:
-        logger.exception("ring_sellers.xlsx failed to load")
-        return {}
+    seller_to_ring = {}
+    for workbook_path in (path, *additional_paths):
+        if not os.path.exists(workbook_path):
+            continue
+        try:
+            book = pd.ExcelFile(workbook_path)
+            for sheet_name in book.sheet_names:
+                frame = pd.read_excel(book, sheet_name=sheet_name, dtype=str)
+                frame.columns = [str(column).strip().upper() for column in frame.columns]
+                if "SELLER_NAME" not in frame.columns:
+                    continue
+                sellers = frame["SELLER_NAME"].fillna("").astype(str).str.strip()
+                if "RING_ID" in frame.columns:
+                    rings = frame["RING_ID"].fillna("").astype(str).str.strip()
+                else:
+                    rings = pd.Series(str(sheet_name).strip(), index=frame.index)
+                for seller, ring_id in zip(sellers, rings):
+                    if seller and ring_id:
+                        seller_to_ring[seller.casefold()] = ring_id
+        except Exception:
+            logger.exception("Seller ring workbook failed to load: %s", workbook_path)
+    return seller_to_ring
 
 
 def load_all_support_files(country_code: str = "KE") -> Dict:
@@ -1179,7 +1194,9 @@ def load_all_support_files(country_code: str = "KE") -> Dict:
         "warranty_category_codes": safe_txt("warranty.txt"),
         "suspected_fake": load_suspected_fake_from_local(_country_tab),
         "duplicate_exempt_codes": safe_txt("duplicate_exempt.txt"),
-        "ring_sellers": _load_ring_sellers("ring_sellers.xlsx"),
+        "ring_sellers": _load_ring_sellers(
+            "ring_sellers.xlsx", additional_paths=("duplicate_sellers.xlsx",)
+        ),
         "restricted_brands_all": load_restricted_brands_from_local(_country_name),
         "prohibited_words_all": load_prohibited_from_local(_country_tab),
         "known_brands": safe_txt("brands.txt"),

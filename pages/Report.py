@@ -6,7 +6,6 @@ import zipfile
 import os
 import shutil
 from io import BytesIO
-import plotly.express as px
 
 
 def _configure_rar_backend(rarfile_module):
@@ -415,6 +414,9 @@ if not master_df.empty:
                     st.info(f"**Peak Activity:** **{busiest_day}** saw the highest volume of SKUs.", icon=":material/trending_up:")
 
             st.divider()
+            # Plotly is only needed when charts are rendered. Keep it out of
+            # report-page startup so simple table/export views stay light.
+            import plotly.express as px
             col_chart, col_table = st.columns([3, 2])
             with col_chart:
                 st.markdown("#### :material/show_chart: Daily Processing Trend")

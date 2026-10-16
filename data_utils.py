@@ -187,6 +187,7 @@ def _write_manual_decision_json(frame, filename: str) -> bool:
     try:
         os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
         frame.to_json(tmp, orient="records", force_ascii=False)
+        # Flush file contents before publishing the checkpoint name.
         with open(tmp, "rb+") as handle:
             os.fsync(handle.fileno())
         os.replace(tmp, path)
@@ -227,8 +228,9 @@ def save_manual_decisions(
     built from. It is recorded in the index so a later, larger upload can find
     this journal; without it the entry is still written, just unmatchable.
     """
-    # Normalize stale/array-like session state before comparison; truth-testing
-    # a NumPy array here raises an ambiguous truth-value TypeError.
+    # Session state can survive reruns and older app versions. Normalize it
+    # before comparison so array-like/stale values cannot raise an ambiguous
+    # truth-value TypeError during a reviewer action.
     if process_signature is None:
         return None
     if not isinstance(process_signature, str):
@@ -287,8 +289,9 @@ def save_manual_decisions(
             _write_manual_index(index)
         return 0
 
-    # Preserve reviewer decisions even when Parquet allocation fails under
-    # Windows resource pressure. Existing Parquet journals remain readable.
+    # Keep reviewer work recoverable even when Parquet allocation fails under
+    # Windows resource pressure. This compact JSON journal is the primary
+    # recovery copy; old Parquet journals remain readable for compatibility.
     if not _write_manual_decision_json(decided, fname):
         if not save_df_parquet(decided, fname):
             return None

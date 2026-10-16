@@ -13,10 +13,12 @@ import pickle
 import re
 import shutil
 import tempfile
+import threading
 import time
 import traceback
 import unicodedata
 import zipfile
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -33,6 +35,12 @@ from urllib3.util.retry import Retry
 from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 _APP_DIR = Path(os.path.abspath(os.path.dirname(__file__)))
+
+# The manifest validator revision is checked on every upload, but its source
+# files rarely change during a running process. Cache the digest against their
+# nanosecond mtimes so retries avoid re-reading and hashing the application.
+_VALIDATOR_DIGEST_CACHE = {"digest": None, "rules_revision": None, "mtimes": {}}
+_VALIDATOR_DIGEST_LOCK = threading.Lock()
 
 
 try:
@@ -99,6 +107,25 @@ def _normalized_image_url(value: object) -> str:
                            parsed.params, urlencode(query), parsed.fragment))
     except Exception:
         return raw
+
+
+def _bounded_executor_map(executor, func, iterable, *, max_pending: int = 8):
+    """Yield ordered executor results while keeping only a small queue alive."""
+    items = iter(iterable)
+    pending = deque()
+    limit = max(1, int(max_pending))
+    for _ in range(limit):
+        try:
+            pending.append(executor.submit(func, next(items)))
+        except StopIteration:
+            break
+    while pending:
+        future = pending.popleft()
+        yield future.result()
+        try:
+            pending.append(executor.submit(func, next(items)))
+        except StopIteration:
+            continue
 
 
 # ── Pre-compiled Regex Patterns ──
@@ -886,7 +913,6 @@ def run_cached_check(func, cache_path, ckwargs):
 # -------------------------------------------------
 # STANDARD VALIDATION LOGIC
 # -------------------------------------------------
-import threading
 from collections import OrderedDict
 
 
@@ -901,13 +927,16 @@ class _BoundedDict(OrderedDict):
             self.popitem(last=False)
 
 
-_IMAGE_DIM_CACHE = _BoundedDict(maxsize=50000)
-_IMAGE_HASH_CACHE = _BoundedDict(maxsize=50000)
-_IMAGE_THUMB_CACHE = _BoundedDict(maxsize=400)
-_IMAGE_DIM_LOCK = threading.Lock()
-_IMAGE_HOST_LOCKS = {}
-_IMAGE_HOST_FAILURES = {}
-_IMAGE_HOST_LOCKS_GUARD = threading.Lock()
+from processing_automation import image_runtime_state
+
+_IMAGE_RUNTIME = image_runtime_state()
+_IMAGE_DIM_CACHE = _IMAGE_RUNTIME["dimensions"]
+_IMAGE_HASH_CACHE = _IMAGE_RUNTIME["hashes"]
+_IMAGE_THUMB_CACHE = _IMAGE_RUNTIME["thumbnails"]
+_IMAGE_DIM_LOCK = _IMAGE_RUNTIME["dim_lock"]
+_IMAGE_HOST_LOCKS = _IMAGE_RUNTIME["host_locks"]
+_IMAGE_HOST_FAILURES = _IMAGE_RUNTIME["host_failures"]
+_IMAGE_HOST_LOCKS_GUARD = _IMAGE_RUNTIME["host_guard"]
 
 # Staging area for the low-resolution advisory produced by check_image_blurry.
 # That check runs on a worker thread, where st.session_state writes are silently
@@ -1350,6 +1379,7 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
         st.session_state["image_fetch_metrics"] = {
             "unique_urls": int(len(urls)),
             "cache_hits": int(_cache_hits),
+            "cache_misses": 0,
             "downloads": 0,
             "network_seconds": 0.0,
             "decode_phash_seconds": 0.0,
@@ -1391,7 +1421,10 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
                             raise ValueError("Remote image exceeds the 12 MB image limit")
                         raw_parts = []
                         raw_size = 0
+                        _body_deadline = time.monotonic() + 12.0
                         for part in r.iter_content(chunk_size=64 * 1024):
+                            if time.monotonic() > _body_deadline:
+                                raise TimeoutError("Image host exceeded the 12-second response budget")
                             if not part:
                                 continue
                             raw_size += len(part)
@@ -1449,10 +1482,9 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
                     _IMAGE_THUMB_CACHE[_key] = _thumb
         # Keep no base64 thumbnail in the upload-wide result list.
         results.append((_key, _size, _ph, "", _net, _decode, _thumb_seconds, _ok))
-    # Bound concurrent response bodies. At 12 MB maximum per image, 12 workers
-    # cap raw image buffers near 48 MB (and temporary joins near 96 MB), rather
-    # than allowing dozens of simultaneous multi-megabyte downloads.
-    _img_workers = 4
+    # The process-wide pool is bounded at four workers in
+    # processing_automation.py. At 12 MB maximum per image this caps raw
+    # response buffers near 48 MB across all active uploads.
 
     def _checkpoint_image_metadata(_items):
         """Persist completed downloads during a long fetch, not only at end."""
@@ -1469,16 +1501,20 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
             append_image_metadata_checkpoint(_persisted)
 
     if new_urls:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=_img_workers) as executor:
-            for _image_index, _image_result in enumerate(executor.map(fetch, new_urls), start=1):
-                _retain_image_result(_image_result)
-                # A failed validation can be retried with the same upload.
-                # Persist checkpoints so URLs completed before the failure are
-                # not downloaded or hashed again.
-                if _image_index % 250 == 0:
-                    _checkpoint_image_metadata(results[-250:])
-                if progress_callback and (_image_index == len(new_urls) or _image_index % 100 == 0):
-                    progress_callback(f"downloaded {min(_image_index, len(new_urls)):,}/{len(new_urls):,} external images")
+        # Share the bounded pool across uploads/sessions instead of spawning a
+        # fresh executor per call. Iterating map() still waits for each result
+        # in input order, preserving the existing checkpoint/progress behavior.
+        for _image_index, _image_result in enumerate(
+            _bounded_executor_map(DOWNLOAD_POOL, fetch, new_urls), start=1
+        ):
+            _retain_image_result(_image_result)
+            # A failed validation can be retried with the same upload.
+            # Persist checkpoints so URLs completed before the failure are
+            # not downloaded or hashed again.
+            if _image_index % 50 == 0:
+                _checkpoint_image_metadata(results[-50:])
+            if progress_callback and (_image_index == len(new_urls) or _image_index % 100 == 0):
+                progress_callback(f"downloaded {min(_image_index, len(new_urls)):,}/{len(new_urls):,} external images")
 
     if zip_descriptors:
         # Peak memory is now this many images rather than the whole batch, so
@@ -1530,11 +1566,7 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
                 if _payloads:
                     for _image_result in executor.map(process_zip_img, _payloads):
                         _retain_image_result(_image_result)
-                    # Archive images are also pHashed locally. Journal these
-                    # in bounded groups so a restart can reuse completed work.
-                    _done = _start + len(_slice)
-                    if _done % 50 < len(_slice) or _done >= len(zip_descriptors):
-                        _checkpoint_image_metadata(results[-min(50, len(results)):])
+                    _checkpoint_image_metadata(results[-len(_payloads):])
                 if progress_callback:
                     progress_callback(f"decoded {min(_start + len(_slice), len(zip_descriptors)):,}/{len(zip_descriptors):,} ZIP images")
                 # Dropped before the next chunk is built, so two chunks are
@@ -1583,6 +1615,7 @@ def _fetch_all_image_dimensions(data: pd.DataFrame, progress_callback=None) -> d
         st.session_state["image_fetch_metrics"] = {
             "unique_urls": int(len(urls)),
             "cache_hits": int(_cache_hits),
+            "cache_misses": int(len(new_urls)),
             "downloads": int(len(new_urls)),
             "network_seconds": round(_network_seconds, 3),
             "decode_phash_seconds": round(_decode_seconds, 3),
@@ -1638,6 +1671,8 @@ from learned_images import (
 from learned_rules import (
     merge_learned_image_rules,
     load_learned_image_rules,
+    iter_learned_image_rules,
+    iter_learned_image_rules,
     record_learned_image_matches_async,
     delete_learned_image_rules,
     delete_associated_learned_image_rules,
@@ -1649,30 +1684,28 @@ from learned_rules import (
 from processing_automation import (
     load_manifest, mark_batch, completed_batches, file_signature,
     save_chunk_results, load_chunk_results, save_stage_frame, load_stage_frame, thumbnail_data_uri,
-    load_image_metadata_cache, save_image_metadata_cache, validation_lock,
+    load_image_metadata_cache, save_image_metadata_cache, append_image_metadata_checkpoint, validation_lock,
+    DOWNLOAD_POOL,
 )
-
-# Older Cloud checkouts may have the durable image cache helpers but predate
-# the append-only checkpoint journal. Fall back to the atomic cache writer so
-# a stale deployment remains usable while still persisting completed images.
-try:
-    from processing_automation import append_image_metadata_checkpoint
-except ImportError:
-    def append_image_metadata_checkpoint(entries):
-        save_image_metadata_cache(entries)
 
 # Restore successful image metadata between Streamlit reruns/restarts. This
 # cache contains only derived dimensions and pHashes; it never contains
 # learned decisions and can be deleted safely.
 try:
-    for _cached_url, _cached_meta in load_image_metadata_cache().items():
-        if not isinstance(_cached_meta, dict):
-            continue
-        _cached_size = _cached_meta.get("size")
-        _cached_phash = str(_cached_meta.get("phash") or "").strip()
-        _IMAGE_DIM_CACHE[str(_cached_url)] = tuple(_cached_size) if isinstance(_cached_size, list) and len(_cached_size) == 2 else None
-        if _cached_phash:
-            _IMAGE_HASH_CACHE[str(_cached_url)] = _cached_phash
+    _image_cache_restore_started = time.perf_counter()
+    if not _IMAGE_RUNTIME["metadata_restored"]:
+        for _cached_url, _cached_meta in load_image_metadata_cache().items():
+            if not isinstance(_cached_meta, dict):
+                continue
+            _cached_size = _cached_meta.get("size")
+            _cached_phash = str(_cached_meta.get("phash") or "").strip()
+            _IMAGE_DIM_CACHE[str(_cached_url)] = tuple(_cached_size) if isinstance(_cached_size, list) and len(_cached_size) == 2 else None
+            if _cached_phash:
+                _IMAGE_HASH_CACHE[str(_cached_url)] = _cached_phash
+        _IMAGE_RUNTIME["metadata_restored"] = True
+    st.session_state.setdefault("validation_stage_timings", {})["Image cache restore"] = round(
+        time.perf_counter() - _image_cache_restore_started, 3
+    )
 except Exception:
     logger.debug("Could not restore persistent image metadata cache", exc_info=True)
 
@@ -5752,6 +5785,59 @@ def _extract_size_key(name: str) -> str:
     return "+".join(sorted(set(tokens))) if tokens else ""
 
 
+_DUPLICATE_DEVICE_FAMILIES = (
+    ("laptop", re.compile(r"\b(?:laptops?|notebooks?|chromebooks?|ultrabooks?|elitebooks?|probooks?|thinkpads?|pavilions?)\b", re.I)),
+    # Prefer explicit phone signals before the broad “Phones & Tablets” parent
+    # category can make every smartphone look like a tablet.
+    ("phone", re.compile(r"\b(?:smartphones?|mobile\s+phones?|cell\s+phones?|iphones?|galaxy\s+(?:s\d+|a\d+|z\s*flip|z\s*fold))\b", re.I)),
+    ("tablet", re.compile(r"\b(?:tablets?|ipads?|galaxy\s+tabs?)\b", re.I)),
+    ("desktop", re.compile(r"\b(?:desktop\s+(?:computers?|pcs?)|all[- ]in[- ]one\s+(?:pcs?|computers?))\b", re.I)),
+    ("monitor", re.compile(r"\b(?:computer\s+)?monitors?\b", re.I)),
+)
+_DUPLICATE_DEVICE_SPEC_PATTERNS = (
+    ("ram", re.compile(r"\b(\d{1,3})\s*gb\s*(?:ram|memory|ddr\s*\d?[a-z0-9-]*)\b|\b(?:ram|memory)\s*(\d{1,3})\s*gb\b", re.I)),
+    ("storage", re.compile(r"\b(\d+(?:[.,]\d+)?)\s*(tb|gb)\s*(?:ssd|hdd|nvme|emmc|rom|storage|internal\s+storage)\b", re.I)),
+    ("cpu", re.compile(r"\b(?:intel\s+)?(?:core\s*)?i[3579]\b|\bryzen\s*[3579]\b|\b(?:snapdragon|dimensity|helio|exynos)\s*[a-z0-9-]+\b|\b(?:celeron|pentium)\b", re.I)),
+    ("screen", re.compile(r"\b\d+(?:[.,]\d+)?\s*(?:inch(?:es)?|in\.?|\")\b", re.I)),
+    ("network", re.compile(r"\b(?:2g|3g|4g|5g|lte|wi-?fi\s*\d*)\b", re.I)),
+    ("battery", re.compile(r"\b\d{3,6}\s*mah\b", re.I)),
+    # A capacity is useful for phones/tablets whose title says e.g. “256GB”
+    # without explicitly labelling it as RAM or storage. The complete numeric
+    # model key and size key must also match before this can cause a rejection.
+    ("capacity", re.compile(r"\b\d+(?:[.,]\d+)?\s*(?:gb|tb)\b", re.I)),
+)
+
+
+def _duplicate_device_family(name: str, category: str) -> str:
+    text = f"{name} {category}"
+    for family, pattern in _DUPLICATE_DEVICE_FAMILIES:
+        if pattern.search(text):
+            return family
+    return ""
+
+
+def _duplicate_device_specs(name: str) -> str:
+    """Return explicit tech specs for conservative same-image matching.
+
+    Shared stock photos are common for devices. An image match alone should
+    not reject a phone/tablet/computer unless the title exposes matching model
+    and specification evidence. Exact text/SEO duplicate checks still run.
+    """
+    text = str(name or "").lower().replace(",", ".")
+    found = []
+    for label, pattern in _DUPLICATE_DEVICE_SPEC_PATTERNS:
+        matches = pattern.findall(text)
+        if matches:
+            normalized = []
+            for match in matches:
+                if isinstance(match, tuple):
+                    normalized.append("".join(str(part) for part in match if part))
+                else:
+                    normalized.append(str(match))
+            found.append(f"{label}=" + ",".join(sorted(set(normalized))))
+    return "|".join(found)
+
+
 _RING_FILLER_WORDS = {
     "portable", "rechargeable", "high", "capacity", "mobile", "phone",
     "pack", "battery", "with", "for", "and", "the", "a", "an",
@@ -5819,7 +5905,8 @@ def check_duplicate_products(
     # copying them here used to add a full-upload memory spike.
     _needed = {
         "PRODUCT_SET_SID", "NAME", "SELLER_NAME", "BRAND", "MAIN_IMAGE",
-        "CATEGORY_CODE", "_cat_clean", "COLOR", "COLOR_FAMILY", "_norm_name",
+        "CATEGORY_CODE", "CATEGORY", "CATEGORY_PATH", "CATEGORY_FULL_PATH",
+        "FULL_CATEGORY_PATH", "_cat_clean", "COLOR", "COLOR_FAMILY", "_norm_name",
         "_brand_lower", "_seller_lower", "_name_lower",
     }
     d = _result_source.loc[:, [c for c in _result_source.columns if c in _needed]].copy()
@@ -5951,6 +6038,43 @@ def check_duplicate_products(
             has_hash = img_d["_phash"].str.len() > 0
             if has_hash.any():
                 hash_d = img_d[has_hash].copy()
+                # For phones, tablets, and computers, shared stock photos are
+                # common. Require matching brand, model-number tokens, and
+                # explicit technical specs before the image can establish a
+                # duplicate. If the title has no usable spec evidence, make
+                # this image key unique to the SKU; text/SEO checks below can
+                # still catch genuine same-title listings.
+                _cat_col = next((c for c in (
+                    "CATEGORY", "CATEGORY_FULL_PATH", "FULL_CATEGORY_PATH", "CATEGORY_PATH"
+                ) if c in hash_d.columns), None)
+                _cat_values = (
+                    hash_d[_cat_col].fillna("").astype(str).tolist()
+                    if _cat_col else [""] * len(hash_d)
+                )
+                _device_families = [
+                    _duplicate_device_family(n, cat)
+                    for n, cat in zip(hash_d["NAME"].astype(str).tolist(), _cat_values)
+                ]
+                _device_specs = [
+                    _duplicate_device_specs(n) for n in hash_d["NAME"].astype(str).tolist()
+                ]
+                _image_model_identity = []
+                for _sid, _family, _brand, _model, _specs in zip(
+                    hash_d["PRODUCT_SET_SID"].astype(str).tolist(),
+                    _device_families,
+                    hash_d["_brand_lower"].astype(str).tolist(),
+                    hash_d["_model_key"].astype(str).tolist(),
+                    _device_specs,
+                ):
+                    if not _family:
+                        _image_model_identity.append("standard:" + _model)
+                    elif _specs and _model:
+                        _image_model_identity.append(
+                            "device:" + "|".join((_family, _brand, _model, _specs))
+                        )
+                    else:
+                        _image_model_identity.append("device-unverified:" + _sid)
+                hash_d["_image_model_identity"] = _image_model_identity
                 hash_d["_img_key"] = (
                     hash_d["_seller_lower"]
                     + "|"
@@ -5960,7 +6084,7 @@ def check_duplicate_products(
                     + "|"
                     + hash_d["_size_key"]
                     + "|"
-                    + hash_d["_model_key"]  # Ensures different-named products with same image are not duped
+                    + hash_d["_image_model_identity"]
                     + "|"
                     + hash_d["_freebie_key"]  # Products with different freebies are exempted
                 )
@@ -6173,8 +6297,6 @@ def validate_products(
     if "_sid_clean" not in data.columns:
         data["_sid_clean"] = data["PRODUCT_SET_SID"]
     
-    if "_norm_name" not in data.columns:
-        data["_norm_name"] = _normalize_series(data["NAME"])
     st.session_state.setdefault("validation_stage_timings", {})["Read and normalize"] = round(time.perf_counter() - _pipeline_started, 3)
 
     validations = [
@@ -6545,12 +6667,23 @@ def validate_products(
     except OSError:
         _learned_rules_mtime = 0
     _learned_map_cache = st.session_state.get("_learned_image_rule_map_cache")
-    if not isinstance(_learned_map_cache, dict) or _learned_map_cache.get("mtime") != _learned_rules_mtime:
+    if (
+        not isinstance(_learned_map_cache, dict)
+        or _learned_map_cache.get("mtime") != _learned_rules_mtime
+        or _learned_map_cache.get("country") != country_validator.code
+    ):
+        _learned_index_started = time.perf_counter()
         _learned_map_cache = {
             "mtime": _learned_rules_mtime,
-            "map": merge_learned_image_rules({}),
+            "country": country_validator.code,
+            "map": merge_learned_image_rules({}, country_code=country_validator.code),
         }
         st.session_state["_learned_image_rule_map_cache"] = _learned_map_cache
+        st.session_state.setdefault("validation_stage_timings", {})["Learned image index"] = round(
+            time.perf_counter() - _learned_index_started, 3
+        )
+    else:
+        st.session_state.setdefault("validation_stage_timings", {}).setdefault("Learned image index", 0.0)
     _learned_image_rule_map = _learned_map_cache.get("map", {})
 
     # Fingerprint check runs LAST so it only touches products that cleared every
@@ -6598,10 +6731,14 @@ def validate_products(
         "variation.txt", "weight.txt", "smartphones.txt", "warranty.txt",
         "sensitive_words.txt", "category_qc_weighted.json",
         "Nigeria_QC_Rules.xlsx", "Morocco_rules.xlsx", "ghana_rules.py",
+        # General rules include the Uganda/market-wide FDA eligibility rules.
+        # Include their nanosecond revision in per-validator cache signatures;
+        # otherwise an identical re-upload could reuse a pre-edit approval.
+        "general_rules.py",
     ]
     _rules_sig = hashlib.md5(
         "".join(
-            f"{f}:{os.path.getmtime(f):.0f}" for f in _rules_files if os.path.exists(f)
+            f"{f}:{os.stat(f).st_mtime_ns}" for f in _rules_files if os.path.exists(f)
         ).encode()
     ).hexdigest()[:12]
 
@@ -7142,7 +7279,45 @@ def validate_products(
 def commit_pending_validation_learning():
     """Commit staged validator findings after Generate Reports is clicked."""
     pending = st.session_state.pop("_pending_validation_learning", None)
-    if not pending:
+    if not isinstance(pending, dict):
+        pending = {}
+
+    # Prefetched replica-jersey/IP rejections are final validation decisions
+    # too. Collect them at commit time, after reviewers' manual decisions, so
+    # approved rows never become learned image rules.
+    _prefetched_jersey_flag = "Category Check – Replica Jersey / IP Violation"
+    _final_report = st.session_state.get("final_report")
+    if isinstance(_final_report, pd.DataFrame) and not _final_report.empty and {"Status", "FLAG", "ProductSetSid"}.issubset(_final_report.columns):
+        _prefetch_flags = _final_report["FLAG"].fillna("").astype(str).str.strip()
+        _prefetch_norm_flags = _prefetch_flags.str.replace(
+            r"\s*\(Prefetched\)\s*$", "", regex=True, case=False
+        ).str.strip().str.casefold()
+        _prefetch_jersey_mask = (
+            _final_report["Status"].fillna("").astype(str).str.strip().str.casefold().eq("rejected")
+            & _prefetch_flags.str.contains(r"\(Prefetched\)\s*$", regex=True, case=False, na=False)
+            & _prefetch_norm_flags.eq(_prefetched_jersey_flag.casefold())
+        )
+        _prefetch_jersey_sids = (
+            _final_report.loc[_prefetch_jersey_mask, "ProductSetSid"]
+            .astype(str).str.strip().drop_duplicates().tolist()
+        )
+        if _prefetch_jersey_sids:
+            pending.setdefault("data", st.session_state.get("all_data_map"))
+            pending.setdefault("hash_by_url", st.session_state.get("_image_phash_by_url", {}))
+            _pending_flags = pending.setdefault("flags", {})
+            _pending_entry = _pending_flags.setdefault(
+                _prefetched_jersey_flag,
+                {"sids": [], "evaluated_sids": [], "reason": "Prefetched replica jersey / IP violation"},
+            )
+            _pending_entry["sids"] = list(dict.fromkeys(
+                list(_pending_entry.get("sids", [])) + _prefetch_jersey_sids
+            ))
+            _pending_entry["evaluated_sids"] = list(dict.fromkeys(
+                list(_pending_entry.get("evaluated_sids", [])) + _prefetch_jersey_sids
+            ))
+            _pending_entry["source"] = "prefetched"
+
+    if not pending.get("flags"):
         return 0
     data = pending.get("data")
     hash_by_url = pending.get("hash_by_url", {})
@@ -7177,8 +7352,9 @@ def commit_pending_validation_learning():
                     "sids": _learn_sids,
                     "flag": flag,
                     "reason": item.get("reason", ""),
-                    "source": "validation",
+                    "source": item.get("source", "validation"),
                     "hash_by_url": hash_by_url,
+                    "country_code": str(st.session_state.get("_process_country", "") or ""),
                 })
             committed += 1
         except Exception:
@@ -7217,7 +7393,7 @@ def derive_status_report(data, results, support_files, country_validator):
     try:
         _bmap = st.session_state.get("_learned_image_rule_map_cache", {}).get("map")
         if not isinstance(_bmap, dict):
-            _bmap = merge_learned_image_rules({})
+            _bmap = merge_learned_image_rules({}, country_code=country_validator.code)
         _all_learned_matches = get_blocked_image_matches(data, _bmap)
         # A restricted-brand image rule must never reject a book listing. The
         # same exemption applies to learned image matches, otherwise a book
@@ -7267,11 +7443,25 @@ def derive_status_report(data, results, support_files, country_validator):
             _sid: _match for _sid, _match in _all_learned_matches.items()
             if _match.get("decision") == "review"
         }
-        _touch_key = tuple(sorted(str(_sid) for _sid in _all_learned_matches))
+        _touch_key = (
+            country_validator.code,
+            tuple(sorted(
+                (
+                    str(_sid),
+                    str(_match.get("matched_rule_url", "") or ""),
+                    str(_match.get("matched_rule_phash", "") or ""),
+                )
+                for _sid, _match in _all_learned_matches.items()
+                if isinstance(_match, dict)
+            )),
+        )
         if _touch_key and st.session_state.get("_learned_match_touch_key") != _touch_key:
             st.session_state["_learned_match_touch_key"] = _touch_key
             try:
-                record_learned_image_matches_async(_all_learned_matches)
+                record_learned_image_matches_async(
+                    _all_learned_matches,
+                    country_code=country_validator.code,
+                )
             except Exception:
                 logger.debug("Could not update learned match timestamps", exc_info=True)
     except Exception as _e:
@@ -7488,6 +7678,9 @@ def derive_status_report(data, results, support_files, country_validator):
     final_df["Learned Rule pHash"] = final_df["ProductSetSid"].astype(str).str.strip().map(
         {str(_sid).strip(): str(_match.get("matched_rule_phash", "") or "").strip() for _sid, _match in _learned_display_matches.items()}
     ).fillna("")
+    final_df["Learned Rule Flag"] = final_df["ProductSetSid"].astype(str).str.strip().map(
+        {str(_sid).strip(): _match.get("flag", "") for _sid, _match in _learned_display_matches.items()}
+    ).fillna("")
     final_df["Learned Confidence"] = final_df["ProductSetSid"].astype(str).str.strip().map(
         {str(_sid).strip(): _match.get("confidence") for _sid, _match in _learned_display_matches.items()}
     )
@@ -7590,6 +7783,45 @@ def cached_validate_products(
     )
 
 
+def _get_validation_revision(rules_revision) -> str | None:
+    """Return a source revision, hashing validator files only when changed."""
+    validator_modules = ("streamlit_app.py", "custom_country_rules.py", "general_rules.py")
+    current_mtimes = {}
+    for module_name in validator_modules:
+        try:
+            current_mtimes[module_name] = (_APP_DIR / module_name).stat().st_mtime_ns
+        except OSError:
+            # Keep resumable chunks intact if a transient file lock prevents a
+            # stat or read. The caller then preserves the existing revision.
+            return None
+
+    with _VALIDATOR_DIGEST_LOCK:
+        cached = _VALIDATOR_DIGEST_CACHE
+        if (
+            cached["digest"] is not None
+            and cached["rules_revision"] == rules_revision
+            and cached["mtimes"] == current_mtimes
+        ):
+            return f"{rules_revision}:{cached['digest']}"
+
+        digest = hashlib.sha256()
+        for module_name in validator_modules:
+            try:
+                digest.update(module_name.encode("utf-8"))
+                with (_APP_DIR / module_name).open("rb") as source_file:
+                    for block in iter(lambda: source_file.read(1024 * 1024), b""):
+                        digest.update(block)
+            except OSError:
+                return None
+        hex_digest = digest.hexdigest()[:20]
+        _VALIDATOR_DIGEST_CACHE.update(
+            digest=hex_digest,
+            rules_revision=rules_revision,
+            mtimes=current_mtimes,
+        )
+        return f"{rules_revision}:{hex_digest}"
+
+
 def _validate_in_chunks_unlocked(data, support_files, country_validator, data_has_warranty,
                       *, cache_prefix, skip_validators=None, on_progress=None,
                       full_batch=None, rules_revision=0.0, manifest=None,
@@ -7602,24 +7834,7 @@ def _validate_in_chunks_unlocked(data, support_files, country_validator, data_ha
     # deliberately treated as stale once and recomputed instead of silently
     # restoring a report produced before a rule was added or changed.
     if manifest is not None:
-        _validator_digest = hashlib.sha256()
-        _validator_code_complete = True
-        for _validator_module in ("streamlit_app.py", "custom_country_rules.py", "general_rules.py"):
-            _validator_path = _APP_DIR / _validator_module
-            try:
-                _validator_digest.update(_validator_module.encode("utf-8"))
-                with _validator_path.open("rb") as _validator_file:
-                    for _block in iter(lambda: _validator_file.read(1024 * 1024), b""):
-                        _validator_digest.update(_block)
-            except OSError:
-                # A transient Windows resource error is not a source change;
-                # preserve completed chunks so a retry can resume safely.
-                _validator_code_complete = False
-                break
-        _validation_revision = (
-            f"{rules_revision}:{_validator_digest.hexdigest()[:20]}"
-            if _validator_code_complete else None
-        )
+        _validation_revision = _get_validation_revision(rules_revision)
         if _validation_revision and manifest.get("validation_revision") != _validation_revision:
             manifest["validation_revision"] = _validation_revision
             manifest["batches"] = {}
@@ -7670,6 +7885,15 @@ def _validate_in_chunks_unlocked(data, support_files, country_validator, data_ha
     chunk_size = max(250, min(int(chunk_size or 1000), 1000))
     total = max(1, (len(sids) + chunk_size - 1) // chunk_size)
     done = completed_batches(manifest or {})
+    resumable_chunks = {f"{batch_prefix}-{index + 1}" for index in range(total)} & done
+    if resumable_chunks and on_progress:
+        try:
+            on_progress(
+                f"Restoring {len(resumable_chunks):,} completed chunks; continuing the remaining work…",
+                len(resumable_chunks), total,
+            )
+        except Exception:
+            logger.debug("Could not publish validation resume status", exc_info=True)
     _resume_cached_chunks = 0
     _resume_cached_rows = 0
     st.session_state["_resume_metrics"] = {
@@ -8134,7 +8358,7 @@ with st.sidebar:
             # The catalog shown to reviewers is the JSON catalog. Excel is
             # only a migration/legacy input and is not used for these counts.
             _json_rules = [
-                r for r in load_learned_image_rules()
+                r for r in iter_learned_image_rules()
                 if str(r.get("status", "active")).casefold() == "active"
             ]
             _json_fingerprints = {
@@ -8393,6 +8617,7 @@ def _reset_report_state(*, clear_uploaded_files: bool = False, clear_zip_cache: 
         "quick_rejects", "_stagedRejections", "post_qc_results", "zip_qc_results",
         "_zip_sid_index", "_zip_sid_set", "_zip_status_cols", "_zip_prefetch_map",
         "current_sig_hash", "_data_filtered_ref",
+        "_review_save_status",
         # PIM_QC_Result.xlsx and the verdict map derived from it. These were
         # missed when the rest of the ZIP state was added here, and they are
         # the loudest omission of the set: the seeding block below feeds every
@@ -8416,6 +8641,7 @@ def _reset_report_state(*, clear_uploaded_files: bool = False, clear_zip_cache: 
         st.session_state.cached_uploaded_files = []
         st.session_state._uploader_detached = False
         st.session_state._uploader_safe_key = False
+        st.session_state.pop("_upload_batch_recovered", None)
     if clear_zip_cache:
         st.session_state.zip_image_store = {}
         st.session_state.zip_image_index = {}
@@ -8426,6 +8652,12 @@ def _reset_report_state(*, clear_uploaded_files: bool = False, clear_zip_cache: 
     _prefixes = ("quick_rej_", "grid_chk_", "toast_", "_flt_", "_fs_") + tuple(extra_key_prefixes)
     _dead_keys = [k for k in st.session_state.keys() if k.startswith(_prefixes)]
     for k in _dead_keys: del st.session_state[k]
+
+    # After dropping large DataFrames and image stores, ask the GC to reclaim
+    # them now rather than waiting for the next generation sweep. Most effective
+    # on Windows where pandas object columns create reference cycles that linger.
+    if clear_uploaded_files or clear_zip_cache:
+        gc.collect()
 
 
 _country_bridge = st.text_input("country_bridge", value="", placeholder="COUNTRY_BRIDGE_DO_NOT_USE", key=f"country_bridge_{st.session_state.get('country_bridge_counter', 0)}", label_visibility="collapsed")
@@ -8452,8 +8684,8 @@ _UPLOAD_R2_PREFIX = f"validation/uploads/{_UPLOAD_R2_NAMESPACE}/"
 
 
 def _persist_upload_batch(records: list[dict]) -> None:
-    """Atomically save the current batch index and mirror it to R2 when configured."""
-    files = []
+    """Persist the current upload list so a process restart can rediscover it."""
+    payload = []
     for record in records or []:
         if not isinstance(record, dict):
             continue
@@ -8464,8 +8696,9 @@ def _persist_upload_batch(records: list[dict]) -> None:
             continue
         if not path.is_file():
             continue
-        files.append({
-            "name": str(record.get("name") or path.name), "path": str(path),
+        payload.append({
+            "name": str(record.get("name") or path.name),
+            "path": str(path),
             "size": int(record.get("size") or path.stat().st_size),
             "md5": str(record.get("md5") or ""),
             "sha256": str(record.get("sha256") or path.stem),
@@ -8474,46 +8707,41 @@ def _persist_upload_batch(records: list[dict]) -> None:
             "r2_saved": bool(record.get("r2_saved", False)),
             "created_at": str(record.get("created_at") or datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()),
         })
-    temp_path = None
     try:
+        _UPLOAD_BATCH_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=_UPLOAD_CACHE_DIR,
+            mode="w", encoding="utf-8", dir=_UPLOAD_BATCH_REGISTRY.parent,
             prefix="current_batch_", suffix=".tmp", delete=False,
         ) as handle:
             temp_path = Path(handle.name)
-            json.dump({"version": 1, "files": files}, handle, ensure_ascii=False)
-            handle.flush()
-            os.fsync(handle.fileno())
+            json.dump({"version": 1, "files": payload}, handle, ensure_ascii=False)
         os.replace(temp_path, _UPLOAD_BATCH_REGISTRY)
+        try:
+            import r2_storage
+            if r2_storage.enabled():
+                saved = r2_storage.upload_file_verified(
+                    _UPLOAD_BATCH_REGISTRY,
+                    f"{_UPLOAD_R2_PREFIX}current_batch.json",
+                    "application/json",
+                )
+                st.session_state["_upload_r2_registry_saved"] = bool(saved)
+        except Exception:
+            logger.warning("Could not save upload recovery index to R2", exc_info=True)
     except OSError:
-        if temp_path:
-            temp_path.unlink(missing_ok=True)
-        logger.exception("Could not save upload recovery metadata locally")
-        return
-    try:
-        import r2_storage
-        if r2_storage.enabled():
-            saved = r2_storage.upload_file_verified(
-                _UPLOAD_BATCH_REGISTRY, f"{_UPLOAD_R2_PREFIX}current_batch.json", "application/json"
-            )
-            st.session_state["_upload_r2_registry_saved"] = bool(saved)
-    except Exception:
-        logger.warning("Could not mirror upload recovery metadata to R2", exc_info=True)
-        st.session_state["_upload_r2_registry_saved"] = False
+        logger.exception("Could not save the upload recovery record")
 
 
 def _restore_upload_batch() -> list[dict]:
-    """Restore this host's latest unexpired upload batch from disk or R2."""
-    records = []
+    """Restore only content-addressed upload files that still exist locally."""
     try:
-        payload = json.loads(_UPLOAD_BATCH_REGISTRY.read_text(encoding="utf-8"))
-        records = payload.get("files", []) if isinstance(payload, dict) else []
+        saved = json.loads(_UPLOAD_BATCH_REGISTRY.read_text(encoding="utf-8"))
+        records = saved.get("files", []) if isinstance(saved, dict) else []
     except (OSError, ValueError, TypeError):
         try:
             import r2_storage
             raw = r2_storage.download_bytes(f"{_UPLOAD_R2_PREFIX}current_batch.json") if r2_storage.enabled() else b""
-            payload = json.loads(raw.decode("utf-8")) if raw else {}
-            records = payload.get("files", []) if isinstance(payload, dict) else []
+            saved = json.loads(raw.decode("utf-8")) if raw else {}
+            records = saved.get("files", []) if isinstance(saved, dict) else []
         except (OSError, ValueError, TypeError):
             return []
     recovered = []
@@ -8522,61 +8750,85 @@ def _restore_upload_batch() -> list[dict]:
             continue
         try:
             digest = str(record.get("sha256") or "").lower()
+            path = Path(os.path.abspath(str(record.get("path") or "")))
+            try:
+                path.relative_to(_UPLOAD_CACHE_DIR)
+            except ValueError:
+                # R2 recovery records can be written by another host whose
+                # absolute workspace path is different. Rebuild the local
+                # destination from the content-addressed filename.
+                if not digest:
+                    continue
+                path = Path(os.path.abspath(os.fspath(_UPLOAD_CACHE_DIR / f"{digest}.upload")))
             size = int(record.get("size") or 0)
-            path = Path(os.path.abspath(os.fspath(_UPLOAD_CACHE_DIR / f"{digest}.upload")))
             created_raw = str(record.get("created_at") or "").strip()
-            created_at = datetime.fromisoformat(created_raw.replace("Z", "+00:00")) if created_raw else datetime.now(timezone.utc)
+            created_at = (
+                datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+                if created_raw else datetime.now(timezone.utc)
+            )
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=timezone.utc)
             if datetime.now(timezone.utc) - created_at > timedelta(hours=24):
                 path.unlink(missing_ok=True)
                 continue
-            local_ok = path.is_file() and path.stat().st_size == size
-            if local_ok:
-                check = hashlib.sha256()
-                with path.open("rb") as handle:
-                    for block in iter(lambda: handle.read(1024 * 1024), b""):
-                        check.update(block)
-                local_ok = check.hexdigest() == digest
-            if not local_ok:
-                import r2_storage
-                if not digest or not r2_storage.enabled() or not r2_storage.download_file_verified(
-                    str(record.get("r2_key") or f"{_UPLOAD_R2_PREFIX}{digest}.upload"), path,
-                    expected_sha256=digest, expected_size=size,
-                ):
+            if not path.is_file() or path.stat().st_size != size:
+                try:
+                    import r2_storage
+                    if not digest or not r2_storage.enabled() or not r2_storage.download_file_verified(
+                        str(record.get("r2_key") or f"{_UPLOAD_R2_PREFIX}{digest}.upload"),
+                        path,
+                        expected_sha256=digest,
+                        expected_size=size,
+                    ):
+                        continue
+                except Exception:
+                    logger.warning("Could not restore an uploaded source file from R2", exc_info=True)
                     continue
+            if path.stat().st_size != size:
+                continue
+            if digest and path.name != f"{digest}.upload":
+                continue
             recovered.append({
                 "name": str(record.get("name") or path.name), "path": str(path),
                 "size": size, "md5": str(record.get("md5") or ""),
                 "sha256": digest, "sha256_prefix": str(record.get("sha256_prefix") or digest[:24]),
                 "r2_key": str(record.get("r2_key") or f"{_UPLOAD_R2_PREFIX}{digest}.upload"),
-                "r2_saved": bool(record.get("r2_saved", False)), "created_at": created_at.isoformat(),
+                "r2_saved": bool(record.get("r2_saved", False)),
+                "created_at": created_at.isoformat(),
             })
         except (OSError, ValueError, TypeError):
             continue
     if recovered:
         _persist_upload_batch(recovered)
+    else:
+        try:
+            _UPLOAD_BATCH_REGISTRY.unlink(missing_ok=True)
+        except OSError:
+            pass
     return recovered
 
 
 def _clear_persisted_upload_batch(records: list[dict]) -> None:
-    """Clear local source uploads and invalidate the R2 current-batch pointer."""
+    """Remove explicitly cleared upload spools and their recovery index."""
     for record in records or []:
+        if not isinstance(record, dict):
+            continue
         try:
             path = Path(os.path.abspath(str(record.get("path") or "")))
             path.relative_to(_UPLOAD_CACHE_DIR)
             path.unlink(missing_ok=True)
         except (OSError, ValueError):
             continue
-    _UPLOAD_BATCH_REGISTRY.unlink(missing_ok=True)
     try:
-        import r2_storage
-        if r2_storage.enabled():
-            r2_storage.upload_bytes(
-                b'{"version":1,"files":[]}', f"{_UPLOAD_R2_PREFIX}current_batch.json", "application/json"
-            )
-    except Exception:
-        logger.warning("Could not invalidate R2 upload recovery metadata", exc_info=True)
+        _UPLOAD_BATCH_REGISTRY.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Could not remove the cleared upload recovery record")
+
+
+if st.session_state.get("cached_uploaded_files") and not _UPLOAD_BATCH_REGISTRY.exists():
+    # Upgrade batches that were already open when durable upload recovery was
+    # introduced, so they gain restart recovery without asking for re-upload.
+    _persist_upload_batch(st.session_state.cached_uploaded_files)
 
 
 # A session restored by an older app version may still carry an implicitly
@@ -8605,7 +8857,8 @@ def _materialize_uploaded_file(uploaded_file) -> dict:
     if not first:
         target = _UPLOAD_CACHE_DIR / (hashlib.sha256(b"").hexdigest() + ".upload")
         target.touch(exist_ok=True)
-        return {"name": uploaded_file.name, "path": str(target), "size": 0, "md5": md5.hexdigest(), "sha256": hashlib.sha256(b"").hexdigest(), "sha256_prefix": hashlib.sha256(b"").hexdigest()[:24]}
+        empty_sha = hashlib.sha256(b"").hexdigest()
+        return {"name": uploaded_file.name, "path": str(target), "size": 0, "md5": md5.hexdigest(), "sha256": empty_sha, "sha256_prefix": empty_sha[:24]}
     tmp = tempfile.NamedTemporaryFile(prefix="upload_", suffix=".part", dir=_UPLOAD_CACHE_DIR, delete=False)
     tmp_path = Path(tmp.name)
     try:
@@ -8619,14 +8872,17 @@ def _materialize_uploaded_file(uploaded_file) -> dict:
                 chunk = uploaded_file.read(1024 * 1024)
         digest = hasher.hexdigest()
         final_path = _UPLOAD_CACHE_DIR / f"{digest}.upload"
-        existing_valid = False
+        existing_is_valid = False
         if final_path.exists() and final_path.stat().st_size == size:
-            existing_hash = hashlib.sha256()
-            with final_path.open("rb") as existing_file:
-                for block in iter(lambda: existing_file.read(1024 * 1024), b""):
-                    existing_hash.update(block)
-            existing_valid = existing_hash.hexdigest() == digest
-        if existing_valid:
+            try:
+                existing_hasher = hashlib.sha256()
+                with final_path.open("rb") as existing_file:
+                    for block in iter(lambda: existing_file.read(1024 * 1024), b""):
+                        existing_hasher.update(block)
+                existing_is_valid = existing_hasher.hexdigest() == digest
+            except OSError:
+                existing_is_valid = False
+        if existing_is_valid:
             tmp_path.unlink(missing_ok=True)
         else:
             os.replace(tmp_path, final_path)
@@ -8672,6 +8928,39 @@ def _upload_size(record: dict) -> int:
         return int(record.get("size", 0) or os.path.getsize(_upload_path(record)))
     except Exception:
         return len(record.get("bytes", b""))
+
+
+def _record_validation_timing_run(signature: str, upload_records: list, row_count: int) -> None:
+    """Keep a small, filename-free history for comparing ZIP/RAR/plain runs."""
+    try:
+        extensions = sorted({Path(str(item.get("name", ""))).suffix.lower().lstrip(".") for item in upload_records if isinstance(item, dict)})
+        kinds = {"zip" if ext == "zip" else "rar" if ext == "rar" else "plain" for ext in extensions}
+        upload_kind = " + ".join(sorted(kind.upper() for kind in kinds)) or "UNKNOWN"
+        record = {
+            "signature": str(signature or ""),
+            "upload_type": upload_kind,
+            "rows": int(row_count or 0),
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "stages": {str(key): float(value) for key, value in st.session_state.get("validation_stage_timings", {}).items() if isinstance(value, (int, float))},
+            "image": {str(key): value for key, value in (st.session_state.get("image_fetch_metrics", {}) or {}).items() if isinstance(value, (int, float))},
+        }
+        history_path = Path(PARQUET_CACHE_DIR) / "validation_timing_history.json"
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            history = json.loads(history_path.read_text(encoding="utf-8"))
+            if not isinstance(history, list):
+                history = []
+        except (OSError, ValueError, TypeError):
+            history = []
+        history = [item for item in history if not isinstance(item, dict) or item.get("signature") != record["signature"]]
+        history.append(record)
+        history = history[-100:]
+        temp = history_path.with_suffix(".json.tmp")
+        temp.write_text(json.dumps(history, ensure_ascii=False), encoding="utf-8")
+        os.replace(temp, history_path)
+        st.session_state["validation_timing_history"] = history
+    except Exception:
+        logger.exception("Could not save validation timing history")
 
 
 def _open_upload_buffer(record: dict):
@@ -8731,6 +9020,43 @@ if _has_files:
 # being processed (including when several files were uploaded together).
 _batch_files_for_display = st.session_state.get("cached_uploaded_files", [])
 if _batch_files_for_display:
+    _preflight_cache = st.session_state.setdefault("_upload_preflight_cache", {})
+    _safe_archive_limit = 1024 * 1024 * 1024
+
+    def _upload_preflight(record):
+        signature = _upload_sha256_prefix(record)
+        cached = _preflight_cache.get(signature)
+        if isinstance(cached, dict):
+            return cached
+        result = {"uncompressed_bytes": 0, "estimated_rows": 0, "data_members": 0, "warning": ""}
+        filename = str(record.get("name", ""))
+        try:
+            if filename.lower().endswith((".zip", ".rar")):
+                with _open_uploaded_archive(_upload_path(record) or _upload_bytes(record), filename) as archive:
+                    for info in archive.infolist():
+                        _is_dir = info.is_dir() if hasattr(info, "is_dir") else info.isdir()
+                        if _is_dir:
+                            continue
+                        size = int(getattr(info, "file_size", 0) or 0)
+                        result["uncompressed_bytes"] += size
+                        member_name = str(info.filename).lower()
+                        if member_name.endswith((".csv", ".xlsx", ".xls")):
+                            result["data_members"] += 1
+                            if member_name.endswith(".csv"):
+                                result["estimated_rows"] += max(0, size // 500)
+                            elif "qc" in member_name:
+                                result["estimated_rows"] += max(0, size // 500)
+            else:
+                size = _upload_size(record)
+                result["uncompressed_bytes"] = size
+                if filename.lower().endswith(".csv"):
+                    result["estimated_rows"] = max(0, size // 500)
+                result["data_members"] = 1
+        except Exception as exc:
+            result["warning"] = str(exc)
+        _preflight_cache[signature] = result
+        return result
+
     def _format_upload_size_label(value):
         try:
             size = max(0, int(value or 0))
@@ -8745,26 +9071,66 @@ if _batch_files_for_display:
         st.markdown("**Files in the current validation batch**")
         if st.session_state.get("_upload_batch_recovered"):
             st.info(
-                "Recovered this batch after the app restarted. Completed validation chunks and saved image checks can be reused.",
+                "Recovered this batch from the previous app run. Completed validation chunks and saved image checks will be reused.",
                 icon=":material/history:",
             )
-        try:
-            import r2_storage
-            if r2_storage.enabled() and st.session_state.get("_upload_r2_registry_saved"):
-                st.caption("Verified R2 recovery copy is available. Configure the bucket lifecycle prefix `validation/uploads/` to expire objects after 1 day.")
-            elif r2_storage.enabled():
-                st.caption("Local recovery is available; the R2 copy could not be verified, so Cloud restart recovery is not guaranteed.")
-            else:
-                st.caption("This batch is saved locally for restart recovery. R2 is not configured for Cloud recovery.")
-        except Exception:
-            st.caption("This batch is saved locally for restart recovery.")
-        for _upload_record in _batch_files_for_display[:8]:
-            st.caption(
-                f"{_upload_record.get('name', 'Uploaded file')} · "
-                f"{_format_upload_size_label(_upload_size(_upload_record))}"
-            )
+        _r2_copy_ready = bool(_batch_files_for_display) and all(
+            bool(item.get("r2_saved")) for item in _batch_files_for_display
+        ) and bool(st.session_state.get("_upload_r2_registry_saved"))
+        if _r2_copy_ready:
+            st.caption("Verified R2 recovery copy is available. Set the R2 lifecycle rule for `validation/uploads/` to expire after 1 day.")
+        else:
+            st.caption("Recovery copy is on this machine. Cloud restart recovery needs the R2 copy and its 1-day lifecycle rule.")
+        _preflight_total = 0
+        _preflight_rows = 0
+        _preflight_members = 0
+        for _upload_index, _upload_record in enumerate(_batch_files_for_display):
+            _preflight = _upload_preflight(_upload_record)
+            _preflight_total += int(_preflight.get("uncompressed_bytes", 0))
+            _preflight_rows += int(_preflight.get("estimated_rows", 0))
+            _preflight_members += int(_preflight.get("data_members", 0))
+            if _upload_index < 8:
+                st.caption(
+                    f"{_upload_record.get('name', 'Uploaded file')} · "
+                    f"{_format_upload_size_label(_upload_size(_upload_record))} upload · "
+                    f"{_format_upload_size_label(_preflight.get('uncompressed_bytes', 0))} unpacked"
+                )
+                if _preflight.get("warning"):
+                    st.warning(f"{_upload_record.get('name', 'Archive')}: {_preflight['warning']}")
         if len(_batch_files_for_display) > 8:
             st.caption(f"+ {len(_batch_files_for_display) - 8:,} more files in this batch")
+        st.caption(
+            f"Preflight · {_format_upload_size_label(_preflight_total)} uncompressed across all files · "
+            f"about {_preflight_rows:,} rows in {_preflight_members:,} data members. "
+            "This is an estimate; the exact product count appears after parsing."
+        )
+    _preflight_blocked = _preflight_total > _safe_archive_limit
+    st.session_state["_upload_preflight_blocked"] = _preflight_blocked
+    if _preflight_blocked:
+        st.error(
+            f"This batch expands to {_format_upload_size_label(_preflight_total)}. "
+            f"The safe processing limit is {_format_upload_size_label(_safe_archive_limit)} uncompressed. "
+            "Remove files or split the archive into smaller batches before validating."
+        )
+
+    _report_ready = not st.session_state.get("final_report", pd.DataFrame()).empty
+    _current_step = 3 if st.session_state.get("exports_cache") else (2 if _report_ready else 1)
+    _steps = [("Upload", 0), ("Validate", 1), ("Review", 2), ("Export", 3)]
+    _step_cols = st.columns(4, gap="small")
+    for _idx, (_label, _step_index) in enumerate(_steps):
+        _step_icon = ":material/check_circle:" if _step_index < _current_step else (":material/radio_button_checked:" if _step_index == _current_step else ":material/radio_button_unchecked:")
+        _step_cols[_idx].markdown(f"{_step_icon} **{_label}**")
+    _workflow_market = f"{country_validator.country} ({country_validator.code})"
+    _workflow_save = st.session_state.get("_review_save_status", {})
+    _workflow_save_label = (
+        f"Review decisions saved locally · {_workflow_save.get('saved_at', '')}"
+        if _workflow_save.get("status") == "saved"
+        else "Review decisions need saving" if _workflow_save.get("status") == "failed"
+        else "No review changes yet"
+    )
+    st.caption(f"Market · {_workflow_market} · {_workflow_save_label}")
+else:
+    st.session_state["_upload_preflight_blocked"] = False
 
 # Rotate the widget before registration after a batch has been detached. This
 # matters because Streamlit deep-copies the previous UploadedFile list inside
@@ -8775,7 +9141,7 @@ if st.session_state.get("_uploader_detached", False) and not st.session_state.ge
     st.rerun()
 
 try:
-    uploaded_files = st.file_uploader("Dpload files", type=["csv", "xlsx", "zip", "rar"], accept_multiple_files=True, key=f"daily_files_{st.session_state.uploader_key}", label_visibility="collapsed")
+    uploaded_files = st.file_uploader("Upload product files", type=["csv", "xlsx", "zip", "rar"], accept_multiple_files=True, key=f"daily_files_{st.session_state.uploader_key}", label_visibility="collapsed", help="Maximum upload size is 200 MB per file. ZIP/RAR archives are also checked against a 1 GB uncompressed safety limit.")
 except MemoryError:
     # Recover sessions created before the detached-uploader fix. Preserve the
     # cached batch and register a fresh widget with no oversized value.
@@ -8801,7 +9167,7 @@ if uploaded_files:
             else:
                 _record["r2_saved"] = False
         except Exception:
-            logger.warning("Could not save uploaded source file to R2", exc_info=True)
+            logger.warning("Could not back up the uploaded source file to R2", exc_info=True)
             _record["r2_saved"] = False
         _md5 = _record["md5"]
         # Streamlit can return the same file more than once when the uploader
@@ -8811,11 +9177,11 @@ if uploaded_files:
             continue
         _seen_upload_hashes.add(_md5)
         _new_cache.append(_record)
-        # Journal each completed upload so a multi-file batch can recover even
-        # if the process exits before the remaining files finish spooling.
+        # Write after each completed spool. If the process exits while a
+        # multi-file batch is being staged, files already copied to durable
+        # storage can still be recovered on the next launch.
         _persist_upload_batch(_new_cache)
     st.session_state.cached_uploaded_files = _new_cache
-    st.session_state.pop("_upload_batch_recovered", None)
     _persist_upload_batch(_new_cache)
     st.session_state._uploader_had_files = True
     # Detach the large UploadedFile list from the widget after the first read.
@@ -8943,7 +9309,7 @@ _total_estimated_rows = st.session_state.get("_row_estimate_cache", 0)
 if _total_estimated_rows > _large_file_threshold:
     st.info(f"**Large file detected** (~{_total_estimated_rows:,} rows estimated) — validation may take 30–60 seconds. Image checks run in parallel to keep things fast.", icon=":material/hourglass_top:")
 
-if st.session_state.get("last_processed_files") != process_signature:
+if st.session_state.get("last_processed_files") != process_signature and not st.session_state.get("_upload_preflight_blocked", False):
     # clear_zip_cache, because the file set has changed: the previous ZIP's
     # image index is keyed on name/brand, so leaving it loaded lets a product
     # from the new upload resolve to an image out of the old archive.
@@ -9409,6 +9775,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                         fast_skip_list = _large_file_skip_validations if _total_estimated_rows > _large_file_threshold else []
 
                         st.write(f"Running validation on {len(all_sids)} products…")
+                        st.caption(f"Parsed batch · {len(data):,} product rows · {len(all_sids):,} unique SKUs · country {country_validator.code}")
                         if zip_sids: st.write(f"ZIP/QC data: {len(zip_sids)} prefetched SKUs, {len(non_zip_sids)} additional SKUs.")
 
                         final_report_parts: list = []
@@ -9445,6 +9812,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                             final_report_parts.append(fr_zip)
                             results_parts.append(res_zip)
 
+                        _report_assembly_started = time.perf_counter()
                         if final_report_parts:
                             final_report_subset = pd.concat(final_report_parts, ignore_index=True)
                             combined_results: dict = {}
@@ -10005,7 +10373,12 @@ if st.session_state.get("last_processed_files") != process_signature:
                             _learned_sid = _learned_source_report["ProductSetSid"].astype(str).str.strip()
                             _learned_maps = {
                                 _col: dict(zip(_learned_sid, _learned_source_report[_col]))
-                                for _col in ("Learned Match", "Learned Match Method", "Learned Match Distance")
+                                for _col in (
+                                    "Learned Match", "Learned Match Method", "Learned Match Distance",
+                                    "Learned Rule URL", "Learned Rule pHash", "Learned Confidence",
+                                    "Learned Decision", "Learned Review Match", "Learned Review Detail",
+                                    "Learned Review Method", "Learned Review Distance", "Learned Review Brand",
+                                )
                                 if _col in _learned_source_report.columns
                             }
                             _final_sid = final_report["ProductSetSid"].astype(str).str.strip()
@@ -10017,11 +10390,19 @@ if st.session_state.get("last_processed_files") != process_signature:
                             ).astype(bool)
                             final_report["Learned Match Method"] = _final_sid.map(_learned_maps.get("Learned Match Method", {})).fillna("")
                             final_report["Learned Match Distance"] = _final_sid.map(_learned_maps.get("Learned Match Distance", {}))
+                            for _learned_extra in (
+                                "Learned Rule URL", "Learned Rule pHash", "Learned Confidence",
+                                "Learned Decision", "Learned Review Match", "Learned Review Detail",
+                                "Learned Review Method", "Learned Review Distance", "Learned Review Brand",
+                            ):
+                                if _learned_extra in _learned_maps:
+                                    final_report[_learned_extra] = _final_sid.map(_learned_maps[_learned_extra])
                         else:
                             final_report["Learned Match"] = False
                             final_report["Learned Match Method"] = ""
                             final_report["Learned Match Distance"] = pd.Series(index=final_report.index, dtype="float64")
 
+                        st.session_state.setdefault("validation_stage_timings", {})["Report assembly"] = round(time.perf_counter() - _report_assembly_started, 3)
                         st.session_state.final_report = final_report
                         st.session_state.all_data_map = data
                         # The complete export source has already been written
@@ -10048,6 +10429,7 @@ if st.session_state.get("last_processed_files") != process_signature:
                                     save_df_parquet(_frame, _artifact_name)
                         st.session_state.current_sig_hash = sig_hash
                         _prepare_lazy_zip_images(_files_for_processing)
+                        _record_validation_timing_run(process_signature, _files_for_processing, len(data))
 
                         try:
                             from constants import GRID_COLS
@@ -10471,10 +10853,14 @@ def handle_jtbridge():
                 if isinstance(_raw_payload, dict) and "sids" in _raw_payload:
                     _payload = _raw_payload.get("sids", {})
                     _auto_comments = _raw_payload.get("comments", {})
+                    _batch_id = str(_raw_payload.get("batch_id", "") or "").strip()
                 else:
                     _payload = _raw_payload
                     _auto_comments = st.session_state.pop("pending_auto_comments", {})
+                    _batch_id = ""
                 if isinstance(_payload, dict) and _payload:
+                    if _batch_id:
+                        st.session_state["_grid_review_batch_id"] = _batch_id
                     _rgroups = {}
                     for _sid, _rkey in _payload.items(): _rgroups.setdefault(_rkey, []).append(_sid)
                     _queue_groups = []
@@ -10579,14 +10965,14 @@ def handle_jtbridge():
                                     _img = _candidate_img
                                     break
                         _removed_rules = [
-                            r for r in load_learned_image_rules()
+                            r for r in iter_learned_image_rules()
                             if str(r.get("image_url", "")).strip() == _img
                         ]
                         if _removed_rules:
                             _urls = {str(r.get("image_url", "") or "").strip() for r in _removed_rules}
                             _hashes = {str(r.get("phash", "") or "").strip().casefold() for r in _removed_rules}
                             _removed_rules = [
-                                r for r in load_learned_image_rules()
+                                r for r in iter_learned_image_rules()
                                 if str(r.get("image_url", "") or "").strip() in _urls
                                 or (
                                     str(r.get("phash", "") or "").strip().casefold()
@@ -10734,59 +11120,122 @@ def render_main_results():
     # analytical deep-dive, not the orientation) had equal billing. Swapped:
     # KPIs always on, charts behind the disclosure.
     render_summary_header(fr)
-    _timing_rows = []
-    for _stage_name, _stage_seconds in sorted(
-        st.session_state.get("validation_stage_timings", {}).items(),
-        key=lambda item: float(item[1]), reverse=True,
-    ):
-        _timing_rows.append({"Validator": f"Stage · {_stage_name}", "Seconds": float(_stage_seconds), "Runs": 1})
-    for _name, _info in sorted(
-        st.session_state.get("validation_timings", {}).items(),
-        key=lambda item: float(item[1].get("seconds", 0)), reverse=True,
-    ):
-        _timing_rows.append({
-            "Validator": _name,
-            "Seconds": float(_info.get("seconds", 0)),
-            "Runs": int(_info.get("runs", 0)),
-        })
-    if _timing_rows or st.session_state.get("validator_status_rows"):
-        with st.expander("Validation diagnostics", expanded=False):
-            _diag_timing_tab, _diag_status_tab = st.tabs(["Timings", "Validator status"])
-            with _diag_timing_tab:
-                st.caption("Measured validator time for the current validation run.")
-                st.dataframe(pd.DataFrame(_timing_rows), hide_index=True, width="stretch")
-                _image_metrics = st.session_state.get("image_fetch_metrics", {}) or {}
-                if _image_metrics:
-                    st.caption("Image preparation detail")
-                    st.dataframe(pd.DataFrame([_image_metrics]), hide_index=True, width="stretch")
-            with _diag_status_tab:
-                _status_frame = pd.DataFrame(st.session_state.get("validator_status_rows", []))
-                if _status_frame.empty:
-                    st.info("Validator status is not available for this run yet.")
-                else:
-                    _status_filter = st.multiselect(
-                        "Show statuses",
-                        ["Active", "Runtime", "Cached", "Skipped", "Failed"],
-                        default=["Active", "Runtime", "Cached", "Skipped", "Failed"],
-                        key="validator_status_filter",
-                    )
-                    st.dataframe(
-                        _status_frame[_status_frame["Status"].isin(_status_filter)],
-                        hide_index=True,
-                        width="stretch",
-                    )
-                    _applied = _status_frame[_status_frame["Status"].isin(["Runtime", "Cached", "Active"])]
-                    _skipped_count = int((_status_frame["Status"] == "Skipped").sum())
-                    st.caption(f"Rules actually applied: {_applied['Validator'].nunique():,} · Skipped with explanation: {_skipped_count:,} · Failed: {int((_status_frame['Status'] == 'Failed').sum()):,}")
+    _review_save = st.session_state.get("_review_save_status", {})
+    if _review_save:
+        if _review_save.get("status") == "saved":
+            st.caption(f":material/cloud_done: Review decisions saved locally · {_review_save.get('saved_at', '')}")
+        else:
+            st.error("Review decisions could not be saved locally. Keep this tab open and retry the action.", icon=":material/save:")
+    _has_diagnostics = bool(
+        st.session_state.get("validation_stage_timings")
+        or st.session_state.get("validation_timings")
+        or st.session_state.get("validator_status_rows")
+    )
+    if _has_diagnostics:
+        _diagnostics = st.expander(
+            "Validation diagnostics",
+            expanded=bool(st.session_state.get("dashboard_show_diagnostics", False)),
+            on_change="rerun",
+        )
+        st.session_state["dashboard_show_diagnostics"] = bool(_diagnostics.open)
+        if _diagnostics.open:
+            with _diagnostics:
+                _timing_rows = []
+                for _stage_name, _stage_seconds in sorted(
+                    st.session_state.get("validation_stage_timings", {}).items(),
+                    key=lambda item: float(item[1]), reverse=True,
+                ):
+                    _timing_rows.append({"Validator": f"Stage · {_stage_name}", "Seconds": float(_stage_seconds), "Runs": 1})
+                for _name, _info in sorted(
+                    st.session_state.get("validation_timings", {}).items(),
+                    key=lambda item: float(item[1].get("seconds", 0)), reverse=True,
+                ):
+                    _timing_rows.append({
+                        "Validator": _name,
+                        "Seconds": float(_info.get("seconds", 0)),
+                        "Runs": int(_info.get("runs", 0)),
+                    })
+                _diag_timing_tab, _diag_status_tab = st.tabs(
+                    ["Timings", "Validator status"], on_change="rerun"
+                )
+                if _diag_timing_tab.open:
+                    with _diag_timing_tab:
+                        st.caption("Measured validator time for the current validation run.")
+                        st.dataframe(pd.DataFrame(_timing_rows), hide_index=True, width="stretch")
+                        _image_metrics = st.session_state.get("image_fetch_metrics", {}) or {}
+                        if _image_metrics:
+                            st.caption("Image preparation detail")
+                            st.dataframe(pd.DataFrame([_image_metrics]), hide_index=True, width="stretch")
+                        _timing_history = st.session_state.get("validation_timing_history", [])
+                        if not _timing_history:
+                            try:
+                                _history_path = Path(PARQUET_CACHE_DIR) / "validation_timing_history.json"
+                                _timing_history = json.loads(_history_path.read_text(encoding="utf-8")) if _history_path.exists() else []
+                            except (OSError, ValueError, TypeError):
+                                _timing_history = []
+                        if _timing_history:
+                            _history_rows = []
+                            for _run in _timing_history:
+                                _stages = _run.get("stages", {})
+                                _image = _run.get("image", {})
+                                _history_rows.append({
+                                    "Upload type": _run.get("upload_type", "UNKNOWN"),
+                                    "Rows": int(_run.get("rows", 0) or 0),
+                                    "Pipeline seconds": round(float(_stages.get("Pipeline total", 0) or 0), 2),
+                                    "Image seconds": round(float(_stages.get("Image download and pHash", 0) or 0), 2),
+                                    "Cache hits": int(_image.get("cache_hits", 0) or 0),
+                                    "Cache misses": int(_image.get("cache_misses", 0) or 0),
+                                    "Downloads": int(_image.get("downloads", 0) or 0),
+                                    "Failed images": int(_image.get("failed", 0) or 0),
+                                })
+                            _history_frame = pd.DataFrame(_history_rows)
+                            if not _history_frame.empty:
+                                st.caption("Recent upload comparison by type")
+                                st.dataframe(
+                                    _history_frame.groupby("Upload type", as_index=False).agg(
+                                        Runs=("Rows", "count"),
+                                        Average_rows=("Rows", "mean"),
+                                        Average_pipeline_s=("Pipeline seconds", "mean"),
+                                        Average_image_s=("Image seconds", "mean"),
+                                        Average_cache_hits=("Cache hits", "mean"),
+                                        Average_cache_misses=("Cache misses", "mean"),
+                                        Average_downloads=("Downloads", "mean"),
+                                        Average_failures=("Failed images", "mean"),
+                                    ).round(2),
+                                    hide_index=True,
+                                    width="stretch",
+                                )
+                if _diag_status_tab.open:
+                    with _diag_status_tab:
+                        _status_frame = pd.DataFrame(st.session_state.get("validator_status_rows", []))
+                        if _status_frame.empty:
+                            st.info("Validator status is not available for this run yet.")
+                        else:
+                            _status_filter = st.multiselect(
+                                "Show statuses",
+                                ["Active", "Runtime", "Cached", "Skipped", "Failed"],
+                                default=["Active", "Runtime", "Cached", "Skipped", "Failed"],
+                                key="validator_status_filter",
+                            )
+                            st.dataframe(
+                                _status_frame[_status_frame["Status"].isin(_status_filter)],
+                                hide_index=True,
+                                width="stretch",
+                            )
+                            _applied = _status_frame[_status_frame["Status"].isin(["Runtime", "Cached", "Active"])]
+                            _skipped_count = int((_status_frame["Status"] == "Skipped").sum())
+                            st.caption(f"Rules actually applied: {_applied['Validator'].nunique():,} · Skipped with explanation: {_skipped_count:,} · Failed: {int((_status_frame['Status'] == 'Failed').sum()):,}")
     # Only renders when something has actually been waived, so it costs a dict
     # lookup on a normal run.
     render_override_history()
 
-    total_count = len(fr)
-    auto_count = len(fr[fr["FLAG"] != "Manual review"])
-    manual_hours = (auto_count * 3) / 60
-
-    with st.expander(_t("dashboard"), expanded=False):
+    if st.toggle(
+        "Show analytics",
+        key="show_validation_analytics",
+        help="Build charts only when you need them.",
+    ):
+        auto_count = int(fr["FLAG"].ne("Manual review").sum()) if "FLAG" in fr.columns else len(fr)
+        manual_hours = (auto_count * 3) / 60
         app_n, rej_n, fig_bar, fig_mix, fig_flags, fig_seller, fig_savings = _build_dashboard_figures(fr_meta, manual_hours)
         g1, g2 = st.columns(2)
         with g1:
@@ -10975,28 +11424,66 @@ def render_main_results():
             # `len(data[data["SELLER_NAME"] == seller])` inside the loop is a
             # full scan of `data` per seller.
             _seller_totals = data["SELLER_NAME"].value_counts() if "SELLER_NAME" in data.columns else pd.Series(dtype=int)
-            for seller in sorted(rej_df["SELLER_NAME"].unique()):
-                df_seller = rej_df[rej_df["SELLER_NAME"] == seller]
-                seller_flags = df_seller["FLAG"].unique()
-                with st.expander(f"Seller: {seller} ({len(df_seller)} items, {len(seller_flags)} flags)"):
-                    wrong_cat_count = len(df_seller[df_seller["FLAG"] == "Wrong Category"])
-                    total_seller_items = int(_seller_totals.get(seller, 0))
-                    wrong_cat_pct = ((wrong_cat_count / total_seller_items * 100) if total_seller_items > 0 else 0)
-                    if wrong_cat_pct >= 40:
-                        st.warning(f"High Error Rate: {wrong_cat_pct:.1f}% of this seller's products have wrong categories.")
-                        sc1, sc2 = st.columns(2)
-                        if sc1.button(f"Approve All for {seller[:15]}", key=f"app_sel_{seller}"):
-                            apply_status_change(df_seller["ProductSetSid"].tolist(), status="Approved")
-                            st.rerun()
-                        if sc2.button(f"Reject All for {seller[:15]}", key=f"rej_sel_{seller}"):
-                            apply_status_change(df_seller["ProductSetSid"].tolist(), status="Rejected", flag="Bulk Seller Reject")
-                            st.rerun()
-                    render_flag_expander(f"Seller: {seller}", df_seller, data, all(c in data.columns for c in ["PRODUCT_WARRANTY", "WARRANTY_DURATION"]), support_files, country_validator, cached_validate_products)
+            _seller_groups = rej_df.groupby("SELLER_NAME", sort=False, dropna=False)
+            _seller_counts = rej_df["SELLER_NAME"].value_counts(dropna=False)
+            _seller_flag_counts = rej_df.groupby("SELLER_NAME", sort=False, dropna=False)["FLAG"].nunique()
+            _display_cache_revision = (
+                f"{st.session_state.get('current_sig_hash', '')}:"
+                f"{st.session_state.get('data_version', 0)}"
+            )
+            for seller in sorted(rej_df["SELLER_NAME"].dropna().unique()):
+                _seller_n = int(_seller_counts.get(seller, 0))
+                _seller_n_flags = int(_seller_flag_counts.get(seller, 0))
+                _seller_expander = st.expander(
+                    f"Seller: {seller} ({_seller_n} items, {_seller_n_flags} flags)",
+                    on_change="rerun",
+                )
+                if _seller_expander.open:
+                    with _seller_expander:
+                        df_seller = _seller_groups.get_group(seller)
+                        wrong_cat_count = int(df_seller["FLAG"].eq("Wrong Category").sum())
+                        total_seller_items = int(_seller_totals.get(seller, 0))
+                        wrong_cat_pct = ((wrong_cat_count / total_seller_items * 100) if total_seller_items > 0 else 0)
+                        if wrong_cat_pct >= 40:
+                            st.warning(f"High Error Rate: {wrong_cat_pct:.1f}% of this seller's products have wrong categories.")
+                            sc1, sc2 = st.columns(2)
+                            if sc1.button(f"Approve All for {seller[:15]}", key=f"app_sel_{seller}"):
+                                apply_status_change(df_seller["ProductSetSid"].tolist(), status="Approved")
+                                st.rerun()
+                            if sc2.button(f"Reject All for {seller[:15]}", key=f"rej_sel_{seller}"):
+                                apply_status_change(df_seller["ProductSetSid"].tolist(), status="Rejected", flag="Bulk Seller Reject")
+                                st.rerun()
+                        render_flag_expander(
+                            f"Seller: {seller}", df_seller, data,
+                            all(c in data.columns for c in ["PRODUCT_WARRANTY", "WARRANTY_DURATION"]),
+                            support_files, country_validator, cached_validate_products,
+                            cache_revision=_display_cache_revision,
+                        )
         else:
             # Severity first, then alphabetical inside each bucket. A flat
             # alphabetical list put a legal blocker below a cosmetic flag
             # purely on the initial letter of its internal name.
             _flags_list = sorted(rej_df["FLAG"].unique(), key=severity_sort_key)
+            _flag_groups = rej_df.groupby("FLAG", sort=False, observed=True)
+            _flag_counts = rej_df["FLAG"].value_counts()
+            if "overturn_direction" in rej_df.columns:
+                _overturn_counts = (
+                    rej_df["overturn_direction"].astype(str).eq("to_rejection")
+                    .groupby(rej_df["FLAG"], sort=False).sum()
+                )
+            else:
+                _overturn_counts = pd.Series(dtype="int64")
+            if "Learned Match" in rej_df.columns:
+                _learned_counts = (
+                    rej_df["Learned Match"].fillna(False).astype(bool)
+                    .groupby(rej_df["FLAG"], sort=False).sum()
+                )
+            else:
+                _learned_counts = pd.Series(dtype="int64")
+            _display_cache_revision = (
+                f"{st.session_state.get('current_sig_hash', '')}:"
+                f"{st.session_state.get('data_version', 0)}"
+            )
 
             _grouped = {}
             for _f in _flags_list:
@@ -11011,58 +11498,22 @@ def render_main_results():
                 if not _titles:
                     continue
 
-                _group_skus = int(rej_df["FLAG"].isin(_titles).sum())
+                _group_skus = sum(int(_flag_counts.get(_flag, 0)) for _flag in _titles)
                 render_severity_group_header(_level, len(_titles), _group_skus)
 
                 for _i, title in enumerate(_titles):
-                    df_flagged = rej_df[rej_df["FLAG"] == title].copy()
                     is_zip = "(Prefetched)" in title
 
-                    # =========================================================
-                    # MEMORY OPTIMIZATION FIX
-                    # =========================================================
-                    # 1. Downcast object types & convert repetitive strings to category
-                    df_flagged = df_flagged.infer_objects()
-                    for col in df_flagged.select_dtypes(include=["object"]).columns:
-                        if df_flagged[col].nunique() / max(len(df_flagged), 1) < 0.5:
-                            df_flagged[col] = df_flagged[col].astype("category")
-
-                    # 2. Keep only essential columns to stop passing 6,000+ wide columns
-                    keep_cols = [
-                        c for c in [
-                            "ProductSetSid", "PRODUCT_SET_SID", "ParentSKU", "Status", 
-                            "FLAG", "Comment", "Comment_Detail", "Reason", "SellerName", 
-                            "SELLER_NAME", "BRAND", "NAME", "Is_Zip", "Is_Manual", 
-                            "overturn_direction", "zip_override", "Learned Match",
-                            "Learned Match Method", "Learned Match Distance",
-                            "Learned Rule URL", "Learned Rule pHash"
-                        ] if c in df_flagged.columns
-                    ]
-                    if keep_cols:
-                        df_flagged = df_flagged[keep_cols]
-
-                    # 3. Force garbage collection before the UI fragment renders
-                    gc.collect()
-                    # =========================================================
-
                     # Build the expander label showing severity mark, validation title, and product count
-                    _n_flagged = len(df_flagged)
+                    _n_flagged = int(_flag_counts.get(title, 0))
                     _mark = SEVERITY.get(_level, {}).get("mark", "•")
                     _prod_label = f"{_n_flagged:,} {'product' if _n_flagged == 1 else 'products'}"
                     exp_label = f"{_mark}  {title} ({_prod_label})"
 
-                    _ov_cnt = 0
-                    if "overturn_direction" in df_flagged.columns:
-                        _ov_raw = df_flagged["overturn_direction"]
-                        if isinstance(_ov_raw, pd.DataFrame):  # duplicate column name guard
-                            _ov_raw = _ov_raw.iloc[:, 0]
-                        _ov_series = _ov_raw.astype(str).replace({"nan": "", "None": "", "<NA>": ""})
-                        _ov_cnt = int((_ov_series == "to_rejection").sum())
+                    _ov_cnt = int(_overturn_counts.get(title, 0))
                     if _ov_cnt > 0:
                         exp_label += f"  •  🔓 {_ov_cnt:,} Overturned"
-                    _learned_cnt = 0
-                    if "Learned Match" in df_flagged.columns:
-                        _learned_cnt = int(df_flagged["Learned Match"].fillna(False).astype(bool).sum())
+                    _learned_cnt = int(_learned_counts.get(title, 0))
                     if _learned_cnt > 0:
                         exp_label += f"  •  🧠 {_learned_cnt:,} Learned"
                     if is_zip:
@@ -11083,9 +11534,32 @@ def render_main_results():
                         key=f"{_row_key_prefix}_{'zip' if is_zip else 'std'}_{_level}_{_i}"
                     )
                     with _row:
-                        with st.expander(exp_label, expanded=st.session_state.get(f"exp_{title}", False)):
-                            st.html(flag_pill_header(title, len(df_flagged), is_zip=is_zip))
-                            render_flag_expander(title, df_flagged, data, _has_warranty_cols, support_files, country_validator, cached_validate_products)
+                        _flag_expander = st.expander(
+                            exp_label,
+                            expanded=st.session_state.get(f"exp_{title}", False),
+                            on_change="rerun",
+                        )
+                        if _flag_expander.open:
+                            with _flag_expander:
+                                # Materialize only the selected validation's
+                                # compact rows after the reviewer opens it.
+                                _flag_keep_cols = [
+                                    c for c in (
+                                        "ProductSetSid", "PRODUCT_SET_SID", "ParentSKU", "Status",
+                                        "FLAG", "Comment", "Comment_Detail", "Reason", "SellerName",
+                                        "SELLER_NAME", "BRAND", "NAME", "Is_Zip", "Is_Manual",
+                                        "overturn_direction", "zip_override", "Learned Match",
+                                        "Learned Match Method", "Learned Match Distance",
+                                        "Learned Rule URL", "Learned Rule pHash",
+                                    ) if c in rej_df.columns
+                                ]
+                                df_flagged = _flag_groups.get_group(title).loc[:, _flag_keep_cols]
+                                st.html(flag_pill_header(title, len(df_flagged), is_zip=is_zip))
+                                render_flag_expander(
+                                    title, df_flagged, data, _has_warranty_cols,
+                                    support_files, country_validator, cached_validate_products,
+                                    cache_revision=_display_cache_revision,
+                                )
     else:
         st.success("All products passed validation — no rejections found.")
 
@@ -11182,11 +11656,11 @@ handle_jtbridge()
 # showing the products as approved after the cards optimistically turn red.
 if st.session_state.get("_review_batch_queue"):
     _drain_review_batch_queue()
-if st.session_state.pop("_grid_pending_report_sync", False):
-    # The iframe message caused this run, but its parent results fragment may
-    # have been scheduled before the report mutation. One clean rerun makes the
-    # updated report authoritative everywhere (tables, counts, exports, paging).
-    st.rerun()
+# The iframe's bridge event already caused this script run. The queued batch
+# is committed above before the results fragment renders, and the stable grid
+# receives the committed report state through SYNC_STATE. A second full rerun
+# here used to tear down the review surface while the batch was being applied.
+st.session_state.pop("_grid_pending_report_sync", None)
 
 render_main_results()
 

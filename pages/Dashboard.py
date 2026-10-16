@@ -2,7 +2,9 @@
 
 import json
 import hashlib
+import gzip
 import os
+import getpass
 import shutil
 import zipfile
 from io import BytesIO, TextIOWrapper
@@ -15,17 +17,28 @@ APP_ROOT = Path(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardi
 import pandas as pd
 import streamlit as st
 import r2_storage
+import supabase_store
+from processing_automation import clear_derived_image_cache
 
 from learned_rules import (
+    DELETED_RULES_ARCHIVE,
     LEARNABLE_FLAGS,
     delete_learned_image_rules,
     deduplicate_learned_image_rules,
+    get_cloud_sync_status,
     load_learned_image_rules,
     learn_image_rejections_bulk,
     normalize_learned_flag,
+    normalize_rule_countries,
+    normalize_rule_values,
     restore_learned_image_rules,
+    replace_learned_image_rules,
+    retry_pending_cloud_sync,
     set_learned_image_rule_review,
     update_learned_image_rule_flag,
+    update_learned_image_rule_countries,
+    update_learned_image_rule_scope,
+    SUPPORTED_RULE_COUNTRIES,
 )
 
 
@@ -53,8 +66,147 @@ def _configure_rar_backend(rarfile_module):
     return None
 
 st.set_page_config(page_title="Dashboard", page_icon=":material/auto_awesome:", layout="wide")
+
+
+def _settings_profile():
+    """Use authenticated identity when enabled; otherwise isolate local users."""
+    try:
+        user = st.user
+        if bool(getattr(user, "is_logged_in", False)):
+            identity = str(getattr(user, "email", "") or getattr(user, "sub", "")).strip().casefold()
+            if identity:
+                return "user-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24], True
+    except Exception:
+        pass
+    identity = os.environ.get("USERNAME") or os.environ.get("USER") or getpass.getuser()
+    if os.name == "nt" or identity not in {"", "adminuser", "appuser"}:
+        return "local-" + hashlib.sha256(identity.casefold().encode("utf-8")).hexdigest()[:24], False
+    return "cloud-shared", False
+
+
+def _load_review_preferences(profile: str) -> dict:
+    local_path = APP_ROOT / ".validation_automation" / "settings" / f"{profile}.json"
+    try:
+        if local_path.is_file():
+            value = json.loads(local_path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        pass
+    if r2_storage.enabled():
+        try:
+            raw = r2_storage.download_bytes(f"settings/review/{profile}.json")
+            value = json.loads(raw.decode("utf-8")) if raw else {}
+            return value if isinstance(value, dict) else {}
+        except (ValueError, UnicodeDecodeError):
+            pass
+    return {}
+
+
+def _save_review_preferences(profile: str, preferences: dict) -> tuple[bool, bool]:
+    payload = json.dumps(preferences, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    local_path = APP_ROOT / ".validation_automation" / "settings" / f"{profile}.json"
+    local_ok = False
+    try:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = local_path.with_suffix(".tmp")
+        temp_path.write_bytes(payload)
+        os.replace(temp_path, local_path)
+        local_ok = True
+    except OSError:
+        pass
+    cloud_ok = not r2_storage.enabled()
+    if r2_storage.enabled():
+        cloud_ok = r2_storage.upload_bytes(
+            payload, f"settings/review/{profile}.json", "application/json"
+        )
+    return local_ok, cloud_ok
+
+
+def _category_learning_payload(engine=None) -> dict:
+    if engine is None:
+        from category_matcher_engine import CategoryMatcherEngine
+        db_path = APP_ROOT / "cat_learning.db"
+        engine = CategoryMatcherEngine(str(db_path))
+    corrections = engine.list_corrections(limit=200000).fillna("").to_dict("records")
+    negatives = engine.list_negatives(limit=200000).fillna("").to_dict("records")
+    payload = {
+        "kind": "category_learning_backup",
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "corrections": corrections,
+        "negatives": negatives,
+    }
+    payload["content_sha256"] = hashlib.sha256(json.dumps(
+        {"corrections": corrections, "negatives": negatives},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return payload
+
+
+def _snapshot_category_learning(engine=None) -> tuple[Path, bool]:
+    payload = json.dumps(_category_learning_payload(engine), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()[:16]
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    root = APP_ROOT / ".learned_rule_snapshots"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"category-learning-{stamp}-{digest}.json.gz"
+    with gzip.open(path, "wb", compresslevel=6) as handle:
+        handle.write(payload)
+    # Retain the newest 100 local backups in this dedicated recovery folder.
+    for old in sorted(root.glob("category-learning-*.json.gz"), key=lambda item: item.stat().st_mtime, reverse=True)[100:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    cloud_ok = not r2_storage.enabled()
+    if r2_storage.enabled():
+        cloud_ok = r2_storage.upload_file_verified(
+            path, f"learned-rules/category-snapshots/{path.name}", "application/gzip"
+        )
+        if cloud_ok:
+            r2_storage.prune_prefix("learned-rules/category-snapshots/", keep=100)
+    return path, cloud_ok
+
+
 st.title("Dashboard")
 st.caption("Upload old rejection reports. Only rejected rows with an image and a supported flag are imported; duplicate URL/pHash/flag rules are skipped.")
+_cloud_sync = get_cloud_sync_status()
+if _cloud_sync["configured"]:
+    if _cloud_sync["status"] == "failed":
+        st.error(
+            f"Learned-rule cloud sync failed; {_cloud_sync['pending_count']:,} change(s) are queued. "
+            f"Last error: {_cloud_sync['last_error'] or 'unknown error'}",
+            icon=":material/cloud_off:",
+        )
+        st.caption(
+            f"Retry queue persisted to {_cloud_sync.get('queue_location')}." if _cloud_sync.get("queue_durable")
+            else "Retry queue could not be persisted outside the current app process."
+        )
+        if st.button("Retry cloud sync", icon=":material/sync:", key="dashboard_retry_rule_sync"):
+            _remaining = retry_pending_cloud_sync()
+            if _remaining:
+                st.warning(f"{_remaining:,} change(s) still need syncing.")
+            else:
+                st.success("Learned rules are synced to Supabase.")
+            st.rerun()
+    elif _cloud_sync["pending_count"]:
+        st.warning(f"{_cloud_sync['pending_count']:,} learned-rule change(s) are waiting for cloud sync.", icon=":material/cloud_upload:")
+        st.caption(
+            f"Retry queue persisted to {_cloud_sync.get('queue_location')}." if _cloud_sync.get("queue_durable")
+            else "Retry queue currently exists only on this app instance."
+        )
+        if st.button("Retry cloud sync", icon=":material/sync:", key="dashboard_retry_pending_rule_sync"):
+            _remaining = retry_pending_cloud_sync()
+            if _remaining:
+                st.warning(f"{_remaining:,} change(s) still need syncing.")
+            else:
+                st.success("Learned rules are synced to Supabase.")
+            st.rerun()
+    else:
+        _last_synced = _cloud_sync.get("last_synced_at", "")
+        st.caption(f":material/cloud_done: Learned-rule sync · {_cloud_sync['status']}" + (f" · {_last_synced}" if _last_synced else ""))
+else:
+    st.caption(":material/storage: Learned rules are saved locally; Supabase is not configured.")
 _runtime_review_matches = st.session_state.get("_learned_review_matches", {})
 if _runtime_review_matches:
     st.info(f":material/rate_review: {len(_runtime_review_matches):,} uncertain near-pHash match(es) were sent to review instead of automatic rejection. Open the validation review queue to inspect them.")
@@ -78,6 +230,10 @@ def _load_dashboard_catalog(mtime_ns: int, day_key: str) -> pd.DataFrame:
     frame = pd.DataFrame(_rules)
     if "brand_infringed" not in frame.columns:
         frame["brand_infringed"] = frame["brand"] if "brand" in frame.columns else ""
+    if not frame.empty:
+        frame["countries"] = frame.get("countries", pd.Series([None] * len(frame), index=frame.index)).map(
+            lambda value: normalize_rule_countries(value, legacy_global=True)
+        )
 
     if frame.empty:
         for _empty_col in ("review_state", "_cluster_key", "cluster_size", "sellers_affected", "confirmed_decisions", "review_due_at", "lifecycle", "confidence_score", "confidence", "_rule_id"):
@@ -92,7 +248,25 @@ def _load_dashboard_catalog(mtime_ns: int, day_key: str) -> pd.DataFrame:
     frame["_cluster_key"] = _image.mask(_image.eq(""), _phash)
     frame["cluster_size"] = frame.groupby("_cluster_key")["_cluster_key"].transform("size").astype(int)
     _seller_nonempty = _seller.replace("", pd.NA)
-    frame["sellers_affected"] = _seller_nonempty.groupby(frame["_cluster_key"]).transform("nunique").fillna(0).astype(int)
+    _matched_sids = frame.get("matched_sids", pd.Series([[] for _ in range(len(frame))], index=frame.index))
+    _matched_sellers = frame.get("matched_sellers", pd.Series([[] for _ in range(len(frame))], index=frame.index))
+    def _list_count(value):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (ValueError, TypeError):
+                value = [value] if value.strip() else []
+        if not isinstance(value, (list, tuple, set)):
+            return 0
+        return len({str(item).strip() for item in value if str(item).strip()})
+    _measured_sku_impact = pd.to_numeric(frame.get("match_count", pd.Series(0, index=frame.index)), errors="coerce").fillna(0).astype(int)
+    _stored_sid_impact = _matched_sids.map(_list_count)
+    frame["skus_affected"] = _measured_sku_impact.where(_measured_sku_impact.gt(0), _stored_sid_impact)
+    _measured_seller_impact = _matched_sellers.map(_list_count)
+    frame["sellers_affected"] = _measured_seller_impact.where(
+        _measured_seller_impact.gt(0),
+        _seller_nonempty.groupby(frame["_cluster_key"]).transform("nunique").fillna(0).astype(int),
+    )
     frame["confirmed_decisions"] = frame["review_state"].eq("Confirmed").groupby(frame["_cluster_key"]).transform("sum").astype(int)
     _created_source = frame["created_at"] if "created_at" in frame.columns else pd.Series(pd.NaT, index=frame.index)
     _created = pd.to_datetime(_created_source, errors="coerce", utc=True)
@@ -118,7 +292,41 @@ def _load_dashboard_catalog(mtime_ns: int, day_key: str) -> pd.DataFrame:
     return frame
 
 
+def _make_compressed_csv_download(frame: pd.DataFrame, columns: list[str]):
+    """Build a CSV.gz on demand, without an intermediate full-size CSV string."""
+    output = tempfile.SpooledTemporaryFile(max_size=2 * 1024 * 1024, mode="w+b")
+    compressed = gzip.GzipFile(fileobj=output, mode="wb", mtime=0)
+    text = TextIOWrapper(compressed, encoding="utf-8", newline="")
+    try:
+        frame.to_csv(text, columns=columns, index=False)
+        text.flush()
+        text.detach()
+        compressed.close()
+        output.seek(0)
+        return output
+    except Exception:
+        try:
+            text.close()
+        except Exception:
+            pass
+        output.close()
+        raise
+
+
 _stored_df = _load_dashboard_catalog(_rules_mtime_ns, datetime.now(timezone.utc).date().isoformat())
+
+
+def _delete_rules_with_undo(records) -> int:
+    """Delete selected rule records and keep the last ten sets restorable."""
+    snapshots = [dict(row) for row in (records or []) if isinstance(row, dict)]
+    if not snapshots:
+        return 0
+    removed = delete_learned_image_rules(snapshots)
+    if removed:
+        history = list(st.session_state.get("_learned_rule_undo_history", []))
+        history.append(snapshots)
+        st.session_state["_learned_rule_undo_history"] = history[-10:]
+    return removed
 
 # Exact pHash audit: CDN URLs can differ while the downloaded image is the
 # same. Keep the flag in the grouping key so one image can still have separate
@@ -278,8 +486,12 @@ def _render_category_admin_module():
                 key="dashboard_delete_category_corrections",
             )
             if st.button("Remove selected corrections", icon=":material/delete_sweep:", disabled=not _delete_category_ids, key="dashboard_remove_category_corrections"):
+                _snapshot_path, _snapshot_cloud_ok = _snapshot_category_learning(_category_engine)
+                if r2_storage.enabled() and not _snapshot_cloud_ok:
+                    st.error("Category-learning backup did not verify in R2. No corrections were removed.")
+                    return
                 _removed = _category_engine.delete_corrections(_delete_category_ids)
-                st.success(f"Removed {_removed:,} category correction(s).")
+                st.success(f"Saved category backup {_snapshot_path.name}; removed {_removed:,} correction(s).")
                 st.rerun()
     with _category_tabs[1]:
         st.dataframe(_negatives.head(500), hide_index=True, width="stretch")
@@ -291,8 +503,12 @@ def _render_category_admin_module():
                 key="dashboard_delete_category_negatives",
             )
             if st.button("Remove selected negative decisions", icon=":material/delete_sweep:", disabled=not _delete_negative_ids, key="dashboard_remove_category_negatives"):
+                _snapshot_path, _snapshot_cloud_ok = _snapshot_category_learning(_category_engine)
+                if r2_storage.enabled() and not _snapshot_cloud_ok:
+                    st.error("Category-learning backup did not verify in R2. No decisions were removed.")
+                    return
                 _removed = _category_engine.delete_negatives(_delete_negative_ids)
-                st.success(f"Removed {_removed:,} negative category decision(s).")
+                st.success(f"Saved category backup {_snapshot_path.name}; removed {_removed:,} negative decision(s).")
                 st.rerun()
     with _category_tabs[2]:
         st.info("Positive corrections teach a product-name pattern to a category. Negative decisions prevent a known wrong category from being suggested again. Removing a row takes effect for new validations after the matcher reloads.", icon=":material/lightbulb:")
@@ -300,20 +516,69 @@ def _render_category_admin_module():
 
 def _render_admin_settings_module():
     st.markdown("## :material/settings: Validation settings")
-    st.caption("Session preferences for review and administration. Validation rules remain unchanged here.")
-    _settings_cols = st.columns(2, gap="large")
-    with _settings_cols[0]:
+    st.caption("Persistent review preferences and safe cache controls. Learned rule files are never removed by cache actions.")
+    st.info("Upload guardrails: 200 MB per file · 1 GB total uncompressed per batch. These limits protect validation from oversized archives.", icon=":material/tune:")
+    base_profile, authenticated = _settings_profile()
+    _profile_country_options = list(SUPPORTED_RULE_COUNTRIES)
+    _profile_country_default = str(st.session_state.get("selected_country", "KE") or "KE").upper()
+    _profile_country = st.selectbox(
+        "Country profile",
+        _profile_country_options,
+        index=_profile_country_options.index(_profile_country_default) if _profile_country_default in _profile_country_options else 0,
+        key="dashboard_settings_country_profile",
+        help="Review preferences are saved separately for each country.",
+    )
+    profile = f"{base_profile}-{_profile_country}"
+    if "_review_preferences_loaded_for" not in st.session_state or st.session_state["_review_preferences_loaded_for"] != profile:
+        preferences = _load_review_preferences(profile) or _load_review_preferences(base_profile)
+        st.session_state["dashboard_default_page_size"] = int(preferences.get("cards_per_page", 100))
+        st.session_state["dashboard_default_image_previews"] = bool(preferences.get("image_previews", False))
+        st.session_state["dashboard_show_diagnostics"] = bool(preferences.get("show_diagnostics", False))
+        st.session_state["_review_preferences_loaded_for"] = profile
+    if not authenticated and base_profile == "cloud-shared":
+        st.info("Cloud sign-in is not configured, so these preferences are shared by this deployment. Configure Streamlit authentication for per-user settings.", icon=":material/info:")
+        if not r2_storage.enabled():
+            st.caption("R2 is not configured; Cloud deployment preferences may reset when the app restarts.")
+    else:
+        st.caption("Preferences are stored under a hashed reviewer profile; the raw identity is not written to storage.")
+
+    with st.form("dashboard_review_preferences"):
         st.markdown("### Review defaults")
         st.selectbox("Default cards per page", [50, 100, 200, 500], key="dashboard_default_page_size")
         st.toggle("Open image previews by default", key="dashboard_default_image_previews")
-        st.toggle("Show technical diagnostics", key="dashboard_show_diagnostics")
-    with _settings_cols[1]:
-        st.markdown("### Data locations")
-        st.code(str(APP_ROOT / "learned_image_rules.json"), language="text")
-        st.code(str(APP_ROOT / "cat_learning.db"), language="text")
-        if st.button("Reload learned catalog", icon=":material/refresh:", key="dashboard_reload_catalog"):
-            st.cache_data.clear()
-            st.success("Catalog caches cleared. The next validation will reload current rules.")
+        st.toggle("Expand validation diagnostics by default", key="dashboard_show_diagnostics")
+        _save_preferences = st.form_submit_button("Save preferences", icon=":material/save:", type="primary")
+    if _save_preferences:
+        preferences = {
+            "cards_per_page": int(st.session_state.dashboard_default_page_size),
+            "image_previews": bool(st.session_state.dashboard_default_image_previews),
+            "show_diagnostics": bool(st.session_state.dashboard_show_diagnostics),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        local_ok, cloud_ok = _save_review_preferences(profile, preferences)
+        if local_ok or cloud_ok:
+            st.session_state.grid_items_per_page = preferences["cards_per_page"]
+            st.session_state.grid_ipp_slider = preferences["cards_per_page"]
+            st.session_state.show_images = preferences["image_previews"]
+            if local_ok and (cloud_ok or not r2_storage.enabled()):
+                st.success("Preferences saved.")
+            else:
+                st.warning("Preferences were saved locally, but Cloudflare R2 did not confirm the cloud copy.")
+        else:
+            st.error("Preferences could not be saved. Check local write permissions and R2 configuration.")
+
+    st.markdown("### Data locations")
+    _data_cols = st.columns(2, gap="medium")
+    _data_cols[0].caption("Learned image rules · authoritative JSON")
+    _data_cols[0].code(str(APP_ROOT / "learned_image_rules.json"), language="text")
+    _data_cols[1].caption("Category learning · SQLite locally, Supabase when configured")
+    _data_cols[1].code(str(APP_ROOT / "cat_learning.db"), language="text")
+
+    st.markdown("### Cache controls")
+    st.caption("This clears only derived image dimensions, hashes, and thumbnails. Learned rules and category learning remain untouched.")
+    if st.button("Clear derived image cache", icon=":material/delete_sweep:", key="dashboard_clear_derived_image_cache"):
+        clear_derived_image_cache()
+        st.success("Derived image cache cleared. Learned rules were not changed.")
 
 
 def _render_admin_diagnostics_module():
@@ -335,6 +600,7 @@ def _render_admin_diagnostics_module():
 
 def _render_admin_recovery_module():
     st.markdown("## :material/backup: Backups and recovery")
+    st.caption("Image-rule and category-learning snapshots include SHA-256 verification and retain the newest 100 copies locally and in R2 when configured.")
     st.caption("Export a point-in-time copy before bulk edits. Restoring is explicit and does not happen during ordinary validation.")
     _rules_path = APP_ROOT / "learned_image_rules.json"
     _rules_payload = _rules_path.read_bytes() if _rules_path.exists() else b"[]"
@@ -352,7 +618,312 @@ def _render_admin_recovery_module():
         key="dashboard_download_rules_backup",
         disabled=not _rules_path.exists(),
     )
-    st.info("For a restore, use the existing import workflow after reviewing the file. The import remains duplicate-safe and preserves one image with multiple distinct reasons.", icon=":material/info:")
+    st.markdown("### Category learning backup")
+    try:
+        from category_matcher_engine import CategoryMatcherEngine
+        _category_db_path = APP_ROOT / "cat_learning.db"
+        _category_engine = CategoryMatcherEngine(str(_category_db_path))
+        _category_backup = _category_learning_payload(_category_engine)
+        _category_backup_bytes = json.dumps(_category_backup, ensure_ascii=False, indent=2).encode("utf-8")
+        _category_digest = hashlib.sha256(_category_backup_bytes).hexdigest()
+        _category_backup_cols = st.columns(2, gap="medium")
+        _category_backup_cols[0].download_button(
+            "Download category-learning backup",
+            data=_category_backup_bytes,
+            file_name=f"category_learning_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            icon=":material/download:",
+            key="dashboard_download_category_backup",
+        )
+        if _category_backup_cols[1].button("Create verified category snapshot", icon=":material/cloud_upload:", key="dashboard_create_category_snapshot"):
+            _snapshot_path, _snapshot_cloud_ok = _snapshot_category_learning(_category_engine)
+            if r2_storage.enabled() and not _snapshot_cloud_ok:
+                st.error("The snapshot was created locally, but R2 verification failed.")
+            elif r2_storage.enabled():
+                st.success(f"Category snapshot saved and verified in R2: {_snapshot_path.name}")
+            else:
+                st.success(f"Category snapshot saved locally: {_snapshot_path.name}. Configure R2 for off-device recovery.")
+        st.caption(
+            f"{len(_category_backup['corrections']):,} corrections · {len(_category_backup['negatives']):,} negative decisions · "
+            f"SHA-256 { _category_digest[:16] }…"
+        )
+        _category_snapshot_objects = r2_storage.list_objects("learned-rules/category-snapshots/", limit=100)
+        _category_snapshot_dir = APP_ROOT / ".learned_rule_snapshots"
+        _category_snapshot_choices = [f"r2::{item['key']}" for item in _category_snapshot_objects]
+        if _category_snapshot_dir.exists():
+            _category_snapshot_choices.extend(
+                f"local::{path.name}"
+                for path in sorted(_category_snapshot_dir.glob("category-learning-*.json.gz"), key=lambda item: item.stat().st_mtime, reverse=True)[:100]
+            )
+        if _category_snapshot_choices:
+            _category_snapshot_choice = st.selectbox(
+                "Category-learning snapshots",
+                _category_snapshot_choices,
+                format_func=lambda value: value.split("::", 1)[-1],
+                key="dashboard_category_snapshot_choice",
+            )
+            if st.button("Preview category snapshot", icon=":material/visibility:", key="dashboard_preview_category_snapshot"):
+                try:
+                    _snapshot_compressed = (
+                        r2_storage.download_bytes(_category_snapshot_choice.split("::", 1)[1])
+                        if _category_snapshot_choice.startswith("r2::")
+                        else (_category_snapshot_dir / _category_snapshot_choice.split("::", 1)[1]).read_bytes()
+                    )
+                    _snapshot_raw = gzip.decompress(_snapshot_compressed)
+                    _snapshot_digest = hashlib.sha256(_snapshot_raw).hexdigest()
+                    _snapshot_expected = Path(_category_snapshot_choice.split("::", 1)[-1]).name.rsplit("-", 1)[-1].replace(".json.gz", "")
+                    if _snapshot_expected and not _snapshot_digest.startswith(_snapshot_expected):
+                        raise ValueError("Snapshot SHA-256 does not match its filename.")
+                    _snapshot_payload = json.loads(_snapshot_raw.decode("utf-8"))
+                    if not isinstance(_snapshot_payload, dict) or _snapshot_payload.get("kind") != "category_learning_backup":
+                        raise ValueError("This is not a category-learning snapshot.")
+                    if not isinstance(_snapshot_payload.get("corrections"), list) or not isinstance(_snapshot_payload.get("negatives"), list):
+                        raise ValueError("Snapshot correction and negative-decision rows are invalid.")
+                    _snapshot_content_digest = hashlib.sha256(json.dumps(
+                        {"corrections": _snapshot_payload["corrections"], "negatives": _snapshot_payload["negatives"]},
+                        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+                    ).encode("utf-8")).hexdigest()
+                    if _snapshot_payload.get("content_sha256") and _snapshot_payload["content_sha256"] != _snapshot_content_digest:
+                        raise ValueError("Category snapshot content checksum does not match.")
+                    st.session_state["_category_snapshot_preview"] = {
+                        "choice": _category_snapshot_choice,
+                        "compressed": _snapshot_compressed,
+                        "sha256": _snapshot_digest,
+                        "corrections": len(_snapshot_payload.get("corrections", [])),
+                        "negatives": len(_snapshot_payload.get("negatives", [])),
+                    }
+                    del _snapshot_payload, _snapshot_raw
+                    st.rerun()
+                except Exception as _category_preview_error:
+                    st.session_state.pop("_category_snapshot_preview", None)
+                    st.error(f"Category snapshot preview failed: {_category_preview_error}")
+            _category_snapshot_preview = st.session_state.get("_category_snapshot_preview", {})
+            if _category_snapshot_preview.get("choice") == _category_snapshot_choice:
+                st.info(
+                    f"Verified snapshot · {_category_snapshot_preview['corrections']:,} corrections · "
+                    f"{_category_snapshot_preview['negatives']:,} negative decisions · "
+                    f"SHA-256 {_category_snapshot_preview['sha256'][:16]}…"
+                )
+                if st.button("Prepare this snapshot for merge", icon=":material/restore:", key="dashboard_prepare_category_snapshot_merge"):
+                    st.session_state["_category_restore_bytes_override"] = gzip.decompress(_category_snapshot_preview["compressed"])
+                    st.session_state.pop("_category_snapshot_preview", None)
+                    st.rerun()
+        _category_restore = st.file_uploader(
+            "Merge a category-learning backup",
+            type=["json"],
+            key="dashboard_restore_category_backup",
+        )
+        _category_restore_override = st.session_state.pop("_category_restore_bytes_override", None)
+        if _category_restore is not None or _category_restore_override is not None:
+            try:
+                _category_restore_bytes = _category_restore.getvalue() if _category_restore is not None else _category_restore_override
+                _category_restore_payload = json.loads(_category_restore_bytes.decode("utf-8-sig"))
+                if not isinstance(_category_restore_payload, dict) or _category_restore_payload.get("kind") != "category_learning_backup":
+                    raise ValueError("Choose a category-learning backup created by this Dashboard.")
+                _incoming_corrections = _category_restore_payload.get("corrections", [])
+                _incoming_negatives = _category_restore_payload.get("negatives", [])
+                if not isinstance(_incoming_corrections, list) or not isinstance(_incoming_negatives, list):
+                    raise ValueError("The backup has invalid correction or negative rows.")
+                _incoming_content_digest = hashlib.sha256(json.dumps(
+                    {"corrections": _incoming_corrections, "negatives": _incoming_negatives},
+                    sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()
+                if _category_restore_payload.get("content_sha256") and _category_restore_payload["content_sha256"] != _incoming_content_digest:
+                    raise ValueError("Category backup content checksum does not match.")
+                _existing_corrections_frame = _category_engine.list_corrections(limit=200000)
+                _existing_corrections = set(zip(
+                    _existing_corrections_frame.get("name", pd.Series(dtype=str)).astype(str).str.casefold(),
+                    _existing_corrections_frame.get("category", pd.Series(dtype=str)).astype(str).str.casefold(),
+                ))
+                _existing_negatives_frame = _category_engine.list_negatives(limit=200000)
+                _existing_negatives = set(zip(
+                    _existing_negatives_frame.get("name", pd.Series(dtype=str)).astype(str).str.casefold(),
+                    _existing_negatives_frame.get("category", pd.Series(dtype=str)).astype(str).str.casefold(),
+                    _existing_negatives_frame.get("reason", pd.Series(dtype=str)).astype(str).str.casefold(),
+                ))
+                _new_corrections = [
+                    row for row in _incoming_corrections
+                    if isinstance(row, dict)
+                    and str(row.get("name", "")).strip()
+                    and str(row.get("category", "")).strip()
+                    and (str(row.get("name", "")).strip().casefold(), str(row.get("category", "")).strip().casefold()) not in _existing_corrections
+                ]
+                _new_negatives = [
+                    row for row in _incoming_negatives
+                    if isinstance(row, dict)
+                    and str(row.get("name", "")).strip()
+                    and str(row.get("category", "")).strip()
+                    and (str(row.get("name", "")).strip().casefold(), str(row.get("category", "")).strip().casefold(), str(row.get("reason", "")).strip().casefold()) not in _existing_negatives
+                ]
+                st.caption(f"Restore preview · {len(_new_corrections):,} new corrections · {len(_new_negatives):,} new negative decisions.")
+                if st.button("Merge category-learning backup", icon=":material/restore:", key="dashboard_merge_category_backup"):
+                    _snapshot_path, _snapshot_cloud_ok = _snapshot_category_learning(_category_engine)
+                    if r2_storage.enabled() and not _snapshot_cloud_ok:
+                        st.error("A verified R2 backup could not be made; no category rows were restored.")
+                    else:
+                        with _category_engine._connect() as _conn:
+                            _conn.executemany(
+                                "INSERT INTO category_corrections (name, category) VALUES (?, ?)",
+                                [(str(row["name"]).strip(), str(row["category"]).strip()) for row in _new_corrections],
+                            )
+                            _conn.executemany(
+                                "INSERT INTO category_negatives (name, category, reason) VALUES (?, ?, ?)",
+                                [(str(row["name"]).strip(), str(row["category"]).strip(), str(row.get("reason", "")).strip()) for row in _new_negatives],
+                            )
+                            _conn.commit()
+                        if supabase_store.enabled():
+                            try:
+                                if _new_corrections:
+                                    supabase_store.insert("category_corrections", [
+                                        {"name": str(row["name"]).strip(), "category": str(row["category"]).strip(), "learned_at": supabase_store.now_iso()}
+                                        for row in _new_corrections
+                                    ])
+                                if _new_negatives:
+                                    supabase_store.insert("category_negatives", [
+                                        {"name": str(row["name"]).strip(), "category": str(row["category"]).strip(), "reason": str(row.get("reason", "")).strip(), "learned_at": supabase_store.now_iso()}
+                                        for row in _new_negatives
+                                    ])
+                            except Exception as _category_sync_error:
+                                st.warning(f"Rows were restored locally, but category data did not fully sync to Supabase: {_category_sync_error}")
+                        _category_engine.load_learning_db()
+                        st.success(f"Restored {len(_new_corrections):,} correction(s) and {len(_new_negatives):,} negative decision(s); existing rows were skipped.")
+                        st.rerun()
+            except Exception as _category_restore_error:
+                st.error(f"Could not read that category backup: {_category_restore_error}")
+    except Exception as _category_backup_error:
+        st.warning(f"Category-learning backup is unavailable: {_category_backup_error}")
+
+    _restore_upload = st.file_uploader(
+        "Restore or merge from a learned-rules JSON backup",
+        type=["json"],
+        key="dashboard_restore_rules_json",
+    )
+    if _restore_upload is not None:
+        if st.button("Merge backup into current catalog", icon=":material/restore:", key="dashboard_merge_rules_backup"):
+            try:
+                _backup_rows = json.loads(_restore_upload.getvalue().decode("utf-8-sig"))
+                if not isinstance(_backup_rows, list) or any(not isinstance(row, dict) for row in _backup_rows):
+                    raise ValueError("Expected a JSON array of learned-rule records.")
+                _restored = restore_learned_image_rules(_backup_rows)
+                st.success(f"Restored {_restored:,} rule(s); existing rules and other reasons were preserved.")
+                st.rerun()
+            except Exception as _restore_error:
+                st.error(f"Could not restore that backup: {_restore_error}")
+    _snapshot_objects = r2_storage.list_objects("learned-rules/snapshots/", limit=100)
+    _snapshot_dir = APP_ROOT / ".learned_rule_snapshots"
+    _snapshot_choices = [f"r2::{row['key']}" for row in _snapshot_objects]
+    if _snapshot_dir.exists():
+        _snapshot_choices.extend(
+            f"local::{path.name}"
+            for path in sorted(_snapshot_dir.glob("*.json.gz"), key=lambda path: path.stat().st_mtime, reverse=True)[:100]
+        )
+    if _snapshot_choices:
+        _snapshot_choice = st.selectbox(
+            "Catalog snapshots (created before imports)",
+            _snapshot_choices,
+            format_func=lambda value: value.split("::", 1)[-1],
+            key="dashboard_r2_snapshot_choice",
+        )
+        _replace_ack = st.checkbox(
+            "I understand this replaces the current catalog. The current version will be archived first.",
+            key="dashboard_replace_snapshot_ack",
+        )
+        _preview_key = st.session_state.get("_dashboard_snapshot_preview", {})
+        _snapshot_preview = _preview_key if _preview_key.get("choice") == _snapshot_choice else None
+        if st.button("Preview selected snapshot", icon=":material/visibility:", key="dashboard_preview_r2_snapshot"):
+            try:
+                if _snapshot_choice.startswith("r2::"):
+                    _preview_bytes = r2_storage.download_bytes(_snapshot_choice.split("::", 1)[1])
+                else:
+                    _preview_bytes = (_snapshot_dir / _snapshot_choice.split("::", 1)[1]).read_bytes()
+                if not _preview_bytes:
+                    raise RuntimeError("The selected snapshot could not be read.")
+                _preview_raw = gzip.decompress(_preview_bytes)
+                _preview_digest = hashlib.sha256(_preview_raw).hexdigest()
+                _expected_digest = Path(_snapshot_choice.split("::", 1)[-1]).name.rsplit("-", 1)[-1].replace(".json.gz", "")
+                if _expected_digest and len(_expected_digest) == 12 and not _preview_digest.startswith(_expected_digest):
+                    raise ValueError("Snapshot checksum does not match its filename.")
+                _preview_rows = json.loads(_preview_raw.decode("utf-8"))
+                if not isinstance(_preview_rows, list) or any(not isinstance(row, dict) for row in _preview_rows):
+                    raise ValueError("The snapshot is not a learned-rule JSON catalog.")
+                st.session_state["_dashboard_snapshot_preview"] = {
+                    "choice": _snapshot_choice,
+                    "compressed_payload": _preview_bytes,
+                    "row_count": len(_preview_rows),
+                    "sha256": _preview_digest,
+                    "compressed_bytes": len(_preview_bytes),
+                }
+                del _preview_rows, _preview_raw
+                st.rerun()
+            except Exception as _preview_error:
+                st.session_state.pop("_dashboard_snapshot_preview", None)
+                st.error(f"Snapshot preview failed: {_preview_error}")
+        if _snapshot_preview:
+            st.info(
+                f"Preview verified · {_snapshot_preview['compressed_bytes'] / 1024 / 1024:.1f} MB compressed · "
+                f"{_snapshot_preview['row_count']:,} rules · SHA-256 {_snapshot_preview['sha256'][:16]}…"
+            )
+        if st.button(
+            "Restore selected snapshot as the active catalog",
+            icon=":material/history:",
+            key="dashboard_restore_r2_snapshot",
+            disabled=not _replace_ack or not _snapshot_preview,
+        ):
+            try:
+                _snapshot_raw = gzip.decompress(_snapshot_preview["compressed_payload"])
+                if not hashlib.sha256(_snapshot_raw).hexdigest().startswith(_snapshot_preview["sha256"]):
+                    raise ValueError("Snapshot checksum changed after preview. Preview it again before restoring.")
+                _snapshot_rows = json.loads(_snapshot_raw.decode("utf-8"))
+                _replaced_count = replace_learned_image_rules(_snapshot_rows, confirmed=True)
+                st.session_state.pop("_dashboard_snapshot_preview", None)
+                st.success(f"Restored {_replaced_count:,} rules. The catalog that was active before restore is in removal history.")
+                st.rerun()
+            except Exception as _snapshot_error:
+                st.error(f"Could not restore snapshot: {_snapshot_error}")
+    if DELETED_RULES_ARCHIVE.exists():
+        _archived = []
+        try:
+            with DELETED_RULES_ARCHIVE.open("r", encoding="utf-8") as _archive_file:
+                for _line in _archive_file:
+                    try:
+                        _entry = json.loads(_line)
+                        _record = _entry.get("rule") if isinstance(_entry, dict) else None
+                        if isinstance(_record, dict):
+                            _record = dict(_record)
+                            _record["_deleted_at"] = str(_entry.get("deleted_at", ""))
+                            _record["_archive_id"] = hashlib.sha256(
+                                "\x1f".join(str(_record.get(_key, "")) for _key in
+                                    ("_deleted_at", "image_url", "phash", "flag", "created_at")).encode("utf-8")
+                            ).hexdigest()[:16]
+                            _archived.append(_record)
+                    except (ValueError, TypeError):
+                        continue
+        except OSError as _archive_error:
+            st.warning(f"Could not read the removal history: {_archive_error}")
+        if _archived:
+            with st.expander(f"Removal history and restore · {len(_archived):,} archived record(s)", expanded=False):
+                _archive_frame = pd.DataFrame(_archived)
+                _archive_frame.insert(0, "Restore", False)
+                _archive_cols = [c for c in ("Restore", "_archive_id", "_deleted_at", "flag", "brand_infringed", "image_url", "phash", "countries", "product_set_sid", "seller_name") if c in _archive_frame.columns]
+                _archive_selection = st.data_editor(
+                    _archive_frame[_archive_cols].tail(500),
+                    hide_index=True,
+                    width="stretch",
+                    disabled=[c for c in _archive_cols if c != "Restore"],
+                    key="dashboard_archived_rule_restore_table",
+                    column_config={"Restore": st.column_config.CheckboxColumn("Restore", help="Select records to restore")},
+                )
+                if st.button("Restore selected archived rules", icon=":material/restore:", key="dashboard_restore_archived_selection"):
+                    _restore_mask = _archive_selection["Restore"].fillna(False).astype(bool)
+                    _restore_ids = set(_archive_selection.loc[_restore_mask, "_archive_id"].astype(str))
+                    _restore_records = [
+                        {k: v for k, v in row.items() if k not in {"_deleted_at", "_archive_id"}}
+                        for row in _archived if str(row.get("_archive_id", "")) in _restore_ids
+                    ]
+                    _restored_count = restore_learned_image_rules(_restore_records)
+                    st.success(f"Restored {_restored_count:,} archived rule(s).")
+                    st.rerun()
+    st.info("Restores merge duplicate-safely. They never replace the live catalog; the last ten dashboard removals also have an Undo action.", icon=":material/info:")
 
 
 if _admin_module == "Category learned rules":
@@ -476,62 +1047,60 @@ with _progress_cols[1]:
     st.caption(f":material/shield: Active rule coverage · {_dashboard_active:,} of {len(_stored_df):,}")
     st.progress(_dashboard_active_pct, text=f"{_dashboard_active_pct:.0%} active")
 _dashboard_flags = _stored_df.get("flag", pd.Series(dtype=str)).astype(str).value_counts().head(6)
-if not _dashboard_flags.empty:
-    with st.expander(":material/analytics: Rule distribution", expanded=False):
-        _distribution_cols = st.columns(min(3, len(_dashboard_flags)), gap="small")
-        for _distribution_index, (_distribution_flag, _distribution_count) in enumerate(_dashboard_flags.items()):
-            with _distribution_cols[_distribution_index % len(_distribution_cols)]:
-                st.metric(str(_distribution_flag), f"{int(_distribution_count):,}")
+if not _dashboard_flags.empty and st.toggle(":material/analytics: Show rule distribution", key="dashboard_show_rule_distribution"):
+    _distribution_cols = st.columns(min(3, len(_dashboard_flags)), gap="small")
+    for _distribution_index, (_distribution_flag, _distribution_count) in enumerate(_dashboard_flags.items()):
+        with _distribution_cols[_distribution_index % len(_distribution_cols)]:
+            st.metric(str(_distribution_flag), f"{int(_distribution_count):,}")
 
-if not _stored_df.empty:
-    with st.expander(":material/insights: Learned data insights", expanded=False):
-        _insight_tabs = st.tabs(["Summary", "Duplicate clusters", "Suggestions"])
-        with _insight_tabs[0]:
-            _summary_cols = st.columns(4)
-            _summary_cols[0].metric("Rules overdue for review", f"{int(_stored_df['lifecycle'].eq('Review overdue').sum()):,}")
-            _summary_cols[1].metric("Multi-seller clusters", f"{int(_stored_df['sellers_affected'].ge(2).sum()):,}")
-            _summary_cols[2].metric("High-confidence rules", f"{int(_stored_df['confidence_score'].ge(.8).sum()):,}")
-            _summary_cols[3].metric("Correction rate", f"{(_stored_df['review_state'].eq('Corrected').mean() * 100):.1f}%")
-            _left, _right = st.columns(2, gap="large")
-            with _left:
-                st.caption(":material/flag: Top rejection reasons")
-                st.dataframe(_stored_df["flag"].value_counts().head(8).rename("Rules"), width="stretch")
-            with _right:
-                st.caption(":material/storefront: Sellers with the most learned matches")
-                _seller_summary = _stored_df["seller_name"].replace("", pd.NA).dropna().value_counts().head(8).rename("Rules") if "seller_name" in _stored_df.columns else pd.Series(dtype=int)
-                st.dataframe(_seller_summary, width="stretch")
-            if "category_code" in _stored_df.columns:
-                st.caption(":material/category: Categories with the most learned matches")
-                st.dataframe(_stored_df["category_code"].replace("", pd.NA).dropna().value_counts().head(10).rename("Rules"), width="stretch")
-        with _insight_tabs[1]:
-            _cluster_table = (
-                _stored_df[_stored_df["_cluster_key"].ne("")]
-                .groupby("_cluster_key", as_index=False)
-                .agg(Products=("_cluster_key", "size"), Sellers=("sellers_affected", "max"), Confirmed=("confirmed_decisions", "max"), Reason=("flag", "first"))
-                .sort_values(["Products", "Sellers"], ascending=False)
-            )
-            if _cluster_table.empty:
-                st.info("No image clusters are available yet.")
-            else:
-                st.caption("Clusters group exact image URLs or exact pHash values. Confirming a representative applies the review state to every rule in that cluster.")
-                st.dataframe(_cluster_table.head(100), hide_index=True, width="stretch")
-                _cluster_options = _cluster_table["_cluster_key"].head(100).tolist()
-                _selected_cluster = st.selectbox("Cluster to review", _cluster_options, format_func=lambda value: f"{value[:42]} · {_cluster_table.loc[_cluster_table['_cluster_key'].eq(value), 'Products'].iloc[0]:,} products", key="learned_cluster_choice")
-                _cluster_records = _stored_df[_stored_df["_cluster_key"].eq(_selected_cluster)]
-                if st.button("Confirm entire cluster", icon=":material/done_all:", key="confirm_learned_cluster"):
-                    for _, _cluster_rule in _cluster_records.iterrows():
-                        set_learned_image_rule_review(_cluster_rule.to_dict(), "Confirmed")
-                    st.success(f"Confirmed {_cluster_records.shape[0]:,} rules in the cluster.")
-                    st.rerun()
-        with _insight_tabs[2]:
-            _suggestions = _stored_df[
-                _stored_df["cluster_size"].ge(3) & _stored_df["review_state"].eq("Unreviewed")
-            ].drop_duplicates("_cluster_key").sort_values(["cluster_size", "sellers_affected"], ascending=False)
-            if _suggestions.empty:
-                st.info("No repeated unreviewed image patterns need attention.")
-            else:
-                st.caption("These patterns appeared repeatedly and are good candidates for a confirmed learned rule or cluster review.")
-                st.dataframe(_suggestions[[c for c in ("_cluster_key", "flag", "cluster_size", "sellers_affected", "confidence") if c in _suggestions.columns]].head(100), hide_index=True, width="stretch")
+if not _stored_df.empty and st.toggle(":material/insights: Show learned data insights", key="dashboard_show_learned_insights"):
+    _insight_tabs = st.tabs(["Summary", "Duplicate clusters", "Suggestions"])
+    with _insight_tabs[0]:
+        _summary_cols = st.columns(4)
+        _summary_cols[0].metric("Rules overdue for review", f"{int(_stored_df['lifecycle'].eq('Review overdue').sum()):,}")
+        _summary_cols[1].metric("Multi-seller clusters", f"{int(_stored_df['sellers_affected'].ge(2).sum()):,}")
+        _summary_cols[2].metric("High-confidence rules", f"{int(_stored_df['confidence_score'].ge(.8).sum()):,}")
+        _summary_cols[3].metric("Correction rate", f"{(_stored_df['review_state'].eq('Corrected').mean() * 100):.1f}%")
+        _left, _right = st.columns(2, gap="large")
+        with _left:
+            st.caption(":material/flag: Top rejection reasons")
+            st.dataframe(_stored_df["flag"].value_counts().head(8).rename("Rules"), width="stretch")
+        with _right:
+            st.caption(":material/storefront: Sellers with the most learned matches")
+            _seller_summary = _stored_df["seller_name"].replace("", pd.NA).dropna().value_counts().head(8).rename("Rules") if "seller_name" in _stored_df.columns else pd.Series(dtype=int)
+            st.dataframe(_seller_summary, width="stretch")
+        if "category_code" in _stored_df.columns:
+            st.caption(":material/category: Categories with the most learned matches")
+            st.dataframe(_stored_df["category_code"].replace("", pd.NA).dropna().value_counts().head(10).rename("Rules"), width="stretch")
+    with _insight_tabs[1]:
+        _cluster_table = (
+            _stored_df[_stored_df["_cluster_key"].ne("")]
+            .groupby("_cluster_key", as_index=False)
+            .agg(Products=("_cluster_key", "size"), Sellers=("sellers_affected", "max"), Confirmed=("confirmed_decisions", "max"), Reason=("flag", "first"))
+            .sort_values(["Products", "Sellers"], ascending=False)
+        )
+        if _cluster_table.empty:
+            st.info("No image clusters are available yet.")
+        else:
+            st.caption("Clusters group exact image URLs or exact pHash values. Confirming a representative applies the review state to every rule in that cluster.")
+            st.dataframe(_cluster_table.head(100), hide_index=True, width="stretch")
+            _cluster_options = _cluster_table["_cluster_key"].head(100).tolist()
+            _selected_cluster = st.selectbox("Cluster to review", _cluster_options, format_func=lambda value: f"{value[:42]} · {_cluster_table.loc[_cluster_table['_cluster_key'].eq(value), 'Products'].iloc[0]:,} products", key="learned_cluster_choice")
+            _cluster_records = _stored_df[_stored_df["_cluster_key"].eq(_selected_cluster)]
+            if st.button("Confirm entire cluster", icon=":material/done_all:", key="confirm_learned_cluster"):
+                for _, _cluster_rule in _cluster_records.iterrows():
+                    set_learned_image_rule_review(_cluster_rule.to_dict(), "Confirmed")
+                st.success(f"Confirmed {_cluster_records.shape[0]:,} rules in the cluster.")
+                st.rerun()
+    with _insight_tabs[2]:
+        _suggestions = _stored_df[
+            _stored_df["cluster_size"].ge(3) & _stored_df["review_state"].eq("Unreviewed")
+        ].drop_duplicates("_cluster_key").sort_values(["cluster_size", "sellers_affected"], ascending=False)
+        if _suggestions.empty:
+            st.info("No repeated unreviewed image patterns need attention.")
+        else:
+            st.caption("These patterns appeared repeatedly and are good candidates for a confirmed learned rule or cluster review.")
+            st.dataframe(_suggestions[[c for c in ("_cluster_key", "flag", "cluster_size", "sellers_affected", "confidence") if c in _suggestions.columns]].head(100), hide_index=True, width="stretch")
 
 # Lightweight queues that turn the catalog and the current validation report
 # into actionable maintenance work. They stay collapsed so opening Dashboard
@@ -613,6 +1182,8 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
             _stored_df["review_state"] = "Unreviewed"
         _review_options = ["All", "Unreviewed", "Confirmed", "Corrected", "Removed"]
         _view_review = st.selectbox("Review state", _review_options, key="learned_rules_view_review")
+        _country_filter_options = ["All"] + list(SUPPORTED_RULE_COUNTRIES)
+        _view_country = st.selectbox("Market scope", _country_filter_options, key="learned_rules_view_country")
         _sort_option = st.selectbox(
             "Audit order",
             ["Priority", "Most reused", "Most sellers", "Brand", "Newest", "Oldest"],
@@ -630,7 +1201,7 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                     hide_index=True, width="stretch",
                 )
                 if st.button("Remove corrected rules", icon=":material/delete_sweep:", key="remove_corrected_rules", type="secondary"):
-                    _removed_corrected = delete_learned_image_rules(_correction_queue.to_dict("records"))
+                    _removed_corrected = _delete_rules_with_undo(_correction_queue.to_dict("records"))
                     st.success(f"Removed {_removed_corrected:,} corrected rule(s).")
                     st.rerun()
         _view_df = _stored_df.copy()
@@ -647,6 +1218,10 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
             _view_df = _view_df[_view_df["brand_infringed"].fillna("").astype(str).str.strip().eq(_view_brand)]
         if _view_review != "All":
             _view_df = _view_df[_view_df["review_state"].fillna("Unreviewed").astype(str).eq(_view_review)]
+        if _view_country != "All":
+            _view_df = _view_df[_view_df["countries"].map(
+                lambda values: "*" in normalize_rule_countries(values) or _view_country in normalize_rule_countries(values)
+            )]
         if _sort_option == "Priority":
             _view_df = _view_df.sort_values(["confidence_score", "sellers_affected", "cluster_size"], ascending=[False, False, False])
         elif _sort_option == "Most reused":
@@ -659,7 +1234,7 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
             _view_df = _view_df.sort_values("created_at", ascending=False)
         else:
             _view_df = _view_df.sort_values("created_at", ascending=True)
-        _display_cols = [c for c in ("_rule_id", "image_url", "phash", "flag", "reason", "brand_infringed", "brand", "seller_name", "product_set_sid", "source", "status", "created_at", "last_matched_at", "last_confirmed_at", "confidence", "cluster_size", "sellers_affected", "lifecycle", "review_due_at") if c in _view_df.columns]
+        _display_cols = [c for c in ("_rule_id", "image_url", "phash", "flag", "reason", "brand_infringed", "brand", "countries", "scope_categories", "scope_brands", "seller_name", "product_set_sid", "source", "status", "created_at", "last_matched_at", "last_confirmed_at", "confidence", "cluster_size", "skus_affected", "sellers_affected", "lifecycle", "review_due_at") if c in _view_df.columns]
         st.caption(f"Showing {_view_df.shape[0]:,} of {_stored_df.shape[0]:,} rules")
         _audit_mode = st.toggle(
             "Audit card view",
@@ -703,6 +1278,7 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                             _audit_brand = str(_audit_row.get("brand_infringed", _audit_row.get("brand", "")) or "").strip()
                             _audit_category = str(_audit_row.get("category_code", "") or "").strip()
                             _audit_review = str(_audit_row.get("review_state", "Unreviewed") or "Unreviewed")
+                            _audit_countries = normalize_rule_countries(_audit_row.get("countries"), legacy_global=True)
                             _audit_image_key = _audit_url or str(_audit_row.get("phash", "")).strip()
                             _audit_matches = _stored_df[
                                 _stored_df.get("image_url", pd.Series(index=_stored_df.index, dtype=str)).astype(str).eq(_audit_image_key)
@@ -721,8 +1297,9 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                                 f"SKU: {_audit_sid or '—'}\n"
                                 f"Seller: {_audit_seller or '—'}\n"
                                 f"Source: {_audit_source or '—'}\n"
+                                f"Markets: {'All countries' if '*' in _audit_countries else ', '.join(_audit_countries) or 'None'}\n"
                                 f"Review: {_audit_review}\n"
-                                f"Rules using image: {len(_audit_matches):,} · Sellers: {_audit_seller_count:,}"
+                                f"Affected SKUs: {int(_audit_row.get('skus_affected', 0) or 0):,} · Sellers: {int(_audit_row.get('sellers_affected', _audit_seller_count) or 0):,}"
                             )
                             # Timestamps are not guaranteed to be unique when a report
                             # imports several rules at once. Include the row identity so
@@ -735,6 +1312,26 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                                 sorted(LEARNABLE_FLAGS),
                                 index=(sorted(LEARNABLE_FLAGS).index(_audit_flag) if _audit_flag in LEARNABLE_FLAGS else 0),
                                 key=f"audit_reason_{_audit_key}",
+                            )
+                            _scope_options = ["All countries", *SUPPORTED_RULE_COUNTRIES]
+                            _scope_default = ["All countries"] if "*" in _audit_countries else _audit_countries
+                            _scope_choice = st.multiselect(
+                                "Applies in",
+                                _scope_options,
+                                default=_scope_default,
+                                key=f"audit_countries_{_audit_key}",
+                            )
+                            _scope_category_values = normalize_rule_values(_audit_row.get("scope_categories"))
+                            _scope_brand_values = normalize_rule_values(_audit_row.get("scope_brands"))
+                            _scope_category_text = st.text_input(
+                                "Category scope (optional; comma-separated codes or path terms)",
+                                value=", ".join(_scope_category_values),
+                                key=f"audit_category_scope_{_audit_key}",
+                            )
+                            _scope_brand_text = st.text_input(
+                                "Brand scope (optional; comma-separated declared brands)",
+                                value=", ".join(_scope_brand_values),
+                                key=f"audit_brand_scope_{_audit_key}",
                             )
                             _a1, _a2, _a3 = st.columns(3)
                             with _a1:
@@ -750,9 +1347,22 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                                     if update_learned_image_rule_flag(_audit_row.to_dict(), _audit_new_flag):
                                         st.success("Saved")
                                         st.rerun()
+                            _scope_to_save = ["*"] if "All countries" in _scope_choice else _scope_choice
+                            if st.button("Save market scope", icon=":material/public:", key=f"audit_scope_save_{_audit_key}", width="stretch"):
+                                if update_learned_image_rule_countries(_audit_row.to_dict(), _scope_to_save):
+                                    st.success("Market scope saved.")
+                                    st.rerun()
+                            if st.button("Save category/brand scope", icon=":material/tune:", key=f"audit_detail_scope_save_{_audit_key}", width="stretch"):
+                                if update_learned_image_rule_scope(
+                                    _audit_row.to_dict(),
+                                    categories=_scope_category_text,
+                                    brands=_scope_brand_text,
+                                ):
+                                    st.success("Category and brand scope saved.")
+                                    st.rerun()
                             with _a1:
                                 if st.button("Remove", icon=":material/delete:", key=f"audit_remove_{_audit_key}", width="stretch"):
-                                    if delete_learned_image_rules([_audit_row.to_dict()]):
+                                    if _delete_rules_with_undo([_audit_row.to_dict()]):
                                         st.success("Removed")
                                         st.rerun()
                             st.divider()
@@ -760,7 +1370,7 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                     _audit_bulk_a, _audit_bulk_b = st.columns([2, 3], gap="small")
                     with _audit_bulk_a:
                         if st.button("Remove selected audit rules", icon=":material/delete_sweep:", type="secondary", key="remove_selected_audit_rules", width="stretch"):
-                            _audit_removed = delete_learned_image_rules(_audit_selected_records)
+                            _audit_removed = _delete_rules_with_undo(_audit_selected_records)
                             st.success(f"Removed {_audit_removed:,} learned rule(s).")
                             st.rerun()
                     with _audit_bulk_b:
@@ -824,7 +1434,7 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                                     st.rerun()
                         with _preview_action_cols[2]:
                             if st.button("", icon=":material/delete:", help="Remove this learned rule", key=f"preview_remove_{_preview_key}"):
-                                if delete_learned_image_rules([_preview_row.to_dict()]):
+                                if _delete_rules_with_undo([_preview_row.to_dict()]):
                                     st.rerun()
                 if _preview_selected_records:
                     _bulk_remove_col, _bulk_count_col = st.columns([2, 3], gap="small")
@@ -838,7 +1448,7 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
                             key="remove_selected_preview_rules",
                             width="stretch",
                         ):
-                            _removed_preview = delete_learned_image_rules(_preview_selected_records)
+                            _removed_preview = _delete_rules_with_undo(_preview_selected_records)
                             st.success(f"Removed {_removed_preview:,} selected image rule(s).")
                             st.rerun()
         st.caption("Tick Remove for rules you want to delete, then save the catalog.")
@@ -862,7 +1472,7 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
         _selected = _edited[_edited["Remove"].astype(bool)] if "Remove" in _edited.columns else pd.DataFrame()
         if st.button("Delete selected rules", icon=":material/delete_sweep:", type="secondary", disabled=_selected.empty, key="delete_selected_learned_rules"):
             _records = _selected.drop(columns=["Remove"], errors="ignore").to_dict("records")
-            _deleted = delete_learned_image_rules(_records)
+            _deleted = _delete_rules_with_undo(_records)
             st.success(f"Deleted {_deleted:,} learned rule(s).")
             st.rerun()
         st.download_button(
@@ -872,27 +1482,6 @@ with st.expander(f"View stored rules ({len(_stored_df):,})", expanded=False):
             mime="application/gzip",
             key="download_learned_rules_csv",
         )
-
-
-def _make_compressed_csv_download(frame: pd.DataFrame, columns: list[str]):
-    """Build a CSV.gz on demand, without an intermediate full-size CSV string."""
-    output = tempfile.SpooledTemporaryFile(max_size=2 * 1024 * 1024, mode="w+b")
-    compressed = gzip.GzipFile(fileobj=output, mode="wb", mtime=0)
-    text = TextIOWrapper(compressed, encoding="utf-8", newline="")
-    try:
-        frame.to_csv(text, columns=columns, index=False)
-        text.flush()
-        text.detach()
-        compressed.close()
-        output.seek(0)
-        return output
-    except Exception:
-        try:
-            text.close()
-        except Exception:
-            pass
-        output.close()
-        raise
 
 
 def _normalise_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1008,6 +1597,7 @@ if uploads:
             status_col = _pick(frame.columns, ["STATUS", "LISTING_STATUS"])
             reason_col = _pick(frame.columns, ["REASON", "COMMENT", "COMMENT_DETAIL"])
             brand_col = _pick(frame.columns, ["BRAND", "BRAND_INFRINGED", "INFRINGED_BRAND", "BRAND_CLAIMED", "CLAIMED_BRAND"])
+            country_col = _pick(frame.columns, ["COUNTRY_CODE", "COUNTRY", "MARKET"])
             if not image_col:
                 problems.append(f"{source_name}: needs an image URL column")
                 continue
@@ -1056,6 +1646,17 @@ if uploads:
             )
             work["MAIN_IMAGE"] = work["MAIN_IMAGE"].astype(str).str.strip()
             work = work[work["MAIN_IMAGE"].ne("") & work["FLAG"].isin(LEARNABLE_FLAGS)]
+            _country_aliases = {
+                "KENYA": "KE", "UGANDA": "UG", "NIGERIA": "NG", "GHANA": "GH",
+                "MOROCCO": "MA", "EGYPT": "EG", "SENEGAL": "SN", "IVORY COAST": "CI",
+            }
+            if country_col:
+                work["_COUNTRY_CODE"] = work[country_col].fillna("").astype(str).str.strip().str.upper().map(
+                    lambda value: _country_aliases.get(value, value)
+                )
+                work.loc[~work["_COUNTRY_CODE"].isin(SUPPORTED_RULE_COUNTRIES), "_COUNTRY_CODE"] = ""
+            else:
+                work["_COUNTRY_CODE"] = ""
             work["_SOURCE_FILE"] = source_name
             work["_REASON"] = work[reason_col].astype(str) if reason_col else "Imported historical rejection"
             prepared.append(work)
@@ -1100,7 +1701,7 @@ if uploads:
                     icon=":material/content_copy:",
                 )
         st.dataframe(
-            preview[["PRODUCT_SET_SID", "MAIN_IMAGE", "FLAG", "_SOURCE_FILE"]].head(100),
+            preview[["PRODUCT_SET_SID", "MAIN_IMAGE", "FLAG", "_COUNTRY_CODE", "_SOURCE_FILE"]].head(100),
             hide_index=True,
             width="stretch",
         )
@@ -1115,7 +1716,7 @@ if uploads:
             }
             _batches = []
             for _source_name, _source_group in _files:
-                for flag, group in _source_group.groupby("FLAG"):
+                for (flag, _country_code), group in _source_group.groupby(["FLAG", "_COUNTRY_CODE"], dropna=False):
                     _batches.append({
                         "data": group,
                         "sids": group["PRODUCT_SET_SID"].astype(str).unique(),
@@ -1123,6 +1724,7 @@ if uploads:
                         "reason": str(group["_REASON"].iloc[0]).strip() or "Imported historical rejection",
                         "source": str(_source_name),
                         "hash_by_url": hash_cache,
+                        "country_code": str(_country_code or ""),
                         "source_name": str(_source_name),
                     })
 
@@ -1141,6 +1743,32 @@ if uploads:
                 _status.caption(f"Preparing {_source_name}; catalog will be written once after all files are processed.")
 
             try:
+                # Snapshot the authoritative catalog before the bulk write.
+                # Keep the compressed file locally and upload it to R2 so an
+                # import can be rolled back even after a cloud restart.
+                _catalog_path = APP_ROOT / "learned_image_rules.json"
+                if _catalog_path.exists():
+                    _snapshot_dir = _catalog_path.parent / ".learned_rule_snapshots"
+                    _snapshot_dir.mkdir(parents=True, exist_ok=True)
+                    _snapshot_hasher = hashlib.sha256()
+                    with _catalog_path.open("rb") as _hash_source:
+                        for _hash_chunk in iter(lambda: _hash_source.read(1024 * 1024), b""):
+                            _snapshot_hasher.update(_hash_chunk)
+                    _snapshot_digest = _snapshot_hasher.hexdigest()[:12]
+                    _snapshot_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    _snapshot_path = _snapshot_dir / f"{_snapshot_stamp}-{_snapshot_digest}.json.gz"
+                    with _catalog_path.open("rb") as _source_catalog, gzip.open(_snapshot_path, "wb", compresslevel=6) as _compressed_catalog:
+                        shutil.copyfileobj(_source_catalog, _compressed_catalog, length=1024 * 1024)
+                    for _old_snapshot in sorted(_snapshot_dir.glob("*.json.gz"), key=lambda path: path.stat().st_mtime, reverse=True)[100:]:
+                        try:
+                            _old_snapshot.unlink()
+                        except OSError:
+                            pass
+                    if r2_storage.enabled():
+                        _snapshot_key = f"learned-rules/snapshots/{_snapshot_path.name}"
+                        if not r2_storage.upload_file_verified(_snapshot_path, _snapshot_key, "application/gzip"):
+                            raise RuntimeError("The pre-import snapshot could not be verified in R2; import was stopped before changing the learned catalog.")
+                        r2_storage.prune_prefix("learned-rules/snapshots/", keep=100)
                 added = learn_image_rejections_bulk(_batches, progress_callback=_report_import_progress)
             except Exception as _import_error:
                 _progress.empty()

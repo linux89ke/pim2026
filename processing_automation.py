@@ -7,6 +7,7 @@ from pathlib import Path
 from collections import OrderedDict
 from typing import Iterable
 import r2_storage
+import streamlit as st
 
 ROOT = Path(os.path.abspath(os.path.dirname(__file__)))
 AUTOMATION_DIR = ROOT / ".validation_automation"
@@ -16,10 +17,85 @@ IMAGE_CACHE_PATH = AUTOMATION_DIR / "image_metadata.json"
 IMAGE_JOURNAL_PATH = AUTOMATION_DIR / "image_metadata.checkpoints.jsonl"
 MANIFEST_DIR.mkdir(exist_ok=True, parents=True)
 THUMB_DIR.mkdir(exist_ok=True, parents=True)
-DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="image-download")
+# One process-wide pool caps total concurrent image work across Streamlit
+# sessions. Each response is bounded in streamlit_app.py, so keep four workers
+# to limit simultaneous image buffers and avoid per-batch executor churn.
+DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="image-download")
 _LOCK = threading.RLock()
 _VALIDATION_LOCKS: OrderedDict[str, threading.Lock] = OrderedDict()
 _LAST_R2_CACHE_UPLOAD = 0.0
+
+
+class BoundedCache(OrderedDict):
+    def __init__(self, max_entries: int, max_weight_bytes: int | None = None):
+        super().__init__()
+        self.max_entries = int(max_entries)
+        self.max_weight_bytes = int(max_weight_bytes or 0)
+        self._weights = {} if self.max_weight_bytes else None
+        self._current_weight = 0
+
+    @staticmethod
+    def _estimate_weight(value) -> int:
+        if isinstance(value, str):
+            # Thumbnails are base64 ASCII data URIs, so character length is
+            # their exact encoded byte length without allocating a copy.
+            return len(value)
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return len(value)
+        return 128
+
+    def __setitem__(self, key, value):
+        if self._weights is not None and key in self._weights:
+            self._current_weight -= self._weights.pop(key)
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        if self._weights is not None:
+            weight = self._estimate_weight(value)
+            self._weights[key] = weight
+            self._current_weight += weight
+        while len(self) > self.max_entries or (
+            self._weights is not None and self._current_weight > self.max_weight_bytes
+        ):
+            self.popitem(last=False)
+
+    def popitem(self, last=True):
+        key, value = super().popitem(last=last)
+        if self._weights is not None:
+            self._current_weight -= self._weights.pop(key, 0)
+        return key, value
+
+    def pop(self, key, default=None):
+        if key not in self:
+            return default
+        value = super().pop(key)
+        if self._weights is not None:
+            self._current_weight -= self._weights.pop(key, 0)
+        return value
+
+    def clear(self):
+        super().clear()
+        if self._weights is not None:
+            self._weights.clear()
+        self._current_weight = 0
+
+
+@st.cache_resource(show_spinner=False)
+def image_runtime_state() -> dict:
+    """Shared, bounded image metadata for reruns and all sessions in-process."""
+    return {
+        "dimensions": BoundedCache(50000),
+        "hashes": BoundedCache(50000),
+        # Entry count alone allowed a few hundred large data URIs to retain
+        # hundreds of MB. Keep thumbnail RAM under 24 MiB; files remain cached
+        # on disk/R2 and are cheap to reload when a reviewer revisits a card.
+        "thumbnails": BoundedCache(400, max_weight_bytes=24 * 1024 * 1024),
+        "dim_lock": threading.Lock(),
+        "host_locks": {},
+        "host_failures": {},
+        "host_guard": threading.Lock(),
+        "metadata_restored": False,
+    }
 
 
 def validation_lock(signature: str) -> threading.Lock:
@@ -41,6 +117,40 @@ def validation_lock(signature: str) -> threading.Lock:
                 break
         return lock
 
+@st.cache_data(ttl=60, show_spinner=False, max_entries=2)
+def _load_image_metadata_cache_cached(cache_path: str, cache_mtime_ns: int, max_entries: int) -> dict:
+    del cache_mtime_ns  # revision participates in the cache key
+    path = Path(cache_path)
+    candidates = []
+    try:
+        if path.exists():
+            candidates.append(path.read_bytes())
+    except OSError:
+        pass
+    for raw in candidates:
+        try:
+            if not raw:
+                continue
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            entries = payload.get("entries", payload)
+            if isinstance(entries, dict):
+                return dict(list(entries.items())[-max_entries:])
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    if r2_storage.enabled():
+        try:
+            raw = r2_storage.download_bytes("validation/image_metadata.json")
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+            entries = payload.get("entries", payload) if isinstance(payload, dict) else {}
+            if isinstance(entries, dict):
+                return dict(list(entries.items())[-max_entries:])
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    return {}
+
+
 def load_image_metadata_cache(max_entries: int = 50000) -> dict:
     """Load the durable URL -> dimensions/pHash cache.
 
@@ -49,36 +159,33 @@ def load_image_metadata_cache(max_entries: int = 50000) -> dict:
     entries are ignored so a damaged cache never prevents validation startup.
     """
     try:
-        if IMAGE_CACHE_PATH.exists():
-            raw = IMAGE_CACHE_PATH.read_bytes()
-        else:
-            raw = r2_storage.download_bytes("validation/image_metadata.json")
-        payload = json.loads(raw.decode("utf-8"))
-        if not isinstance(payload, dict):
-            return {}
-        entries = payload.get("entries", payload)
-        if not isinstance(entries, dict):
-            return {}
-        entries = dict(list(entries.items())[-max_entries:])
-    except (OSError, ValueError, TypeError):
-        entries = {}
+        mtime_ns = IMAGE_CACHE_PATH.stat().st_mtime_ns if IMAGE_CACHE_PATH.exists() else 0
+    except OSError:
+        mtime_ns = 0
+    entries = _load_image_metadata_cache_cached(str(IMAGE_CACHE_PATH), mtime_ns, int(max_entries))
+    # The append-only journal is the crash-safe checkpoint path during a long
+    # image run. Replaying it avoids rewriting a large JSON cache every few
+    # dozen downloads and recovers the latest completed checkpoint on restart.
     try:
         with IMAGE_JOURNAL_PATH.open("r", encoding="utf-8") as journal:
             for line in journal:
                 try:
                     item = json.loads(line)
-                    url, value = str(item.get("url") or "").strip(), item.get("value")
+                    url = str(item.get("url") or "").strip()
+                    value = item.get("value")
                     if url and isinstance(value, dict):
                         entries[url] = value
                 except (ValueError, TypeError):
                     continue
     except OSError:
         pass
-    return dict(list(entries.items())[-max_entries:])
+    if len(entries) > int(max_entries):
+        entries = dict(list(entries.items())[-int(max_entries):])
+    return entries
 
 
 def append_image_metadata_checkpoint(entries: dict) -> None:
-    """Journal successful image checks so an interrupted run can reuse them."""
+    """Append a small durable image checkpoint without rewriting the full cache."""
     if not isinstance(entries, dict) or not entries:
         return
     now = datetime.now(timezone.utc).isoformat()
@@ -86,20 +193,27 @@ def append_image_metadata_checkpoint(entries: dict) -> None:
     for url, value in entries.items():
         if not str(url).strip() or not isinstance(value, dict):
             continue
-        size, phash = value.get("size"), str(value.get("phash") or "").strip()
+        size = value.get("size")
+        phash = str(value.get("phash") or "").strip()
         if not phash and not size:
             continue
-        lines.append(json.dumps({"url": str(url), "value": {
-            "size": list(size) if isinstance(size, (tuple, list)) and len(size) == 2 else None,
-            "phash": phash, "updated_at": value.get("updated_at") or now,
-        }}, ensure_ascii=False, separators=(",", ":")))
+        lines.append(json.dumps({
+            "url": str(url),
+            "value": {
+                "size": list(size) if isinstance(size, (tuple, list)) and len(size) == 2 else None,
+                "phash": phash,
+                "updated_at": value.get("updated_at") or now,
+            },
+        }, ensure_ascii=False, separators=(",", ":")))
     if not lines:
         return
     try:
+        IMAGE_JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _LOCK, IMAGE_JOURNAL_PATH.open("a", encoding="utf-8") as journal:
             journal.write("\n".join(lines) + "\n")
             journal.flush()
             os.fsync(journal.fileno())
+        _load_image_metadata_cache_cached.clear()
     except OSError:
         pass
 
@@ -134,11 +248,15 @@ def save_image_metadata_cache(entries: dict, max_entries: int = 50000) -> None:
                     break
                 except (PermissionError, OSError):
                     time.sleep(0.05 * (2 ** _attempt))
-            if replaced:
-                try:
-                    IMAGE_JOURNAL_PATH.write_text("", encoding="utf-8")
-                except OSError:
-                    pass
+            if not replaced:
+                return
+            # The compact cache now contains every journal entry, so the
+            # append-only recovery file can be safely reset.
+            try:
+                IMAGE_JOURNAL_PATH.write_text("", encoding="utf-8")
+            except OSError:
+                pass
+            _load_image_metadata_cache_cached.clear()
             global _LAST_R2_CACHE_UPLOAD
             if r2_storage.enabled() and time.monotonic() - _LAST_R2_CACHE_UPLOAD > 30:
                 _LAST_R2_CACHE_UPLOAD = time.monotonic()
@@ -149,6 +267,23 @@ def save_image_metadata_cache(entries: dict, max_entries: int = 50000) -> None:
                 )
         except OSError:
             pass
+
+
+def clear_derived_image_cache() -> None:
+    """Clear image dimensions/pHashes and the disk cache; never touches learned rules."""
+    state = image_runtime_state()
+    with state["dim_lock"]:
+        state["dimensions"].clear()
+        state["hashes"].clear()
+        state["thumbnails"].clear()
+        state["host_failures"].clear()
+        state["metadata_restored"] = True
+    try:
+        IMAGE_CACHE_PATH.unlink(missing_ok=True)
+        IMAGE_JOURNAL_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+    _load_image_metadata_cache_cached.clear()
 
 def chunk_artifact_dir(signature: str) -> Path:
     path = AUTOMATION_DIR / "chunks" / str(signature)

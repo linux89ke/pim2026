@@ -849,7 +849,7 @@ def evaluate_all_checks(data: pd.DataFrame, country_code: str) -> pd.DataFrame:
     if not _refurb_data:
         try:
             from loaders import load_refurb_data_from_local
-            _refurb_data = load_refurb_data_from_local()
+            _refurb_data = load_refurb_data_from_local(str(country_code).upper())
         except Exception:
             pass
 
@@ -872,7 +872,7 @@ def evaluate_all_checks(data: pd.DataFrame, country_code: str) -> pd.DataFrame:
         if _sf_df is None:
             try:
                 from loaders import load_suspected_fake_from_local
-                _sf_df = load_suspected_fake_from_local().get(country_code)
+                _sf_df = load_suspected_fake_from_local(str(country_code).upper()).get(country_code)
             except Exception:
                 _sf_df = None
         _sneaker_cats = _supp2.get("sneaker_category_codes") or []

@@ -22,9 +22,16 @@ from pathlib import Path
 
 import pandas as pd
 import supabase_store
+import r2_storage
+
+try:
+    import orjson as _fast_json
+except ImportError:  # local environments may still use the stdlib fallback
+    _fast_json = None
 
 RULES_PATH = Path(__file__).resolve().parent / "learned_image_rules.json"
 DELETED_RULES_ARCHIVE = RULES_PATH.with_name("learned_image_rules.deleted.jsonl")
+REMOTE_SYNC_OUTBOX = RULES_PATH.with_name("learned_image_sync_pending.json")
 _RULES_LOAD_ERROR = None
 
 
@@ -121,7 +128,9 @@ LEARNABLE_FLAGS = frozenset({
     "Restricted brands", "Suspected Fake product",
     "Brand Image Mismatch", "Counterfeit Sneakers",
     "Suspected counterfeit Jerseys",
+    "Category Check – Replica Jersey / IP Violation",
 })
+SUPPORTED_RULE_COUNTRIES = ("KE", "UG", "NG", "GH", "MA", "EG", "SN", "CI")
 FLAG_ALIASES = {
     "poor image": "Poor images", "poor images": "Poor images",
     "poor image quality": "Poor images",
@@ -149,6 +158,9 @@ FLAG_ALIASES = {
     "counterfeit jerseys": "Suspected counterfeit Jerseys",
     "suspected counterfeit jersey": "Suspected counterfeit Jerseys",
     "suspected counterfeit jerseys": "Suspected counterfeit Jerseys",
+    "category check – replica jersey / ip violation": "Category Check – Replica Jersey / IP Violation",
+    "category check - replica jersey / ip violation": "Category Check – Replica Jersey / IP Violation",
+    "replica jersey / ip violation": "Category Check – Replica Jersey / IP Violation",
 }
 # When one image has several learned reasons, generic poor-image quality is
 # the least specific explanation. Keep it as a fallback so a more specific
@@ -166,6 +178,7 @@ _LEARNED_FLAG_PRIORITY = {
     "Suspected Fake product": 70,
     "Counterfeit Sneakers": 70,
     "Suspected counterfeit Jerseys": 70,
+    "Category Check – Replica Jersey / IP Violation": 75,
 }
 
 _LOCK = threading.RLock()
@@ -177,14 +190,98 @@ _REMOTE_RULES_FETCHED_AT = 0.0
 _REMOTE_RULES_TTL = 60.0
 _REMOTE_RULES_SUSPICIOUS = False
 _PAGE_RULE_CACHE = OrderedDict()
-_PAGE_RULE_CACHE_MAX = 16
+_PAGE_RULE_CACHE_MAX = 64   # covers batches up to ~64k rows at 1k chunk size
 _RUNTIME_INDEX = None
 _RUNTIME_INDEX_MTIME = -1
 _LOG = logging.getLogger(__name__)
+_REMOTE_SYNC_STATUS = {
+    "status": "not_configured",
+    "pending": [],
+    "last_synced_at": "",
+    "last_error": "",
+    "queue_durable": False,
+    "queue_location": "",
+}
+_REMOTE_SYNC_OUTBOX_LOADED = False
+
+
+def _save_remote_sync_outbox_locked() -> None:
+    """Persist cloud write retries separately from the authoritative rule catalog."""
+    temp = REMOTE_SYNC_OUTBOX.with_suffix(".json.tmp")
+    try:
+        REMOTE_SYNC_OUTBOX.parent.mkdir(parents=True, exist_ok=True)
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(_REMOTE_SYNC_STATUS.get("pending", [])[-5000:], handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, REMOTE_SYNC_OUTBOX)
+        if r2_storage.enabled():
+            _queue_uploaded = r2_storage.upload_bytes(
+                REMOTE_SYNC_OUTBOX.read_bytes(),
+                "learned-rules/sync-outbox.json",
+                "application/json",
+            )
+            _REMOTE_SYNC_STATUS["queue_durable"] = bool(_queue_uploaded)
+            _REMOTE_SYNC_STATUS["queue_location"] = "R2" if _queue_uploaded else "local only"
+        else:
+            _REMOTE_SYNC_STATUS["queue_durable"] = True
+            _REMOTE_SYNC_STATUS["queue_location"] = "local"
+    except Exception:
+        _LOG.exception("Could not persist learned-rule cloud sync retry queue")
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _load_remote_sync_outbox_locked() -> None:
+    global _REMOTE_SYNC_OUTBOX_LOADED
+    if _REMOTE_SYNC_OUTBOX_LOADED:
+        return
+    _REMOTE_SYNC_OUTBOX_LOADED = True
+    try:
+        if REMOTE_SYNC_OUTBOX.exists():
+            with REMOTE_SYNC_OUTBOX.open("r", encoding="utf-8") as handle:
+                records = json.load(handle)
+        elif r2_storage.enabled():
+            _raw = r2_storage.download_bytes("learned-rules/sync-outbox.json")
+            records = json.loads(_raw.decode("utf-8")) if _raw else []
+            if records:
+                REMOTE_SYNC_OUTBOX.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+                _REMOTE_SYNC_STATUS["queue_durable"] = True
+                _REMOTE_SYNC_STATUS["queue_location"] = "R2"
+        else:
+            records = []
+        if isinstance(records, list):
+            _REMOTE_SYNC_STATUS["pending"] = [row for row in records if isinstance(row, dict)][-5000:]
+            if _REMOTE_SYNC_STATUS["pending"]:
+                _REMOTE_SYNC_STATUS["status"] = "pending"
+                if not _REMOTE_SYNC_STATUS.get("queue_location"):
+                    _REMOTE_SYNC_STATUS["queue_location"] = "local"
+                _REMOTE_SYNC_STATUS["queue_durable"] = True
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError):
+        _LOG.exception("Could not load learned-rule cloud sync retry queue")
 
 
 def _clear_page_rule_cache() -> None:
     _PAGE_RULE_CACHE.clear()
+
+
+def get_cloud_sync_status() -> dict:
+    """Return the latest image-rule cloud sync state without exposing secrets."""
+    with _LOCK:
+        _load_remote_sync_outbox_locked()
+        return {
+            "configured": bool(supabase_store.enabled()),
+            "status": _REMOTE_SYNC_STATUS.get("status", "not_configured"),
+            "pending_count": len(_REMOTE_SYNC_STATUS.get("pending", [])),
+            "last_synced_at": _REMOTE_SYNC_STATUS.get("last_synced_at", ""),
+            "last_error": _REMOTE_SYNC_STATUS.get("last_error", ""),
+            "queue_durable": bool(_REMOTE_SYNC_STATUS.get("queue_durable", False)),
+            "queue_location": str(_REMOTE_SYNC_STATUS.get("queue_location", "")),
+        }
 
 def _sync_sqlite_locked(rules: list) -> None:
     """Compatibility no-op for callers from the pre-JSON-only implementation."""
@@ -198,6 +295,45 @@ def normalize_learned_flag(value: str) -> str:
     return FLAG_ALIASES.get(raw.casefold(), raw)
 
 
+def normalize_rule_countries(value, *, legacy_global: bool = True) -> list[str]:
+    """Normalize learned-rule market scope; legacy records remain global."""
+    if value is None:
+        return ["*"] if legacy_global else []
+    if isinstance(value, str):
+        raw_values = re.split(r"[,;|]", value)
+    else:
+        try:
+            raw_values = list(value)
+        except TypeError:
+            raw_values = [value]
+    countries = sorted({str(item).strip().upper() for item in raw_values if str(item).strip()})
+    if not countries:
+        return ["*"] if legacy_global else []
+    if "*" in countries or "ALL" in countries:
+        return ["*"]
+    return [code for code in countries if code in SUPPORTED_RULE_COUNTRIES]
+
+
+def normalize_rule_values(value) -> list[str]:
+    """Normalize optional category or brand scope values."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_values = re.split(r"[,;\n|]", value)
+    else:
+        try:
+            raw_values = list(value)
+        except TypeError:
+            raw_values = [value]
+    return sorted({str(item).strip() for item in raw_values
+                   if str(item).strip() and str(item).strip().casefold() not in {"nan", "none"}}, key=str.casefold)
+
+
+def _rule_applies_in_country(rule: dict, country_code: str) -> bool:
+    countries = normalize_rule_countries(rule.get("countries"), legacy_global=True)
+    return not country_code or "*" in countries or str(country_code).strip().upper() in countries
+
+
 def _load_locked() -> list:
     global _RULES_MTIME, _RULES, _RULES_LOAD_ERROR
     try:
@@ -207,12 +343,15 @@ def _load_locked() -> list:
         mtime = RULES_PATH.stat().st_mtime_ns
     except OSError:
         mtime = 0.0
-    if mtime == _RULES_MTIME:
+    if mtime == _RULES_MTIME and _RULES is not None:
         return _RULES
     _clear_page_rule_cache()
     try:
-        with RULES_PATH.open("r", encoding="utf-8") as handle:
-            loaded = json.load(handle)
+        if _fast_json is not None:
+            loaded = _fast_json.loads(RULES_PATH.read_bytes())
+        else:
+            with RULES_PATH.open("r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
         if not isinstance(loaded, list):
             raise ValueError("catalog root must be a JSON array")
         _RULES = loaded
@@ -278,21 +417,55 @@ def load_learned_image_rules() -> list:
         return list(_load_locked())
 
 
+def iter_learned_image_rules(country_code: str = ""):
+    """Iterate the cached catalog for read-only work without copying its list.
+
+    The returned dictionaries must be treated as read-only. Mutations should
+    continue to use ``load_learned_image_rules`` and the explicit update APIs.
+    Writers replace the cached list under ``_LOCK``; retaining this reference
+    keeps an in-progress iteration stable while that happens.
+    """
+    if supabase_store.enabled():
+        # The public loader provides a defensive list for remote callers; keep
+        # that behavior here because Supabase data is refreshed asynchronously
+        # and the local catalog is not authoritative when remote sync is on.
+        rules = load_learned_image_rules()
+    else:
+        with _LOCK:
+            rules = _load_locked()
+
+    code = str(country_code or "").strip().upper()
+    for rule in rules or ():
+        if not code or _rule_applies_in_country(rule, code):
+            yield rule
+
 _REMOTE_RULE_COLUMNS = {
     "image_url", "phash", "flag", "reason", "comment", "brand_infringed",
     "category_code", "product_set_sid", "seller_name", "status", "review_state",
     "source", "created_at", "updated_at", "last_matched_at", "last_confirmed_at",
-    "review_due_at",
+    "review_due_at", "countries", "match_count", "matched_sids", "matched_sellers", "impact_truncated",
+    "brand_infringed_by_country", "scope_categories", "scope_brands",
 }
 
 
 def _remote_upsert_rules(records: list[dict]) -> None:
-    if not records or not supabase_store.enabled():
+    if not records:
+        return
+    if not supabase_store.enabled():
+        with _LOCK:
+            _REMOTE_SYNC_STATUS.update(status="local_only", last_error="")
         return
     now = supabase_store.now_iso()
     payload = []
     for record in records:
         row = {key: record.get(key) for key in _REMOTE_RULE_COLUMNS}
+        row["countries"] = normalize_rule_countries(record.get("countries"), legacy_global=True)
+        row["match_count"] = int(record.get("match_count", 0) or 0)
+        row["matched_sids"] = list(record.get("matched_sids", []) or [])
+        row["matched_sellers"] = list(record.get("matched_sellers", []) or [])
+        row["brand_infringed_by_country"] = record.get("brand_infringed_by_country", {}) or {}
+        row["scope_categories"] = normalize_rule_values(record.get("scope_categories"))
+        row["scope_brands"] = normalize_rule_values(record.get("scope_brands"))
         row["updated_at"] = row.get("updated_at") or now
         row["created_at"] = row.get("created_at") or now
         for field in ("last_matched_at", "last_confirmed_at", "review_due_at"):
@@ -338,8 +511,54 @@ def _remote_upsert_rules(records: list[dict]) -> None:
         _REMOTE_RULES_FETCHED_AT = 0.0
         _REMOTE_RULES_SUSPICIOUS = False
         _clear_page_rule_cache()
+        with _LOCK:
+            _load_remote_sync_outbox_locked()
+            pending = _REMOTE_SYNC_STATUS.setdefault("pending", [])
+            synced_keys = {
+                (str(row.get("image_url", "") or ""), str(row.get("phash", "") or ""),
+                 normalize_learned_flag(row.get("flag", "")), str(row.get("status", "active") or "active"))
+                for row in payload
+            }
+            pending[:] = [
+                item for item in pending
+                if (str(item.get("image_url", "") or ""), str(item.get("phash", "") or ""),
+                    normalize_learned_flag(item.get("flag", "")), str(item.get("status", "active") or "active"))
+                not in synced_keys
+            ]
+            _REMOTE_SYNC_STATUS.update(
+                status="synced" if not pending else "pending",
+                last_synced_at=supabase_store.now_iso(),
+                last_error="",
+            )
+            _save_remote_sync_outbox_locked()
     except Exception as exc:
         _LOG.warning("Could not write learned rules to Supabase: %s", exc)
+        with _LOCK:
+            _load_remote_sync_outbox_locked()
+            pending = _REMOTE_SYNC_STATUS.setdefault("pending", [])
+            known = {
+                (str(row.get("image_url", "") or ""), str(row.get("phash", "") or ""),
+                 normalize_learned_flag(row.get("flag", "")), str(row.get("status", "active") or "active"))
+                for row in pending
+            }
+            for row in payload:
+                key = (str(row.get("image_url", "") or ""), str(row.get("phash", "") or ""),
+                       normalize_learned_flag(row.get("flag", "")), str(row.get("status", "active") or "active"))
+                if key not in known:
+                    pending.append(row)
+                    known.add(key)
+            del pending[:-5000]
+            _REMOTE_SYNC_STATUS.update(status="failed", last_error=f"{type(exc).__name__}: {exc}")
+            _save_remote_sync_outbox_locked()
+
+
+def retry_pending_cloud_sync() -> int:
+    """Retry queued rule writes. Returns the number of records still pending."""
+    with _LOCK:
+        pending = list(_REMOTE_SYNC_STATUS.get("pending", []))
+    if pending and supabase_store.enabled():
+        _remote_upsert_rules(pending)
+    return int(get_cloud_sync_status()["pending_count"])
 
 
 def _remote_delete_rules(records: list[dict]) -> None:
@@ -415,6 +634,7 @@ def remove_learned_rule_match(
     *,
     rule_urls=None,
     rule_phashes=None,
+    country_code: str = "",
     explicit_approval: bool = False,
 ) -> int:
     """Remove only the matched learned image rule for an explicit approval.
@@ -435,16 +655,60 @@ def remove_learned_rule_match(
     if not canonical_flag or (not urls and not phashes):
         return 0
 
+    country_code = str(country_code or "").strip().upper()
     matched_rules = [
-        rule for rule in load_learned_image_rules()
+        rule for rule in iter_learned_image_rules()
         if isinstance(rule, dict)
         and normalize_learned_flag(rule.get("flag", "")) == canonical_flag
+        and _rule_applies_in_country(rule, country_code)
         and (
             (str(rule.get("image_url", "") or "").strip() in urls)
             or (str(rule.get("phash", "") or "").strip().casefold() in phashes)
         )
     ]
-    return delete_learned_image_rules(matched_rules)
+    if not country_code:
+        return delete_learned_image_rules(matched_rules)
+
+    # An explicit approval corrects the rule for this market. Preserve other
+    # market decisions when a rule is shared globally or across countries.
+    changed, removed = [], []
+    with _LOCK:
+        current = list(load_learned_image_rules())
+        existing_identities = _rule_identity_counts(current)
+        for rule in current:
+            if rule not in matched_rules:
+                continue
+            old_countries = normalize_rule_countries(rule.get("countries"), legacy_global=True)
+            next_countries = (
+                [code for code in SUPPORTED_RULE_COUNTRIES if code != country_code]
+                if "*" in old_countries
+                else [code for code in old_countries if code != country_code]
+            )
+            if not next_countries:
+                removed.append(rule)
+            else:
+                rule["countries"] = next_countries
+                rule["updated_at"] = datetime.now(timezone.utc).isoformat()
+                changed.append(rule)
+        if not changed and not removed:
+            return 0
+        kept = [rule for rule in current if rule not in removed]
+        _assert_no_rules_lost(existing_identities - _rule_identity_counts(removed), kept)
+        if removed:
+            _archive_deleted_rules(removed)
+        temp = RULES_PATH.with_suffix(".json.tmp")
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(kept, handle, indent=2, ensure_ascii=False)
+        _atomic_replace_rules(temp, RULES_PATH)
+        global _RULES, _RULES_MTIME, _RUNTIME_INDEX, _RUNTIME_INDEX_MTIME
+        _RULES = kept
+        _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
+        _RUNTIME_INDEX = None
+        _RUNTIME_INDEX_MTIME = -1
+        _sync_sqlite_locked(_RULES)
+        _remote_delete_rules(removed)
+        _remote_upsert_rules(changed)
+        return len(changed) + len(removed)
 
 
 def delete_associated_learned_image_rules(rules) -> int:
@@ -600,6 +864,31 @@ def restore_learned_image_rules(rules) -> int:
         return len(new_items)
 
 
+def replace_learned_image_rules(rules, *, confirmed: bool = False) -> int:
+    """Explicitly restore a complete catalog snapshot after archiving current rules."""
+    if not confirmed:
+        raise ValueError("Replacing the learned catalog requires explicit confirmation.")
+    replacement = [dict(row) for row in (rules or []) if isinstance(row, dict)]
+    with _LOCK:
+        current = list(load_learned_image_rules())
+        if _RULES_LOAD_ERROR:
+            raise RuntimeError(f"Current catalog is unreadable; refusing replacement: {_RULES_LOAD_ERROR}")
+        _archive_deleted_rules(current)
+        temp = RULES_PATH.with_suffix(".json.tmp")
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(replacement, handle, indent=2, ensure_ascii=False)
+        _atomic_replace_rules(temp, RULES_PATH)
+        global _RULES, _RULES_MTIME, _RUNTIME_INDEX, _RUNTIME_INDEX_MTIME
+        _RULES = replacement
+        _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
+        _RUNTIME_INDEX = None
+        _RUNTIME_INDEX_MTIME = -1
+        _sync_sqlite_locked(_RULES)
+        _remote_delete_rules(current)
+        _remote_upsert_rules(replacement)
+        return len(replacement)
+
+
 def restore_archived_learned_image_rules() -> int:
     """Restore all records from the append-only explicit-deletion archive."""
     if not DELETED_RULES_ARCHIVE.exists():
@@ -703,50 +992,172 @@ def set_learned_image_rule_review(rule: dict, review_state: str) -> bool:
         return True
 
 
-def merge_learned_image_rules(blocked_map: dict) -> dict:
+def update_learned_image_rule_countries(rule: dict, countries) -> bool:
+    """Set the allowed markets for one learned rule, preserving all other metadata."""
+    if not isinstance(rule, dict):
+        return False
+    normalized = normalize_rule_countries(countries, legacy_global=False)
+    if not normalized:
+        return False
+    target = (
+        str(rule.get("image_url", "")).strip(),
+        str(rule.get("phash", "")).strip(),
+        str(rule.get("created_at", "")).strip(),
+    )
+    with _LOCK:
+        current = list(load_learned_image_rules())
+        existing_identities = _rule_identity_counts(current)
+        changed_rules = []
+        for item in current:
+            key = (
+                str(item.get("image_url", "")).strip(),
+                str(item.get("phash", "")).strip(),
+                str(item.get("created_at", "")).strip(),
+            )
+            if key == target:
+                old = normalize_rule_countries(item.get("countries"), legacy_global=True)
+                if old == normalized:
+                    return False
+                item["countries"] = normalized
+                item["updated_at"] = datetime.now(timezone.utc).isoformat()
+                changed_rules.append(item)
+                break
+        if not changed_rules:
+            return False
+        _assert_no_rules_lost(existing_identities, current)
+        temp = RULES_PATH.with_suffix(".json.tmp")
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(current, handle, indent=2, ensure_ascii=False)
+        _atomic_replace_rules(temp, RULES_PATH)
+        global _RULES, _RULES_MTIME, _RUNTIME_INDEX, _RUNTIME_INDEX_MTIME
+        _RULES = current
+        _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
+        _RUNTIME_INDEX = None
+        _RUNTIME_INDEX_MTIME = -1
+        _sync_sqlite_locked(_RULES)
+        _remote_upsert_rules(changed_rules)
+        return True
+
+
+def update_learned_image_rule_scope(rule: dict, *, categories=None, brands=None) -> bool:
+    """Set optional category and declared-brand restrictions on one rule."""
+    if not isinstance(rule, dict):
+        return False
+    normalized_categories = normalize_rule_values(categories)
+    normalized_brands = normalize_rule_values(brands)
+    target = (
+        str(rule.get("image_url", "")).strip(),
+        str(rule.get("phash", "")).strip(),
+        str(rule.get("created_at", "")).strip(),
+    )
+    with _LOCK:
+        current = list(load_learned_image_rules())
+        existing_identities = _rule_identity_counts(current)
+        changed_rules = []
+        for item in current:
+            key = (
+                str(item.get("image_url", "")).strip(),
+                str(item.get("phash", "")).strip(),
+                str(item.get("created_at", "")).strip(),
+            )
+            if key == target:
+                if (normalize_rule_values(item.get("scope_categories")) == normalized_categories
+                        and normalize_rule_values(item.get("scope_brands")) == normalized_brands):
+                    return False
+                item["scope_categories"] = normalized_categories
+                item["scope_brands"] = normalized_brands
+                item["updated_at"] = datetime.now(timezone.utc).isoformat()
+                changed_rules.append(item)
+                break
+        if not changed_rules:
+            return False
+        _assert_no_rules_lost(existing_identities, current)
+        temp = RULES_PATH.with_suffix(".json.tmp")
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(current, handle, indent=2, ensure_ascii=False)
+        _atomic_replace_rules(temp, RULES_PATH)
+        global _RULES, _RULES_MTIME, _RUNTIME_INDEX, _RUNTIME_INDEX_MTIME
+        _RULES = current
+        _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
+        _RUNTIME_INDEX = None
+        _RUNTIME_INDEX_MTIME = -1
+        _sync_sqlite_locked(_RULES)
+        _remote_upsert_rules(changed_rules)
+        return True
+
+
+def merge_learned_image_rules(blocked_map: dict, country_code: str = "") -> dict:
     """Merge active JSON rules into the URL/pHash matcher map."""
     merged = dict(blocked_map or {})
     with _LOCK:
-        merged.update(load_learned_image_rule_index().get("by_key", {}))
+        merged.update(load_learned_image_rule_index(country_code).get("by_key", {}))
     return merged
 
 
-def load_learned_image_rule_index() -> dict:
+def load_learned_image_rule_index(country_code: str = "") -> dict:
     """Return compact URL/pHash lookups for validation runtime use."""
     global _RUNTIME_INDEX, _RUNTIME_INDEX_MTIME
     try:
         mtime = RULES_PATH.stat().st_mtime_ns
     except OSError:
         mtime = 0
-    if _RUNTIME_INDEX is not None and _RUNTIME_INDEX_MTIME == mtime:
+    country_code = str(country_code or "").strip().upper()
+    if _RUNTIME_INDEX is not None and _RUNTIME_INDEX_MTIME == (mtime, country_code):
         return _RUNTIME_INDEX
-    by_key, flag_counts, seller_counts = {}, {}, {}
-    for rule in load_learned_image_rules():
+    # Validation callers consume the URL/pHash matcher only. Building two more
+    # per-catalog aggregation dictionaries here duplicated tens of thousands
+    # of strings/keys on every country-specific index build, while Dashboard
+    # analytics already derive counts from the full catalog when requested.
+    by_key = {}
+    for rule in iter_learned_image_rules():
         if str(rule.get("status", "active")).lower() != "active":
+            continue
+        if not _rule_applies_in_country(rule, country_code):
             continue
         flag = normalize_learned_flag(rule.get("flag", ""))
         if flag not in LEARNABLE_FLAGS:
             continue
         entry = {
             "flag": flag,
-            "brand": rule.get("brand_infringed", "") or rule.get("brand", ""),
+            "brand": _brand_for_rule_country(rule, country_code),
+            "brand_candidates": _brand_candidates_for_rule_country(rule, country_code),
             "url": rule.get("image_url", ""),
             "phash": rule.get("phash", ""),
             "comment": rule.get("comment", ""),
-            "source": "json",
+            "scope_categories": normalize_rule_values(rule.get("scope_categories")),
+            "scope_brands": normalize_rule_values(rule.get("scope_brands")),
         }
         for key in (str(rule.get("image_url", "")).strip(), str(rule.get("phash", "")).strip()):
             if key:
                 _old = by_key.get(key)
                 if _old is None or _LEARNED_FLAG_PRIORITY.get(flag, 50) >= _LEARNED_FLAG_PRIORITY.get(str(_old.get("flag", "")), 50):
                     by_key[key] = entry
-        flag_counts[flag] = flag_counts.get(flag, 0) + 1
-        seller = str(rule.get("seller_name", "")).strip()
-        if seller:
-            seller_counts[seller] = seller_counts.get(seller, 0) + 1
-    _RUNTIME_INDEX = {"by_key": by_key, "flag_counts": flag_counts, "seller_counts": seller_counts}
-    _RUNTIME_INDEX_MTIME = mtime
+    _RUNTIME_INDEX = {"by_key": by_key, "flag_counts": {}, "seller_counts": {}}
+    _RUNTIME_INDEX_MTIME = (mtime, country_code)
+    # Validation keeps only the compact country-specific URL/pHash index.
+    # Release the expanded catalog and Supabase response list; the Dashboard
+    # reloads full rule details on demand, while validation reuses this index.
+    global _RULES, _REMOTE_RULES
+    _RULES = None
+    _REMOTE_RULES = None
     return _RUNTIME_INDEX
+
+
+def _brand_candidates_for_rule_country(rule: dict, country_code: str) -> list[str]:
+    by_country = rule.get("brand_infringed_by_country", {})
+    if isinstance(by_country, dict):
+        values = by_country.get(str(country_code or "").strip().upper()) or by_country.get("*") or []
+        if isinstance(values, str):
+            values = [values]
+        clean = list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+        if clean:
+            return clean
+    fallback = str(rule.get("brand_infringed", "") or rule.get("brand", "")).strip()
+    return [fallback] if fallback else []
+
+
+def _brand_for_rule_country(rule: dict, country_code: str) -> str:
+    return " / ".join(_brand_candidates_for_rule_country(rule, country_code))
 
 
 def load_learned_image_rules_for_urls(urls) -> list[dict]:
@@ -791,7 +1202,7 @@ def load_learned_image_rules_for_urls(urls) -> list[dict]:
             _LOG.warning("Could not query learned rules for current images: %s", exc)
     with _LOCK:
         out = [
-            rule for rule in load_learned_image_rules()
+            rule for rule in iter_learned_image_rules()
             if str(rule.get("image_url", "")).strip() in wanted
         ]
         _PAGE_RULE_CACHE[cache_key] = list(out)
@@ -809,6 +1220,7 @@ def learn_image_rejections(
     comment: str = "",
     source: str = "validation",
     hash_by_url: dict | None = None,
+    country_code: str = "",
 ) -> int:
     """Append unique image rules for rejected SIDs and return new-rule count."""
     flag = normalize_learned_flag(flag)
@@ -827,6 +1239,7 @@ def learn_image_rejections(
     _unique["_learn_image_url"] = _unique[image_col].fillna("").astype(str).str.strip()
     _unique = _unique[~_unique["_learn_image_url"].str.casefold().isin({"", "nan", "none", "n/a"})]
     _created_at = datetime.now(timezone.utc).isoformat()
+    _countries = normalize_rule_countries([country_code] if country_code else None)
     records = [{
             "image_url": url,
             "phash": str(hash_by_url.get(url, "") or "").strip(),
@@ -835,6 +1248,7 @@ def learn_image_rejections(
             "comment": str(comment or ""),
             "brand": str(row.get("BRAND_INFRINGED", row.get("BRAND", "")) or "").strip(),
             "brand_infringed": str(row.get("BRAND_INFRINGED", row.get("BRAND", "")) or "").strip(),
+            "brand_infringed_by_country": ({str(country_code).strip().upper(): [str(row.get("BRAND_INFRINGED", row.get("BRAND", "")) or "").strip()]} if country_code else {}),
             "category_code": str(row.get("CATEGORY_CODE", "") or "").strip(),
             "product_set_sid": str(row.get("PRODUCT_SET_SID", "")).strip(),
             "seller_name": str(row.get("SELLER_NAME", "") or "").strip(),
@@ -844,6 +1258,13 @@ def learn_image_rejections(
             "last_matched_at": "",
             "last_confirmed_at": "",
             "review_due_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+            "countries": _countries,
+            "scope_categories": [],
+            "scope_brands": [],
+            "match_count": 0,
+            "matched_sids": [],
+            "matched_sellers": [],
+            "impact_truncated": False,
         } for row in _unique.to_dict("records")
         if flag != "Restricted brands" or str(row.get("BRAND_INFRINGED", row.get("BRAND", "")) or "").strip()
         for url in [str(row.get("_learn_image_url", "")).strip()]]
@@ -866,18 +1287,45 @@ def learn_image_rejections(
         url_keys = {(url, flag) for url, _phash, flag in keys if url}
         phash_keys = {(_phash, flag) for _url, _phash, flag in keys if _phash}
         additions = []
+        changed_rules = []
         for record in records:
             key = (record["image_url"], record["phash"], record["flag"])
-            if key in keys or (record["image_url"], record["flag"]) in url_keys or (
-                record["phash"] and (record["phash"], record["flag"]) in phash_keys
-            ):
+            _record_brand = str(record.get("brand_infringed", "") or "").strip().casefold()
+            existing = next((item for item in current
+                if normalize_learned_flag(item.get("flag", "")) == record["flag"]
+                and (record["flag"] != "Restricted brands" or
+                     str(item.get("brand_infringed", item.get("brand", "")) or "").strip().casefold() == _record_brand)
+                and ((record["image_url"] and str(item.get("image_url", "")).strip() == record["image_url"])
+                     or (record["phash"] and str(item.get("phash", "")).strip().casefold() == record["phash"].casefold()))), None)
+            if existing is not None:
+                old_countries = normalize_rule_countries(existing.get("countries"), legacy_global=True)
+                if record["flag"] == "Restricted brands":
+                    _brands_by_country = existing.setdefault("brand_infringed_by_country", {})
+                    if not isinstance(_brands_by_country, dict):
+                        _brands_by_country = {}
+                        existing["brand_infringed_by_country"] = _brands_by_country
+                    _brand_country = str(country_code or "*").strip().upper()
+                    _brand_values = _brands_by_country.setdefault(_brand_country, [])
+                    if isinstance(_brand_values, str):
+                        _brand_values = [_brand_values]
+                    _new_brand = str(record.get("brand_infringed", "") or "").strip()
+                    if _new_brand and _new_brand.casefold() not in {str(v).casefold() for v in _brand_values}:
+                        _brand_values.append(_new_brand)
+                        existing["brand_infringed_by_country"][_brand_country] = _brand_values
+                        changed_rules.append(existing)
+                if "*" not in old_countries:
+                    _country_union = set(old_countries) | set(_countries)
+                    merged_countries = ["*"] if "*" in _country_union else sorted(_country_union)
+                    if merged_countries != old_countries:
+                        existing["countries"] = merged_countries
+                        changed_rules.append(existing)
                 continue
             keys.add(key)
             url_keys.add((record["image_url"], record["flag"]))
             if record["phash"]:
                 phash_keys.add((record["phash"], record["flag"]))
             additions.append(record)
-        if not additions:
+        if not additions and not changed_rules:
             return 0
         payload = current + additions
         _assert_no_rules_lost(existing_identities, payload)
@@ -889,7 +1337,7 @@ def learn_image_rejections(
         _RULES = payload
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
         _sync_sqlite_locked(_RULES)
-        _remote_upsert_rules(additions)
+        _remote_upsert_rules(additions + changed_rules)
         return len(additions)
 
 
@@ -898,39 +1346,64 @@ def learn_image_rejections_async(*args, **kwargs):
     return _WRITER.submit(learn_image_rejections, *args, **kwargs)
 
 
-def record_learned_image_matches(matches) -> int:
-    """Update match timestamps at most once per rule per day.
-
-    Matching happens during validation, so writing the entire JSON catalog for
-    every run would recreate the old performance problem even without SQLite.
-    A daily timestamp is enough for lifecycle reporting and keeps validation
-    reads effectively read-only.
-    """
+def record_learned_image_matches(matches, country_code: str = "") -> int:
+    """Track unique matched SKUs/sellers and refresh rule recency metadata."""
     if not matches:
         return 0
-    urls = {str(item.get("url", "")).strip() for item in matches.values() if isinstance(item, dict) and item.get("url")}
-    phashes = {str(item.get("phash", "")).strip() for item in matches.values() if isinstance(item, dict) and item.get("phash")}
-    if not urls and not phashes:
+    by_rule = {}
+    for sid, item in matches.items():
+        if not isinstance(item, dict):
+            continue
+        rule_url = str(item.get("matched_rule_url", "") or "").strip()
+        rule_phash = str(item.get("matched_rule_phash", "") or "").strip().casefold()
+        if not rule_url and not rule_phash:
+            continue
+        key = (rule_url, rule_phash)
+        bucket = by_rule.setdefault(key, {"sids": set(), "sellers": set()})
+        clean_sid = str(sid or "").strip()
+        clean_seller = str(item.get("seller_name", "") or "").strip()
+        if clean_sid:
+            bucket["sids"].add(clean_sid)
+        if clean_seller:
+            bucket["sellers"].add(clean_seller)
+    if not by_rule:
         return 0
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
-    cutoff = now_dt - timedelta(days=1)
+    sid_cap, seller_cap = 500, 100
+    country_code = str(country_code or "").strip().upper()
     with _LOCK:
         current = list(load_learned_image_rules())
         existing_identities = _rule_identity_counts(current)
         changed = 0
         for rule in current:
-            if str(rule.get("image_url", "")).strip() in urls or str(rule.get("phash", "")).strip() in phashes:
-                previous = str(rule.get("last_matched_at", "") or "").strip()
-                if previous:
-                    try:
-                        previous_dt = datetime.fromisoformat(previous.replace("Z", "+00:00"))
-                        if previous_dt.tzinfo is None:
-                            previous_dt = previous_dt.replace(tzinfo=timezone.utc)
-                        if previous_dt >= cutoff:
-                            continue
-                    except ValueError:
-                        pass
+            if not _rule_applies_in_country(rule, country_code):
+                continue
+            url = str(rule.get("image_url", "")).strip()
+            phash = str(rule.get("phash", "")).strip().casefold()
+            bucket = by_rule.get((url, phash)) or by_rule.get((url, "")) or by_rule.get(("", phash))
+            if bucket is None:
+                continue
+            old_sids = list(dict.fromkeys(str(value).strip() for value in (rule.get("matched_sids") or []) if str(value).strip()))
+            old_sellers = list(dict.fromkeys(str(value).strip() for value in (rule.get("matched_sellers") or []) if str(value).strip()))
+            merged_sids = list(dict.fromkeys(old_sids + sorted(bucket["sids"])))
+            merged_sellers = list(dict.fromkeys(old_sellers + sorted(bucket["sellers"])))
+            new_sids = merged_sids[:sid_cap]
+            new_sellers = merged_sellers[:seller_cap]
+            if new_sids != old_sids[:sid_cap] or new_sellers != old_sellers[:seller_cap]:
+                rule["matched_sids"] = new_sids
+                rule["matched_sellers"] = new_sellers
+                rule["match_count"] = len(new_sids)
+                rule["impact_truncated"] = len(merged_sids) > sid_cap or len(merged_sellers) > seller_cap
+                changed += 1
+            previous = str(rule.get("last_matched_at", "") or "").strip()
+            try:
+                previous_dt = datetime.fromisoformat(previous.replace("Z", "+00:00")) if previous else None
+                if previous_dt is not None and previous_dt.tzinfo is None:
+                    previous_dt = previous_dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                previous_dt = None
+            if previous_dt is None or previous_dt.date() < now_dt.date():
                 rule["last_matched_at"] = now
                 changed += 1
         if not changed:
@@ -944,13 +1417,17 @@ def record_learned_image_matches(matches) -> int:
         _RULES = current
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
         _sync_sqlite_locked(_RULES)
-        changed_rules = [rule for rule in current if str(rule.get("last_matched_at", "")) == now]
+        changed_rules = [rule for rule in current if (
+            (str(rule.get("image_url", "")).strip(), str(rule.get("phash", "")).strip().casefold()) in by_rule
+            or (str(rule.get("image_url", "")).strip(), "") in by_rule
+            or ("", str(rule.get("phash", "")).strip().casefold()) in by_rule
+        )]
         _remote_upsert_rules(changed_rules)
         return changed
 
 
-def record_learned_image_matches_async(matches):
-    return _WRITER.submit(record_learned_image_matches, matches)
+def record_learned_image_matches_async(matches, country_code: str = ""):
+    return _WRITER.submit(record_learned_image_matches, matches, country_code)
 
 
 def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
@@ -961,7 +1438,7 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
     rebuilding the full catalog after every file or rejection reason.
     """
     all_records = []
-    seen = set()
+    seen = {}
     batches = list(batches or [])
     for batch_index, batch in enumerate(batches, start=1):
         data = batch.get("data") if isinstance(batch, dict) else None
@@ -984,6 +1461,8 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
                 progress_callback(batch_index, len(batches), batch)
             continue
         hash_by_url = batch.get("hash_by_url", {}) or {}
+        _country = str(batch.get("country_code", "") or "").strip().upper()
+        _countries = normalize_rule_countries([_country] if _country else None)
         subset = data[data["PRODUCT_SET_SID"].astype(str).str.strip().isin(sid_set)]
         unique = subset.drop_duplicates(subset=["PRODUCT_SET_SID"]).copy()
         unique["_learn_image_url"] = unique[image_col].fillna("").astype(str).str.strip()
@@ -1002,6 +1481,7 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
                 "comment": str(batch.get("comment", "") or ""),
                 "brand": _brand_infringed,
                 "brand_infringed": _brand_infringed,
+                "brand_infringed_by_country": ({_country or "*": [_brand_infringed]} if _brand_infringed else {}),
                 "category_code": str(row.get("CATEGORY_CODE", "") or "").strip(),
                 "product_set_sid": str(row.get("PRODUCT_SET_SID", "")).strip(),
                 "seller_name": str(row.get("SELLER_NAME", "") or "").strip(),
@@ -1011,23 +1491,34 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
                 "last_matched_at": "",
                 "last_confirmed_at": "",
                 "review_due_at": (_created_at + timedelta(days=30)).isoformat(),
+                "countries": _countries,
+                "scope_categories": normalize_rule_values(batch.get("scope_categories")),
+                "scope_brands": normalize_rule_values(batch.get("scope_brands")),
+                "match_count": 0,
+                "matched_sids": [],
+                "matched_sellers": [],
+                "impact_truncated": False,
             }
             # Collapse repeated rows within the same import using the same
             # URL/pHash + reason key used against the existing catalog. A
             # different flag for the same image remains a valid addition.
             identity = (record["image_url"], record["phash"], record["flag"])
-            if identity in seen:
+            pending = seen.get(identity)
+            if pending is None:
+                seen[identity] = record
+                all_records.append(record)
                 continue
-            if (record["image_url"], record["flag"]) in {
-                (url_key, flag_key) for url_key, _phash_key, flag_key in seen
-            }:
-                continue
-            if record["phash"] and (record["phash"], record["flag"]) in {
-                (phash_key, flag_key) for _url_key, phash_key, flag_key in seen
-            }:
-                continue
-            seen.add(identity)
-            all_records.append(record)
+            # One durable image/reason row can track country-specific brands
+            # without broadening the actual restriction to another market.
+            pending_countries = set(normalize_rule_countries(pending.get("countries")))
+            pending_countries.update(normalize_rule_countries(record.get("countries")))
+            pending["countries"] = sorted(pending_countries) if "*" not in pending_countries else ["*"]
+            pending_brands = pending.setdefault("brand_infringed_by_country", {})
+            for code, brands in (record.get("brand_infringed_by_country") or {}).items():
+                current_brands = pending_brands.setdefault(code, [])
+                for brand in (brands if isinstance(brands, list) else [brands]):
+                    if brand and str(brand).casefold() not in {str(value).casefold() for value in current_brands}:
+                        current_brands.append(brand)
         if progress_callback:
             progress_callback(batch_index, len(batches), batch)
     if not all_records:
@@ -1035,20 +1526,35 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
     with _LOCK:
         current = list(load_learned_image_rules())
         existing_identities = _rule_identity_counts(current)
-        keys = {(str(r.get("image_url", "")).strip(), str(r.get("phash", "")).strip(), normalize_learned_flag(r.get("flag", ""))) for r in current}
-        url_keys = {(url, flag) for url, _phash, flag in keys if url}
-        phash_keys = {(_phash, flag) for _url, _phash, flag in keys if _phash}
         additions = []
+        changed_rules = []
         for record in all_records:
-            key = (record["image_url"], record["phash"], record["flag"])
-            if key in keys or (record["image_url"], record["flag"]) in url_keys or (record["phash"] and (record["phash"], record["flag"]) in phash_keys):
+            existing = next((item for item in current
+                if normalize_learned_flag(item.get("flag", "")) == record["flag"]
+                and ((record["image_url"] and str(item.get("image_url", "")).strip() == record["image_url"])
+                     or (record["phash"] and str(item.get("phash", "")).strip().casefold() == record["phash"].casefold()))), None)
+            if existing is not None:
+                old_countries = normalize_rule_countries(existing.get("countries"), legacy_global=True)
+                if record["flag"] == "Restricted brands":
+                    existing_brands = existing.setdefault("brand_infringed_by_country", {})
+                    for country, brands in (record.get("brand_infringed_by_country") or {}).items():
+                        target = existing_brands.setdefault(country, [])
+                        if isinstance(target, str):
+                            target = [target]
+                            existing_brands[country] = target
+                        for brand in (brands if isinstance(brands, list) else [brands]):
+                            if brand and str(brand).casefold() not in {str(value).casefold() for value in target}:
+                                target.append(brand)
+                                changed_rules.append(existing)
+                if "*" not in old_countries:
+                    _country_union = set(old_countries) | set(record["countries"])
+                    merged_countries = ["*"] if "*" in _country_union else sorted(_country_union)
+                    if merged_countries != old_countries:
+                        existing["countries"] = merged_countries
+                        changed_rules.append(existing)
                 continue
-            keys.add(key)
-            url_keys.add((record["image_url"], record["flag"]))
-            if record["phash"]:
-                phash_keys.add((record["phash"], record["flag"]))
             additions.append(record)
-        if not additions:
+        if not additions and not changed_rules:
             return 0
         payload = current + additions
         _assert_no_rules_lost(existing_identities, payload)
@@ -1060,7 +1566,7 @@ def learn_image_rejections_bulk(batches, progress_callback=None) -> int:
         _RULES = payload
         _RULES_MTIME = RULES_PATH.stat().st_mtime_ns
         _sync_sqlite_locked(_RULES)
-        _remote_upsert_rules(additions)
+        _remote_upsert_rules(additions + changed_rules)
         return len(additions)
 
 

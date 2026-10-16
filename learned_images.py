@@ -58,6 +58,8 @@ _BLOCKED_FLAG_MAP = {
     "adult / nsfw content":         "NSFW Images",
     "suspected counterfeit":         "Suspected Fake product",
     "counterfeit product":           "Suspected Fake product",
+    "suspected fake":                "Suspected Fake product",
+    "suspected fake product":        "Suspected Fake product",
 }
 
 
@@ -200,6 +202,11 @@ def get_blocked_image_matches(
     if not img_col or not sid_col:
         return {}
 
+    seller_col = next((c for c in ("SELLER_NAME", "SellerName", "seller_name") if c in data.columns), None)
+    brand_col = next((c for c in ("BRAND", "Brand", "brand") if c in data.columns), None)
+    category_col = next((c for c in ("CATEGORY", "CATEGORY_PATH", "FULL_CATEGORY_PATH", "CATEGORY_CODE") if c in data.columns), None)
+    category_code_col = next((c for c in ("CATEGORY_CODE", "CategoryCode") if c in data.columns), None)
+
     if hash_by_url is None:
         try:
             hash_by_url = st.session_state.get("_image_phash_by_url", {})
@@ -253,6 +260,9 @@ def get_blocked_image_matches(
             hash(tuple(zip(
                 data[sid_col].fillna("").astype(str).str.strip(),
                 data[img_col].fillna("").astype(str).str.strip(),
+                data[brand_col].fillna("").astype(str).str.strip() if brand_col else [""] * len(data),
+                data[category_col].fillna("").astype(str).str.strip() if category_col else [""] * len(data),
+                data[category_code_col].fillna("").astype(str).str.strip() if category_code_col else [""] * len(data),
             )))
         )
         _cached_matches = _MATCH_RESULT_CACHE.get(_match_key)
@@ -264,7 +274,25 @@ def get_blocked_image_matches(
     matches = {}
     _sid_values = data[sid_col].fillna("").astype(str).str.strip().to_numpy()
     _url_values = data[img_col].fillna("").astype(str).str.strip().to_numpy()
-    for sid, url in zip(_sid_values, _url_values):
+    _seller_values = (
+        data[seller_col].fillna("").astype(str).str.strip().to_numpy()
+        if seller_col else [""] * len(_sid_values)
+    )
+    _brand_values = (
+        data[brand_col].fillna("").astype(str).str.strip().to_numpy()
+        if brand_col else [""] * len(_sid_values)
+    )
+    _category_values = (
+        data[category_col].fillna("").astype(str).str.strip().to_numpy()
+        if category_col else [""] * len(_sid_values)
+    )
+    _category_code_values = (
+        data[category_code_col].fillna("").astype(str).str.strip().to_numpy()
+        if category_code_col else [""] * len(_sid_values)
+    )
+    for sid, url, seller_name, declared_brand, category_value, category_code_value in zip(
+        _sid_values, _url_values, _seller_values, _brand_values, _category_values, _category_code_values
+    ):
         if not url or url.lower() == "nan" or not sid:
             continue
 
@@ -316,6 +344,17 @@ def get_blocked_image_matches(
                             matched_by = "near-phash"
 
         if entry:
+            _scope_categories = [str(value).strip().casefold() for value in entry.get("scope_categories", []) if str(value).strip()]
+            if _scope_categories:
+                _category_norm = str(category_value or "").strip().casefold()
+                # The code is checked separately from the chosen path column.
+                _category_code_norm = str(category_code_value or "").strip().casefold()
+                # Scope values may be exact category codes or path fragments.
+                if not any(value == _category_code_norm or value == _category_norm or value in _category_norm for value in _scope_categories):
+                    continue
+            _scope_brands = entry.get("scope_brands", [])
+            if _scope_brands and not _learned_brands_agree(declared_brand, _scope_brands):
+                continue
             flag = entry.get("flag", "Poor images")
             brand = entry.get("brand", "")
             if flag == "Restricted brands" and brand:
@@ -342,6 +381,7 @@ def get_blocked_image_matches(
             matches[sid] = {
                 "flag": flag,
                 "brand": brand,
+                "brand_candidates": entry.get("brand_candidates", [brand] if brand else []),
                 "url": url,
                 # The matched rule URL is different from the product URL for
                 # pHash and near-pHash matches. Keep it so review surfaces can
@@ -364,6 +404,7 @@ def get_blocked_image_matches(
                     or (matched_by == "near-phash" and int(distance or 99) <= 4)
                     else "review"
                 ),
+                "seller_name": str(seller_name or "").strip(),
             }
 
     if _match_key is not None:
@@ -376,18 +417,22 @@ def get_blocked_image_matches(
 def _learned_brands_agree(declared: str, learned: str) -> bool:
     """Return True when the listing brand is compatible with the image brand."""
     declared = str(declared or "").strip().casefold()
-    learned = str(learned or "").strip().casefold()
-    if not learned or learned in {"nan", "none", "unknown", "no brand", "n/a"}:
+    if isinstance(learned, (list, tuple, set)):
+        learned_values = [str(value).strip().casefold() for value in learned if str(value).strip()]
+    else:
+        learned_values = [str(learned or "").strip().casefold()]
+    learned_values = [value for value in learned_values if value not in {"nan", "none", "unknown", "no brand", "n/a"}]
+    if not learned_values:
         return True
     if not declared or declared in {"nan", "none", "unknown", "no brand", "n/a"}:
         return False
-    if declared == learned:
-        return True
     # Treat "NIVEA" and "NIVEA BABY" as compatible while rejecting unrelated
     # declarations such as Generic, Lattafa, or Sanford.
-    return bool(
-        re.search(r"\b" + re.escape(learned) + r"\b", declared)
+    return any(
+        declared == learned
+        or re.search(r"\b" + re.escape(learned) + r"\b", declared)
         or re.search(r"\b" + re.escape(declared) + r"\b", learned)
+        for learned in learned_values
     )
 
 
@@ -423,6 +468,16 @@ def check_blocked_image_fingerprints(
         return pd.DataFrame(columns=data.columns)
 
     country_code = str(kwargs.get("country_code", "")).strip().upper()
+    code_to_path = kwargs.get("code_to_path", {}) or {}
+    category_text = data.get("CATEGORY", pd.Series("", index=data.index)).fillna("").astype(str).str.strip()
+    category_code = data.get("CATEGORY_CODE", pd.Series("", index=data.index)).fillna("").astype(str).str.strip()
+    mapped_category = category_code.map(code_to_path).fillna("").astype(str).str.strip()
+    category_path = category_text.where(category_text.str.len().gt(0), mapped_category).str.casefold()
+    books_sids = set(data.loc[
+        category_path.str.startswith("books, movies and music")
+        | category_path.str.contains(r"(?:^|[/,>])\s*books?\b", regex=True, na=False),
+        sid_col,
+    ].astype(str).str.strip())
     declared_brand_by_sid = {}
     if "BRAND" in data.columns:
         declared_brand_by_sid = dict(zip(
@@ -439,6 +494,8 @@ def check_blocked_image_fingerprints(
             # the old iterrows path created one for every product.
             frow = data.iloc[_row_pos].copy()
             learned_flag = str(m.get("flag", "Poor images")).strip()
+            if learned_flag == "Restricted brands" and sid in books_sids:
+                continue
             # Uganda has no restricted-brand rejection catalogue. Its learned
             # restricted-image records are used only as evidence that the
             # declared brand should agree with the brand attached to the image.
@@ -446,9 +503,10 @@ def check_blocked_image_fingerprints(
             # Brand Image Mismatch validation so it is reviewable and clearly
             # explains the wrong brand.
             if country_code == "UG" and learned_flag == "Restricted brands":
+                learned_brands = m.get("brand_candidates") or [m.get("brand", "")]
                 learned_brand = str(m.get("brand", "")).strip()
                 declared_brand = declared_brand_by_sid.get(sid, "")
-                if _learned_brands_agree(declared_brand, learned_brand):
+                if _learned_brands_agree(declared_brand, learned_brands):
                     continue
                 frow["Comment_Detail"] = (
                     f"Image shows '{learned_brand}' but listing brand is "
