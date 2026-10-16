@@ -1607,7 +1607,7 @@ if uploads:
             status_col = _pick(frame.columns, ["STATUS", "LISTING_STATUS"])
             reason_col = _pick(frame.columns, ["REASON", "COMMENT", "COMMENT_DETAIL"])
             brand_col = _pick(frame.columns, ["BRAND", "BRAND_INFRINGED", "INFRINGED_BRAND", "BRAND_CLAIMED", "CLAIMED_BRAND"])
-            country_col = _pick(frame.columns, ["COUNTRY_CODE", "COUNTRY", "MARKET"])
+            country_col = _pick(frame.columns, ["ACTIVE_STATUS_COUNTRY", "COUNTRY_CODE", "COUNTRY", "MARKET"])
             if not image_col:
                 problems.append(f"{source_name}: needs an image URL column")
                 continue
