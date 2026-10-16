@@ -4505,7 +4505,18 @@ function _announceGridReady() {{
 
 window.addEventListener('message', function(e) {{
   if (e.data && e.data.type === 'SYNC_STATE') {{
+    var syncRevision = Number(e.data.sync_revision) || 0;
+    // A delayed broadcaster from an earlier rerun must not replace cards from
+    // a newer server page or move the iframe pager backwards.
+    if (syncRevision && syncRevision < window._lastGridSyncRevision) return;
+    if (syncRevision) window._lastGridSyncRevision = syncRevision;
     var cardsChanged = false;
+    var incomingServerPage = Number(e.data.server_page || 0);
+    var serverPageChanged = window._activeServerPage !== incomingServerPage;
+    if (serverPageChanged) {{
+      window._activeServerPage = incomingServerPage;
+      PAGE_STATE.autoPages = 1;
+    }}
     if (e.data.images) {{
       for (var _s in e.data.images) {{ IMAGES[_s] = e.data.images[_s]; }}
       // Hard ceiling. Each entry is a base64 data URI, so without this a long
@@ -4518,7 +4529,7 @@ window.addEventListener('message', function(e) {{
     // Tell the sender it landed so it stops retrying. The old code fired the
     // full payload four times at every frame regardless of success.
     try {{
-      var _ack = {{type: 'SYNC_ACK', sig: e.data.cards_sig || null}};
+      var _ack = {{type: 'SYNC_ACK', sig: e.data.cards_sig || null, sync_revision: syncRevision}};
       window.parent.postMessage(_ack, '*');
       for (var _i = 0; _i < window.parent.frames.length; _i++) {{
         try {{ window.parent.frames[_i].postMessage(_ack, '*'); }} catch(_e) {{}}
@@ -4532,15 +4543,9 @@ window.addEventListener('message', function(e) {{
       // the browser doesn't tear down/rebuild the whole DOM.
       var sig = e.data.cards_sig || null;
       if (sig === null || sig !== _lastCardsSig) {{
-        var incomingServerPage = Number(e.data.server_page || 0);
-        var serverPageChanged = window._activeServerPage !== incomingServerPage;
         CARDS = e.data.cards;
         _lastCardsSig = sig;
         cardsChanged = true;
-        window._activeServerPage = incomingServerPage;
-        // Keep the in-page scroll depth when a batch only updates card status.
-        // Reset it only after the reviewer changes the server page.
-        if (serverPageChanged) PAGE_STATE.autoPages = 1;
       }}
     }}
     if (e.data.committed) COMMITTED = e.data.committed;
@@ -5667,6 +5672,7 @@ function _updatePageControls(totalCount) {{
 window._serverPage = window._serverPage || 0;
 window._serverPageCount = window._serverPageCount || 1;
 window._serverPagePending = false;
+window._lastGridSyncRevision = Number(window._lastGridSyncRevision) || 0;
 function updateServerPageControls() {{
   var page = Math.max(0, Number(window._serverPage) || 0);
   var total = Math.max(1, Number(window._serverPageCount) || 1);
@@ -7358,6 +7364,12 @@ def visual_review_modal(support_files):
         # shrinks the result set to 7 pages should land on page 7, not 1.
         st.session_state.grid_page = total_pages - 1
 
+    # Keep the Streamlit footer number aligned after filter-context restores
+    # and page-count clamping, not only after an iframe navigation event.
+    _confirmed_page = int(st.session_state.get("grid_page", 0) or 0)
+    st.session_state.jump_bot = _confirmed_page + 1
+    st.session_state._grid_page_contexts[_curr_ctx] = _confirmed_page
+
     # 'Total items' used to sit on its own line above a separate 'Page (of N)'
     # label — two rows saying one thing. The count now rides on the page
     # control at the bottom.
@@ -7564,11 +7576,21 @@ def visual_review_modal(support_files):
     # that reloaded iframe with nothing to draw.
     _grid_html_sig = hashlib.md5(_grid_html_str.encode("utf-8")).hexdigest()
     _iframe_reloaded = st.session_state.get("_grid_last_html_sig") != _grid_html_sig
+    _server_page = int(st.session_state.get("grid_page", 0) or 0)
+    _server_page_changed = st.session_state.get("_grid_last_sent_page") != _server_page
     _send_bulk = (
-        st.session_state.get("_grid_last_sent_sig") != _cards_sig or _iframe_reloaded
+        st.session_state.get("_grid_last_sent_sig") != _cards_sig
+        or _iframe_reloaded
+        or _server_page_changed
     )
     st.session_state._grid_last_sent_sig = _cards_sig
     st.session_state._grid_last_html_sig = _grid_html_sig
+    st.session_state._grid_last_sent_page = _server_page
+
+    # Each broadcaster gets a monotonic revision so a late retry from an older
+    # rerun cannot overwrite the current page state in the grid iframe.
+    _sync_revision = int(st.session_state.get("_grid_sync_revision", 0) or 0) + 1
+    st.session_state["_grid_sync_revision"] = _sync_revision
 
     # Images for the current page are sent whenever the card set changes, and
     # the iframe holds them in a size-capped store. Tracking what the browser
@@ -7659,8 +7681,9 @@ def visual_review_modal(support_files):
         grid_sort: {json.dumps(curr_sort or '')},
         grid_filter: {json.dumps(curr_flag or '')},
         grid_page_size: {int(ipp)},
-        server_page: {int(st.session_state.get('grid_page', 0) or 0)},
+        server_page: {_server_page},
         server_page_count: {int(total_pages)},
+        sync_revision: {_sync_revision},
         {_cards_field}
         {_images_field}
         cards_sig: {json.dumps(_cards_sig)},
@@ -7670,7 +7693,9 @@ def visual_review_modal(support_files):
       var timer = null;
       window.addEventListener('message', function(ev) {{
         if (!ev.data) return;
-        if (ev.data.type === 'SYNC_ACK') {{
+        if (ev.data.type === 'SYNC_ACK' &&
+            Number(ev.data.sync_revision) === Number(PAYLOAD.sync_revision) &&
+            String(ev.data.sig || '') === String(PAYLOAD.cards_sig || '')) {{
           acked = true;
           if (timer) {{ clearTimeout(timer); timer = null; }}
         }} else if (ev.data.type === 'GRID_READY') {{
